@@ -126,7 +126,11 @@ fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
                 if (inverse) |inv| {
                     relation = edge_mod.resolveRelation(e, inv);
                     inverse_name = inv.name;
+                } else {
+                    relation = edge_mod.resolveRelation(e, null);
                 }
+            } else {
+                relation = edge_mod.resolveRelation(e, null);
             }
         } else {
             // To edge: look for a From edge in the target that references us.

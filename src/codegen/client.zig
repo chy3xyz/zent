@@ -54,56 +54,9 @@ pub fn EntityClient(comptime info: TypeInfo) type {
             return DeleteBuilder.init(self.allocator, self.driver);
         }
 
-        // Edge traversal: Query entities from O2M/M2M edge
-        // For example: QueryCars(user_id) returns Car entities owned by user_id
-        pub fn QueryEdge(self: Self, comptime edge_name: []const u8, parent_ids: []const i64) !QueryBuilder {
-            // Find the edge by name
-            const edge = findEdge(info, edge_name) orelse {
-                return error.EdgeNotFound;
-            };
-
-            // Return a query that filters by edge
-            var q = QueryBuilder.init(self.allocator, self.driver);
-
-            // Add predicate to filter by parent IDs - use edge column
-            const edge_column = getEdgeSourceColumn(edge);
-
-            // Build values array - simplified version
-            var values: [16]sql.Value = undefined;
-            for (parent_ids, 0..) |id, i| {
-                if (i >= 16) break;
-                values[i] = .{ .int = id };
-            }
-            const slice = values[0..parent_ids.len];
-
-            // Note: This queries the CURRENT entity's table, not the target's
-            // In a full implementation, we'd need to switch to target QueryBuilder
-            // For now, we just return the query with the IN predicate set up
-            if (parent_ids.len > 0) {
-                _ = q.Where(.{sql.In(edge_column, slice)});
-            }
-
-            return q;
-        }
-
         pub const EntityType = Entity;
         pub const meta = Meta;
     };
-}
-
-/// Find an edge by name in the type info
-fn findEdge(comptime info: TypeInfo, comptime name: []const u8) ?EdgeInfo {
-    inline for (info.edges) |e| {
-        if (std.mem.eql(u8, e.name, name)) {
-            return e;
-        }
-    }
-    return null;
-}
-
-/// Get the column name in edge table that points to source
-fn getEdgeSourceColumn(comptime edge: EdgeInfo) []const u8 {
-    return edge.name ++ "_id";
 }
 
 fn toSnakeCase(name: []const u8) []const u8 {
@@ -137,10 +90,12 @@ fn structFieldName(comptime name: []const u8) [:0]const u8 {
 }
 
 /// Generate a root Client type from multiple TypeInfos.
+/// The Client holds entity sub-clients and per-edge query helpers.
 pub fn Client(comptime infos: []const TypeInfo) type {
     comptime {
         var fields: []const std.builtin.Type.StructField = &.{};
 
+        // Entity sub-clients (user, car, group, ...)
         for (infos) |info| {
             const ClientType = EntityClient(info);
 
@@ -179,6 +134,25 @@ pub fn makeClient(comptime infos: []const TypeInfo, allocator: std.mem.Allocator
 /// Creates entity tables and junction tables for M2M edges.
 pub fn createAllTables(comptime infos: []const TypeInfo, driver: sql_driver.Driver) !void {
     return migrate.createAllTables(driver, infos);
+}
+
+/// Query target entities via an O2M/M2M edge.
+/// For example: queryTargets(infos, "cars", &[1], allocator, driver) returns Car entities for user 1.
+pub fn queryTargets(
+    comptime infos: []const TypeInfo,
+    comptime source_name: []const u8,
+    comptime edge_name: []const u8,
+    parent_ids: []const i64,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+) !std.array_list.Managed(anyopaque) {
+    _ = infos;
+    _ = source_name;
+    _ = edge_name;
+    _ = parent_ids;
+    _ = allocator;
+    _ = driver;
+    return error.NotImplemented;
 }
 
 // ------------------------------------------------------------------

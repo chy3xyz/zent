@@ -68,14 +68,15 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
         var foreign_keys: []const ForeignKeyDef = &.{};
 
         for (info.edges) |e| {
-            if (e.kind == .from and e.relation == .o2m) {
-                // O2M From edge: this entity has a foreign key column
+            if (e.kind == .from and (e.relation == .o2m or e.relation == .m2o)) {
+                // O2M/M2O From edge: this entity has a foreign key column
                 // e.g., Car.owner -> User (owner_id column in car table)
-                const fk_col_name = (e.inverse_name orelse e.name) ++ "_id";
+                // Column name is edge_name + "_id"
+                const fk_col_name = e.name ++ "_id";
                 const col = ColumnDef{
                     .name = fk_col_name,
                     .sql_type = "INTEGER",
-                    .not_null = !e.optional,
+                    .not_null = !e.required,
                     .unique = e.unique,
                 };
                 columns = columns ++ &[_]ColumnDef{col};
@@ -88,11 +89,11 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
             } else if (e.kind == .from and e.relation == .o2o) {
                 // O2O From edge: foreign key column
-                const fk_col_name = (e.inverse_name orelse e.name) ++ "_id";
+                const fk_col_name = e.name ++ "_id";
                 const col = ColumnDef{
                     .name = fk_col_name,
                     .sql_type = "INTEGER",
-                    .not_null = !e.optional,
+                    .not_null = !e.required,
                     .unique = true, // O2O FK is always unique
                 };
                 columns = columns ++ &[_]ColumnDef{col};
@@ -168,7 +169,7 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
 
     const writer = buf.writer();
 
-    try writer.writeAll("CREATE TABLE ");
+    try writer.writeAll("CREATE TABLE IF NOT EXISTS ");
     try quoteIdent(dialect, writer, table.name);
     try writer.writeAll(" (\n");
 
@@ -260,21 +261,27 @@ pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect)
 
 /// Create all tables for a set of TypeInfos (create-only migration).
 /// This creates tables in dependency order and also creates junction tables for M2M edges.
+/// For O2M/M2O To edges, it adds the FK column to the source entity's table.
 pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver.dialect();
 
     // Create main entity tables
+    // For each entity, also check if any OTHER entity has a From edge pointing here,
+    // which means we need to add FK columns to that other entity's table.
+    // We handle this by building the table definition with FK columns from both
+    // own From edges AND from cross-referenced To edges.
     inline for (infos) |info| {
-        const table = comptime tableFromTypeInfo(info);
+        const table = comptime tableFromTypeInfoCrossRef(info, infos);
         const sql = try createTableSQL(table, dialect);
         defer std.heap.page_allocator.free(sql);
         _ = try driver.exec(sql, &.{});
     }
 
-    // Create junction tables for M2M edges
+    // Create junction tables for M2M edges (both To and From sides).
+    // CREATE TABLE IF NOT EXISTS handles duplicates when both sides declare M2M.
     inline for (infos) |info| {
         inline for (info.edges) |e| {
-            if (e.kind == .to and e.relation == .m2m) {
+            if (e.relation == .m2m) {
                 const jtable = comptime junctionTableForEdge(e, info);
                 const sql = try createTableSQL(jtable, dialect);
                 defer std.heap.page_allocator.free(sql);
@@ -295,6 +302,122 @@ pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeIn
             defer std.heap.page_allocator.free(sql);
             _ = try driver.exec(sql, &.{});
         }
+    }
+}
+
+/// Like tableFromTypeInfo, but also adds FK columns from cross-referenced To edges.
+/// For example, if User has a To("cars", Car) O2M edge, this adds a "user_id" FK column
+/// to the Car table pointing back to User.
+fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
+    comptime {
+        var columns: []const ColumnDef = &.{};
+        var foreign_keys: []const ForeignKeyDef = &.{};
+
+        // Generate columns from fields
+        for (info.fields) |f| {
+            const col = ColumnDef{
+                .name = f.name,
+                .sql_type = f.sql_type,
+                .primary_key = f.is_id,
+                .not_null = !f.optional and !f.nillable,
+                .unique = f.unique,
+                .default_value = defaultValueStr(f),
+                .auto_increment = f.is_id,
+            };
+            columns = columns ++ &[_]ColumnDef{col};
+        }
+
+        // Own From edges generate FK columns in this table
+        for (info.edges) |e| {
+            if (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) {
+                const fk_col_name = e.name ++ "_id";
+                const col = ColumnDef{
+                    .name = fk_col_name,
+                    .sql_type = "INTEGER",
+                    .not_null = !e.required,
+                    .unique = e.unique,
+                };
+                columns = columns ++ &[_]ColumnDef{col};
+
+                const fk = ForeignKeyDef{
+                    .columns = &[_][]const u8{fk_col_name},
+                    .ref_table = toSnakeCase(e.target_name),
+                    .ref_columns = &[_][]const u8{"id"},
+                };
+                foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
+            }
+        }
+
+        // Cross-referenced To edges: if another entity has a To edge pointing here
+        // with O2M relation, add the FK column to THIS table.
+        // For example: User has To("cars", Car) → Car gets "user_id" FK column.
+        // If this entity already has a corresponding From edge, the FK is handled
+        // by that From edge (e.g., Car.From("owner", User).Ref("cars")) and we
+        // skip adding a duplicate column.
+        for (all_infos) |other_info| {
+            for (other_info.edges) |e| {
+                // Find To edges from other entities pointing to this entity
+                if (e.kind == .to and std.mem.eql(u8, e.target_name, info.name)) {
+                    // Check if this entity already has a corresponding From edge.
+                    var has_from_inverse = false;
+                    for (info.edges) |my_edge| {
+                        if (my_edge.kind == .from and
+                            std.mem.eql(u8, my_edge.target_name, other_info.name) and
+                            my_edge.ref != null and
+                            std.mem.eql(u8, my_edge.ref.?, e.name))
+                        {
+                            has_from_inverse = true;
+                            break;
+                        }
+                    }
+                    if (has_from_inverse) continue;
+
+                    if (e.relation == .o2m) {
+                        // O2M: "one User has many Cars" → Car table gets FK column
+                        const fk_col_name = toSnakeCase(other_info.name) ++ "_id";
+                        // Check if this column already exists
+                        var exists = false;
+                        for (columns) |c| {
+                            if (std.mem.eql(u8, c.name, fk_col_name)) {
+                                exists = true;
+                                break;
+                            }
+                        }
+                        if (!exists) {
+                            const col = ColumnDef{
+                                .name = fk_col_name,
+                                .sql_type = "INTEGER",
+                                .not_null = true,
+                                .unique = false,
+                            };
+                            columns = columns ++ &[_]ColumnDef{col};
+
+                            const fk = ForeignKeyDef{
+                                .columns = &[_][]const u8{fk_col_name},
+                                .ref_table = other_info.table_name,
+                                .ref_columns = &[_][]const u8{"id"},
+                            };
+                            foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
+                        }
+                    }
+                }
+            }
+        }
+
+        // Primary keys
+        var pks: []const []const u8 = &.{};
+        for (info.fields) |f| {
+            if (f.is_id) {
+                pks = pks ++ &[_][]const u8{f.name};
+            }
+        }
+
+        return TableDef{
+            .name = info.table_name,
+            .columns = columns,
+            .primary_keys = pks,
+            .foreign_keys = foreign_keys,
+        };
     }
 }
 
