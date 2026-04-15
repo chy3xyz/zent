@@ -16,6 +16,7 @@ const start_schema = @import("schema.zig");
 const User = start_schema.User;
 const Car = start_schema.Car;
 const Group = start_schema.Group;
+const UserGroup = start_schema.UserGroup;
 const UserSettings = start_schema.UserSettings;
 const ActiveUserView = start_schema.ActiveUserView;
 
@@ -23,11 +24,12 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     // --- Phase 1: Schema definition and comptime introspection ---
-    const graph = comptime buildGraph(&.{ User, Car, Group, ActiveUserView });
+    const graph = comptime buildGraph(&.{ User, Car, Group, ActiveUserView, UserGroup });
     const user_info = graph.types[0];
     const car_info = graph.types[1];
     const group_info = graph.types[2];
     const view_info = graph.types[3];
+    const user_group_info = graph.types[4];
 
     std.debug.print("=== Phase 1: Schema Introspection ===\n", .{});
     std.debug.print("Entity: {s}, Table: {s}, Fields: {d}, Edges: {d}\n", .{
@@ -54,6 +56,9 @@ pub fn main() !void {
     });
     std.debug.print("View: {s}, Table: {s}, Fields: {d}, is_view={}\n", .{
         view_info.name, view_info.table_name, view_info.fields.len, view_info.is_view,
+    });
+    std.debug.print("Edge Schema: {s}, Table: {s}, Fields: {d}\n", .{
+        user_group_info.name, user_group_info.table_name, user_group_info.fields.len,
     });
 
     // --- Phase 0: SQL Builder Demo ---
@@ -165,6 +170,16 @@ pub fn main() !void {
     std.debug.print("Created car: id={d}, model={s}\n", .{ car2.id, car2.model });
 
     std.debug.print("Added users to groups via AddEdge.\n", .{});
+
+    // CREATE UserGroup edge record directly (edge schema with extra field)
+    std.debug.print("\n-- CREATE UserGroup edge record --\n", .{});
+    var ug_builder = client.user_group.Create();
+    defer ug_builder.deinit();
+    _ = ug_builder.setFieldValue("user_id", alice.id);
+    _ = ug_builder.setFieldValue("group_id", group2.id);
+    _ = ug_builder.setFieldValue("joined_at", 1705318200);
+    const ug = try ug_builder.Save();
+    std.debug.print("Created user_group: user_id={d}, group_id={d}, joined_at={d}\n", .{ ug.user_id, ug.group_id, ug.joined_at.? });
 
     const user_preds = client.user.predicates;
 

@@ -32,6 +32,8 @@ pub const EdgeInfo = struct {
     ref: ?[]const u8,
     field_name: ?[]const u8,
     inverse_name: ?[]const u8,
+    through: ?type,
+    through_name: ?[]const u8,
 };
 
 pub const IndexInfo = struct {
@@ -155,6 +157,8 @@ fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
             }
         }
 
+        const through_name: ?[]const u8 = if (e.through) |t| toSnakeCase(t.schema_name) else null;
+
         return EdgeInfo{
             .name = e.name,
             .target = e.target,
@@ -167,6 +171,8 @@ fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
             .ref = e.ref,
             .field_name = e.field_name,
             .inverse_name = inverse_name,
+            .through = e.through,
+            .through_name = through_name,
         };
     }
 }

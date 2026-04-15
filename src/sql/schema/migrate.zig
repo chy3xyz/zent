@@ -311,15 +311,19 @@ pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeIn
     }
 
     // Create junction tables for M2M edges (both To and From sides).
+    // Skip edges that use an explicit edge schema (through).
     // CREATE TABLE IF NOT EXISTS handles duplicates when both sides declare M2M.
     inline for (infos) |info| {
         if (info.is_view) continue;
         inline for (info.edges) |e| {
-            if (e.relation == .m2m) {
+            if (e.relation == .m2m and e.through == null) {
                 const jtable = comptime junctionTableForEdge(e, info);
                 const sql = try createTableSQL(jtable, dialect);
                 defer std.heap.page_allocator.free(sql);
-                _ = try driver.exec(sql, &.{});
+                _ = try driver.exec(
+                    sql,
+                    &.{},
+                );
             }
         }
     }

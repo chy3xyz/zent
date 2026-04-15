@@ -218,7 +218,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 setEntityField(&entity, fv.name, fv.value, self.allocator);
             }
 
-            // Insert M2M junction table rows
+            // Insert M2M junction table rows (or edge schema rows)
             inline for (info.edges) |edge| {
                 if (edge.relation == .m2m) {
                     for (self.edge_values.items) |ev| {
@@ -226,7 +226,9 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                             const target_info = findTypeInfo(infos, edge.target_name);
                             const source_table = info.table_name;
                             const target_table = target_info.table_name;
-                            const junction_table = if (std.mem.lessThan(u8, source_table, target_table))
+                            const junction_table = if (edge.through_name) |tn|
+                                tn
+                            else if (std.mem.lessThan(u8, source_table, target_table))
                                 source_table ++ "_" ++ target_table
                             else
                                 target_table ++ "_" ++ source_table;

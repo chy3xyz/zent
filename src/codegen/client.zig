@@ -276,10 +276,12 @@ pub fn queryTargets(
     }
 
     if (edge.relation == .m2m) {
-        // M2M: query via junction table
+        // M2M: query via junction table or edge schema (through)
         const source_table = source_info.table_name;
         const target_table = target_info.table_name;
-        const junction_table = if (std.mem.lessThan(u8, source_table, target_table))
+        const junction_table = if (edge.through_name) |tn|
+            tn
+        else if (std.mem.lessThan(u8, source_table, target_table))
             source_table ++ "_" ++ target_table
         else
             target_table ++ "_" ++ source_table;

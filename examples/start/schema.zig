@@ -49,6 +49,14 @@ const UserBase = Schema("User", .{
     },
 });
 
+pub const UserGroup = Schema("UserGroup", .{
+    .fields = &.{
+        field.Int("user_id"),
+        field.Int("group_id"),
+        field.Time("joined_at").Optional(),
+    },
+});
+
 pub const ActiveUserView = Schema("ActiveUserView", .{
     .view = true,
     .view_sql = "SELECT id, name, age, status, settings, created_at, updated_at FROM user WHERE status = 'active'",
@@ -64,5 +72,5 @@ pub const ActiveUserView = Schema("ActiveUserView", .{
 // M2M is declared with To on both sides.
 // O2M is declared with To on the "one" side and From on the "many" side.
 pub const Car = withEdges(CarBase, &.{edge.From("owner", UserBase).Ref("cars")});
-pub const Group = withEdges(GroupBase, &.{edge.To("users", UserBase)});
-pub const User = withEdges(UserBase, &.{ edge.To("cars", Car), edge.To("groups", GroupBase) });
+pub const Group = withEdges(GroupBase, &.{edge.To("users", UserBase).Through(UserGroup)});
+pub const User = withEdges(UserBase, &.{ edge.To("cars", Car), edge.To("groups", GroupBase).Through(UserGroup) });

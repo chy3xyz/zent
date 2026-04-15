@@ -24,6 +24,7 @@ pub const Edge = struct {
     immutable: bool = false,
     ref: ?[]const u8 = null,
     field_name: ?[]const u8 = null, // explicit FK field binding
+    through: ?type = null, // edge schema for M2M junction table
 
     pub fn Unique(self: Edge) Edge {
         var e = self;
@@ -52,6 +53,12 @@ pub const Edge = struct {
     pub fn Field(self: Edge, comptime fk_field: []const u8) Edge {
         var e = self;
         e.field_name = fk_field;
+        return e;
+    }
+
+    pub fn Through(self: Edge, comptime schema: type) Edge {
+        var e = self;
+        e.through = schema;
         return e;
     }
 };
