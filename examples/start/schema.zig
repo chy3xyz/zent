@@ -30,6 +30,7 @@ const UserBase = Schema("User", .{
         field.Int("age").Positive(),
         field.String("name").Default("unknown"),
     },
+    .mixins = &.{zent.core.mixin.TimeMixin},
 });
 
 // M2M is declared with To on both sides.

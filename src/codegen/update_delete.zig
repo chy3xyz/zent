@@ -116,13 +116,19 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         }
 
         fn canSetField(comptime Expected: type, Actual: type) bool {
+            // Unwrap optional type for comparison
+            const Unwrapped = if (@typeInfo(Expected) == .optional)
+                @typeInfo(Expected).optional.child
+            else
+                Expected;
+
             // Direct match
             if (Expected == Actual) return true;
             // int literals
-            if (Expected == i64 and Actual == comptime_int) return true;
-            if (Expected == f64 and Actual == comptime_float) return true;
+            if (Unwrapped == i64 and Actual == comptime_int) return true;
+            if (Unwrapped == f64 and Actual == comptime_float) return true;
             // String types - check various pointer/array forms
-            if (Expected == []const u8) {
+            if (Unwrapped == []const u8) {
                 return switch (@typeInfo(Actual)) {
                     .pointer => |ptr| {
                         if (ptr.child == u8 and ptr.size == .slice) return true;

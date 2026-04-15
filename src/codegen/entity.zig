@@ -6,12 +6,13 @@ pub fn Entity(comptime info: TypeInfo) type {
     comptime {
         var fields: [info.fields.len]std.builtin.Type.StructField = undefined;
         for (info.fields, 0..) |f, i| {
+            const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
             fields[i] = .{
                 .name = (f.name)[0..f.name.len :0],
-                .type = f.zig_type,
+                .type = FieldType,
                 .default_value_ptr = null,
                 .is_comptime = false,
-                .alignment = @alignOf(f.zig_type),
+                .alignment = @alignOf(FieldType),
             };
         }
         return @Type(.{
