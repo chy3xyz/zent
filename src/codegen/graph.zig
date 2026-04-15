@@ -201,8 +201,7 @@ fn toSnakeCase(name: []const u8) []const u8 {
             if (std.ascii.isUpper(c) and i > 0) {
                 result = result ++ "_";
             }
-            const lowered: [1]u8 = .{std.ascii.toLower(c)};
-            result = result ++ lowered[0..];
+            result = result ++ &[_]u8{std.ascii.toLower(c)};
         }
         return result;
     }

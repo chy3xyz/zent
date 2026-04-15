@@ -11,6 +11,11 @@ pub const Value = union(enum) {
     bytes: []const u8,
 };
 
+pub const QueryResult = struct {
+    sql: []const u8,
+    args: []const Value,
+};
+
 /// Base query builder. Tracks the SQL string and bound arguments.
 pub const Builder = struct {
     allocator: std.mem.Allocator,
@@ -32,7 +37,7 @@ pub const Builder = struct {
         b.args.deinit();
     }
 
-    pub fn query(b: *const Builder) struct { sql: []const u8, args: []const Value } {
+    pub fn query(b: *const Builder) QueryResult {
         return .{ .sql = b.buffer.items, .args = b.args.items };
     }
 
@@ -114,13 +119,18 @@ pub fn Table(name: []const u8) TableBuilder {
 pub const ColumnRef = struct {
     table: ?[]const u8,
     name: []const u8,
+    raw: bool = false,
 
     pub fn appendTo(self: ColumnRef, b: *Builder) !void {
         if (self.table) |t| {
             try b.ident(t);
             try b.writeByte('.');
         }
-        try b.ident(self.name);
+        if (self.raw) {
+            try b.writeString(self.name);
+        } else {
+            try b.ident(self.name);
+        }
     }
 };
 
@@ -411,7 +421,7 @@ pub const Selector = struct {
         return s;
     }
 
-    pub fn query(s: *Selector) !struct { sql: []const u8, args: []const Value } {
+    pub fn query(s: *Selector) !QueryResult {
         try s.b.writeString("SELECT ");
         if (s.distinct) try s.b.writeString("DISTINCT ");
         for (s.columns.items, 0..) |col, i| {
@@ -506,7 +516,7 @@ pub const InsertBuilder = struct {
         return i;
     }
 
-    pub fn query(i: *InsertBuilder) !struct { sql: []const u8, args: []const Value } {
+    pub fn query(i: *InsertBuilder) !QueryResult {
         try i.b.writeString("INSERT INTO ");
         try i.b.ident(i.table);
         if (i.col_names.items.len > 0) {
@@ -539,17 +549,22 @@ pub fn Insert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8)
 // UPDATE
 // ------------------------------------------------------------------
 
+pub const UpdateSet = struct {
+    column: []const u8,
+    value: Value,
+};
+
 pub const UpdateBuilder = struct {
     b: Builder,
     table: []const u8,
-    sets: std.array_list.Managed(struct { column: []const u8, value: Value }),
+    sets: std.array_list.Managed(UpdateSet),
     wheres: std.array_list.Managed(Predicate),
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) UpdateBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
             .table = table,
-            .sets = std.array_list.Managed(struct { column: []const u8, value: Value }).init(allocator),
+            .sets = std.array_list.Managed(UpdateSet).init(allocator),
             .wheres = std.array_list.Managed(Predicate).init(allocator),
         };
     }
@@ -570,7 +585,7 @@ pub const UpdateBuilder = struct {
         return u;
     }
 
-    pub fn query(u: *UpdateBuilder) !struct { sql: []const u8, args: []const Value } {
+    pub fn query(u: *UpdateBuilder) !QueryResult {
         try u.b.writeString("UPDATE ");
         try u.b.ident(u.table);
         try u.b.writeString(" SET ");
@@ -622,7 +637,7 @@ pub const DeleteBuilder = struct {
         return d;
     }
 
-    pub fn query(d: *DeleteBuilder) !struct { sql: []const u8, args: []const Value } {
+    pub fn query(d: *DeleteBuilder) !QueryResult {
         try d.b.writeString("DELETE FROM ");
         try d.b.ident(d.table);
         if (d.wheres.items.len > 0) {

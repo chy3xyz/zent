@@ -3,7 +3,8 @@ const Row = @import("driver.zig").Row;
 
 /// Scan a database row into a value of type T.
 /// Supports primitives, optional primitives, and structs.
-pub fn scanRow(comptime T: type, row: Row) !T {
+/// String slices are duplicated using the provided allocator.
+pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
     const info = @typeInfo(T);
     switch (info) {
         .int => |int| {
@@ -27,20 +28,21 @@ pub fn scanRow(comptime T: type, row: Row) !T {
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                return row.getText(0) orelse return error.TypeMismatch;
+                const text = row.getText(0) orelse return error.TypeMismatch;
+                return try allocator.dupe(u8, text);
             }
             @compileError("Unsupported pointer type for scanning: " ++ @typeName(T));
         },
         .optional => |opt| {
             if (row.isNull(0)) return null;
-            return try scanRow(opt.child, row);
+            return try scanRow(opt.child, allocator, row);
         },
         .@"struct" => |s| {
             var value: T = undefined;
             inline for (s.fields) |field| {
                 const col_index = findColumnIndex(row, field.name);
                 if (col_index) |idx| {
-                    @field(value, field.name) = try scanColumn(field.type, row, idx);
+                    @field(value, field.name) = try scanColumn(field.type, allocator, row, idx);
                 } else {
                     if (@typeInfo(field.type) == .optional) {
                         @field(value, field.name) = null;
@@ -65,7 +67,7 @@ fn findColumnIndex(row: Row, name: []const u8) ?usize {
     return null;
 }
 
-fn scanColumn(comptime T: type, row: Row, index: usize) !T {
+fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: usize) !T {
     const info = @typeInfo(T);
     switch (info) {
         .int => |int| {
@@ -89,13 +91,14 @@ fn scanColumn(comptime T: type, row: Row, index: usize) !T {
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                return row.getText(index) orelse return error.TypeMismatch;
+                const text = row.getText(index) orelse return error.TypeMismatch;
+                return try allocator.dupe(u8, text);
             }
             @compileError("Unsupported pointer type for scanning: " ++ @typeName(T));
         },
         .optional => |opt| {
             if (row.isNull(index)) return null;
-            return try scanColumn(opt.child, row, index);
+            return try scanColumn(opt.child, allocator, row, index);
         },
         else => @compileError("Unsupported column type for scanning: " ++ @typeName(T)),
     }
@@ -165,7 +168,7 @@ test "scan primitive" {
         .nulls = &.{false},
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
-    const v = try scanRow(i32, row);
+    const v = try scanRow(i32, std.testing.allocator, row);
     try std.testing.expectEqual(@as(i32, 42), v);
 }
 
@@ -182,7 +185,7 @@ test "scan struct" {
         .nulls = &.{ false, false, false },
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
-    const user = try scanRow(User, row);
+    const user = try scanRow(User, std.testing.allocator, row);
     try std.testing.expectEqual(@as(i64, 1), user.id);
     try std.testing.expectEqualStrings("alice", user.name);
     try std.testing.expectEqual(@as(i32, 30), user.age);
@@ -196,6 +199,6 @@ test "scan optional null" {
         .nulls = &.{true},
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
-    const v = try scanRow(?i32, row);
+    const v = try scanRow(?i32, std.testing.allocator, row);
     try std.testing.expect(v == null);
 }

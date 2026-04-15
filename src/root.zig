@@ -13,4 +13,11 @@ pub const core = struct {
 
 pub const codegen = struct {
     pub const graph = @import("codegen/graph.zig");
+    pub const entity = @import("codegen/entity.zig").Entity;
+    pub const meta = @import("codegen/meta.zig").Meta;
+    pub const predicate = @import("codegen/predicate.zig");
+    pub const create = @import("codegen/create.zig").CreateBuilder;
+    pub const query = @import("codegen/query.zig").QueryBuilder;
+    pub const update_delete = @import("codegen/update_delete.zig");
+    pub const client = @import("codegen/client.zig");
 };
