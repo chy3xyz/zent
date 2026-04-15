@@ -150,6 +150,8 @@ pub const Predicate = union(enum) {
     is_null: []const u8,
     is_not_null: []const u8,
     raw: []const u8,
+    in_subquery: struct { column: []const u8, sql: []const u8 },
+    exists_subquery: []const u8,
     and_: struct { left: *const Predicate, right: *const Predicate },
     or_: struct { left: *const Predicate, right: *const Predicate },
     not_: *const Predicate,
@@ -214,6 +216,17 @@ pub const Predicate = union(enum) {
             },
             .raw => |sql_text| {
                 try b.writeString(sql_text);
+            },
+            .in_subquery => |p| {
+                try b.ident(p.column);
+                try b.writeString(" IN (");
+                try b.writeString(p.sql);
+                try b.writeByte(')');
+            },
+            .exists_subquery => |sql_text| {
+                try b.writeString("EXISTS (");
+                try b.writeString(sql_text);
+                try b.writeByte(')');
             },
             .and_ => |p| {
                 try b.writeByte('(');
@@ -291,6 +304,14 @@ pub fn Not(pred: *const Predicate) Predicate {
 
 pub fn Raw(sql_text: []const u8) Predicate {
     return .{ .raw = sql_text };
+}
+
+pub fn InSubquery(column: []const u8, sql_text: []const u8) Predicate {
+    return .{ .in_subquery = .{ .column = column, .sql = sql_text } };
+}
+
+pub fn ExistsSubquery(sql_text: []const u8) Predicate {
+    return .{ .exists_subquery = sql_text };
 }
 
 // ------------------------------------------------------------------
@@ -772,4 +793,22 @@ test "Raw predicate" {
     const q = try s.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE age > 20", q.sql);
     try std.testing.expectEqual(@as(usize, 0), q.args.len);
+}
+
+test "Subquery predicates" {
+    const allocator = std.testing.allocator;
+
+    // IN subquery
+    var s1 = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    defer s1.deinit();
+    _ = s1.from(Table("users")).where(InSubquery("id", "SELECT user_id FROM orders"));
+    const q1 = try s1.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE \"id\" IN (SELECT user_id FROM orders)", q1.sql);
+
+    // EXISTS subquery
+    var s2 = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    defer s2.deinit();
+    _ = s2.from(Table("users")).where(ExistsSubquery("SELECT 1 FROM orders WHERE orders.user_id = users.id"));
+    const q2 = try s2.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)", q2.sql);
 }

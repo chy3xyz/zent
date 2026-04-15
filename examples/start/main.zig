@@ -245,6 +245,15 @@ pub fn main() !void {
     defer raw_users.deinit();
     std.debug.print("Users with raw predicate (age > 20): {d}\n", .{raw_users.items.len});
 
+    // SUBQUERY predicates demo
+    std.debug.print("\n-- SUBQUERY PREDICATES --\n", .{});
+    var qsub = client.user.Query();
+    defer qsub.deinit();
+    _ = qsub.Where(&[_]sql.Predicate{sql.ExistsSubquery("SELECT 1 FROM \"car\" WHERE \"owner_id\" = \"user\".\"id\"")});
+    var sub_users = try qsub.All();
+    defer sub_users.deinit();
+    std.debug.print("Users who own at least one car (EXISTS subquery): {d}\n", .{sub_users.items.len});
+
     // FIRST / ONLY
     var q2 = client.user.Query();
     defer q2.deinit();
