@@ -19,6 +19,7 @@ pub fn QueryBuilder(comptime info: TypeInfo, comptime Entity: type) type {
         order_terms: std.array_list.Managed(sql.Order),
         limit_val: ?usize,
         offset_val: ?usize,
+        distinct: bool,
         with_trashed: bool,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver) Self {
@@ -29,6 +30,7 @@ pub fn QueryBuilder(comptime info: TypeInfo, comptime Entity: type) type {
                 .order_terms = std.array_list.Managed(sql.Order).init(allocator),
                 .limit_val = null,
                 .offset_val = null,
+                .distinct = false,
                 .with_trashed = false,
             };
         }
@@ -73,6 +75,17 @@ pub fn QueryBuilder(comptime info: TypeInfo, comptime Entity: type) type {
 
         pub fn Offset(self: *Self, n: usize) *Self {
             self.offset_val = n;
+            return self;
+        }
+
+        pub fn Page(self: *Self, page_num: usize, per_page: usize) *Self {
+            self.limit_val = per_page;
+            self.offset_val = (page_num - 1) * per_page;
+            return self;
+        }
+
+        pub fn Distinct(self: *Self) *Self {
+            self.distinct = true;
             return self;
         }
 
@@ -216,6 +229,7 @@ pub fn QueryBuilder(comptime info: TypeInfo, comptime Entity: type) type {
             var selector = sql.Select(self.allocator, self.driver.dialect(), &columns);
             // NOTE: defer selector.deinit() would free the SQL buffer before caller uses it.
             _ = selector.from(t);
+            _ = selector.setDistinct(self.distinct);
 
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {

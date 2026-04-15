@@ -288,6 +288,24 @@ pub fn main() !void {
     const age_min = try qmin.Min("age");
     std.debug.print("Min age: {d}\n", .{age_min.int});
 
+    // PAGINATION
+    std.debug.print("\n-- PAGINATION --\n", .{});
+    var qpage = client.user.Query();
+    defer qpage.deinit();
+    _ = qpage.Page(1, 2);
+    var page1 = try qpage.All();
+    defer page1.deinit();
+    std.debug.print("Page 1 (2 per page): {d} users\n", .{page1.items.len});
+
+    // DISTINCT
+    std.debug.print("\n-- DISTINCT --\n", .{});
+    var qdistinct = client.user.Query();
+    defer qdistinct.deinit();
+    _ = qdistinct.Distinct();
+    var distinct_users = try qdistinct.All();
+    defer distinct_users.deinit();
+    std.debug.print("Distinct users: {d}\n", .{distinct_users.items.len});
+
     // UPDATE
     std.debug.print("\n-- UPDATE --\n", .{});
     var upd = client.user.Update();
