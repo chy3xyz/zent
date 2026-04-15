@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const lib_unit_tests = b.addTest(.{
         .root_module = test_mod,
     });
+    lib_unit_tests.linkSystemLibrary("sqlite3");
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
     // Example: start
@@ -33,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .name = "start",
         .root_module = start_mod,
     });
+    start_exe.linkSystemLibrary("sqlite3");
     b.installArtifact(start_exe);
 
     const run_start = b.addRunArtifact(start_exe);

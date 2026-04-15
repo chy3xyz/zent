@@ -14,15 +14,15 @@ pub const Value = union(enum) {
 /// Base query builder. Tracks the SQL string and bound arguments.
 pub const Builder = struct {
     allocator: std.mem.Allocator,
-    buffer: std.ArrayList(u8),
-    args: std.ArrayList(Value),
+    buffer: std.array_list.Managed(u8),
+    args: std.array_list.Managed(Value),
     dialect: Dialect,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect) Builder {
         return .{
             .allocator = allocator,
-            .buffer = std.ArrayList(u8).init(allocator),
-            .args = std.ArrayList(Value).init(allocator),
+            .buffer = std.array_list.Managed(u8).init(allocator),
+            .args = std.array_list.Managed(Value).init(allocator),
             .dialect = dialect,
         };
     }
@@ -71,10 +71,10 @@ pub const Builder = struct {
 
     pub fn join(b: *Builder, sep: []const u8, nodes: anytype) !void {
         const info = @typeInfo(@TypeOf(nodes));
-        if (info != .Struct or !info.Struct.is_tuple) {
+        if (info != .@"struct" or !info.@"struct".is_tuple) {
             @compileError("join expects a tuple of nodes");
         }
-        inline for (info.Struct.fields, 0..) |_, i| {
+        inline for (info.@"struct".fields, 0..) |_, i| {
             if (i > 0) try b.writeString(sep);
             const node = nodes[i];
             try node.appendTo(b);
@@ -202,22 +202,18 @@ pub const Predicate = union(enum) {
                 try b.writeString(" IS NOT NULL");
             },
             .and_ => |p| {
-                try b.wrap(struct {
-                    fn f(bb: *Builder) !void {
-                        try p.left.appendTo(bb);
-                        try bb.writeString(" AND ");
-                        try p.right.appendTo(bb);
-                    }
-                }.f);
+                try b.writeByte('(');
+                try p.left.appendTo(b);
+                try b.writeString(" AND ");
+                try p.right.appendTo(b);
+                try b.writeByte(')');
             },
             .or_ => |p| {
-                try b.wrap(struct {
-                    fn f(bb: *Builder) !void {
-                        try p.left.appendTo(bb);
-                        try bb.writeString(" OR ");
-                        try p.right.appendTo(bb);
-                    }
-                }.f);
+                try b.writeByte('(');
+                try p.left.appendTo(b);
+                try b.writeString(" OR ");
+                try p.right.appendTo(b);
+                try b.writeByte(')');
             },
             .not_ => |p| {
                 try b.writeString("NOT ");
@@ -332,13 +328,13 @@ pub const Join = struct {
 
 pub const Selector = struct {
     b: Builder,
-    columns: std.ArrayList(ColumnRef),
+    columns: std.array_list.Managed(ColumnRef),
     table: ?TableBuilder,
-    joins: std.ArrayList(Join),
-    predicates: std.ArrayList(Predicate),
-    group_cols: std.ArrayList([]const u8),
+    joins: std.array_list.Managed(Join),
+    predicates: std.array_list.Managed(Predicate),
+    group_cols: std.array_list.Managed([]const u8),
     having_pred: ?Predicate,
-    order_terms: std.ArrayList(Order),
+    order_terms: std.array_list.Managed(Order),
     limit_val: ?usize,
     offset_val: ?usize,
     distinct: bool,
@@ -346,13 +342,13 @@ pub const Selector = struct {
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) Selector {
         var s = Selector{
             .b = Builder.init(allocator, dialect),
-            .columns = std.ArrayList(ColumnRef).init(allocator),
+            .columns = std.array_list.Managed(ColumnRef).init(allocator),
             .table = null,
-            .joins = std.ArrayList(Join).init(allocator),
-            .predicates = std.ArrayList(Predicate).init(allocator),
-            .group_cols = std.ArrayList([]const u8).init(allocator),
+            .joins = std.array_list.Managed(Join).init(allocator),
+            .predicates = std.array_list.Managed(Predicate).init(allocator),
+            .group_cols = std.array_list.Managed([]const u8).init(allocator),
             .having_pred = null,
-            .order_terms = std.ArrayList(Order).init(allocator),
+            .order_terms = std.array_list.Managed(Order).init(allocator),
             .limit_val = null,
             .offset_val = null,
             .distinct = false,
@@ -463,7 +459,8 @@ pub const Selector = struct {
             try s.b.writeString(" OFFSET ");
             try s.b.writeString(try std.fmt.allocPrint(s.b.allocator, "{d}", .{n}));
         }
-        return s.b.query();
+        const bq = s.b.query();
+        return .{ .sql = bq.sql, .args = bq.args };
     }
 };
 
@@ -478,15 +475,15 @@ pub fn Select(allocator: std.mem.Allocator, dialect: Dialect, columns: []const C
 pub const InsertBuilder = struct {
     b: Builder,
     table: []const u8,
-    col_names: std.ArrayList([]const u8),
-    rows: std.ArrayList(std.ArrayList(Value)),
+    col_names: std.array_list.Managed([]const u8),
+    rows: std.array_list.Managed(std.array_list.Managed(Value)),
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
             .table = table,
-            .col_names = std.ArrayList([]const u8).init(allocator),
-            .rows = std.ArrayList(std.ArrayList(Value)).init(allocator),
+            .col_names = std.array_list.Managed([]const u8).init(allocator),
+            .rows = std.array_list.Managed(std.array_list.Managed(Value)).init(allocator),
         };
     }
 
@@ -503,7 +500,7 @@ pub const InsertBuilder = struct {
     }
 
     pub fn values(i: *InsertBuilder, row: []const Value) *InsertBuilder {
-        var list = std.ArrayList(Value).init(i.b.allocator);
+        var list = std.array_list.Managed(Value).init(i.b.allocator);
         list.appendSlice(row) catch unreachable;
         i.rows.append(list) catch unreachable;
         return i;
@@ -545,15 +542,15 @@ pub fn Insert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8)
 pub const UpdateBuilder = struct {
     b: Builder,
     table: []const u8,
-    sets: std.ArrayList(struct { column: []const u8, value: Value }),
-    wheres: std.ArrayList(Predicate),
+    sets: std.array_list.Managed(struct { column: []const u8, value: Value }),
+    wheres: std.array_list.Managed(Predicate),
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) UpdateBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
             .table = table,
-            .sets = std.ArrayList(struct { column: []const u8, value: Value }).init(allocator),
-            .wheres = std.ArrayList(Predicate).init(allocator),
+            .sets = std.array_list.Managed(struct { column: []const u8, value: Value }).init(allocator),
+            .wheres = std.array_list.Managed(Predicate).init(allocator),
         };
     }
 
@@ -605,13 +602,13 @@ pub fn Update(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8)
 pub const DeleteBuilder = struct {
     b: Builder,
     table: []const u8,
-    wheres: std.ArrayList(Predicate),
+    wheres: std.array_list.Managed(Predicate),
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) DeleteBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
             .table = table,
-            .wheres = std.ArrayList(Predicate).init(allocator),
+            .wheres = std.array_list.Managed(Predicate).init(allocator),
         };
     }
 
