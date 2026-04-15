@@ -12,8 +12,22 @@ pub const FieldValue = struct {
     value: sql.Value,
 };
 
+fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {
+    for (infos) |ti| {
+        if (std.mem.eql(u8, ti.name, name)) return ti;
+    }
+    @compileError("TypeInfo not found: " ++ name);
+}
+
+fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
+    for (info.edges) |e| {
+        if (std.mem.eql(u8, e.name, name)) return e;
+    }
+    @compileError("Edge not found: " ++ name ++ " on " ++ info.name);
+}
+
 /// Generate a Create builder for an entity.
-pub fn CreateBuilder(comptime info: TypeInfo, comptime Entity: type) type {
+pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, comptime Entity: type) type {
     return struct {
         const Self = @This();
 
@@ -65,6 +79,19 @@ pub fn CreateBuilder(comptime info: TypeInfo, comptime Entity: type) type {
                 if (!found) @compileError("Unknown field: " ++ field_name);
             }
             return self.setValue(field_name, toSqlValue(value));
+        }
+
+        /// Add target IDs for an M2M edge.
+        /// After Save(), junction table rows will be inserted automatically.
+        pub fn AddEdge(self: *Self, comptime edge_name: []const u8, ids: []const i64) *Self {
+            comptime {
+                const edge = findEdgeInfo(info, edge_name);
+                if (edge.relation != .m2m) {
+                    @compileError("AddEdge is only supported for M2M edges: " ++ edge_name);
+                }
+            }
+            self.edge_values.append(.{ .edge = edge_name, .ids = ids }) catch unreachable;
+            return self;
         }
 
         fn canSetField(comptime Expected: type, Actual: type) bool {
@@ -137,6 +164,32 @@ pub fn CreateBuilder(comptime info: TypeInfo, comptime Entity: type) type {
                 setEntityField(&entity, fv.name, fv.value);
             }
 
+            // Insert M2M junction table rows
+            inline for (info.edges) |edge| {
+                if (edge.relation == .m2m) {
+                    for (self.edge_values.items) |ev| {
+                        if (std.mem.eql(u8, ev.edge, edge.name)) {
+                            const target_info = findTypeInfo(infos, edge.target_name);
+                            const source_table = info.table_name;
+                            const target_table = target_info.table_name;
+                            const junction_table = if (std.mem.lessThan(u8, source_table, target_table))
+                                source_table ++ "_" ++ target_table
+                            else
+                                target_table ++ "_" ++ source_table;
+                            const source_col = source_table ++ "_id";
+                            const target_col = target_table ++ "_id";
+
+                            for (ev.ids) |target_id| {
+                                _ = try self.driver.exec(
+                                    "INSERT INTO \"" ++ junction_table ++ "\" (\"" ++ source_col ++ "\", \"" ++ target_col ++ "\") VALUES (?, ?)",
+                                    &.{ .{ .int = entity.id }, .{ .int = target_id } },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             return entity;
         }
 
@@ -207,7 +260,8 @@ test "Create builder basic" {
 
     const info = comptime fromSchema(User);
     const UserEntity = comptime EntityGen(info);
-    const Builder = CreateBuilder(info, UserEntity);
+    const infos = &[_]TypeInfo{info};
+    const Builder = CreateBuilder(infos, info, UserEntity);
 
     var b = Builder.init(std.testing.allocator, undefined);
     defer b.deinit();

@@ -28,7 +28,7 @@ fn capitalize(comptime s: []const u8) []const u8 {
 /// Client for a single entity type.
 pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     const Entity = EntityGen(info);
-    const CreateBuilder = CreateGen(info, Entity);
+    const CreateBuilder = CreateGen(infos, info, Entity);
     const QueryBuilder = QueryGen(info, Entity);
     const UpdateBuilder = UpdateGen(info);
     const DeleteBuilder = DeleteGen(info);

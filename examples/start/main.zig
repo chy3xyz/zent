@@ -88,12 +88,27 @@ pub fn main() !void {
     std.debug.print("\n=== Phase 2: Generated CRUD ===\n", .{});
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
-    // CREATE User
-    std.debug.print("-- CREATE User --\n", .{});
+    // CREATE Group
+    std.debug.print("-- CREATE Group --\n", .{});
+    var group1_builder = client.group.Create();
+    defer group1_builder.deinit();
+    _ = group1_builder.setFieldValue("name", "Admins");
+    const group1 = try group1_builder.Save();
+    std.debug.print("Created group: id={d}, name={s}\n", .{ group1.id, group1.name });
+
+    var group2_builder = client.group.Create();
+    defer group2_builder.deinit();
+    _ = group2_builder.setFieldValue("name", "Users");
+    const group2 = try group2_builder.Save();
+    std.debug.print("Created group: id={d}, name={s}\n", .{ group2.id, group2.name });
+
+    // CREATE User with M2M edge adder
+    std.debug.print("\n-- CREATE User --\n", .{});
     var create_builder1 = client.user.Create();
     defer create_builder1.deinit();
     _ = create_builder1.setFieldValue("name", "Alice");
     _ = create_builder1.setFieldValue("age", 30);
+    _ = create_builder1.AddEdge("groups", &.{group1.id});
     const alice = try create_builder1.Save();
     std.debug.print("Created user: id={d}, name={s}, age={d}\n", .{ alice.id, alice.name, alice.age });
 
@@ -101,6 +116,7 @@ pub fn main() !void {
     defer create_builder2.deinit();
     _ = create_builder2.setFieldValue("name", "Bob");
     _ = create_builder2.setFieldValue("age", 25);
+    _ = create_builder2.AddEdge("groups", &.{group2.id});
     const bob = try create_builder2.Save();
     std.debug.print("Created user: id={d}, name={s}, age={d}\n", .{ bob.id, bob.name, bob.age });
 
@@ -123,30 +139,7 @@ pub fn main() !void {
     const car2 = try car2_builder.Save();
     std.debug.print("Created car: id={d}, model={s}\n", .{ car2.id, car2.model });
 
-    // CREATE Group
-    std.debug.print("\n-- CREATE Group --\n", .{});
-    var group1_builder = client.group.Create();
-    defer group1_builder.deinit();
-    _ = group1_builder.setFieldValue("name", "Admins");
-    const group1 = try group1_builder.Save();
-    std.debug.print("Created group: id={d}, name={s}\n", .{ group1.id, group1.name });
-
-    var group2_builder = client.group.Create();
-    defer group2_builder.deinit();
-    _ = group2_builder.setFieldValue("name", "Users");
-    const group2 = try group2_builder.Save();
-    std.debug.print("Created group: id={d}, name={s}\n", .{ group2.id, group2.name });
-
-    // --- M2M: Insert junction table entries manually (Phase 5 will add helper) ---
-    _ = try drv.exec(
-        "INSERT INTO \"group_user\" (\"group_id\", \"user_id\") VALUES (?, ?)",
-        &.{ .{ .int = group1.id }, .{ .int = alice.id } },
-    );
-    _ = try drv.exec(
-        "INSERT INTO \"group_user\" (\"group_id\", \"user_id\") VALUES (?, ?)",
-        &.{ .{ .int = group2.id }, .{ .int = bob.id } },
-    );
-    std.debug.print("Added users to groups via junction table.\n", .{});
+    std.debug.print("Added users to groups via AddEdge.\n", .{});
 
     // QUERY with predicates
     std.debug.print("\n-- QUERY Users --\n", .{});
