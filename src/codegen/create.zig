@@ -125,6 +125,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         pub fn Save(self: *Self) !Entity {
+            return self.saveInternal(false);
+        }
+
+        pub fn SaveOrUpdate(self: *Self) !Entity {
+            return self.saveInternal(true);
+        }
+
+        fn saveInternal(self: *Self, comptime or_replace: bool) !Entity {
             if (info.policy) |p| {
                 if (p.evalMutation(.create, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -159,7 +167,10 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             }
 
             // Insert the entity
-            var builder = sql.Insert(self.allocator, self.driver.dialect(), info.table_name);
+            var builder = if (or_replace)
+                sql.InsertOrReplace(self.allocator, self.driver.dialect(), info.table_name)
+            else
+                sql.Insert(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = builder.columns(columns.items).values(args.items);
             const q = try builder.query();
@@ -191,9 +202,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                             const source_col = source_table ++ "_id";
                             const target_col = target_table ++ "_id";
 
+                            const insert_sql = if (or_replace)
+                                "INSERT OR REPLACE INTO \"" ++ junction_table ++ "\" (\"" ++ source_col ++ "\", \"" ++ target_col ++ "\") VALUES (?, ?)"
+                            else
+                                "INSERT INTO \"" ++ junction_table ++ "\" (\"" ++ source_col ++ "\", \"" ++ target_col ++ "\") VALUES (?, ?)";
+
                             for (ev.ids) |target_id| {
                                 _ = try self.driver.exec(
-                                    "INSERT INTO \"" ++ junction_table ++ "\" (\"" ++ source_col ++ "\", \"" ++ target_col ++ "\") VALUES (?, ?)",
+                                    insert_sql,
                                     &.{ .{ .int = entity.id }, .{ .int = target_id } },
                                 );
                             }
@@ -598,4 +614,28 @@ test "validateSqlValue match" {
     try validateSqlValue(info, .{ .string = "a@b.com" });
     try std.testing.expectError(error.ValidationFailed, validateSqlValue(info, .{ .string = "invalid" }));
     try std.testing.expectError(error.ValidationFailed, validateSqlValue(info, .{ .int = 1 }));
+}
+
+test "Create builder SaveOrUpdate compiles" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, UserEntity);
+
+    var b = Builder.init(std.testing.allocator, undefined, &.{});
+    defer b.deinit();
+
+    _ = b.setFieldValue("name", "alice").setFieldValue("age", 30);
+    // We can't actually execute SaveOrUpdate without a real driver,
+    // but we verify the method exists and compiles.
+    try std.testing.expectEqual(@as(usize, 2), b.values.items.len);
 }

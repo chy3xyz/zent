@@ -516,6 +516,7 @@ pub const InsertBuilder = struct {
     table: []const u8,
     col_names: std.array_list.Managed([]const u8),
     rows: std.array_list.Managed(std.array_list.Managed(Value)),
+    or_replace: bool,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
         return .{
@@ -523,6 +524,7 @@ pub const InsertBuilder = struct {
             .table = table,
             .col_names = std.array_list.Managed([]const u8).init(allocator),
             .rows = std.array_list.Managed(std.array_list.Managed(Value)).init(allocator),
+            .or_replace = false,
         };
     }
 
@@ -546,7 +548,11 @@ pub const InsertBuilder = struct {
     }
 
     pub fn query(i: *InsertBuilder) !QueryResult {
-        try i.b.writeString("INSERT INTO ");
+        if (i.or_replace) {
+            try i.b.writeString("INSERT OR REPLACE INTO ");
+        } else {
+            try i.b.writeString("INSERT INTO ");
+        }
         try i.b.ident(i.table);
         if (i.col_names.items.len > 0) {
             try i.b.writeString(" (");
@@ -572,6 +578,12 @@ pub const InsertBuilder = struct {
 
 pub fn Insert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
     return InsertBuilder.init(allocator, dialect, table);
+}
+
+pub fn InsertOrReplace(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
+    var builder = InsertBuilder.init(allocator, dialect, table);
+    builder.or_replace = true;
+    return builder;
 }
 
 // ------------------------------------------------------------------
@@ -730,6 +742,16 @@ test "INSERT" {
     _ = i.columns(&.{ "name", "age" }).values(&.{ .{ .string = "alice" }, .{ .int = 30 } });
     const q = try i.query();
     try std.testing.expectEqualStrings("INSERT INTO \"users\" (\"name\", \"age\") VALUES (?, ?)", q.sql);
+    try std.testing.expectEqual(@as(usize, 2), q.args.len);
+}
+
+test "INSERT OR REPLACE" {
+    const allocator = std.testing.allocator;
+    var i = InsertOrReplace(allocator, Dialect.sqlite, "users");
+    defer i.deinit();
+    _ = i.columns(&.{ "id", "name" }).values(&.{ .{ .int = 1 }, .{ .string = "alice" } });
+    const q = try i.query();
+    try std.testing.expectEqualStrings("INSERT OR REPLACE INTO \"users\" (\"id\", \"name\") VALUES (?, ?)", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
 }
 

@@ -402,6 +402,20 @@ pub fn main() !void {
     }
     std.debug.print("\n", .{});
 
+    // UPSERT
+    std.debug.print("\n-- UPSERT --\n", .{});
+    var upsert_builder = client.group.Create();
+    defer upsert_builder.deinit();
+    _ = upsert_builder.setFieldValue("id", group1.id).setFieldValue("name", "AdminsUpdated");
+    const upserted = try upsert_builder.SaveOrUpdate();
+    std.debug.print("Upserted group: id={d}, name={s}\n", .{ upserted.id, upserted.name });
+
+    var q_upsert = client.group.Query();
+    defer q_upsert.deinit();
+    _ = q_upsert.Where(.{client.group.predicates.nameEQ(.{ .string = "AdminsUpdated" })});
+    const found_upsert = try q_upsert.Only();
+    std.debug.print("Verified upsert: id={d}, name={s}\n", .{ found_upsert.id, found_upsert.name });
+
     // UPDATE
     std.debug.print("\n-- UPDATE --\n", .{});
     var upd = client.user.Update();
