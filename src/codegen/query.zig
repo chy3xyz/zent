@@ -94,6 +94,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         with_edges: std.ArrayListUnmanaged([]const u8),
         group_cols: std.ArrayListUnmanaged([]const u8),
         having_pred: ?sql.Predicate,
+        for_update: bool,
+        for_share: bool,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver) Self {
             return .{
@@ -108,6 +110,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 .with_edges = .empty,
                 .group_cols = .empty,
                 .having_pred = null,
+                .for_update = false,
+                .for_share = false,
             };
         }
 
@@ -187,6 +191,16 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn Having(self: *Self, pred: sql.Predicate) *Self {
             self.having_pred = pred;
+            return self;
+        }
+
+        pub fn ForUpdate(self: *Self) *Self {
+            self.for_update = true;
+            return self;
+        }
+
+        pub fn ForShare(self: *Self) *Self {
+            self.for_share = true;
             return self;
         }
 
@@ -444,6 +458,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
             if (self.offset_val) |n| {
                 _ = selector.offset(n);
+            }
+            if (self.for_update) {
+                _ = selector.forUpdate();
+            } else if (self.for_share) {
+                _ = selector.forShare();
             }
             return try selector.query();
         }

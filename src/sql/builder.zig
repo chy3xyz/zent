@@ -377,6 +377,8 @@ pub const Selector = struct {
     limit_val: ?usize,
     offset_val: ?usize,
     distinct: bool,
+    for_update: bool,
+    for_share: bool,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) Selector {
         var s = Selector{
@@ -391,6 +393,8 @@ pub const Selector = struct {
             .limit_val = null,
             .offset_val = null,
             .distinct = false,
+            .for_update = false,
+            .for_share = false,
         };
         s.columns.appendSlice(columns) catch unreachable;
         return s;
@@ -450,6 +454,16 @@ pub const Selector = struct {
         return s;
     }
 
+    pub fn forUpdate(s: *Selector) *Selector {
+        s.for_update = true;
+        return s;
+    }
+
+    pub fn forShare(s: *Selector) *Selector {
+        s.for_share = true;
+        return s;
+    }
+
     pub fn query(s: *Selector) !QueryResult {
         try s.b.writeString("SELECT ");
         if (s.distinct) try s.b.writeString("DISTINCT ");
@@ -497,6 +511,11 @@ pub const Selector = struct {
         if (s.offset_val) |n| {
             try s.b.writeString(" OFFSET ");
             try s.b.writeString(try std.fmt.allocPrint(s.b.allocator, "{d}", .{n}));
+        }
+        if (s.for_update) {
+            try s.b.writeString(" FOR UPDATE");
+        } else if (s.for_share) {
+            try s.b.writeString(" FOR SHARE");
         }
         const bq = s.b.query();
         return .{ .sql = bq.sql, .args = bq.args };
@@ -833,4 +852,20 @@ test "Subquery predicates" {
     _ = s2.from(Table("users")).where(ExistsSubquery("SELECT 1 FROM orders WHERE orders.user_id = users.id"));
     const q2 = try s2.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)", q2.sql);
+}
+
+test "FOR UPDATE and FOR SHARE" {
+    const allocator = std.testing.allocator;
+
+    var s1 = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    defer s1.deinit();
+    _ = s1.from(Table("users")).forUpdate();
+    const q1 = try s1.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" FOR UPDATE", q1.sql);
+
+    var s2 = Select(allocator, Dialect.postgres, &.{Table("users").c("id")});
+    defer s2.deinit();
+    _ = s2.from(Table("users")).forShare();
+    const q2 = try s2.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" FOR SHARE", q2.sql);
 }

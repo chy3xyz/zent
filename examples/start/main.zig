@@ -261,6 +261,18 @@ pub fn main() !void {
     const only_alice = try q2.Only();
     std.debug.print("Only Alice: id={d}, name={s}, status={s}, theme={s}\n", .{ only_alice.id, only_alice.name, only_alice.status, only_alice.settings.theme });
 
+    // FOR UPDATE demo (SQLite does not support SELECT FOR UPDATE, so we catch the error)
+    std.debug.print("\n-- FOR UPDATE --\n", .{});
+    var qlock = client.user.Query();
+    defer qlock.deinit();
+    _ = qlock.Where(.{user_preds.nameEQ(.{ .string = "Alice" })}).ForUpdate();
+    if (qlock.Only()) |locked_alice| {
+        std.debug.print("Locked Alice: id={d}, name={s}\n", .{ locked_alice.id, locked_alice.name });
+    } else |err| switch (err) {
+        error.SqlitePrepareFailed => std.debug.print("SELECT FOR UPDATE is not supported by SQLite (expected)\n", .{}),
+        else => return err,
+    }
+
     // QUERY View (read-only entity)
     std.debug.print("\n-- QUERY ActiveUserView (view) --\n", .{});
     var view_query = client.active_user_view.Query();
