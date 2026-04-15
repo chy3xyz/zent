@@ -8,18 +8,13 @@ const scanRow = zent.sql_scan.scanRow;
 const fromSchema = zent.codegen.graph.fromSchema;
 const Entity = zent.codegen.entity;
 const Client = zent.codegen.client;
+const migrate = zent.sql_schema;
 
 const start_schema = @import("schema.zig");
 
 const User = start_schema.User;
 const Car = start_schema.Car;
 const Group = start_schema.Group;
-
-const UserRow = struct {
-    id: i64,
-    name: []const u8,
-    age: i64,
-};
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -66,19 +61,20 @@ pub fn main() !void {
     std.debug.print("SQL: {s}\n", .{q.sql});
     std.debug.print("Args count: {d}\n", .{q.args.len});
 
-    // --- Phase 2: Generated Client + CRUD ---
-    std.debug.print("\n=== Phase 2: Generated CRUD ===\n", .{});
+    // --- Phase 4: Migration (Create Tables) ---
+    std.debug.print("\n=== Phase 4: Migration ===\n", .{});
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
 
-    // Create tables manually for demo (migration comes in Phase 4)
-    _ = try drv.exec(
-        "CREATE TABLE \"user\" (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
-        &.{},
-    );
-
-    // Generate client
     const infos = comptime &[_]zent.codegen.graph.TypeInfo{ user_info, car_info, group_info };
+
+    // Use automatic migration instead of manual CREATE TABLE
+    std.debug.print("Creating tables via migration...\n", .{});
+    try migrate.createAllTables(drv.asDriver(), infos);
+    std.debug.print("Tables created successfully.\n", .{});
+
+    // --- Phase 2: Generated Client + CRUD ---
+    std.debug.print("\n=== Phase 2: Generated CRUD ===\n", .{});
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     // CREATE
@@ -146,5 +142,5 @@ pub fn main() !void {
     const count_after = try q4.Count();
     std.debug.print("Users after delete: {d}\n", .{count_after});
 
-    std.debug.print("\nPhase 0 + Phase 1 + Phase 2 completed successfully.\n", .{});
+    std.debug.print("\nPhase 0 + Phase 1 + Phase 2 + Phase 4 completed successfully.\n", .{});
 }

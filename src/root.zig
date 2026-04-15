@@ -3,6 +3,7 @@ pub const sql_dialect = @import("sql/dialect.zig");
 pub const sql_driver = @import("sql/driver.zig");
 pub const sql_scan = @import("sql/scan.zig");
 pub const sql_sqlite = @import("sql/sqlite.zig");
+pub const sql_schema = @import("sql/schema/migrate.zig");
 
 pub const core = struct {
     pub const field = @import("core/field.zig");

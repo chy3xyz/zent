@@ -3,6 +3,7 @@ const TypeInfo = @import("graph.zig").TypeInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
 const sql_driver = @import("../sql/driver.zig");
 const sql = @import("../sql/builder.zig");
+const migrate = @import("../sql/schema/migrate.zig");
 
 const EntityGen = @import("entity.zig").Entity;
 const CreateGen = @import("create.zig").CreateBuilder;
@@ -172,6 +173,12 @@ pub fn makeClient(comptime infos: []const TypeInfo, allocator: std.mem.Allocator
         @field(result, field_name) = ClientType.init(allocator, driver);
     }
     return result;
+}
+
+/// Create all database tables (create-only migration).
+/// Creates entity tables and junction tables for M2M edges.
+pub fn createAllTables(comptime infos: []const TypeInfo, driver: sql_driver.Driver) !void {
+    return migrate.createAllTables(driver, infos);
 }
 
 // ------------------------------------------------------------------
