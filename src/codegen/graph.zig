@@ -290,6 +290,101 @@ pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
     }
 }
 
+/// Add virtual FieldInfo entries for edge foreign-key columns.
+/// This ensures generated entity structs include FK fields so that
+/// setFieldValue works for edge columns like "owner_id".
+fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TypeInfo {
+    comptime {
+        var fields: []const FieldInfo = info.fields;
+
+        // Own From edges generate FK columns in this table.
+        for (info.edges) |e| {
+            if (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) {
+                const fk_col_name = e.name ++ "_id";
+                fields = fields ++ &[_]FieldInfo{FieldInfo{
+                    .name = fk_col_name,
+                    .field_type = .int,
+                    .zig_type = i64,
+                    .sql_type = "INTEGER",
+                    .optional = !e.required,
+                    .nillable = false,
+                    .unique = e.relation == .o2o or e.unique,
+                    .immutable = false,
+                    .default = .none,
+                    .validators = &.{},
+                    .is_id = false,
+                }};
+            }
+        }
+
+        // Cross-referenced To edges: if another entity has a To edge pointing here
+        // with O2M relation and we do NOT have a corresponding From edge,
+        // add the FK column to this entity's fields.
+        for (all_infos) |other_info| {
+            for (other_info.edges) |e| {
+                if (e.kind == .to and std.mem.eql(u8, e.target_name, info.name)) {
+                    var has_from_inverse = false;
+                    for (info.edges) |my_edge| {
+                        if (my_edge.kind == .from and
+                            std.mem.eql(u8, my_edge.target_name, other_info.name) and
+                            my_edge.ref != null and
+                            std.mem.eql(u8, my_edge.ref.?, e.name))
+                        {
+                            has_from_inverse = true;
+                            break;
+                        }
+                    }
+                    if (has_from_inverse) continue;
+
+                    if (e.relation == .o2m) {
+                        const fk_col_name = toSnakeCase(other_info.name) ++ "_id";
+                        var exists = false;
+                        for (fields) |f| {
+                            if (std.mem.eql(u8, f.name, fk_col_name)) {
+                                exists = true;
+                                break;
+                            }
+                        }
+                        if (!exists) {
+                            fields = fields ++ &[_]FieldInfo{FieldInfo{
+                                .name = fk_col_name,
+                                .field_type = .int,
+                                .zig_type = i64,
+                                .sql_type = "INTEGER",
+                                .optional = false,
+                                .nillable = false,
+                                .unique = false,
+                                .immutable = false,
+                                .default = .none,
+                                .validators = &.{},
+                                .is_id = false,
+                            }};
+                        }
+                    }
+                }
+            }
+        }
+
+        return TypeInfo{
+            .name = info.name,
+            .table_name = info.table_name,
+            .fields = fields,
+            .edges = info.edges,
+            .indexes = info.indexes,
+        };
+    }
+}
+
+fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
+    comptime {
+        var result: []const TypeInfo = &.{};
+        for (infos) |info| {
+            result = result ++ &[_]TypeInfo{addEdgeFields(info, infos)};
+        }
+        return result;
+    }
+}
+
 /// A Graph holds multiple TypeInfos.
 pub const Graph = struct {
     types: []const TypeInfo,
@@ -302,7 +397,8 @@ pub fn buildGraph(comptime schemas: []const type) Graph {
             types = types ++ &[_]TypeInfo{fromSchema(S)};
         }
         const resolved = resolveGraphEdges(types);
-        return Graph{ .types = resolved };
+        const with_fields = addEdgeFieldsToAll(resolved);
+        return Graph{ .types = with_fields };
     }
 }
 

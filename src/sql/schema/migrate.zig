@@ -76,7 +76,7 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 const col = ColumnDef{
                     .name = fk_col_name,
                     .sql_type = "INTEGER",
-                    .not_null = !e.required,
+                    .not_null = e.required,
                     .unique = e.unique,
                 };
                 columns = columns ++ &[_]ColumnDef{col};
@@ -93,7 +93,7 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 const col = ColumnDef{
                     .name = fk_col_name,
                     .sql_type = "INTEGER",
-                    .not_null = !e.required,
+                    .not_null = e.required,
                     .unique = true, // O2O FK is always unique
                 };
                 columns = columns ++ &[_]ColumnDef{col};
@@ -331,13 +331,24 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
         for (info.edges) |e| {
             if (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) {
                 const fk_col_name = e.name ++ "_id";
-                const col = ColumnDef{
-                    .name = fk_col_name,
-                    .sql_type = "INTEGER",
-                    .not_null = !e.required,
-                    .unique = e.unique,
-                };
-                columns = columns ++ &[_]ColumnDef{col};
+                // Skip adding the column definition if it was already added via info.fields
+                // (e.g., from addEdgeFields), but still add the FK constraint.
+                var col_exists = false;
+                for (columns) |c| {
+                    if (std.mem.eql(u8, c.name, fk_col_name)) {
+                        col_exists = true;
+                        break;
+                    }
+                }
+                if (!col_exists) {
+                    const col = ColumnDef{
+                        .name = fk_col_name,
+                        .sql_type = "INTEGER",
+                        .not_null = e.required,
+                        .unique = e.unique,
+                    };
+                    columns = columns ++ &[_]ColumnDef{col};
+                }
 
                 const fk = ForeignKeyDef{
                     .columns = &[_][]const u8{fk_col_name},
