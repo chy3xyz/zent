@@ -59,25 +59,29 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return copy;
         }
 
-        pub fn Create(self: Self) CreateBuilder {
-            return CreateBuilder.init(self.allocator, self.driver, self.hooks);
-        }
-
         pub fn Query(self: Self) QueryBuilder {
             return QueryBuilder.init(self.allocator, self.driver);
         }
 
+        pub fn Create(self: Self) CreateBuilder {
+            if (info.is_view) @compileError("Create is not supported for view entities");
+            return CreateBuilder.init(self.allocator, self.driver, self.hooks);
+        }
+
         pub fn Update(self: Self) UpdateBuilder {
+            if (info.is_view) @compileError("Update is not supported for view entities");
             return UpdateBuilder.init(self.allocator, self.driver, self.hooks);
         }
 
         pub fn Delete(self: Self) DeleteBuilder {
+            if (info.is_view) @compileError("Delete is not supported for view entities");
             return DeleteBuilder.init(self.allocator, self.driver, self.hooks);
         }
 
         /// Query target entities via an edge.
         /// Example: user_client.QueryEdge("cars", &.{alice.id}) returns Car entities.
         pub fn QueryEdge(self: Self, comptime edge_name: []const u8, parent_ids: []const i64) !QueryTargetsResult(infos, info.name, edge_name) {
+            if (info.is_view) @compileError("QueryEdge is not supported for view entities");
             return queryTargets(infos, info.name, edge_name, parent_ids, self.allocator, self.driver);
         }
 

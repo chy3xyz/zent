@@ -268,27 +268,52 @@ pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect)
     return std.heap.page_allocator.dupe(u8, buf.items);
 }
 
+/// Generate CREATE VIEW SQL.
+pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
+    const view_sql = info.view_sql orelse return error.MissingViewSQL;
+    var buf = std.array_list.Managed(u8).initCapacity(std.heap.page_allocator, 256) catch unreachable;
+    defer buf.deinit();
+    const writer = buf.writer();
+
+    try writer.writeAll("CREATE VIEW IF NOT EXISTS ");
+    try quoteIdent(dialect, writer, info.table_name);
+    try writer.writeAll(" AS ");
+    try writer.writeAll(view_sql);
+
+    return std.heap.page_allocator.dupe(u8, buf.items);
+}
+
 /// Create all tables for a set of TypeInfos (create-only migration).
 /// This creates tables in dependency order and also creates junction tables for M2M edges.
 /// For O2M/M2O To edges, it adds the FK column to the source entity's table.
 pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver.dialect();
 
-    // Create main entity tables
+    // Create main entity tables (skip views)
     // For each entity, also check if any OTHER entity has a From edge pointing here,
     // which means we need to add FK columns to that other entity's table.
     // We handle this by building the table definition with FK columns from both
     // own From edges AND from cross-referenced To edges.
     inline for (infos) |info| {
-        const table = comptime tableFromTypeInfoCrossRef(info, infos);
-        const sql = try createTableSQL(table, dialect);
-        defer std.heap.page_allocator.free(sql);
-        _ = try driver.exec(sql, &.{});
+        if (info.is_view) {
+            const sql = try createViewSQL(info, dialect);
+            defer std.heap.page_allocator.free(sql);
+            _ = try driver.exec(
+                sql,
+                &.{},
+            );
+        } else {
+            const table = comptime tableFromTypeInfoCrossRef(info, infos);
+            const sql = try createTableSQL(table, dialect);
+            defer std.heap.page_allocator.free(sql);
+            _ = try driver.exec(sql, &.{});
+        }
     }
 
     // Create junction tables for M2M edges (both To and From sides).
     // CREATE TABLE IF NOT EXISTS handles duplicates when both sides declare M2M.
     inline for (infos) |info| {
+        if (info.is_view) continue;
         inline for (info.edges) |e| {
             if (e.relation == .m2m) {
                 const jtable = comptime junctionTableForEdge(e, info);
@@ -299,8 +324,9 @@ pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeIn
         }
     }
 
-    // Create indexes
+    // Create indexes (skip views)
     inline for (infos) |info| {
+        if (info.is_view) continue;
         inline for (info.indexes) |idx| {
             const idx_def = IndexDef{
                 .name = idx.name,

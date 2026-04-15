@@ -49,6 +49,18 @@ const UserBase = Schema("User", .{
     },
 });
 
+pub const ActiveUserView = Schema("ActiveUserView", .{
+    .view = true,
+    .view_sql = "SELECT id, name, age, status, settings, created_at, updated_at FROM user WHERE status = 'active'",
+    .fields = &.{
+        field.Int("age"),
+        field.String("name"),
+        field.Enum("status", &.{ "active", "inactive" }),
+        field.JSON("settings", UserSettings),
+    },
+    .mixins = &.{zent.core.mixin.TimeMixin},
+});
+
 // M2M is declared with To on both sides.
 // O2M is declared with To on the "one" side and From on the "many" side.
 pub const Car = withEdges(CarBase, &.{edge.From("owner", UserBase).Ref("cars")});

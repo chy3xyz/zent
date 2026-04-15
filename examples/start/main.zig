@@ -17,15 +17,17 @@ const User = start_schema.User;
 const Car = start_schema.Car;
 const Group = start_schema.Group;
 const UserSettings = start_schema.UserSettings;
+const ActiveUserView = start_schema.ActiveUserView;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     // --- Phase 1: Schema definition and comptime introspection ---
-    const graph = comptime buildGraph(&.{ User, Car, Group });
+    const graph = comptime buildGraph(&.{ User, Car, Group, ActiveUserView });
     const user_info = graph.types[0];
     const car_info = graph.types[1];
     const group_info = graph.types[2];
+    const view_info = graph.types[3];
 
     std.debug.print("=== Phase 1: Schema Introspection ===\n", .{});
     std.debug.print("Entity: {s}, Table: {s}, Fields: {d}, Edges: {d}\n", .{
@@ -49,6 +51,9 @@ pub fn main() !void {
 
     std.debug.print("Entity: {s}, Table: {s}, Fields: {d}, Edges: {d}\n", .{
         group_info.name, group_info.table_name, group_info.fields.len, group_info.edges.len,
+    });
+    std.debug.print("View: {s}, Table: {s}, Fields: {d}, is_view={}\n", .{
+        view_info.name, view_info.table_name, view_info.fields.len, view_info.is_view,
     });
 
     // --- Phase 0: SQL Builder Demo ---
@@ -210,6 +215,17 @@ pub fn main() !void {
     _ = q2.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
     const only_alice = try q2.Only();
     std.debug.print("Only Alice: id={d}, name={s}, status={s}, theme={s}\n", .{ only_alice.id, only_alice.name, only_alice.status, only_alice.settings.theme });
+
+    // QUERY View (read-only entity)
+    std.debug.print("\n-- QUERY ActiveUserView (view) --\n", .{});
+    var view_query = client.active_user_view.Query();
+    defer view_query.deinit();
+    var active_users = try view_query.All();
+    defer active_users.deinit();
+    std.debug.print("Active users from view: {d}\n", .{active_users.items.len});
+    for (active_users.items) |u| {
+        std.debug.print("  id={d}, name={s}, status={s}\n", .{ u.id, u.name, u.status });
+    }
 
     // QUERY Cars by owner (O2M edge traversal)
     std.debug.print("\n-- QUERY Cars (edge traversal) --\n", .{});

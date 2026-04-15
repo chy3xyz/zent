@@ -59,6 +59,8 @@ pub fn Schema(comptime name: []const u8, comptime config: struct {
     indexes: []const @import("index.zig").Index = &.{},
     mixins: []const type = &.{},
     policy: ?@import("../privacy/policy.zig").Policy = null,
+    view: bool = false,
+    view_sql: ?[]const u8 = null,
 }) type {
     const all_fields = mergeMixinFields(config.fields, config.mixins);
     const all_edges = mergeMixinEdges(config.edges, config.mixins);
@@ -71,6 +73,8 @@ pub fn Schema(comptime name: []const u8, comptime config: struct {
         pub const edges = all_edges;
         pub const indexes = all_indexes;
         pub const policy = all_policy;
+        pub const is_view = config.view;
+        pub const view_sql = config.view_sql;
     };
 }
 

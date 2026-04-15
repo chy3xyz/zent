@@ -16,6 +16,7 @@ fn fieldName(comptime base: []const u8, comptime suffix: []const u8) [:0]const u
 /// Build a predicate function namespace.
 pub fn Predicates(comptime info: TypeInfo) type {
     comptime {
+        @setEvalBranchQuota(10000);
         var fields: []const std.builtin.Type.StructField = &.{};
         for (info.fields) |f| {
             const PredFn = *const fn (sql.Value) sql.Predicate;
@@ -90,6 +91,7 @@ pub fn Predicates(comptime info: TypeInfo) type {
 /// Instantiate the predicate namespace with actual function values.
 pub fn makePredicates(comptime info: TypeInfo) Predicates(info) {
     comptime {
+        @setEvalBranchQuota(10000);
         var result: Predicates(info) = undefined;
         for (info.fields) |f| {
             const col = f.name;
