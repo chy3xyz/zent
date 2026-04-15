@@ -154,6 +154,13 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             return res.rows_affected;
         }
 
+        /// Execute the UPDATE and expect exactly one row to be affected.
+        pub fn SaveOne(self: *Self) !void {
+            const affected = try self.Save();
+            if (affected == 0) return error.NotFound;
+            if (affected > 1) return error.NotSingular;
+        }
+
         fn isStringLike(comptime T: type) bool {
             return switch (@typeInfo(T)) {
                 .pointer => |ptr| {
@@ -281,6 +288,20 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             return self.execHardDelete();
         }
 
+        /// Execute the DELETE and expect exactly one row to be affected.
+        pub fn ExecOne(self: *Self) !void {
+            const affected = try self.Exec();
+            if (affected == 0) return error.NotFound;
+            if (affected > 1) return error.NotSingular;
+        }
+
+        /// Force a hard DELETE and expect exactly one row to be affected.
+        pub fn ForceExecOne(self: *Self) !void {
+            const affected = try self.ForceExec();
+            if (affected == 0) return error.NotFound;
+            if (affected > 1) return error.NotSingular;
+        }
+
         fn execSoftDelete(self: *Self) !usize {
             if (info.policy) |p| {
                 if (p.evalMutation(.delete, info.table_name) == .deny) {
@@ -389,5 +410,31 @@ test "Delete builder basic" {
     defer d.deinit();
 
     _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
+    try std.testing.expectEqual(@as(usize, 1), d.predicates.items.len);
+}
+
+test "Update builder SaveOne and Delete builder ExecOne compile" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const Upd = UpdateBuilder(info);
+    const Del = DeleteBuilder(info);
+
+    var u = Upd.init(std.testing.allocator, undefined, &.{});
+    defer u.deinit();
+    _ = u.set("name", .{ .string = "bob" }).Where(&.{sql.EQ("id", .{ .int = 1 })});
+
+    var d = Del.init(std.testing.allocator, undefined, &.{});
+    defer d.deinit();
+    _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
+
+    // Compilation check only; actual execution requires a real driver.
+    try std.testing.expectEqual(@as(usize, 1), u.values.items.len);
     try std.testing.expectEqual(@as(usize, 1), d.predicates.items.len);
 }

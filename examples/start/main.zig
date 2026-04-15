@@ -426,6 +426,13 @@ pub fn main() !void {
     const updated = try upd.Save();
     std.debug.print("Updated {d} row(s)\n", .{updated});
 
+    // UPDATE one row exactly
+    var upd_one = client.user.Update();
+    defer upd_one.deinit();
+    _ = upd_one.setFieldValue("age", 32).Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
+    try upd_one.SaveOne();
+    std.debug.print("Updated exactly one row via SaveOne\n", .{});
+
     // DELETE (should be denied by privacy policy)
     std.debug.print("\n-- DELETE (Privacy Policy Demo) --\n", .{});
     var del = client.user.Delete();
@@ -475,8 +482,8 @@ pub fn main() !void {
     var gdel_force = client.group.Delete();
     defer gdel_force.deinit();
     _ = gdel_force.Where(.{client.group.predicates.nameEQ(.{ .string = "TX Group" })});
-    const force_deleted = try gdel_force.ForceExec();
-    std.debug.print("Force deleted {d} group(s)\n", .{force_deleted});
+    try gdel_force.ForceExecOne();
+    std.debug.print("Force deleted exactly one group via ForceExecOne\n", .{});
 
     var gq4 = client.group.Query();
     defer gq4.deinit();
