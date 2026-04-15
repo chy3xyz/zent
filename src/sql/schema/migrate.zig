@@ -506,6 +506,164 @@ fn toSnakeCase(name: []const u8) []const u8 {
     }
 }
 
+pub const ExistingColumn = struct {
+    name: []const u8,
+    sql_type: []const u8,
+    not_null: bool,
+    pk: bool,
+};
+
+pub const ExistingIndex = struct {
+    name: []const u8,
+    unique: bool,
+};
+
+/// Query existing columns for a table (SQLite: PRAGMA table_info).
+fn getExistingColumns(allocator: std.mem.Allocator, driver: sql_driver.Driver, table_name: []const u8) !std.array_list.Managed(ExistingColumn) {
+    var result = std.array_list.Managed(ExistingColumn).init(allocator);
+    errdefer result.deinit();
+
+    var buf: [256]u8 = undefined;
+    const sql_text = try std.fmt.bufPrint(&buf, "PRAGMA table_info(\"{s}\")", .{table_name});
+
+    var rows = try driver.query(sql_text, &.{});
+    defer rows.deinit();
+
+    while (rows.next()) |row| {
+        const name = row.getText(1) orelse continue;
+        const sql_type = row.getText(2) orelse "";
+        const not_null = (row.getInt(3) orelse 0) != 0;
+        const pk = (row.getInt(5) orelse 0) != 0;
+        try result.append(.{
+            .name = try allocator.dupe(u8, name),
+            .sql_type = try allocator.dupe(u8, sql_type),
+            .not_null = not_null,
+            .pk = pk,
+        });
+    }
+    return result;
+}
+
+fn freeExistingColumns(allocator: std.mem.Allocator, columns: *std.array_list.Managed(ExistingColumn)) void {
+    for (columns.items) |c| {
+        allocator.free(c.name);
+        allocator.free(c.sql_type);
+    }
+    columns.deinit();
+}
+
+/// Query existing indexes for a table (SQLite: PRAGMA index_list).
+fn getExistingIndexes(allocator: std.mem.Allocator, driver: sql_driver.Driver, table_name: []const u8) !std.array_list.Managed(ExistingIndex) {
+    var result = std.array_list.Managed(ExistingIndex).init(allocator);
+    errdefer result.deinit();
+
+    var buf: [256]u8 = undefined;
+    const sql_text = try std.fmt.bufPrint(&buf, "PRAGMA index_list(\"{s}\")", .{table_name});
+
+    var rows = try driver.query(sql_text, &.{});
+    defer rows.deinit();
+
+    while (rows.next()) |row| {
+        const name = row.getText(1) orelse continue;
+        const unique = (row.getInt(2) orelse 0) != 0;
+        try result.append(.{
+            .name = try allocator.dupe(u8, name),
+            .unique = unique,
+        });
+    }
+    return result;
+}
+
+fn freeExistingIndexes(allocator: std.mem.Allocator, indexes: *std.array_list.Managed(ExistingIndex)) void {
+    for (indexes.items) |i| {
+        allocator.free(i.name);
+    }
+    indexes.deinit();
+}
+
+fn columnExists(columns: []const ExistingColumn, name: []const u8) bool {
+    for (columns) |c| {
+        if (std.mem.eql(u8, c.name, name)) return true;
+    }
+    return false;
+}
+
+fn indexExists(indexes: []const ExistingIndex, name: []const u8) bool {
+    for (indexes) |i| {
+        if (std.mem.eql(u8, i.name, name)) return true;
+    }
+    return false;
+}
+
+/// Generate ALTER TABLE ADD COLUMN SQL for a single column.
+fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, col: ColumnDef, dialect: Dialect) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(allocator);
+    defer buf.deinit();
+    const writer = buf.writer();
+
+    try writer.print("ALTER TABLE ", .{});
+    try quoteIdent(dialect, writer, table_name);
+    try writer.print(" ADD COLUMN ", .{});
+    try quoteIdent(dialect, writer, col.name);
+    try writer.print(" {s}", .{col.sql_type});
+
+    // For ALTER ADD COLUMN, avoid NOT NULL without a default to keep SQLite happy.
+    if (col.default_value) |dv| {
+        try writer.print(" DEFAULT {s}", .{dv});
+    }
+
+    if (col.unique and !col.primary_key) {
+        try writer.print(" UNIQUE", .{});
+    }
+
+    return buf.toOwnedSlice();
+}
+
+/// Migrate schema: create missing tables, add missing columns, and create missing indexes.
+/// This is a simplified auto-migration that does NOT drop columns or alter types.
+pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+    const dialect = driver.dialect();
+
+    // Step 1: create tables and indexes that don't exist yet.
+    try createAllTables(driver, infos);
+
+    // Step 2: for each non-view entity, check for missing columns and indexes.
+    inline for (infos) |info| {
+        if (info.is_view) continue;
+
+        const table = comptime tableFromTypeInfoCrossRef(info, infos);
+
+        var existing_cols = try getExistingColumns(allocator, driver, table.name);
+        defer freeExistingColumns(allocator, &existing_cols);
+
+        // Add missing columns
+        for (table.columns) |col| {
+            if (!columnExists(existing_cols.items, col.name)) {
+                const sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect);
+                defer allocator.free(sql);
+                _ = try driver.exec(sql, &.{});
+            }
+        }
+
+        var existing_idxs = try getExistingIndexes(allocator, driver, table.name);
+        defer freeExistingIndexes(allocator, &existing_idxs);
+
+        // Add missing indexes
+        inline for (info.indexes) |idx| {
+            const idx_def = IndexDef{
+                .name = idx.name,
+                .columns = idx.columns,
+                .unique = idx.unique,
+            };
+            if (!indexExists(existing_idxs.items, idx_def.name)) {
+                const sql = try createIndexSQL(idx_def, table.name, dialect);
+                defer allocator.free(sql);
+                _ = try driver.exec(sql, &.{});
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
@@ -551,4 +709,39 @@ test "Create table SQL" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "AUTOINCREMENT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "name TEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "age INTEGER") != null);
+}
+
+test "Migrate schema adds missing columns" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    // Create legacy table with only id + name
+    _ = try drv.exec("CREATE TABLE legacy_user (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)", &.{});
+
+    const LegacyUser = schema("LegacyUser", .{
+        .fields = &.{ field.String("name"), field.Int("age"), field.String("email") },
+    });
+
+    const info = comptime fromSchema(LegacyUser);
+    const infos = &[_]TypeInfo{info};
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+
+    // Verify new columns exist via PRAGMA
+    var rows = try drv.query("PRAGMA table_info(legacy_user)", &.{});
+    defer rows.deinit();
+
+    var found_age = false;
+    var found_email = false;
+    while (rows.next()) |row| {
+        const col_name = row.getText(1) orelse continue;
+        if (std.mem.eql(u8, col_name, "age")) found_age = true;
+        if (std.mem.eql(u8, col_name, "email")) found_email = true;
+    }
+    try std.testing.expect(found_age);
+    try std.testing.expect(found_email);
 }

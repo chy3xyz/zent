@@ -83,7 +83,7 @@ pub fn main() !void {
 
     // Use automatic migration instead of manual CREATE TABLE
     std.debug.print("Creating tables via migration...\n", .{});
-    try migrate.createAllTables(drv.asDriver(), infos);
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
     std.debug.print("Tables created successfully.\n", .{});
 
     // Debug: show table structure
