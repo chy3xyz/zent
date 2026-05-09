@@ -1,5 +1,6 @@
 const std = @import("std");
 const Dialect = @import("dialect.zig").Dialect;
+const Step = @import("../graph/step.zig").Step;
 
 /// A value that can be passed as a SQL argument.
 pub const Value = union(enum) {
@@ -50,9 +51,10 @@ pub const Builder = struct {
     }
 
     pub fn ident(b: *Builder, name: []const u8) !void {
-        var buf: [256]u8 = undefined;
-        const quoted = try b.dialect.quoteIdent(&buf, name);
-        try b.buffer.appendSlice(quoted);
+        const quote: u8 = if (std.mem.eql(u8, b.dialect.name, "mysql")) '`' else '"';
+        try b.buffer.append(quote);
+        try b.buffer.appendSlice(name);
+        try b.buffer.append(quote);
     }
 
     pub fn arg(b: *Builder, value: Value) !void {
@@ -154,6 +156,14 @@ pub const Predicate = union(enum) {
     raw: []const u8,
     in_subquery: struct { column: []const u8, sql: []const u8 },
     exists_subquery: []const u8,
+    /// EXISTS subquery generated lazily via a function pointer.
+    /// The function receives a Builder and appends the subquery body (without "EXISTS").
+    exists_fn: *const fn (*Builder) anyerror!void,
+    not_exists_fn: *const fn (*Builder) anyerror!void,
+    /// EXISTS subquery with additional predicates on the neighbor side.
+    /// The step describes the edge to traverse; preds are applied as AND
+    /// conditions inside the subquery.
+    has_neighbors_with: struct { step: Step, preds: []const Predicate },
     and_: struct { left: *const Predicate, right: *const Predicate },
     or_: struct { left: *const Predicate, right: *const Predicate },
     not_: *const Predicate,
@@ -228,6 +238,65 @@ pub const Predicate = union(enum) {
             .exists_subquery => |sql_text| {
                 try b.writeString("EXISTS (");
                 try b.writeString(sql_text);
+                try b.writeByte(')');
+            },
+            .exists_fn => |f| {
+                try b.writeString("EXISTS (");
+                try f(b);
+                try b.writeByte(')');
+            },
+            .not_exists_fn => |f| {
+                try b.writeString("NOT EXISTS (");
+                try f(b);
+                try b.writeByte(')');
+            },
+            .has_neighbors_with => |h| {
+                try b.writeString("EXISTS (SELECT 1 FROM ");
+                switch (h.step.edge_rel) {
+                    .o2m, .o2o => {
+                        try b.ident(h.step.edge_table);
+                        try b.writeString(" WHERE ");
+                        try b.ident(h.step.edge_columns[0]);
+                        try b.writeString(" = ");
+                        try b.ident(h.step.from_table);
+                        try b.writeByte('.');
+                        try b.ident(h.step.from_column);
+                    },
+                    .m2o => {
+                        try b.ident(h.step.to_table);
+                        try b.writeString(" WHERE ");
+                        try b.ident(h.step.to_table);
+                        try b.writeByte('.');
+                        try b.ident(h.step.to_column);
+                        try b.writeString(" = ");
+                        try b.ident(h.step.from_table);
+                        try b.writeByte('.');
+                        try b.ident(h.step.edge_columns[0]);
+                    },
+                    .m2m => {
+                        try b.ident(h.step.edge_table);
+                        try b.writeString(" j INNER JOIN ");
+                        try b.ident(h.step.to_table);
+                        try b.writeString(" t ON j.");
+                        try b.ident(h.step.targetPK());
+                        try b.writeString(" = t.");
+                        try b.ident(h.step.to_column);
+                        try b.writeString(" WHERE j.");
+                        try b.ident(h.step.sourcePK());
+                        try b.writeString(" = ");
+                        try b.ident(h.step.from_table);
+                        try b.writeByte('.');
+                        try b.ident(h.step.from_column);
+                    },
+                }
+                if (h.preds.len > 0) {
+                    try b.writeString(" AND (");
+                    for (h.preds, 0..) |pred, i| {
+                        if (i > 0) try b.writeString(" AND ");
+                        try pred.appendTo(b);
+                    }
+                    try b.writeByte(')');
+                }
                 try b.writeByte(')');
             },
             .and_ => |p| {
@@ -320,19 +389,40 @@ pub fn ExistsSubquery(sql_text: []const u8) Predicate {
 // Order
 // ------------------------------------------------------------------
 
-pub const Order = struct {
-    column: []const u8,
-    desc: bool = false,
+pub const Order = union(enum) {
+    /// Order by a simple column.
+    column: struct { name: []const u8, desc: bool = false },
+    /// Order by an arbitrary expression.
+    expr: struct {
+        gen: *const fn (*Builder) anyerror!void,
+        desc: bool = false,
+    },
 
     pub fn appendTo(self: Order, b: *Builder) !void {
-        try b.ident(self.column);
-        if (self.desc) {
-            try b.writeString(" DESC");
-        } else {
-            try b.writeString(" ASC");
+        switch (self) {
+            .column => |o| {
+                try b.ident(o.name);
+                if (o.desc) try b.writeString(" DESC");
+            },
+            .expr => |o| {
+                try o.gen(b);
+                if (o.desc) try b.writeString(" DESC");
+            },
         }
     }
 };
+
+pub fn OrderAsc(column: []const u8) Order {
+    return .{ .column = .{ .name = column, .desc = false } };
+}
+
+pub fn OrderDesc(column: []const u8) Order {
+    return .{ .column = .{ .name = column, .desc = true } };
+}
+
+pub fn OrderExpr(comptime gen: anytype, desc: bool) Order {
+    return .{ .expr = .{ .gen = &gen, .desc = desc } };
+}
 
 // ------------------------------------------------------------------
 // Join
@@ -382,7 +472,7 @@ pub const Selector = struct {
     for_update: bool,
     for_share: bool,
 
-    pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) Selector {
+    pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) !Selector {
         var s = Selector{
             .b = Builder.init(allocator, dialect),
             .columns = std.array_list.Managed(ColumnRef).init(allocator),
@@ -398,7 +488,7 @@ pub const Selector = struct {
             .for_update = false,
             .for_share = false,
         };
-        s.columns.appendSlice(columns) catch unreachable;
+        try s.columns.appendSlice(columns);
         return s;
     }
 
@@ -416,18 +506,18 @@ pub const Selector = struct {
         return s;
     }
 
-    pub fn join(s: *Selector, j: Join) *Selector {
-        s.joins.append(j) catch unreachable;
+    pub fn join(s: *Selector, j: Join) !*Selector {
+        try s.joins.append(j);
         return s;
     }
 
-    pub fn where(s: *Selector, pred: Predicate) *Selector {
-        s.predicates.append(pred) catch unreachable;
+    pub fn where(s: *Selector, pred: Predicate) !*Selector {
+        try s.predicates.append(pred);
         return s;
     }
 
-    pub fn groupBy(s: *Selector, columns: []const []const u8) *Selector {
-        s.group_cols.appendSlice(columns) catch unreachable;
+    pub fn groupBy(s: *Selector, columns: []const []const u8) !*Selector {
+        try s.group_cols.appendSlice(columns);
         return s;
     }
 
@@ -436,8 +526,8 @@ pub const Selector = struct {
         return s;
     }
 
-    pub fn orderBy(s: *Selector, o: Order) *Selector {
-        s.order_terms.append(o) catch unreachable;
+    pub fn orderBy(s: *Selector, o: Order) !*Selector {
+        try s.order_terms.append(o);
         return s;
     }
 
@@ -508,11 +598,15 @@ pub const Selector = struct {
         }
         if (s.limit_val) |n| {
             try s.b.writeString(" LIMIT ");
-            try s.b.writeString(try std.fmt.allocPrint(s.b.allocator, "{d}", .{n}));
+            var num_buf: [32]u8 = undefined;
+            const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{n});
+            try s.b.writeString(num_str);
         }
         if (s.offset_val) |n| {
             try s.b.writeString(" OFFSET ");
-            try s.b.writeString(try std.fmt.allocPrint(s.b.allocator, "{d}", .{n}));
+            var num_buf: [32]u8 = undefined;
+            const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{n});
+            try s.b.writeString(num_str);
         }
         if (s.for_update) {
             try s.b.writeString(" FOR UPDATE");
@@ -524,8 +618,8 @@ pub const Selector = struct {
     }
 };
 
-pub fn Select(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) Selector {
-    return Selector.init(allocator, dialect, columns);
+pub fn Select(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) !Selector {
+    return try Selector.init(allocator, dialect, columns);
 }
 
 // ------------------------------------------------------------------
@@ -556,15 +650,16 @@ pub const InsertBuilder = struct {
         i.rows.deinit();
     }
 
-    pub fn columns(i: *InsertBuilder, cols: []const []const u8) *InsertBuilder {
-        i.col_names.appendSlice(cols) catch unreachable;
+    pub fn columns(i: *InsertBuilder, cols: []const []const u8) !*InsertBuilder {
+        try i.col_names.appendSlice(cols);
         return i;
     }
 
-    pub fn values(i: *InsertBuilder, row: []const Value) *InsertBuilder {
+    pub fn values(i: *InsertBuilder, row: []const Value) !*InsertBuilder {
         var list = std.array_list.Managed(Value).init(i.b.allocator);
-        list.appendSlice(row) catch unreachable;
-        i.rows.append(list) catch unreachable;
+        errdefer list.deinit();
+        try list.appendSlice(row);
+        try i.rows.append(list);
         return i;
     }
 
@@ -637,13 +732,13 @@ pub const UpdateBuilder = struct {
         u.wheres.deinit();
     }
 
-    pub fn set(u: *UpdateBuilder, column: []const u8, value: Value) *UpdateBuilder {
-        u.sets.append(.{ .column = column, .value = value }) catch unreachable;
+    pub fn set(u: *UpdateBuilder, column: []const u8, value: Value) !*UpdateBuilder {
+        try u.sets.append(.{ .column = column, .value = value });
         return u;
     }
 
-    pub fn where(u: *UpdateBuilder, pred: Predicate) *UpdateBuilder {
-        u.wheres.append(pred) catch unreachable;
+    pub fn where(u: *UpdateBuilder, pred: Predicate) !*UpdateBuilder {
+        try u.wheres.append(pred);
         return u;
     }
 
@@ -694,8 +789,8 @@ pub const DeleteBuilder = struct {
         d.wheres.deinit();
     }
 
-    pub fn where(d: *DeleteBuilder, pred: Predicate) *DeleteBuilder {
-        d.wheres.append(pred) catch unreachable;
+    pub fn where(d: *DeleteBuilder, pred: Predicate) !*DeleteBuilder {
+        try d.wheres.append(pred);
         return d;
     }
 
@@ -752,17 +847,17 @@ pub const BulkUpdateBuilder = struct {
         u.rows.deinit();
     }
 
-    pub fn row(u: *BulkUpdateBuilder, id: i64) *BulkUpdateBuilder {
-        u.rows.append(.{
+    pub fn row(u: *BulkUpdateBuilder, id: i64) !*BulkUpdateBuilder {
+        try u.rows.append(.{
             .id = id,
             .sets = std.array_list.Managed(BulkUpdateSet).init(u.b.allocator),
-        }) catch unreachable;
+        });
         return u;
     }
 
-    pub fn set(u: *BulkUpdateBuilder, column: []const u8, value: Value) *BulkUpdateBuilder {
+    pub fn set(u: *BulkUpdateBuilder, column: []const u8, value: Value) !*BulkUpdateBuilder {
         var current = &u.rows.items[u.rows.items.len - 1];
-        current.sets.append(.{ .column = column, .value = value }) catch unreachable;
+        try current.sets.append(.{ .column = column, .value = value });
         return u;
     }
 
@@ -782,7 +877,7 @@ pub const BulkUpdateBuilder = struct {
                         break;
                     }
                 }
-                if (!found) columns.append(s.column) catch unreachable;
+                if (!found) try columns.append(s.column);
             }
         }
 
@@ -833,13 +928,13 @@ pub const BulkDeleteBuilder = struct {
     table: []const u8,
     groups: std.array_list.Managed(std.array_list.Managed(Predicate)),
 
-    pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) BulkDeleteBuilder {
+    pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) !BulkDeleteBuilder {
         var self = BulkDeleteBuilder{
             .b = Builder.init(allocator, dialect),
             .table = table,
             .groups = std.array_list.Managed(std.array_list.Managed(Predicate)).init(allocator),
         };
-        self.groups.append(std.array_list.Managed(Predicate).init(allocator)) catch unreachable;
+        try self.groups.append(std.array_list.Managed(Predicate).init(allocator));
         return self;
     }
 
@@ -849,14 +944,14 @@ pub const BulkDeleteBuilder = struct {
         d.groups.deinit();
     }
 
-    pub fn next(d: *BulkDeleteBuilder) *BulkDeleteBuilder {
-        d.groups.append(std.array_list.Managed(Predicate).init(d.b.allocator)) catch unreachable;
+    pub fn next(d: *BulkDeleteBuilder) !*BulkDeleteBuilder {
+        try d.groups.append(std.array_list.Managed(Predicate).init(d.b.allocator));
         return d;
     }
 
-    pub fn where(d: *BulkDeleteBuilder, pred: Predicate) *BulkDeleteBuilder {
+    pub fn where(d: *BulkDeleteBuilder, pred: Predicate) !*BulkDeleteBuilder {
         var current = &d.groups.items[d.groups.items.len - 1];
-        current.append(pred) catch unreachable;
+        try current.append(pred);
         return d;
     }
 
@@ -891,12 +986,13 @@ pub const BulkDeleteBuilder = struct {
 
 test "basic SELECT with WHERE" {
     const allocator = std.testing.allocator;
-    var s = Select(allocator, Dialect.sqlite, &.{
+    var s = try Select(allocator, Dialect.sqlite, &.{
         Table("users").c("id"),
         Table("users").c("name"),
     });
     defer s.deinit();
-    _ = s.from(Table("users")).where(EQ("age", .{ .int = 30 }));
+    _ = s.from(Table("users"));
+    _ = try s.where(EQ("age", .{ .int = 30 }));
     const q = try s.query();
     try std.testing.expectEqualStrings("SELECT \"id\", \"name\" FROM \"users\" WHERE \"age\" = ?", q.sql);
     try std.testing.expectEqual(@as(usize, 1), q.args.len);
@@ -905,17 +1001,16 @@ test "basic SELECT with WHERE" {
 
 test "SELECT with JOIN, ORDER BY, LIMIT, OFFSET" {
     const allocator = std.testing.allocator;
-    var s = Select(allocator, Dialect.sqlite, &.{
+    var s = try Select(allocator, Dialect.sqlite, &.{
         Table("users").c("id"),
         Table("users").c("name"),
     });
     defer s.deinit();
-    _ = s.from(Table("users"))
-        .join(.{ .kind = .inner, .table = Table("groups"), .on = EQ("groups.id", .{ .int = 1 }) })
-        .where(EQ("users.active", .{ .bool = true }))
-        .orderBy(.{ .column = "users.id", .desc = true })
-        .limit(10)
-        .offset(20);
+    _ = s.from(Table("users"));
+    _ = try s.join(.{ .kind = .inner, .table = Table("groups"), .on = EQ("groups.id", .{ .int = 1 }) });
+    _ = try s.where(EQ("users.active", .{ .bool = true }));
+    _ = try s.orderBy(.{ .column = .{ .name = "users.id", .desc = true } });
+    _ = s.limit(10).offset(20);
     const q = try s.query();
     try std.testing.expectEqualStrings(
         "SELECT \"id\", \"name\" FROM \"users\" INNER JOIN \"groups\" ON \"groups\".\"id\" = ? WHERE \"users\".\"active\" = ? ORDER BY \"users\".\"id\" DESC LIMIT 10 OFFSET 20",
@@ -928,7 +1023,8 @@ test "INSERT" {
     const allocator = std.testing.allocator;
     var i = Insert(allocator, Dialect.sqlite, "users");
     defer i.deinit();
-    _ = i.columns(&.{ "name", "age" }).values(&.{ .{ .string = "alice" }, .{ .int = 30 } });
+    _ = try i.columns(&.{ "name", "age" });
+    _ = try i.values(&.{ .{ .string = "alice" }, .{ .int = 30 } });
     const q = try i.query();
     try std.testing.expectEqualStrings("INSERT INTO \"users\" (\"name\", \"age\") VALUES (?, ?)", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
@@ -938,7 +1034,8 @@ test "INSERT OR REPLACE" {
     const allocator = std.testing.allocator;
     var i = InsertOrReplace(allocator, Dialect.sqlite, "users");
     defer i.deinit();
-    _ = i.columns(&.{ "id", "name" }).values(&.{ .{ .int = 1 }, .{ .string = "alice" } });
+    _ = try i.columns(&.{ "id", "name" });
+    _ = try i.values(&.{ .{ .int = 1 }, .{ .string = "alice" } });
     const q = try i.query();
     try std.testing.expectEqualStrings("INSERT OR REPLACE INTO \"users\" (\"id\", \"name\") VALUES (?, ?)", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
@@ -948,7 +1045,8 @@ test "UPDATE" {
     const allocator = std.testing.allocator;
     var u = Update(allocator, Dialect.sqlite, "users");
     defer u.deinit();
-    _ = u.set("name", .{ .string = "bob" }).where(EQ("id", .{ .int = 1 }));
+    _ = try u.set("name", .{ .string = "bob" });
+    _ = try u.where(EQ("id", .{ .int = 1 }));
     const q = try u.query();
     try std.testing.expectEqualStrings("UPDATE \"users\" SET \"name\" = ? WHERE \"id\" = ?", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
@@ -958,7 +1056,7 @@ test "DELETE" {
     const allocator = std.testing.allocator;
     var d = Delete(allocator, Dialect.sqlite, "users");
     defer d.deinit();
-    _ = d.where(EQ("id", .{ .int = 1 }));
+    _ = try d.where(EQ("id", .{ .int = 1 }));
     const q = try d.query();
     try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE \"id\" = ?", q.sql);
     try std.testing.expectEqual(@as(usize, 1), q.args.len);
@@ -970,9 +1068,10 @@ test "predicate AND/OR/NOT" {
     const p2 = GT("score", .{ .int = 100 });
     const combined = And(&p1, &p2);
 
-    var s = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
     defer s.deinit();
-    _ = s.from(Table("users")).where(combined);
+    _ = s.from(Table("users"));
+    _ = try s.where(combined);
     const q = try s.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE (\"age\" = ? AND \"score\" > ?)", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
@@ -980,16 +1079,17 @@ test "predicate AND/OR/NOT" {
 
 test "Postgres placeholders" {
     const allocator = std.testing.allocator;
-    var s = Select(allocator, Dialect.postgres, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.postgres, &.{Table("users").c("id")});
     defer s.deinit();
-    _ = s.from(Table("users")).where(EQ("age", .{ .int = 30 }));
+    _ = s.from(Table("users"));
+    _ = try s.where(EQ("age", .{ .int = 30 }));
     const q = try s.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE \"age\" = $1", q.sql);
 }
 
 test "MySQL identifiers" {
     const allocator = std.testing.allocator;
-    var s = Select(allocator, Dialect.mysql, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.mysql, &.{Table("users").c("id")});
     defer s.deinit();
     _ = s.from(Table("users"));
     const q = try s.query();
@@ -998,9 +1098,10 @@ test "MySQL identifiers" {
 
 test "Raw predicate" {
     const allocator = std.testing.allocator;
-    var s = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
     defer s.deinit();
-    _ = s.from(Table("users")).where(Raw("age > 20"));
+    _ = s.from(Table("users"));
+    _ = try s.where(Raw("age > 20"));
     const q = try s.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE age > 20", q.sql);
     try std.testing.expectEqual(@as(usize, 0), q.args.len);
@@ -1010,16 +1111,18 @@ test "Subquery predicates" {
     const allocator = std.testing.allocator;
 
     // IN subquery
-    var s1 = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s1 = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
     defer s1.deinit();
-    _ = s1.from(Table("users")).where(InSubquery("id", "SELECT user_id FROM orders"));
+    _ = s1.from(Table("users"));
+    _ = try s1.where(InSubquery("id", "SELECT user_id FROM orders"));
     const q1 = try s1.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE \"id\" IN (SELECT user_id FROM orders)", q1.sql);
 
     // EXISTS subquery
-    var s2 = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s2 = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
     defer s2.deinit();
-    _ = s2.from(Table("users")).where(ExistsSubquery("SELECT 1 FROM orders WHERE orders.user_id = users.id"));
+    _ = s2.from(Table("users"));
+    _ = try s2.where(ExistsSubquery("SELECT 1 FROM orders WHERE orders.user_id = users.id"));
     const q2 = try s2.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)", q2.sql);
 }
@@ -1027,13 +1130,13 @@ test "Subquery predicates" {
 test "FOR UPDATE and FOR SHARE" {
     const allocator = std.testing.allocator;
 
-    var s1 = Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s1 = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
     defer s1.deinit();
     _ = s1.from(Table("users")).forUpdate();
     const q1 = try s1.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" FOR UPDATE", q1.sql);
 
-    var s2 = Select(allocator, Dialect.postgres, &.{Table("users").c("id")});
+    var s2 = try Select(allocator, Dialect.postgres, &.{Table("users").c("id")});
     defer s2.deinit();
     _ = s2.from(Table("users")).forShare();
     const q2 = try s2.query();
@@ -1045,8 +1148,11 @@ test "BulkUpdate SQL generation" {
     var u = BulkUpdateBuilder.init(allocator, Dialect.sqlite, "users");
     defer u.deinit();
 
-    _ = u.row(1).set("name", .{ .string = "alice" }).set("age", .{ .int = 31 });
-    _ = u.row(2).set("name", .{ .string = "bob" });
+    _ = try u.row(1);
+    _ = try u.set("name", .{ .string = "alice" });
+    _ = try u.set("age", .{ .int = 31 });
+    _ = try u.row(2);
+    _ = try u.set("name", .{ .string = "bob" });
 
     const q = try u.query();
     try std.testing.expectEqualStrings(
@@ -1058,11 +1164,12 @@ test "BulkUpdate SQL generation" {
 
 test "BulkDelete SQL generation" {
     const allocator = std.testing.allocator;
-    var d = BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
+    var d = try BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
     defer d.deinit();
 
-    _ = d.where(EQ("id", .{ .int = 1 }));
-    _ = d.next().where(EQ("id", .{ .int = 2 }));
+    _ = try d.where(EQ("id", .{ .int = 1 }));
+    _ = try d.next();
+    _ = try d.where(EQ("id", .{ .int = 2 }));
 
     const q = try d.query();
     try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE \"id\" = ? OR \"id\" = ?", q.sql);
@@ -1071,11 +1178,13 @@ test "BulkDelete SQL generation" {
 
 test "BulkDelete with predicate groups" {
     const allocator = std.testing.allocator;
-    var d = BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
+    var d = try BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
     defer d.deinit();
 
-    _ = d.where(EQ("status", .{ .string = "inactive" })).where(GT("age", .{ .int = 30 }));
-    _ = d.next().where(EQ("status", .{ .string = "banned" }));
+    _ = try d.where(EQ("status", .{ .string = "inactive" }));
+    _ = try d.where(GT("age", .{ .int = 30 }));
+    _ = try d.next();
+    _ = try d.where(EQ("status", .{ .string = "banned" }));
 
     const q = try d.query();
     try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE (\"status\" = ? AND \"age\" > ?) OR \"status\" = ?", q.sql);

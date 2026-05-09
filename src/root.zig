@@ -28,6 +28,14 @@ pub const codegen = struct {
 
 pub const runtime = struct {
     pub const hook = @import("runtime/hook.zig");
+    pub const err = @import("runtime/error.zig");
+};
+
+pub const graph = struct {
+    pub const step = @import("graph/step.zig");
+    pub const neighbors = @import("graph/neighbors.zig");
 };
 
 pub const privacy = @import("privacy/policy.zig");
+
+pub const entql = @import("entql/parser.zig");

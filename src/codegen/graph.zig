@@ -4,6 +4,7 @@ const edge_mod = @import("../core/edge.zig");
 const index_mod = @import("../core/index.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const Policy = @import("../privacy/policy.zig").Policy;
+const graph_step = @import("../graph/step.zig");
 
 pub const FieldInfo = struct {
     name: []const u8,
@@ -413,6 +414,66 @@ fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
             result = result ++ &[_]TypeInfo{addEdgeFields(info, infos)};
         }
         return result;
+    }
+}
+
+/// Resolve the foreign-key column name for a non-M2M edge.
+fn getEdgeFKColumn(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) []const u8 {
+    if (edge.kind == .to) {
+        for (target_info.edges) |target_edge| {
+            if (target_edge.kind == .from) {
+                if (target_edge.ref) |ref| {
+                    if (std.mem.eql(u8, ref, edge.name)) {
+                        return target_edge.name ++ "_id";
+                    }
+                }
+            }
+        }
+        return toSnakeCase(source_info.name) ++ "_id";
+    } else {
+        return edge.name ++ "_id";
+    }
+}
+
+fn getJunctionTable(comptime edge: EdgeInfo, comptime source_table: []const u8, comptime target_table: []const u8) []const u8 {
+    if (edge.through_name) |tn| return tn;
+    if (std.mem.lessThan(u8, source_table, target_table))
+        return source_table ++ "_" ++ target_table;
+    return target_table ++ "_" ++ source_table;
+}
+
+/// Build a graph Step from edge/source/target metadata at comptime.
+pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) graph_step.Step {
+    const source_table = source_info.table_name;
+    const target_table = target_info.table_name;
+
+    if (edge.relation == .m2m) {
+        const junction = getJunctionTable(edge, source_table, target_table);
+        const source_col = source_table ++ "_id";
+        const target_col = target_table ++ "_id";
+        return graph_step.Step{
+            .from_table = source_table,
+            .from_column = "id",
+            .to_table = target_table,
+            .to_column = "id",
+            .edge_rel = .m2m,
+            .edge_table = junction,
+            .edge_columns = &[_][]const u8{ target_col, source_col },
+            .inverse = edge.kind == .from,
+        };
+    } else {
+        const fk_col = getEdgeFKColumn(edge, source_info, target_info);
+        const is_to = edge.kind == .to;
+        return graph_step.Step{
+            .from_table = source_table,
+            .from_column = "id",
+            .to_table = target_table,
+            .to_column = "id",
+            .edge_rel = if (is_to) .o2m else .m2o,
+            .edge_table = if (is_to) target_table else source_table,
+            .edge_columns = &[_][]const u8{fk_col},
+            .inverse = !is_to,
+        };
     }
 }
 

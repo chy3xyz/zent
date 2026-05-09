@@ -2,6 +2,7 @@ const std = @import("std");
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
+const buildEdgeStep = @import("graph.zig").buildEdgeStep;
 const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
 const sql_scan = @import("../sql/scan.zig");
@@ -9,6 +10,8 @@ const Dialect = @import("../sql/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
 const EntityGen = @import("entity.zig").Entity;
 const LightEntityGen = @import("entity.zig").LightEntity;
+const graph_step = @import("../graph/step.zig");
+const graph_neighbors = @import("../graph/neighbors.zig");
 
 fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {
     for (infos) |ti| {
@@ -22,60 +25,6 @@ fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
         if (std.mem.eql(u8, e.name, name)) return e;
     }
     @compileError("Edge not found: " ++ name ++ " on " ++ info.name);
-}
-
-fn toSnakeCase(name: []const u8) []const u8 {
-    comptime {
-        var result: []const u8 = "";
-        for (name, 0..) |c, i| {
-            if (std.ascii.isUpper(c) and i > 0) {
-                result = result ++ "_";
-            }
-            result = result ++ &[_]u8{std.ascii.toLower(c)};
-        }
-        return result;
-    }
-}
-
-fn getEdgeFKColumn(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) []const u8 {
-    if (edge.kind == .to) {
-        for (target_info.edges) |target_edge| {
-            if (target_edge.kind == .from) {
-                if (target_edge.ref) |ref| {
-                    if (std.mem.eql(u8, ref, edge.name)) {
-                        return target_edge.name ++ "_id";
-                    }
-                }
-            }
-        }
-        return toSnakeCase(source_info.name) ++ "_id";
-    } else {
-        return edge.name ++ "_id";
-    }
-}
-
-fn buildEagerLoadSqlPrefix(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) []const u8 {
-    const source_table = source_info.table_name;
-    const target_table = target_info.table_name;
-
-    if (edge.relation == .m2m) {
-        const junction_table = if (edge.through_name) |tn|
-            tn
-        else if (std.mem.lessThan(u8, source_table, target_table))
-            source_table ++ "_" ++ target_table
-        else
-            target_table ++ "_" ++ source_table;
-        const source_col = source_table ++ "_id";
-        const target_col = target_table ++ "_id";
-        return "SELECT t.*, j.\"" ++ source_col ++ "\" AS __fk FROM \"" ++ target_table ++ "\" t JOIN \"" ++ junction_table ++ "\" j ON t.\"id\" = j.\"" ++ target_col ++ "\" WHERE j.\"" ++ source_col ++ "\" IN (";
-    } else {
-        const fk_col = getEdgeFKColumn(edge, source_info, target_info);
-        if (edge.kind == .to) {
-            return "SELECT t.*, t.\"" ++ fk_col ++ "\" AS __fk FROM \"" ++ target_table ++ "\" t WHERE t.\"" ++ fk_col ++ "\" IN (";
-        } else {
-            return "SELECT t.*, s.\"id\" AS __fk FROM \"" ++ target_table ++ "\" t JOIN \"" ++ source_table ++ "\" s ON t.\"id\" = s.\"" ++ fk_col ++ "\" WHERE s.\"id\" IN (";
-        }
-    }
 }
 
 /// Generate a Query builder for an entity.
@@ -122,17 +71,17 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             self.group_cols.deinit(self.allocator);
         }
 
-        pub fn Where(self: *Self, predicates: anytype) *Self {
+        pub fn Where(self: *Self, predicates: anytype) !*Self {
             switch (@typeInfo(@TypeOf(predicates))) {
                 .pointer, .array => {
                     for (predicates) |p| {
-                        self.predicates.append(p) catch unreachable;
+                        try self.predicates.append(p);
                     }
                 },
                 .@"struct" => |s| {
                     if (s.is_tuple) {
                         inline for (predicates) |p| {
-                            self.predicates.append(p) catch unreachable;
+                            try self.predicates.append(p);
                         }
                     } else {
                         @compileError("Where expects a tuple or slice of sql.Predicate");
@@ -143,10 +92,26 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return self;
         }
 
-        pub fn OrderBy(self: *Self, terms: []const sql.Order) *Self {
+        pub fn OrderBy(self: *Self, terms: []const sql.Order) !*Self {
             for (terms) |t| {
-                self.order_terms.append(t) catch unreachable;
+                try self.order_terms.append(t);
             }
+            return self;
+        }
+
+        /// Order results by the count of neighbors reachable via `edge_name`.
+        /// For example, `OrderByEdgeCount("cars", .desc)` produces:
+        ///   ORDER BY (SELECT COUNT(*) FROM "car" WHERE "car"."owner_id" = "user"."id") DESC
+        pub fn OrderByEdgeCount(self: *Self, comptime edge_name: []const u8, comptime desc: bool) !*Self {
+            const edge = comptime findEdgeInfo(info, edge_name);
+            const target_info = comptime findTypeInfo(infos, edge.target_name);
+            const step = comptime buildEdgeStep(edge, info, target_info);
+            const order = sql.OrderExpr(struct {
+                fn gen(b: *sql.Builder) anyerror!void {
+                    try graph_neighbors.appendEdgeCount(b, step);
+                }
+            }.gen, desc);
+            try self.order_terms.append(order);
             return self;
         }
 
@@ -176,15 +141,15 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return self;
         }
 
-        pub fn WithEdge(self: *Self, comptime edge_name: []const u8) *Self {
+        pub fn WithEdge(self: *Self, comptime edge_name: []const u8) !*Self {
             _ = comptime findEdgeInfo(info, edge_name);
-            self.with_edges.append(self.allocator, edge_name) catch unreachable;
+            try self.with_edges.append(self.allocator, edge_name);
             return self;
         }
 
-        pub fn GroupBy(self: *Self, columns: []const []const u8) *Self {
+        pub fn GroupBy(self: *Self, columns: []const []const u8) !*Self {
             for (columns) |c| {
-                self.group_cols.append(self.allocator, c) catch unreachable;
+                try self.group_cols.append(self.allocator, c);
             }
             return self;
         }
@@ -235,7 +200,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
             while (rows.next()) |row| {
                 const entity = try sql_scan.scanRow(Entity, self.allocator, row);
-                result.append(entity) catch unreachable;
+                try result.append(entity);
             }
 
             for (self.with_edges.items) |edge_name| {
@@ -287,7 +252,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
             while (rows.next()) |row| {
                 const id = row.getInt(0) orelse return error.TypeMismatch;
-                result.append(id) catch unreachable;
+                try result.append(id);
             }
             return result;
         }
@@ -362,31 +327,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (std.mem.eql(u8, edge_name, edge.name)) {
                     const target_info = comptime findTypeInfo(infos, edge.target_name);
                     const TargetEntity = comptime LightEntityGen(infos, target_info);
-                    const sql_prefix = comptime buildEagerLoadSqlPrefix(edge, info, target_info);
+                    const step = comptime buildEdgeStep(edge, info, target_info);
 
-                    var parent_ids = try self.allocator.alloc(i64, entities.len);
-                    defer self.allocator.free(parent_ids);
+                    // Build parent ID values
+                    var parent_id_values = try self.allocator.alloc(sql.Value, entities.len);
+                    defer self.allocator.free(parent_id_values);
                     for (entities, 0..) |e, i| {
-                        parent_ids[i] = e.id;
+                        parent_id_values[i] = .{ .int = e.id };
                     }
 
-                    var sql_buf = std.array_list.Managed(u8).init(self.allocator);
-                    defer sql_buf.deinit();
-                    try sql_buf.appendSlice(sql_prefix);
-                    for (parent_ids, 0..) |_, i| {
-                        if (i > 0) try sql_buf.appendSlice(", ");
-                        try sql_buf.append('?');
-                    }
-                    try sql_buf.append(')');
-                    const sql_text = sql_buf.items;
+                    // Use the graph layer to build the neighbor query
+                    var b = sql.Builder.init(self.allocator, self.driver.dialect());
+                    defer b.deinit();
+                    try graph_neighbors.appendSetNeighbors(&b, step, parent_id_values);
+                    const qr = b.query();
 
-                    var args = try self.allocator.alloc(sql.Value, parent_ids.len);
-                    defer self.allocator.free(args);
-                    for (parent_ids, 0..) |id, i| {
-                        args[i] = .{ .int = id };
-                    }
-
-                    var rows = try self.driver.query(sql_text, args);
+                    var rows = try self.driver.query(qr.sql, qr.args);
                     defer rows.deinit();
 
                     var map = std.AutoHashMap(i64, std.ArrayListUnmanaged(TargetEntity)).init(self.allocator);
@@ -428,28 +384,28 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             inline for (info.fields[0..column_count], 0..) |f, i| {
                 columns[i] = t.c(f.name);
             }
-            var selector = sql.Select(self.allocator, self.driver.dialect(), &columns);
+            var selector = try sql.Select(self.allocator, self.driver.dialect(), &columns);
             // NOTE: defer selector.deinit() would free the SQL buffer before caller uses it.
             _ = selector.from(t);
             _ = selector.setDistinct(self.distinct);
 
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
-                    _ = selector.where(pred);
+                    _ = try selector.where(pred);
                 }
             }
             if (info.soft_delete and !self.with_trashed) {
-                _ = selector.where(sql.IsNull("deleted_at"));
+                _ = try selector.where(sql.IsNull("deleted_at"));
             }
             if (self.group_cols.items.len > 0) {
-                _ = selector.groupBy(self.group_cols.items);
+                _ = try selector.groupBy(self.group_cols.items);
             }
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
             }
             if (self.order_terms.items.len > 0) {
                 for (self.order_terms.items) |term| {
-                    _ = selector.orderBy(term);
+                    _ = try selector.orderBy(term);
                 }
             }
             if (self.limit_val) |n| {
@@ -469,19 +425,19 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         fn buildCountQuery(self: *Self) !sql.QueryResult {
             const t = sql.Table(info.table_name);
             const count_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
-            var selector = sql.Select(self.allocator, self.driver.dialect(), &.{count_col});
+            var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{count_col});
             // NOTE: defer selector.deinit() would free the SQL buffer before caller uses it.
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
-                    _ = selector.where(pred);
+                    _ = try selector.where(pred);
                 }
             }
             if (info.soft_delete and !self.with_trashed) {
-                _ = selector.where(sql.IsNull("deleted_at"));
+                _ = try selector.where(sql.IsNull("deleted_at"));
             }
             if (self.group_cols.items.len > 0) {
-                _ = selector.groupBy(self.group_cols.items);
+                _ = try selector.groupBy(self.group_cols.items);
             }
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
@@ -492,18 +448,18 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         fn buildAggregateQuery(self: *Self, comptime agg_expr: []const u8) !sql.QueryResult {
             const t = sql.Table(info.table_name);
             const agg_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
-            var selector = sql.Select(self.allocator, self.driver.dialect(), &.{agg_col});
+            var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{agg_col});
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
-                    _ = selector.where(pred);
+                    _ = try selector.where(pred);
                 }
             }
             if (info.soft_delete and !self.with_trashed) {
-                _ = selector.where(sql.IsNull("deleted_at"));
+                _ = try selector.where(sql.IsNull("deleted_at"));
             }
             if (self.group_cols.items.len > 0) {
-                _ = selector.groupBy(self.group_cols.items);
+                _ = try selector.groupBy(self.group_cols.items);
             }
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);

@@ -26,16 +26,23 @@ pub const SQLiteDriver = struct {
         _ = c.sqlite3_close(self.db);
     }
 
+    fn logSqliteError(db: *c.sqlite3, context: []const u8) void {
+        const msg = c.sqlite3_errmsg(db);
+        std.log.err("SQLite error ({s}): {s}", .{ context, std.mem.span(msg) });
+    }
+
     pub fn exec(self: *SQLiteDriver, sql: []const u8, args: []const Value) !driver.Result {
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
         if (rc != c.SQLITE_OK or stmt == null) {
+            logSqliteError(self.db, "prepare");
             return error.SqlitePrepareFailed;
         }
         defer _ = c.sqlite3_finalize(stmt);
         try bindArgs(stmt.?, args);
         const step_rc = c.sqlite3_step(stmt.?);
         if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
+            logSqliteError(self.db, "exec");
             return error.SqliteExecFailed;
         }
         return driver.Result{
@@ -48,6 +55,7 @@ pub const SQLiteDriver = struct {
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, query_sql.ptr, @intCast(query_sql.len), &stmt, null);
         if (rc != c.SQLITE_OK or stmt == null) {
+            logSqliteError(self.db, "prepare query");
             return error.SqlitePrepareFailed;
         }
         try bindArgs(stmt.?, args);
@@ -129,6 +137,7 @@ const SQLiteTx = struct {
     fn commit(ptr: *anyopaque) !void {
         const self: *SQLiteTx = @ptrCast(@alignCast(ptr));
         if (self.committed) return;
+        defer self.driver.allocator.destroy(self);
         _ = try self.driver.exec("COMMIT", &.{});
         self.committed = true;
     }
@@ -136,6 +145,7 @@ const SQLiteTx = struct {
     fn rollback(ptr: *anyopaque) !void {
         const self: *SQLiteTx = @ptrCast(@alignCast(ptr));
         if (self.committed) return;
+        defer self.driver.allocator.destroy(self);
         _ = try self.driver.exec("ROLLBACK", &.{});
         self.committed = true;
     }

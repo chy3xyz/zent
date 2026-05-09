@@ -65,13 +65,13 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         // Set field value helper (dynamic, no compile-time checking).
-        pub fn setValue(self: *Self, name: []const u8, value: sql.Value) *Self {
-            self.values.append(.{ .name = name, .value = value }) catch unreachable;
+        pub fn setValue(self: *Self, name: []const u8, value: sql.Value) !*Self {
+            try self.values.append(.{ .name = name, .value = value });
             return self;
         }
 
         /// Set a field value with compile-time name and type checking.
-        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) *Self {
+        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
                 var found = false;
@@ -103,24 +103,24 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             }
 
             if (comptime needs_json) {
-                const json_str = std.json.Stringify.valueAlloc(self.allocator, value, .{}) catch unreachable;
-                self.json_strings.append(json_str) catch unreachable;
-                return self.setValue(field_name, .{ .string = json_str });
+                const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+                try self.json_strings.append(json_str);
+                return try self.setValue(field_name, .{ .string = json_str });
             }
 
-            return self.setValue(field_name, toSqlValue(value));
+            return try self.setValue(field_name, toSqlValue(value));
         }
 
         /// Add target IDs for an M2M edge.
         /// After Save(), junction table rows will be inserted automatically.
-        pub fn AddEdge(self: *Self, comptime edge_name: []const u8, ids: []const i64) *Self {
+        pub fn AddEdge(self: *Self, comptime edge_name: []const u8, ids: []const i64) !*Self {
             comptime {
                 const edge = findEdgeInfo(info, edge_name);
                 if (edge.relation != .m2m) {
                     @compileError("AddEdge is only supported for M2M edges: " ++ edge_name);
                 }
             }
-            self.edge_values.append(.{ .edge = edge_name, .ids = ids }) catch unreachable;
+            try self.edge_values.append(.{ .edge = edge_name, .ids = ids });
             return self;
         }
 
@@ -162,8 +162,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                         try validateSqlValue(f, fv.value);
                     }
                 }
-                columns.append(fv.name) catch unreachable;
-                args.append(fv.value) catch unreachable;
+                try columns.append(fv.name);
+                try args.append(fv.value);
             }
 
             // Insert the entity
@@ -172,7 +172,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             else
                 sql.Insert(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
-            _ = builder.columns(columns.items).values(args.items);
+            _ = try builder.columns(columns.items);
+            _ = try builder.values(args.items);
             const q = try builder.query();
             const res = try self.driver.exec(q.sql, q.args);
 
@@ -182,7 +183,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // Fill other fields from mutation values
             for (self.values.items) |fv| {
                 if (std.mem.eql(u8, fv.name, "id")) continue;
-                setEntityField(&entity, fv.name, fv.value, self.allocator);
+                try setEntityField(&entity, fv.name, fv.value, self.allocator);
             }
 
             // Insert M2M junction table rows (or edge schema rows)
@@ -242,16 +243,16 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return entity;
         }
 
-        fn setEntityField(entity: *Entity, name: []const u8, value: sql.Value, allocator: std.mem.Allocator) void {
+        fn setEntityField(entity: *Entity, name: []const u8, value: sql.Value, allocator: std.mem.Allocator) !void {
             inline for (info.fields) |f| {
                 if (std.mem.eql(u8, f.name, name)) {
-                    @field(entity, f.name) = valueToType(f.zig_type, f.field_type, value, allocator);
+                    @field(entity, f.name) = try valueToType(f.zig_type, f.field_type, value, allocator);
                     return;
                 }
             }
         }
 
-        fn valueToType(comptime T: type, comptime ft: @import("../core/field.zig").FieldType, value: sql.Value, allocator: std.mem.Allocator) T {
+        fn valueToType(comptime T: type, comptime ft: @import("../core/field.zig").FieldType, value: sql.Value, allocator: std.mem.Allocator) !T {
             return switch (@typeInfo(T)) {
                 .int => @intCast(value.int),
                 .bool => value.bool,
@@ -259,7 +260,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 else => {
                     if (T == []const u8) return value.string;
                     if (ft == .json) {
-                        const parsed = std.json.parseFromSliceLeaky(T, allocator, value.string, .{}) catch unreachable;
+                        const parsed = try std.json.parseFromSliceLeaky(T, allocator, value.string, .{});
                         return parsed;
                     }
                     @compileError("Unsupported type for value conversion: " ++ @typeName(T));
@@ -364,7 +365,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) !Self {
             var self = Self{
                 .allocator = allocator,
                 .driver = driver,
@@ -372,7 +373,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 .rows = std.array_list.Managed(std.array_list.Managed(FieldValue)).init(allocator),
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
             };
-            self.rows.append(std.array_list.Managed(FieldValue).init(allocator)) catch unreachable;
+            try self.rows.append(std.array_list.Managed(FieldValue).init(allocator));
             return self;
         }
 
@@ -384,18 +385,18 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         }
 
         /// Start a new row in the bulk insert batch.
-        pub fn Next(self: *Self) *Self {
-            self.rows.append(std.array_list.Managed(FieldValue).init(self.allocator)) catch unreachable;
+        pub fn Next(self: *Self) !*Self {
+            try self.rows.append(std.array_list.Managed(FieldValue).init(self.allocator));
             return self;
         }
 
-        pub fn setValue(self: *Self, name: []const u8, value: sql.Value) *Self {
+        pub fn setValue(self: *Self, name: []const u8, value: sql.Value) !*Self {
             var row = &self.rows.items[self.rows.items.len - 1];
-            row.append(.{ .name = name, .value = value }) catch unreachable;
+            try row.append(.{ .name = name, .value = value });
             return self;
         }
 
-        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) *Self {
+        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
                 var found = false;
@@ -427,12 +428,12 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             }
 
             if (comptime needs_json) {
-                const json_str = std.json.Stringify.valueAlloc(self.allocator, value, .{}) catch unreachable;
-                self.json_strings.append(json_str) catch unreachable;
-                return self.setValue(field_name, .{ .string = json_str });
+                const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+                try self.json_strings.append(json_str);
+                return try self.setValue(field_name, .{ .string = json_str });
             }
 
-            return self.setValue(field_name, toSqlValue(value));
+            return try self.setValue(field_name, toSqlValue(value));
         }
 
         pub fn Save(self: *Self) !std.array_list.Managed(i64) {
@@ -479,17 +480,17 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             var columns = std.array_list.Managed([]const u8).init(self.allocator);
             defer columns.deinit();
             for (first_row.items) |fv| {
-                columns.append(fv.name) catch unreachable;
+                try columns.append(fv.name);
             }
 
             var builder = sql.Insert(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
-            _ = builder.columns(columns.items);
+            _ = try builder.columns(columns.items);
             for (self.rows.items) |row| {
                 var sql_values = std.array_list.Managed(sql.Value).init(self.allocator);
                 defer sql_values.deinit();
-                for (row.items) |fv| sql_values.append(fv.value) catch unreachable;
-                _ = builder.values(sql_values.items);
+                for (row.items) |fv| try sql_values.append(fv.value);
+                _ = try builder.values(sql_values.items);
             }
             const base = try builder.query();
 
@@ -505,7 +506,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             errdefer ids.deinit();
             while (rows.next()) |row| {
                 const id = row.getInt(0) orelse return error.TypeMismatch;
-                ids.append(id) catch unreachable;
+                try ids.append(id);
             }
             return ids;
         }

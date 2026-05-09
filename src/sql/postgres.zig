@@ -1,47 +1,279 @@
 const std = @import("std");
+const c = @cImport(@cInclude("libpq-fe.h"));
 const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
 
-/// PostgreSQL driver using libpq (C bindings).
-/// Note: This is a placeholder implementation.
-/// For production use, you would need to add proper libpq bindings.
-pub const PostgresDriver = struct {
-    allocator: std.mem.Allocator,
-    connected: bool = false,
+const PG_ERRBUF_SIZE = 256;
 
-    pub fn open(allocator: std.mem.Allocator, conn_str: []const u8) !PostgresDriver {
-        _ = conn_str;
-        return PostgresDriver{
-            .allocator = allocator,
-            .connected = true,
-        };
+pub const PostgresDriver = struct {
+    conn: *c.PGconn,
+    allocator: std.mem.Allocator,
+
+    pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8) !PostgresDriver {
+        // libpq expects a null-terminated string
+        const conninfo_z = try allocator.dupeZ(u8, conninfo);
+        defer allocator.free(conninfo_z);
+
+        const conn = c.PQconnectdb(conninfo_z.ptr);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            defer c.PQfinish(conn);
+            const msg = c.PQerrorMessage(conn);
+            std.log.err("postgres connect failed: {s}", .{std.mem.span(msg)});
+            return error.PostgresConnectFailed;
+        }
+        return PostgresDriver{ .conn = conn, .allocator = allocator };
+    }
+
+    pub fn connectDb(allocator: std.mem.Allocator, host: []const u8, port: u16, dbname: []const u8, user: []const u8, password: []const u8) !PostgresDriver {
+        const conninfo = try std.fmt.allocPrint(allocator,
+            "host={s} port={d} dbname={s} user={s} password={s}",
+            .{ host, port, dbname, user, password },
+        );
+        defer allocator.free(conninfo);
+        return connect(allocator, conninfo);
     }
 
     pub fn close(self: *PostgresDriver) void {
-        self.connected = false;
+        c.PQfinish(self.conn);
+    }
+
+    fn logPgError(conn: *c.PGconn, context: []const u8) void {
+        const msg = c.PQerrorMessage(conn);
+        std.log.err("postgres error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
     pub fn exec(self: *PostgresDriver, sql: []const u8, args: []const Value) !driver.Result {
-        _ = self;
-        _ = sql;
-        _ = args;
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        const nParams: c_int = @intCast(args.len);
+        var paramValues: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+        var paramLengths: std.ArrayListUnmanaged(c_int) = .empty;
+        var paramFormats: std.ArrayListUnmanaged(c_int) = .empty;
+        defer {
+            for (paramValues.items, 0..) |pv, i| {
+                if (pv) |p| {
+                    if (args[i] == .string or args[i] == .bytes) {
+                        self.allocator.free(std.mem.span(p));
+                    }
+                }
+            }
+            paramValues.deinit(self.allocator);
+            paramLengths.deinit(self.allocator);
+            paramFormats.deinit(self.allocator);
+        }
+
+        try paramValues.resize(self.allocator, @intCast(nParams));
+        try paramLengths.resize(self.allocator, @intCast(nParams));
+        try paramFormats.resize(self.allocator, @intCast(nParams));
+
+        for (args, 0..) |arg, i| {
+            const idx: usize = i;
+            switch (arg) {
+                .null => {
+                    paramValues.items[idx] = null;
+                    paramLengths.items[idx] = 0;
+                    paramFormats.items[idx] = 0; // text format
+                },
+                .bool => |v| {
+                    const s = if (v) "t" else "f";
+                    paramValues.items[idx] = @ptrCast(s);
+                    paramLengths.items[idx] = @intCast(s.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .int => |v| {
+                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(s.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .float => |v| {
+                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(s.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .string => |v| {
+                    const s = try self.allocator.dupeZ(u8, v);
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(v.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .bytes => |v| {
+                    const s = try self.allocator.dupeZ(u8, v);
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(v.len);
+                    paramFormats.items[idx] = 1; // binary format
+                },
+            }
+        }
+
+        const res = c.PQexecParams(
+            self.conn,
+            sql_z.ptr,
+            nParams,
+            null, // let libpq infer param types from text
+            paramValues.items.ptr,
+            paramLengths.items.ptr,
+            paramFormats.items.ptr,
+            0, // text results
+        );
+        if (res == null) {
+            logPgError(self.conn, "exec");
+            return error.PostgresExecFailed;
+        }
+        defer c.PQclear(res);
+
+        const status = c.PQresultStatus(res);
+        if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
+            logPgError(self.conn, "exec");
+            return error.PostgresExecFailed;
+        }
+
+        const affected = c.PQcmdTuples(res);
+        var rows_affected: usize = 0;
+        if (affected) |a| {
+            rows_affected = std.fmt.parseInt(usize, std.mem.span(a), 10) catch 0;
+        }
+
+        // Get last insert id from RETURNING clause if present, or use oid
+        var last_insert_id: ?i64 = null;
+        if (c.PQntuples(res) > 0) {
+            const oid_value = c.PQgetvalue(res, 0, 0);
+            if (oid_value) |val| {
+                last_insert_id = std.fmt.parseInt(i64, std.mem.span(val), 10) catch null;
+            }
+        }
+
         return driver.Result{
-            .rows_affected = 0,
-            .last_insert_id = null,
+            .rows_affected = rows_affected,
+            .last_insert_id = last_insert_id,
         };
     }
 
     pub fn query(self: *PostgresDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
-        _ = self;
-        _ = query_sql;
-        _ = args;
-        return error.NotImplemented;
+        const sql_z = try self.allocator.dupeZ(u8, query_sql);
+        errdefer self.allocator.free(sql_z);
+
+        const nParams: c_int = @intCast(args.len);
+        var paramValues: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+        var paramLengths: std.ArrayListUnmanaged(c_int) = .empty;
+        var paramFormats: std.ArrayListUnmanaged(c_int) = .empty;
+        defer {
+            for (paramValues.items, 0..) |pv, i| {
+                if (pv) |p| {
+                    if (i < args.len and (args[i] == .string or args[i] == .bytes)) {
+                        self.allocator.free(std.mem.span(p));
+                    }
+                }
+            }
+            paramValues.deinit(self.allocator);
+            paramLengths.deinit(self.allocator);
+            paramFormats.deinit(self.allocator);
+        }
+
+        try paramValues.resize(self.allocator, @intCast(nParams));
+        try paramLengths.resize(self.allocator, @intCast(nParams));
+        try paramFormats.resize(self.allocator, @intCast(nParams));
+
+        for (args, 0..) |arg, i| {
+            const idx: usize = i;
+            switch (arg) {
+                .null => {
+                    paramValues.items[idx] = null;
+                    paramLengths.items[idx] = 0;
+                    paramFormats.items[idx] = 0;
+                },
+                .bool => |v| {
+                    const s = if (v) "t" else "f";
+                    paramValues.items[idx] = @ptrCast(s);
+                    paramLengths.items[idx] = @intCast(s.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .int => |v| {
+                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(s.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .float => |v| {
+                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(s.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .string => |v| {
+                    const s = try self.allocator.dupeZ(u8, v);
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(v.len);
+                    paramFormats.items[idx] = 0;
+                },
+                .bytes => |v| {
+                    const s = try self.allocator.dupeZ(u8, v);
+                    paramValues.items[idx] = s.ptr;
+                    paramLengths.items[idx] = @intCast(v.len);
+                    paramFormats.items[idx] = 1;
+                },
+            }
+        }
+
+        const res = c.PQexecParams(
+            self.conn,
+            sql_z.ptr,
+            nParams,
+            null,
+            paramValues.items.ptr,
+            paramLengths.items.ptr,
+            paramFormats.items.ptr,
+            0,
+        );
+        if (res == null) {
+            logPgError(self.conn, "query");
+            return error.PostgresQueryFailed;
+        }
+        errdefer c.PQclear(res);
+
+        const status = c.PQresultStatus(res);
+        if (status != c.PGRES_TUPLES_OK) {
+            logPgError(self.conn, "query");
+            return error.PostgresQueryFailed;
+        }
+
+        const rows_ptr = try self.allocator.create(PostgresRows);
+        errdefer self.allocator.destroy(rows_ptr);
+        rows_ptr.* = PostgresRows{
+            .result = res.?,
+            .allocator = self.allocator,
+            .row_index = 0,
+            .num_rows = @intCast(c.PQntuples(res)),
+            .num_fields = @intCast(c.PQnfields(res)),
+        };
+        // result ownership transferred to PostgresRows
+        _ = &res;
+
+        return driver.Rows{
+            .ptr = rows_ptr,
+            .vtable = &PostgresRows.vtable,
+        };
     }
 
     pub fn beginTx(self: *PostgresDriver) !driver.Tx {
-        _ = self;
-        return error.NotImplemented;
+        _ = try self.exec("BEGIN", &.{});
+
+        const tx_ptr = try self.allocator.create(PostgresTx);
+        errdefer self.allocator.destroy(tx_ptr);
+        tx_ptr.* = PostgresTx{
+            .driver = self,
+            .committed = false,
+        };
+
+        return driver.Tx{
+            .inner = self.asDriver(),
+            .commitFn = PostgresTx.commit,
+            .rollbackFn = PostgresTx.rollback,
+            .ptr = tx_ptr,
+        };
     }
 
     pub fn asDriver(self: *PostgresDriver) driver.Driver {
@@ -84,14 +316,135 @@ pub const PostgresDriver = struct {
     };
 };
 
+const PostgresTx = struct {
+    driver: *PostgresDriver,
+    committed: bool,
+
+    fn commit(ptr: *anyopaque) !void {
+        const self: *PostgresTx = @ptrCast(@alignCast(ptr));
+        if (self.committed) return;
+        defer self.driver.allocator.destroy(self);
+        _ = try self.driver.exec("COMMIT", &.{});
+        self.committed = true;
+    }
+
+    fn rollback(ptr: *anyopaque) !void {
+        const self: *PostgresTx = @ptrCast(@alignCast(ptr));
+        if (self.committed) return;
+        defer self.driver.allocator.destroy(self);
+        _ = try self.driver.exec("ROLLBACK", &.{});
+        self.committed = true;
+    }
+};
+
+const PostgresRows = struct {
+    result: *c.PGresult,
+    allocator: std.mem.Allocator,
+    row_index: c_int,
+    num_rows: c_int,
+    num_fields: c_int,
+
+    const vtable = driver.Rows.VTable{
+        .next = next,
+        .deinit = deinit,
+    };
+
+    fn next(ptr: *anyopaque) ?driver.Row {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        if (self.row_index >= self.num_rows) return null;
+        const row = driver.Row{
+            .ptr = self,
+            .vtable = &row_vtable,
+        };
+        self.row_index += 1;
+        return row;
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        c.PQclear(self.result);
+        const alloc = self.allocator;
+        alloc.destroy(self);
+    }
+
+    const row_vtable = driver.Row.VTable{
+        .columnCount = columnCount,
+        .columnName = columnName,
+        .getInt = getInt,
+        .getFloat = getFloat,
+        .getText = getText,
+        .getBlob = getBlob,
+        .isNull = isNull,
+    };
+
+    fn currentRow(self: *PostgresRows) c_int {
+        return self.row_index - 1;
+    }
+
+    fn columnCount(ptr: *anyopaque) usize {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        return @intCast(self.num_fields);
+    }
+
+    fn columnName(ptr: *anyopaque, index: usize) []const u8 {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        const name = c.PQfname(self.result, @intCast(index));
+        return std.mem.span(name);
+    }
+
+    fn getInt(ptr: *anyopaque, index: usize) ?i64 {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
+        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
+        if (val == null) return null;
+        return std.fmt.parseInt(i64, std.mem.span(val), 10) catch null;
+    }
+
+    fn getFloat(ptr: *anyopaque, index: usize) ?f64 {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
+        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
+        if (val == null) return null;
+        return std.fmt.parseFloat(f64, std.mem.span(val)) catch null;
+    }
+
+    fn getText(ptr: *anyopaque, index: usize) ?[]const u8 {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
+        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
+        if (val == null) return null;
+        return std.mem.span(val);
+    }
+
+    fn getBlob(ptr: *anyopaque, index: usize) ?[]const u8 {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
+        var length: c_int = 0;
+        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
+        if (val == null) return null;
+        // For binary format, PQgetlength gives the byte length
+        length = c.PQgetlength(self.result, self.currentRow(), @intCast(index));
+        return val[0..@intCast(length)];
+    }
+
+    fn isNull(ptr: *anyopaque, index: usize) bool {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        return c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0;
+    }
+};
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
 
-test "Postgres driver basic operations" {
-    const allocator = std.testing.allocator;
-    var drv = try PostgresDriver.open(allocator, "host=localhost dbname=test user=postgres");
-    defer drv.close();
+test "Postgres placeholder style" {
+    var buf: [16]u8 = undefined;
+    const ph = try Dialect.postgres.placeholder(&buf, 1);
+    try std.testing.expectEqualStrings("$1", ph);
+}
 
-    try std.testing.expect(drv.connected == true);
+test "Postgres quote ident" {
+    var buf: [64]u8 = undefined;
+    const q = try Dialect.postgres.quoteIdent(&buf, "my_table");
+    try std.testing.expectEqualStrings("\"my_table\"", q);
 }

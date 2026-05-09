@@ -64,12 +64,13 @@ pub fn main() !void {
     // --- Phase 0: SQL Builder Demo ---
     std.debug.print("\n=== Phase 0: SQL Builder ===\n", .{});
     const t = sql.Table("users");
-    var query = sql.Select(allocator, Dialect.sqlite, &.{
+    var query = try sql.Select(allocator, Dialect.sqlite, &.{
         t.c("id"),
         t.c("name"),
     });
     defer query.deinit();
-    _ = query.from(t).where(sql.EQ("age", .{ .int = 30 }));
+    _ = query.from(t);
+    _ = try query.where(sql.EQ("age", .{ .int = 30 }));
     const q = try query.query();
     std.debug.print("SQL: {s}\n", .{q.sql});
     std.debug.print("Args count: {d}\n", .{q.args.len});
@@ -116,23 +117,26 @@ pub fn main() !void {
 
     // CREATE Group
     std.debug.print("-- CREATE Group --\n", .{});
-    var group1_builder = client.group.Create();
+    var group1_builder = try client.group.Create();
     defer group1_builder.deinit();
-    _ = group1_builder.setFieldValue("name", "Admins");
+    _ = try group1_builder.setFieldValue("name", "Admins");
     const group1 = try group1_builder.Save();
     std.debug.print("Created group: id={d}, name={s}\n", .{ group1.id, group1.name });
 
-    var group2_builder = client.group.Create();
+    var group2_builder = try client.group.Create();
     defer group2_builder.deinit();
-    _ = group2_builder.setFieldValue("name", "Users");
+    _ = try group2_builder.setFieldValue("name", "Users");
     const group2 = try group2_builder.Save();
     std.debug.print("Created group: id={d}, name={s}\n", .{ group2.id, group2.name });
 
     // VALIDATION demo
     std.debug.print("\n-- VALIDATION --\n", .{});
-    var invalid_builder = client.user.Create();
+    var invalid_builder = try client.user.Create();
     defer invalid_builder.deinit();
-    _ = invalid_builder.setFieldValue("name", "Invalid").setFieldValue("age", -1).setFieldValue("status", "active").setFieldValue("settings", UserSettings{ .theme = "red", .notifications = false });
+    _ = try invalid_builder.setFieldValue("name", "Invalid");
+    _ = try invalid_builder.setFieldValue("age", -1);
+    _ = try invalid_builder.setFieldValue("status", "active");
+    _ = try invalid_builder.setFieldValue("settings", UserSettings{ .theme = "red", .notifications = false });
     if (invalid_builder.Save()) |_| {
         std.debug.print("Unexpected success for invalid data\n", .{});
     } else |err| switch (err) {
@@ -142,42 +146,42 @@ pub fn main() !void {
 
     // CREATE User with M2M edge adder
     std.debug.print("\n-- CREATE User --\n", .{});
-    var create_builder1 = client.user.Create();
+    var create_builder1 = try client.user.Create();
     defer create_builder1.deinit();
-    _ = create_builder1.setFieldValue("name", "Alice");
-    _ = create_builder1.setFieldValue("age", 30);
-    _ = create_builder1.setFieldValue("status", "active");
-    _ = create_builder1.setFieldValue("settings", UserSettings{ .theme = "dark", .notifications = true });
-    _ = create_builder1.AddEdge("groups", &.{group1.id});
+    _ = try create_builder1.setFieldValue("name", "Alice");
+    _ = try create_builder1.setFieldValue("age", 30);
+    _ = try create_builder1.setFieldValue("status", "active");
+    _ = try create_builder1.setFieldValue("settings", UserSettings{ .theme = "dark", .notifications = true });
+    _ = try create_builder1.AddEdge("groups", &.{group1.id});
     const alice = try create_builder1.Save();
     std.debug.print("Created user: id={d}, name={s}, age={d}, status={s}, theme={s}\n", .{ alice.id, alice.name, alice.age, alice.status, alice.settings.theme });
 
-    var create_builder2 = client.user.Create();
+    var create_builder2 = try client.user.Create();
     defer create_builder2.deinit();
-    _ = create_builder2.setFieldValue("name", "Bob");
-    _ = create_builder2.setFieldValue("age", 25);
-    _ = create_builder2.setFieldValue("status", "inactive");
-    _ = create_builder2.setFieldValue("settings", UserSettings{ .theme = "light", .notifications = false });
-    _ = create_builder2.AddEdge("groups", &.{group2.id});
+    _ = try create_builder2.setFieldValue("name", "Bob");
+    _ = try create_builder2.setFieldValue("age", 25);
+    _ = try create_builder2.setFieldValue("status", "inactive");
+    _ = try create_builder2.setFieldValue("settings", UserSettings{ .theme = "light", .notifications = false });
+    _ = try create_builder2.AddEdge("groups", &.{group2.id});
     const bob = try create_builder2.Save();
     std.debug.print("Created user: id={d}, name={s}, age={d}, status={s}, theme={s}\n", .{ bob.id, bob.name, bob.age, bob.status, bob.settings.theme });
 
     // CREATE Car (with O2M owner edge)
     std.debug.print("\n-- CREATE Car --\n", .{});
-    var car1_builder = client.car.Create();
+    var car1_builder = try client.car.Create();
     defer car1_builder.deinit();
-    _ = car1_builder.setFieldValue("model", "Tesla Model S");
-    _ = car1_builder.setFieldValue("registered_at", 1705318200);
+    _ = try car1_builder.setFieldValue("model", "Tesla Model S");
+    _ = try car1_builder.setFieldValue("registered_at", 1705318200);
     // The owner_id FK column was auto-generated by migration
-    _ = car1_builder.setFieldValue("owner_id", alice.id);
+    _ = try car1_builder.setFieldValue("owner_id", alice.id);
     const car1 = try car1_builder.Save();
     std.debug.print("Created car: id={d}, model={s}\n", .{ car1.id, car1.model });
 
-    var car2_builder = client.car.Create();
+    var car2_builder = try client.car.Create();
     defer car2_builder.deinit();
-    _ = car2_builder.setFieldValue("model", "Toyota Camry");
-    _ = car2_builder.setFieldValue("registered_at", 1687269600);
-    _ = car2_builder.setFieldValue("owner_id", alice.id);
+    _ = try car2_builder.setFieldValue("model", "Toyota Camry");
+    _ = try car2_builder.setFieldValue("registered_at", 1687269600);
+    _ = try car2_builder.setFieldValue("owner_id", alice.id);
     const car2 = try car2_builder.Save();
     std.debug.print("Created car: id={d}, model={s}\n", .{ car2.id, car2.model });
 
@@ -185,11 +189,11 @@ pub fn main() !void {
 
     // CREATE UserGroup edge record directly (edge schema with extra field)
     std.debug.print("\n-- CREATE UserGroup edge record --\n", .{});
-    var ug_builder = client.user_group.Create();
+    var ug_builder = try client.user_group.Create();
     defer ug_builder.deinit();
-    _ = ug_builder.setFieldValue("user_id", alice.id);
-    _ = ug_builder.setFieldValue("group_id", group2.id);
-    _ = ug_builder.setFieldValue("joined_at", 1705318200);
+    _ = try ug_builder.setFieldValue("user_id", alice.id);
+    _ = try ug_builder.setFieldValue("group_id", group2.id);
+    _ = try ug_builder.setFieldValue("joined_at", 1705318200);
     const ug = try ug_builder.Save();
     std.debug.print("Created user_group: user_id={d}, group_id={d}, joined_at={d}\n", .{ ug.user_id, ug.group_id, ug.joined_at.? });
 
@@ -198,18 +202,18 @@ pub fn main() !void {
     // TRANSACTION demo
     std.debug.print("\n-- TRANSACTION --\n", .{});
     var tx = try zent.codegen.client.beginTx(infos, client);
-    var tx_group_builder = tx.client.group.Create();
+    var tx_group_builder = try tx.client.group.Create();
     defer tx_group_builder.deinit();
-    _ = tx_group_builder.setFieldValue("name", "TX Group");
+    _ = try tx_group_builder.setFieldValue("name", "TX Group");
     const tx_group = try tx_group_builder.Save();
     std.debug.print("Created group in tx: id={d}, name={s}\n", .{ tx_group.id, tx_group.name });
 
-    var tx_user_builder = tx.client.user.Create();
+    var tx_user_builder = try tx.client.user.Create();
     defer tx_user_builder.deinit();
-    _ = tx_user_builder.setFieldValue("name", "TX User");
-    _ = tx_user_builder.setFieldValue("age", 99);
-    _ = tx_user_builder.setFieldValue("status", "active");
-    _ = tx_user_builder.setFieldValue("settings", UserSettings{ .theme = "tx", .notifications = false });
+    _ = try tx_user_builder.setFieldValue("name", "TX User");
+    _ = try tx_user_builder.setFieldValue("age", 99);
+    _ = try tx_user_builder.setFieldValue("status", "active");
+    _ = try tx_user_builder.setFieldValue("settings", UserSettings{ .theme = "tx", .notifications = false });
     const tx_user = try tx_user_builder.Save();
     std.debug.print("Created user in tx: id={d}, name={s}\n", .{ tx_user.id, tx_user.name });
 
@@ -219,7 +223,7 @@ pub fn main() !void {
     // Verify tx data is visible outside tx
     var qtx = client.user.Query();
     defer qtx.deinit();
-    _ = qtx.Where(.{user_preds.nameEQ(.{ .string = "TX User" })});
+    _ = try qtx.Where(.{user_preds.nameEQ(.{ .string = "TX User" })});
     const tx_user_outside = try qtx.Only();
     std.debug.print("Verified tx user outside tx: id={d}, name={s}\n", .{ tx_user_outside.id, tx_user_outside.name });
 
@@ -228,7 +232,7 @@ pub fn main() !void {
 
     var qbuilder = client.user.Query();
     defer qbuilder.deinit();
-    _ = qbuilder.Where(.{user_preds.ageEQ(.{ .int = 30 })});
+    _ = try qbuilder.Where(.{user_preds.ageEQ(.{ .int = 30 })});
     var users = try qbuilder.All();
     defer users.deinit();
     std.debug.print("Users with age=30: {d}\n", .{users.items.len});
@@ -240,7 +244,7 @@ pub fn main() !void {
     std.debug.print("\n-- RAW PREDICATE --\n", .{});
     var qraw = client.user.Query();
     defer qraw.deinit();
-    _ = qraw.Where(&[_]sql.Predicate{sql.Raw("age > 20")});
+    _ = try qraw.Where(&[_]sql.Predicate{sql.Raw("age > 20")});
     var raw_users = try qraw.All();
     defer raw_users.deinit();
     std.debug.print("Users with raw predicate (age > 20): {d}\n", .{raw_users.items.len});
@@ -249,15 +253,40 @@ pub fn main() !void {
     std.debug.print("\n-- SUBQUERY PREDICATES --\n", .{});
     var qsub = client.user.Query();
     defer qsub.deinit();
-    _ = qsub.Where(&[_]sql.Predicate{sql.ExistsSubquery("SELECT 1 FROM \"car\" WHERE \"owner_id\" = \"user\".\"id\"")});
+    _ = try qsub.Where(&[_]sql.Predicate{sql.ExistsSubquery("SELECT 1 FROM \"car\" WHERE \"owner_id\" = \"user\".\"id\"")});
     var sub_users = try qsub.All();
     defer sub_users.deinit();
     std.debug.print("Users who own at least one car (EXISTS subquery): {d}\n", .{sub_users.items.len});
 
+    // EDGE PREDICATES demo (HasNeighbors via generated predicates)
+    std.debug.print("\n-- EDGE PREDICATES (HasNeighbors) --\n", .{});
+    var qhas = client.user.Query();
+    defer qhas.deinit();
+    _ = try qhas.Where(.{user_preds.HasCars()});
+    var has_cars_users = try qhas.All();
+    defer has_cars_users.deinit();
+    std.debug.print("Users who have at least one car (HasCars predicate): {d}\n", .{has_cars_users.items.len});
+    for (has_cars_users.items) |u| {
+        std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
+    }
+
+    // EDGE PREDICATES WITH FILTER (HasNeighborsWith)
+    std.debug.print("\n-- EDGE PREDICATES WITH FILTER (HasNeighborsWith) --\n", .{});
+    var qhas_with = client.user.Query();
+    defer qhas_with.deinit();
+    const tesla_pred = client.car.predicates.modelEQ(.{ .string = "Tesla Model S" });
+    _ = try qhas_with.Where(.{user_preds.HasCarsWith(&.{tesla_pred})});
+    var has_tesla_users = try qhas_with.All();
+    defer has_tesla_users.deinit();
+    std.debug.print("Users who own a Tesla Model S (HasCarsWith predicate): {d}\n", .{has_tesla_users.items.len});
+    for (has_tesla_users.items) |u| {
+        std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
+    }
+
     // FIRST / ONLY
     var q2 = client.user.Query();
     defer q2.deinit();
-    _ = q2.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
+    _ = try q2.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
     const only_alice = try q2.Only();
     std.debug.print("Only Alice: id={d}, name={s}, status={s}, theme={s}\n", .{ only_alice.id, only_alice.name, only_alice.status, only_alice.settings.theme });
 
@@ -265,7 +294,8 @@ pub fn main() !void {
     std.debug.print("\n-- FOR UPDATE --\n", .{});
     var qlock = client.user.Query();
     defer qlock.deinit();
-    _ = qlock.Where(.{user_preds.nameEQ(.{ .string = "Alice" })}).ForUpdate();
+    _ = try qlock.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
+    _ = qlock.ForUpdate();
     if (qlock.Only()) |locked_alice| {
         std.debug.print("Locked Alice: id={d}, name={s}\n", .{ locked_alice.id, locked_alice.name });
     } else |err| switch (err) {
@@ -306,7 +336,8 @@ pub fn main() !void {
     std.debug.print("\n-- EAGER LOADING --\n", .{});
     var qeager = client.user.Query();
     defer qeager.deinit();
-    _ = qeager.WithEdge("cars").WithEdge("groups");
+    _ = try qeager.WithEdge("cars");
+    _ = try qeager.WithEdge("groups");
     var eager_users = try qeager.All();
     defer {
         qeager.deinitEdges(eager_users.items);
@@ -379,7 +410,7 @@ pub fn main() !void {
     std.debug.print("\n-- GROUP BY --\n", .{});
     var qg = client.user.Query();
     defer qg.deinit();
-    _ = qg.GroupBy(&.{"status"});
+    _ = try qg.GroupBy(&.{"status"});
     var grouped = try qg.All();
     defer grouped.deinit();
     std.debug.print("Unique statuses: {d}\n", .{grouped.items.len});
@@ -391,7 +422,8 @@ pub fn main() !void {
     std.debug.print("\n-- HAVING --\n", .{});
     var qh = client.user.Query();
     defer qh.deinit();
-    _ = qh.GroupBy(&.{"status"}).Having(sql.GTE("COUNT(*)", .{ .int = 2 }));
+    _ = try qh.GroupBy(&.{"status"});
+    _ = qh.Having(sql.GTE("COUNT(*)", .{ .int = 2 }));
     var having = try qh.All();
     defer having.deinit();
     std.debug.print("Statuses with >= 2 users: {d}\n", .{having.items.len});
@@ -399,13 +431,43 @@ pub fn main() !void {
         std.debug.print("  status={s}\n", .{u.status});
     }
 
+    // ORDER BY EDGE COUNT
+    std.debug.print("\n-- ORDER BY EDGE COUNT --\n", .{});
+    var q_by_edge = client.user.Query();
+    defer q_by_edge.deinit();
+    _ = try q_by_edge.OrderByEdgeCount("cars", true);
+    var users_by_cars = try q_by_edge.All();
+    defer users_by_cars.deinit();
+    std.debug.print("Users ordered by car count (desc):\n", .{});
+    for (users_by_cars.items) |u| {
+        std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
+    }
+
+    // ORDER BY EDGE COUNT using generated order terms
+    std.debug.print("\n-- ORDER BY EDGE COUNT (orders field) --\n", .{});
+    var q_by_edge2 = client.user.Query();
+    defer q_by_edge2.deinit();
+    _ = try q_by_edge2.OrderBy(&.{client.user.orders.byCarsCount(false)});
+    var users_by_cars_asc = try q_by_edge2.All();
+    defer users_by_cars_asc.deinit();
+    std.debug.print("Users ordered by car count (asc):\n", .{});
+    for (users_by_cars_asc.items) |u| {
+        std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
+    }
+
     // BULK INSERT
     std.debug.print("\n-- BULK INSERT --\n", .{});
-    var bulk = client.user.BulkInsert();
+    var bulk = try client.user.BulkInsert();
     defer bulk.deinit();
-    _ = bulk.setFieldValue("name", "Bulk1").setFieldValue("age", 10).setFieldValue("status", "active").setFieldValue("settings", UserSettings{ .theme = "red", .notifications = false });
-    _ = bulk.Next();
-    _ = bulk.setFieldValue("name", "Bulk2").setFieldValue("age", 20).setFieldValue("status", "inactive").setFieldValue("settings", UserSettings{ .theme = "blue", .notifications = true });
+    _ = try bulk.setFieldValue("name", "Bulk1");
+    _ = try bulk.setFieldValue("age", 10);
+    _ = try bulk.setFieldValue("status", "active");
+    _ = try bulk.setFieldValue("settings", UserSettings{ .theme = "red", .notifications = false });
+    _ = try bulk.Next();
+    _ = try bulk.setFieldValue("name", "Bulk2");
+    _ = try bulk.setFieldValue("age", 20);
+    _ = try bulk.setFieldValue("status", "inactive");
+    _ = try bulk.setFieldValue("settings", UserSettings{ .theme = "blue", .notifications = true });
     const bulk_ids = try bulk.Save();
     defer bulk_ids.deinit();
     std.debug.print("Bulk inserted {d} users, ids: ", .{bulk_ids.items.len});
@@ -416,15 +478,16 @@ pub fn main() !void {
 
     // UPSERT
     std.debug.print("\n-- UPSERT --\n", .{});
-    var upsert_builder = client.group.Create();
+    var upsert_builder = try client.group.Create();
     defer upsert_builder.deinit();
-    _ = upsert_builder.setFieldValue("id", group1.id).setFieldValue("name", "AdminsUpdated");
+    _ = try upsert_builder.setFieldValue("id", group1.id);
+    _ = try upsert_builder.setFieldValue("name", "AdminsUpdated");
     const upserted = try upsert_builder.SaveOrUpdate();
     std.debug.print("Upserted group: id={d}, name={s}\n", .{ upserted.id, upserted.name });
 
     var q_upsert = client.group.Query();
     defer q_upsert.deinit();
-    _ = q_upsert.Where(.{client.group.predicates.nameEQ(.{ .string = "AdminsUpdated" })});
+    _ = try q_upsert.Where(.{client.group.predicates.nameEQ(.{ .string = "AdminsUpdated" })});
     const found_upsert = try q_upsert.Only();
     std.debug.print("Verified upsert: id={d}, name={s}\n", .{ found_upsert.id, found_upsert.name });
 
@@ -432,16 +495,17 @@ pub fn main() !void {
     std.debug.print("\n-- UPDATE --\n", .{});
     var upd = client.user.Update();
     defer upd.deinit();
-    _ = upd.setFieldValue("age", 31)
-        .setFieldValue("settings", UserSettings{ .theme = "auto", .notifications = true })
-        .Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
+    _ = try upd.setFieldValue("age", 31);
+    _ = try upd.setFieldValue("settings", UserSettings{ .theme = "auto", .notifications = true });
+    _ = try upd.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
     const updated = try upd.Save();
     std.debug.print("Updated {d} row(s)\n", .{updated});
 
     // UPDATE one row exactly
     var upd_one = client.user.Update();
     defer upd_one.deinit();
-    _ = upd_one.setFieldValue("age", 32).Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
+    _ = try upd_one.setFieldValue("age", 32);
+    _ = try upd_one.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
     try upd_one.SaveOne();
     std.debug.print("Updated exactly one row via SaveOne\n", .{});
 
@@ -449,23 +513,26 @@ pub fn main() !void {
     std.debug.print("\n-- BULK UPDATE --\n", .{});
     var bulk_upd = client.user.BulkUpdate();
     defer bulk_upd.deinit();
-    _ = bulk_upd.Row(alice.id).setFieldValue("age", 40);
-    _ = bulk_upd.Row(bob.id).setFieldValue("age", 35);
+    _ = try bulk_upd.Row(alice.id);
+    _ = try bulk_upd.setFieldValue("age", 40);
+    _ = try bulk_upd.Row(bob.id);
+    _ = try bulk_upd.setFieldValue("age", 35);
     const bulk_updated = try bulk_upd.Save();
     std.debug.print("Bulk updated {d} row(s)\n", .{bulk_updated});
 
     var qbulk = client.user.Query();
     defer qbulk.deinit();
-    _ = qbulk.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
+    _ = try qbulk.Where(.{user_preds.nameEQ(.{ .string = "Alice" })});
     const bulk_alice = try qbulk.Only();
     std.debug.print("Verified Alice age after bulk update: {d}\n", .{bulk_alice.age});
 
     // BULK DELETE (on Car, which has no privacy policy or soft_delete)
     std.debug.print("\n-- BULK DELETE --\n", .{});
-    var bulk_del = client.car.BulkDelete();
+    var bulk_del = try client.car.BulkDelete();
     defer bulk_del.deinit();
-    _ = bulk_del.Where(.{client.car.predicates.modelEQ(.{ .string = "Tesla Model S" })});
-    _ = bulk_del.Next().Where(.{client.car.predicates.modelEQ(.{ .string = "Toyota Camry" })});
+    _ = try bulk_del.Where(.{client.car.predicates.modelEQ(.{ .string = "Tesla Model S" })});
+    _ = try bulk_del.Next();
+    _ = try bulk_del.Where(.{client.car.predicates.modelEQ(.{ .string = "Toyota Camry" })});
     const bulk_deleted = try bulk_del.Exec();
     std.debug.print("Bulk deleted {d} row(s)\n", .{bulk_deleted});
 
@@ -478,7 +545,8 @@ pub fn main() !void {
     std.debug.print("\n-- IMMUTABLE FIELD --\n", .{});
     var ug_upd = client.user_group.Update();
     defer ug_upd.deinit();
-    _ = ug_upd.set("joined_at", .{ .int = 9999 }).Where(.{client.user_group.predicates.user_idEQ(.{ .int = ug.user_id })});
+    _ = try ug_upd.set("joined_at", .{ .int = 9999 });
+    _ = try ug_upd.Where(.{client.user_group.predicates.user_idEQ(.{ .int = ug.user_id })});
     const ug_updated = ug_upd.Save() catch |err| switch (err) {
         error.ImmutableField => blk: {
             std.debug.print("Update of immutable field denied (expected)\n", .{});
@@ -492,7 +560,7 @@ pub fn main() !void {
     std.debug.print("\n-- DELETE (Privacy Policy Demo) --\n", .{});
     var del = client.user.Delete();
     defer del.deinit();
-    _ = del.Where(.{user_preds.nameEQ(.{ .string = "Bob" })});
+    _ = try del.Where(.{user_preds.nameEQ(.{ .string = "Bob" })});
     const deleted = del.Exec() catch |err| switch (err) {
         error.PrivacyDenied => blk: {
             std.debug.print("Delete denied by privacy policy (OnDelete)\n", .{});
@@ -517,7 +585,7 @@ pub fn main() !void {
 
     var gdel = client.group.Delete();
     defer gdel.deinit();
-    _ = gdel.Where(.{client.group.predicates.nameEQ(.{ .string = "TX Group" })});
+    _ = try gdel.Where(.{client.group.predicates.nameEQ(.{ .string = "TX Group" })});
     const soft_deleted = try gdel.Exec();
     std.debug.print("Soft deleted {d} group(s)\n", .{soft_deleted});
 
@@ -536,7 +604,7 @@ pub fn main() !void {
 
     var gdel_force = client.group.Delete();
     defer gdel_force.deinit();
-    _ = gdel_force.Where(.{client.group.predicates.nameEQ(.{ .string = "TX Group" })});
+    _ = try gdel_force.Where(.{client.group.predicates.nameEQ(.{ .string = "TX Group" })});
     try gdel_force.ForceExecOne();
     std.debug.print("Force deleted exactly one group via ForceExecOne\n", .{});
 

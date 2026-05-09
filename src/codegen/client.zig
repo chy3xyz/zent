@@ -16,6 +16,9 @@ const DeleteGen = @import("update_delete.zig").DeleteBuilder;
 const BulkUpdateGen = @import("update_delete.zig").BulkUpdateBuilder;
 const BulkDeleteGen = @import("update_delete.zig").BulkDeleteBuilder;
 const PredGen = @import("predicate.zig").makePredicates;
+const buildEdgeStep = @import("graph.zig").buildEdgeStep;
+const graph_neighbors = @import("../graph/neighbors.zig");
+const graph_step = @import("../graph/step.zig");
 const MetaGen = @import("meta.zig").Meta;
 
 fn capitalize(comptime s: []const u8) []const u8 {
@@ -29,6 +32,67 @@ fn capitalize(comptime s: []const u8) []const u8 {
     }
 }
 
+/// Generate a struct with edge-count order term functions for a given entity.
+/// Each edge produces a method `by{Name}Count(desc: bool) sql.Order`.
+fn EdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
+    _ = infos;
+    comptime {
+        const edge_count = info.edges.len;
+        var field_names: [edge_count][:0]const u8 = undefined;
+        var field_types: [edge_count]type = undefined;
+        var field_attrs: [edge_count]std.builtin.Type.StructField.Attributes = undefined;
+
+        const OrderFn = *const fn (bool) sql.Order;
+
+        for (info.edges, 0..) |edge, i| {
+            field_names[i] = byEdgeName(edge.name);
+            field_types[i] = OrderFn;
+            field_attrs[i] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(OrderFn) };
+        }
+
+        return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+    }
+}
+
+fn byEdgeName(comptime edge_name: []const u8) [:0]const u8 {
+    comptime {
+        var buf: [256:0]u8 = undefined;
+        const prefix = "by";
+        const suffix = "Count";
+        @memcpy(buf[0..prefix.len], prefix);
+        buf[prefix.len] = std.ascii.toUpper(edge_name[0]);
+        @memcpy(buf[prefix.len + 1 .. prefix.len + 1 + edge_name.len - 1], edge_name[1..]);
+        @memcpy(buf[prefix.len + 1 + edge_name.len - 1 .. prefix.len + 1 + edge_name.len - 1 + suffix.len], suffix);
+        const len = prefix.len + 1 + edge_name.len - 1 + suffix.len;
+        buf[len] = 0;
+        return buf[0..len :0];
+    }
+}
+
+/// Instantiate edge order terms.
+fn makeEdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) EdgeOrderTerms(infos, info) {
+    comptime {
+        var result: EdgeOrderTerms(infos, info) = undefined;
+        for (info.edges) |edge| {
+            const target_info = findTypeInfo(infos, edge.target_name);
+            const step = buildEdgeStep(edge, info, target_info);
+
+            const name = byEdgeName(edge.name);
+
+            @field(result, name) = struct {
+                fn orderFn(desc: bool) sql.Order {
+                    return sql.OrderExpr(struct {
+                        fn gen(b: *sql.Builder) anyerror!void {
+                            try graph_neighbors.appendEdgeCount(b, step);
+                        }
+                    }.gen, desc);
+                }
+            }.orderFn;
+        }
+        return result;
+    }
+}
+
 /// Client for a single entity type.
 pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     const Entity = EntityGen(infos, info);
@@ -39,7 +103,8 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
     const DeleteBuilder = DeleteGen(info);
     const BulkUpdateBuilder = BulkUpdateGen(info);
     const BulkDeleteBuilder = BulkDeleteGen(info);
-    const Predicates = comptime PredGen(info);
+    const Predicates = comptime PredGen(infos, info);
+    const EdgeOrders = comptime makeEdgeOrderTerms(infos, info);
     const Meta = comptime MetaGen(info);
 
     return struct {
@@ -48,6 +113,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
         predicates: @TypeOf(Predicates),
+        orders: @TypeOf(EdgeOrders),
         hooks: []const Hook,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver) Self {
@@ -55,6 +121,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
                 .allocator = allocator,
                 .driver = driver,
                 .predicates = Predicates,
+                .orders = EdgeOrders,
                 .hooks = &.{},
             };
         }
@@ -69,14 +136,14 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return QueryBuilder.init(self.allocator, self.driver);
         }
 
-        pub fn Create(self: Self) CreateBuilder {
+        pub fn Create(self: Self) !CreateBuilder {
             if (info.is_view) @compileError("Create is not supported for view entities");
             return CreateBuilder.init(self.allocator, self.driver, self.hooks);
         }
 
-        pub fn BulkInsert(self: Self) BulkInsertBuilder {
+        pub fn BulkInsert(self: Self) !BulkInsertBuilder {
             if (info.is_view) @compileError("BulkInsert is not supported for view entities");
-            return BulkInsertBuilder.init(self.allocator, self.driver, self.hooks);
+            return try BulkInsertBuilder.init(self.allocator, self.driver, self.hooks);
         }
 
         pub fn Update(self: Self) UpdateBuilder {
@@ -94,7 +161,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return BulkUpdateBuilder.init(self.allocator, self.driver, self.hooks);
         }
 
-        pub fn BulkDelete(self: Self) BulkDeleteBuilder {
+        pub fn BulkDelete(self: Self) !BulkDeleteBuilder {
             if (info.is_view) @compileError("BulkDelete is not supported for view entities");
             return BulkDeleteBuilder.init(self.allocator, self.driver, self.hooks);
         }
@@ -318,7 +385,7 @@ pub fn queryTargets(
 
         while (rows.next()) |row| {
             const entity = try sql_scan.scanRow(TargetEntity, allocator, row);
-            result.append(entity) catch unreachable;
+            try result.append(entity);
         }
         return result;
     } else {
@@ -364,7 +431,7 @@ pub fn queryTargets(
 
         while (rows.next()) |row| {
             const entity = try sql_scan.scanRow(TargetEntity, allocator, row);
-            result.append(entity) catch unreachable;
+            try result.append(entity);
         }
         return result;
     }

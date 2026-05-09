@@ -102,13 +102,13 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         }
 
         /// Set a field value dynamically (no compile-time checking).
-        pub fn set(self: *Self, field_name: []const u8, value: sql.Value) *Self {
-            self.values.append(.{ .name = field_name, .value = value }) catch unreachable;
+        pub fn set(self: *Self, field_name: []const u8, value: sql.Value) !*Self {
+            try self.values.append(.{ .name = field_name, .value = value });
             return self;
         }
 
         /// Set a field value with compile-time name and type checking.
-        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) *Self {
+        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
                 var found = false;
@@ -141,26 +141,26 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             }
 
             if (comptime needs_json) {
-                const json_str = std.json.Stringify.valueAlloc(self.allocator, value, .{}) catch unreachable;
-                self.json_strings.append(json_str) catch unreachable;
-                return self.set(field_name, .{ .string = json_str });
+                const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+                try self.json_strings.append(json_str);
+                return try self.set(field_name, .{ .string = json_str });
             }
 
-            return self.set(field_name, toSqlValue(value));
+            return try self.set(field_name, toSqlValue(value));
         }
 
         /// Add predicates for WHERE clause.
-        pub fn Where(self: *Self, predicates: anytype) *Self {
+        pub fn Where(self: *Self, predicates: anytype) !*Self {
             switch (@typeInfo(@TypeOf(predicates))) {
                 .pointer, .array => {
                     for (predicates) |p| {
-                        self.predicates.append(p) catch unreachable;
+                        try self.predicates.append(p);
                     }
                 },
                 .@"struct" => |s| {
                     if (s.is_tuple) {
                         inline for (predicates) |p| {
-                            self.predicates.append(p) catch unreachable;
+                            try self.predicates.append(p);
                         }
                     } else {
                         @compileError("Where expects a tuple or slice of sql.Predicate");
@@ -204,11 +204,11 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             defer builder.deinit();
 
             for (self.values.items) |fv| {
-                _ = builder.set(fv.name, fv.value);
+                _ = try builder.set(fv.name, fv.value);
             }
 
             for (self.predicates.items) |pred| {
-                _ = builder.where(pred);
+                _ = try builder.where(pred);
             }
 
             const q = try builder.query();
@@ -249,17 +249,17 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         /// Add predicates for WHERE clause.
-        pub fn Where(self: *Self, predicates: anytype) *Self {
+        pub fn Where(self: *Self, predicates: anytype) !*Self {
             switch (@typeInfo(@TypeOf(predicates))) {
                 .pointer, .array => {
                     for (predicates) |p| {
-                        self.predicates.append(p) catch unreachable;
+                        try self.predicates.append(p);
                     }
                 },
                 .@"struct" => |s| {
                     if (s.is_tuple) {
                         inline for (predicates) |p| {
-                            self.predicates.append(p) catch unreachable;
+                            try self.predicates.append(p);
                         }
                     } else {
                         @compileError("Where expects a tuple or slice of sql.Predicate");
@@ -323,10 +323,10 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const now: i64 = @intCast(c.time(null));
             var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
-            _ = builder.set("deleted_at", .{ .int = now });
+            _ = try builder.set("deleted_at", .{ .int = now });
 
             for (self.predicates.items) |pred| {
-                _ = builder.where(pred);
+                _ = try builder.where(pred);
             }
 
             const q = try builder.query();
@@ -357,7 +357,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             defer builder.deinit();
 
             for (self.predicates.items) |pred| {
-                _ = builder.where(pred);
+                _ = try builder.where(pred);
             }
 
             const q = try builder.query();
@@ -396,19 +396,19 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         }
 
         /// Start a new row with the given id.
-        pub fn Row(self: *Self, id: i64) *Self {
-            _ = self.b.row(id);
+        pub fn Row(self: *Self, id: i64) !*Self {
+            _ = try self.b.row(id);
             return self;
         }
 
         /// Set a field value dynamically (no compile-time checking).
-        pub fn set(self: *Self, field_name: []const u8, value: sql.Value) *Self {
-            _ = self.b.set(field_name, value);
+        pub fn set(self: *Self, field_name: []const u8, value: sql.Value) !*Self {
+            _ = try self.b.set(field_name, value);
             return self;
         }
 
         /// Set a field value with compile-time name and type checking.
-        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) *Self {
+        pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
                 var found = false;
@@ -441,12 +441,12 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             }
 
             if (comptime needs_json) {
-                const json_str = std.json.Stringify.valueAlloc(self.allocator, value, .{}) catch unreachable;
-                self.json_strings.append(json_str) catch unreachable;
-                return self.set(field_name, .{ .string = json_str });
+                const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
+                try self.json_strings.append(json_str);
+                return try self.set(field_name, .{ .string = json_str });
             }
 
-            return self.set(field_name, toSqlValue(value));
+            return try self.set(field_name, toSqlValue(value));
         }
 
         /// Execute the bulk UPDATE and return rows affected.
@@ -499,12 +499,12 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         b: sql.BulkDeleteBuilder,
         hooks: []const Hook,
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) !Self {
             return .{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
-                .b = sql.BulkDeleteBuilder.init(allocator, driver.dialect(), info.table_name),
+                .b = try sql.BulkDeleteBuilder.init(allocator, driver.dialect(), info.table_name),
             };
         }
 
@@ -513,24 +513,24 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         }
 
         /// Start a new predicate group for the next row to delete.
-        pub fn Next(self: *Self) *Self {
-            _ = self.b.next();
+        pub fn Next(self: *Self) !*Self {
+            _ = try self.b.next();
             return self;
         }
 
         /// Add predicates for the current row's WHERE clause.
         /// Groups are ORed together in the final DELETE.
-        pub fn Where(self: *Self, predicates: anytype) *Self {
+        pub fn Where(self: *Self, predicates: anytype) !*Self {
             switch (@typeInfo(@TypeOf(predicates))) {
                 .pointer, .array => {
                     for (predicates) |p| {
-                        _ = self.b.where(p);
+                        _ = try self.b.where(p);
                     }
                 },
                 .@"struct" => |s| {
                     if (s.is_tuple) {
                         inline for (predicates) |p| {
-                            _ = self.b.where(p);
+                            _ = try self.b.where(p);
                         }
                     } else {
                         @compileError("Where expects a tuple or slice of sql.Predicate");
