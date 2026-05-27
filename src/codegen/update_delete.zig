@@ -9,6 +9,9 @@ const Op = @import("../runtime/hook.zig").Op;
 const privacy = @import("../privacy/policy.zig");
 
 const FieldValue = @import("create.zig").FieldValue;
+
+// C time() — libc is linked via build.zig
+extern "c" fn time(tloc: ?*anyopaque) c_long;
 const validateSqlValue = @import("create.zig").validateSqlValue;
 
 fn isStringLike(comptime T: type) bool {
@@ -318,9 +321,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             }
 
             // Get current timestamp (seconds since epoch)
-            // Using C time() as a fallback since std.time.timestamp() was removed in Zig 0.16.0
-            const c = @cImport(@cInclude("time.h"));
-            const now: i64 = @intCast(c.time(null));
+            const now: i64 = @intCast(time(null));
             var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .{ .int = now });

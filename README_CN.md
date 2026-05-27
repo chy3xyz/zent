@@ -19,7 +19,7 @@ Zig 语言实现的实体框架（Entity Framework），复刻自 [ent](https://
 
 ### 环境要求
 
-- Zig 0.16.0 或更高版本
+- Zig 0.17.0 或更高版本
 - SQLite3 开发库
 
 ### 安装

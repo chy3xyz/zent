@@ -1,8 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cDefine("MYSQL_NO_DATA", "1");
-    @cInclude("mariadb/mysql.h");
-});
+const c = @import("mysql_c");
 const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");

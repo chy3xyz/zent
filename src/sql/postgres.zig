@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @cImport(@cInclude("libpq-fe.h"));
+const c = @import("pg_c");
 const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @cImport(@cInclude("sqlite3.h"));
+const c = @import("sqlite3_c");
 const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");

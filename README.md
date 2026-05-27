@@ -19,7 +19,7 @@ A Zig language implementation of an Entity Framework, inspired by [ent](https://
 
 ### Prerequisites
 
-- Zig 0.16.0 or later
+- Zig 0.17.0 or later
 - SQLite3 development libraries
 
 ### Installation
