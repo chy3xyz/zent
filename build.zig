@@ -150,6 +150,27 @@ pub fn build(b: *std.Build) void {
     pool_step.dependOn(&run_pool.step);
 
     // -------------------------------------------------------------
+    // Benchmarks
+    // -------------------------------------------------------------
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("zent", zent_mod);
+    bench_mod.addImport("sqlite3_c", sqlite_c_mod);
+    bench_mod.linkSystemLibrary("sqlite3", .{});
+    const bench_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("benchmark", "Run performance benchmarks");
+    bench_step.dependOn(&run_bench.step);
+
+    // -------------------------------------------------------------
     // Top-level test step
     // -------------------------------------------------------------
     const test_step = b.step("test", "Run unit tests");

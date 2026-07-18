@@ -36,6 +36,7 @@ cd zent
 zig build run-start    # schema introspection + CRUD smoke test
 zig build run-complex  # e-commerce demo with advanced SQL
 zig build run-pool     # connection-pool usage demo
+zig build benchmark    # micro-benchmarks
 ```
 
 ### Run Tests

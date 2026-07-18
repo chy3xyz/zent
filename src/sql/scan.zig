@@ -64,6 +64,84 @@ pub fn scanRowOffset(comptime T: type, allocator: std.mem.Allocator, row: Row, c
     return scanRowInner(T, allocator, row, offset);
 }
 
+/// Scan a database row into a value of type T without using an allocator.
+///
+/// Only primitive, non-allocating types are supported:
+///   - signed integers up to 64 bits
+///   - floats up to 64 bits
+///   - booleans
+///   - optionals of the above
+///   - structs whose fields are exclusively the above
+///
+/// String slices, nested structs, and JSON-decoded fields are rejected at
+/// compile time. This is intended for hot paths where every allocation matters.
+pub fn scanRowNoAlloc(comptime T: type, row: Row) !T {
+    comptime {
+        const info = @typeInfo(T);
+        if (info != .@"struct") {
+            @compileError("scanRowNoAlloc only supports structs; got " ++ @typeName(T));
+        }
+        for (info.@"struct".field_types) |FieldType| {
+            switch (@typeInfo(FieldType)) {
+                .int, .float, .bool => {},
+                .optional => |opt| {
+                    switch (@typeInfo(opt.child)) {
+                        .int, .float, .bool => {},
+                        else => @compileError("scanRowNoAlloc does not support allocating types in optional: " ++ @typeName(FieldType)),
+                    }
+                },
+                else => @compileError("scanRowNoAlloc does not support allocating types: " ++ @typeName(FieldType)),
+            }
+        }
+    }
+    return scanRowInnerNoAlloc(T, row, 0);
+}
+
+fn scanColumnNoAlloc(comptime T: type, row: Row, index: usize) !T {
+    const info = @typeInfo(T);
+    switch (info) {
+        .int => |int| {
+            if (int.bits <= 64 and int.signedness == .signed) {
+                const v = row.getInt(index) orelse return error.TypeMismatch;
+                return @intCast(v);
+            }
+            @compileError("Unsupported integer type for scanning: " ++ @typeName(T));
+        },
+        .float => |float| {
+            if (float.bits <= 64) {
+                const v = row.getFloat(index) orelse return error.TypeMismatch;
+                if (T == f32) return @floatCast(v);
+                return v;
+            }
+            @compileError("Unsupported float type for scanning: " ++ @typeName(T));
+        },
+        .bool => {
+            const v = row.getInt(index) orelse return error.TypeMismatch;
+            return v != 0;
+        },
+        .optional => |opt| {
+            if (row.isNull(index)) return null;
+            return try scanColumnNoAlloc(opt.child, row, index);
+        },
+        else => @compileError("Unsupported type for no-alloc scanning: " ++ @typeName(T)),
+    }
+}
+
+fn scanRowInnerNoAlloc(comptime T: type, row: Row, comptime offset: usize) !T {
+    const info = @typeInfo(T);
+    var value: T = undefined;
+    var col_idx: usize = offset;
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "edges")) {
+            @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+        } else {
+            @field(value, field_name) = try scanColumnNoAlloc(field_type, row, col_idx);
+            col_idx += 1;
+        }
+    }
+    return value;
+}
+
 fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize) !T {
     const info = @typeInfo(T);
     switch (info) {
