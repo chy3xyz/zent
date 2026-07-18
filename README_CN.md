@@ -9,11 +9,12 @@ Zig 语言实现的实体框架（Entity Framework），复刻自 [ent](https://
 - **Schema 即代码**：用 Zig 代码直接定义实体、字段、边、索引
 - **完全静态类型安全**：所有查询构造器、变更构造器在编译期即类型安全
 - **Comptime 驱动**：利用 Zig 的 comptime 元编程能力，无需外部代码生成工具
-- **SQL 优先**：支持 SQLite（当前），PostgreSQL/MySQL 支持（占位符实现）
+- **SQL 优先**：SQLite 为一等支持，同时提供 PostgreSQL/MySQL 驱动
 - **图遍历查询**：优雅的关系型数据库关联查询抽象
 - **Fluent API**：链式调用，简洁易用
 - **Hooks 系统**：用于操作前后的运行时钩子
 - **隐私策略**：用于访问控制的灵活策略框架
+- **连接池**：基于 Mutex 的预热连接池，支持借出时健康检查
 
 ## 快速开始
 
@@ -32,7 +33,9 @@ cd zent
 ### 运行示例
 
 ```bash
-zig build run-start
+zig build run-start    # Schema 内省 + CRUD 冒烟测试
+zig build run-complex  # 电商高级 SQL 操作演示
+zig build run-pool     # 连接池使用演示
 ```
 
 ### 运行测试

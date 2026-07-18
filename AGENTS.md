@@ -9,10 +9,12 @@
 
 ## Commands
 
-- `zig build` — build the library and the `start` example
-- `zig build test` — run unit tests (50 tests, 0 leaks)
+- `zig build` — build the library and example executables
+- `zig build test` — run unit tests (53 tests, 0 leaks)
 - `zig build test-integration` — run SQLite integration tests
 - `zig build run-start` — run the `examples/start` smoke test
+- `zig build run-complex` — run the `examples/complex` e-commerce demo
+- `zig build run-pool` — run the `examples/pool` connection-pool demo
 - `zig fmt --check src examples tests build.zig` — formatting
 
 ## Repository conventions
@@ -41,5 +43,7 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `src/privacy/` — privacy policy framework
 - `src/graph/` — graph traversal helpers
 - `src/entql/` — EntQL expression parser
-- `examples/` — example apps (currently `start/`)
+- `examples/start/` — schema introspection + CRUD smoke test
+- `examples/complex/` — e-commerce demo with advanced SQL operations
+- `examples/pool/` — connection-pool usage demo
 - `tests/integration/` — end-to-end tests

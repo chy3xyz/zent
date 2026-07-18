@@ -9,11 +9,12 @@ A Zig language implementation of an Entity Framework, inspired by [ent](https://
 - **Schema as Code**: Define entities, fields, edges, and indexes directly in Zig code
 - **Full Static Type Safety**: All query and mutation builders are type-safe at compile time
 - **Comptime Driven**: Leverages Zig's comptime meta-programming capabilities, no external code generation tools needed
-- **SQL First**: SQLite (first-class), PostgreSQL and MySQL drivers present (less exercised)
+- **SQL First**: SQLite (first-class), PostgreSQL and MySQL drivers also supported
 - **Graph Traversal Queries**: Elegant abstraction for relational database relationship queries
 - **Fluent API**: Chainable calls, clean and easy to use
 - **Hooks System**: Runtime hooks for before/after operations
 - **Privacy Policy**: Flexible policy framework for access control
+- **Connection Pool**: Mutex-backed pool with warmup and on-borrow health checks
 
 ## Quick Start
 
@@ -29,10 +30,12 @@ git clone https://github.com/chy3xyz/zent.git
 cd zent
 ```
 
-### Run Example
+### Run Examples
 
 ```bash
-zig build run-start
+zig build run-start    # schema introspection + CRUD smoke test
+zig build run-complex  # e-commerce demo with advanced SQL
+zig build run-pool     # connection-pool usage demo
 ```
 
 ### Run Tests

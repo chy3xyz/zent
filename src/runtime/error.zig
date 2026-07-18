@@ -20,7 +20,7 @@ pub const DbError = error{
     PrivacyDenied,
     /// A required column was not present in the result set.
     MissingColumn,
-    /// A database value could not be converted to the expected Rust type.
+    /// A database value could not be converted to the expected Zig type.
     TypeMismatch,
     /// Attempted to write to an immutable field.
     ImmutableField,
