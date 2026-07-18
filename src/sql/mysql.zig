@@ -262,6 +262,13 @@ pub const MySQLDriver = struct {
         };
     }
 
+    pub fn ping(self: *MySQLDriver) !void {
+        if (c.mysql_ping(self.conn) != 0) {
+            logMySQLError(self.conn, "ping");
+            return error.MySQLPingFailed;
+        }
+    }
+
     pub fn beginTx(self: *MySQLDriver) !driver.Tx {
         // MySQL autocommit is on by default, so BEGIN disables it within the tx
         _ = try self.exec("BEGIN", &.{});
@@ -270,13 +277,14 @@ pub const MySQLDriver = struct {
         errdefer self.allocator.destroy(tx_ptr);
         tx_ptr.* = MySQLTx{
             .driver = self,
-            .committed = false,
+            .state = .active,
         };
 
         return driver.Tx{
             .inner = self.asDriver(),
             .commitFn = MySQLTx.commit,
             .rollbackFn = MySQLTx.rollback,
+            .deinitFn = MySQLTx.deinit,
             .ptr = tx_ptr,
         };
     }
@@ -318,27 +326,39 @@ pub const MySQLDriver = struct {
                 return Dialect.mysql;
             }
         }.f,
+        .ping = struct {
+            fn f(ptr: *anyopaque) anyerror!void {
+                const self_ptr: *MySQLDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.ping();
+            }
+        }.f,
     };
 };
 
 const MySQLTx = struct {
     driver: *MySQLDriver,
-    committed: bool,
+    state: enum { active, committed, rolled_back },
 
     fn commit(ptr: *anyopaque) !void {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
-        if (self.committed) return;
-        defer self.driver.allocator.destroy(self);
+        if (self.state != .active) return;
+        self.state = .committed;
         _ = try self.driver.exec("COMMIT", &.{});
-        self.committed = true;
     }
 
     fn rollback(ptr: *anyopaque) !void {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
-        if (self.committed) return;
-        defer self.driver.allocator.destroy(self);
+        if (self.state != .active) return;
+        self.state = .rolled_back;
         _ = try self.driver.exec("ROLLBACK", &.{});
-        self.committed = true;
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *MySQLTx = @ptrCast(@alignCast(ptr));
+        if (self.state == .active) {
+            _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+        }
+        self.driver.allocator.destroy(self);
     }
 };
 

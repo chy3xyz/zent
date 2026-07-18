@@ -161,6 +161,27 @@ pub fn build(b: *std.Build) void {
     complex_step.dependOn(&run_complex.step);
 
     // ---------------------------------------------------------------
+    // Example: pool (connection-pool demo)
+    // ---------------------------------------------------------------
+    const pool_mod = b.createModule(.{
+        .root_source_file = b.path("examples/pool/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pool_mod.addImport("zent", zent_mod);
+    pool_mod.addImport("sqlite3_c", sqlite_c_mod);
+    pool_mod.linkSystemLibrary("sqlite3", .{});
+    const pool_exe = b.addExecutable(.{
+        .name = "pool",
+        .root_module = pool_mod,
+    });
+    b.installArtifact(pool_exe);
+
+    const run_pool = b.addRunArtifact(pool_exe);
+    const pool_step = b.step("run-pool", "Run the connection pool example");
+    pool_step.dependOn(&run_pool.step);
+
+    // ---------------------------------------------------------------
     // Top-level test step
     // ---------------------------------------------------------------
     const test_step = b.step("test", "Run unit tests");

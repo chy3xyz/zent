@@ -112,6 +112,10 @@ pub const SQLiteDriver = struct {
         };
     }
 
+    pub fn ping(self: *SQLiteDriver) !void {
+        _ = try self.exec("SELECT 1", &.{});
+    }
+
     pub fn asDriver(self: *SQLiteDriver) driver.Driver {
         return driver.Driver{
             .ptr = self,
@@ -147,6 +151,12 @@ pub const SQLiteDriver = struct {
         .dialect = struct {
             fn f(_: *anyopaque) Dialect {
                 return Dialect.sqlite;
+            }
+        }.f,
+        .ping = struct {
+            fn f(ptr: *anyopaque) anyerror!void {
+                const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.ping();
             }
         }.f,
     };

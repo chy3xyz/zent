@@ -113,6 +113,7 @@ pub const Driver = struct {
         beginTx: *const fn (ptr: *anyopaque) anyerror!Tx,
         close: *const fn (ptr: *anyopaque) void,
         dialect: *const fn (ptr: *anyopaque) Dialect,
+        ping: *const fn (ptr: *anyopaque) anyerror!void,
     };
 
     pub fn exec(self: Driver, query_sql: []const u8, args: []const Value) !Result {
@@ -133,5 +134,9 @@ pub const Driver = struct {
 
     pub fn dialect(self: Driver) Dialect {
         return self.vtable.dialect(self.ptr);
+    }
+
+    pub fn ping(self: Driver) !void {
+        return self.vtable.ping(self.ptr);
     }
 };

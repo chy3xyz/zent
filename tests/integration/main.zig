@@ -9,6 +9,7 @@ pub fn main() !void {
     // Tests are discovered and run by the Zig test framework.
     // This file exists as an entry point for the integration test build step.
     _ = @import("sqlite.zig");
+    _ = @import("pool.zig");
 
     // TODO: conditionally add postgres and mysql integration tests
     // when a test database is available.

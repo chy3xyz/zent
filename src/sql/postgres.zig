@@ -242,6 +242,13 @@ pub const PostgresDriver = struct {
         };
     }
 
+    pub fn ping(self: *PostgresDriver) !void {
+        if (c.PQstatus(self.conn) != c.CONNECTION_OK) {
+            logPgError(self.conn, "ping");
+            return error.PostgresPingFailed;
+        }
+    }
+
     pub fn beginTx(self: *PostgresDriver) !driver.Tx {
         _ = try self.exec("BEGIN", &.{});
 
@@ -249,13 +256,14 @@ pub const PostgresDriver = struct {
         errdefer self.allocator.destroy(tx_ptr);
         tx_ptr.* = PostgresTx{
             .driver = self,
-            .committed = false,
+            .state = .active,
         };
 
         return driver.Tx{
             .inner = self.asDriver(),
             .commitFn = PostgresTx.commit,
             .rollbackFn = PostgresTx.rollback,
+            .deinitFn = PostgresTx.deinit,
             .ptr = tx_ptr,
         };
     }
@@ -297,27 +305,39 @@ pub const PostgresDriver = struct {
                 return Dialect.postgres;
             }
         }.f,
+        .ping = struct {
+            fn f(ptr: *anyopaque) anyerror!void {
+                const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.ping();
+            }
+        }.f,
     };
 };
 
 const PostgresTx = struct {
     driver: *PostgresDriver,
-    committed: bool,
+    state: enum { active, committed, rolled_back },
 
     fn commit(ptr: *anyopaque) !void {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
-        if (self.committed) return;
-        defer self.driver.allocator.destroy(self);
+        if (self.state != .active) return;
+        self.state = .committed;
         _ = try self.driver.exec("COMMIT", &.{});
-        self.committed = true;
     }
 
     fn rollback(ptr: *anyopaque) !void {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
-        if (self.committed) return;
-        defer self.driver.allocator.destroy(self);
+        if (self.state != .active) return;
+        self.state = .rolled_back;
         _ = try self.driver.exec("ROLLBACK", &.{});
-        self.committed = true;
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *PostgresTx = @ptrCast(@alignCast(ptr));
+        if (self.state == .active) {
+            _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+        }
+        self.driver.allocator.destroy(self);
     }
 };
 
