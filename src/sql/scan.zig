@@ -39,15 +39,15 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
         },
         .@"struct" => |s| {
             var value: T = undefined;
-            inline for (s.fields) |field| {
-                const col_index = findColumnIndex(row, field.name);
+            inline for (s.field_names, s.field_types) |field_name, field_type| {
+                const col_index = findColumnIndex(row, field_name);
                 if (col_index) |idx| {
-                    @field(value, field.name) = try scanColumn(field.type, allocator, row, idx);
+                    @field(value, field_name) = try scanColumn(field_type, allocator, row, idx);
                 } else {
-                    if (@typeInfo(field.type) == .optional) {
-                        @field(value, field.name) = null;
-                    } else if (comptime std.mem.eql(u8, field.name, "edges")) {
-                        @field(value, field.name) = @as(@TypeOf(@field(value, field.name)), .{});
+                    if (@typeInfo(field_type) == .optional) {
+                        @field(value, field_name) = null;
+                    } else if (comptime std.mem.eql(u8, field_name, "edges")) {
+                        @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
                     } else {
                         return error.MissingColumn;
                     }
@@ -192,6 +192,7 @@ test "scan struct" {
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
     const user = try scanRow(User, std.testing.allocator, row);
+    defer std.testing.allocator.free(user.name);
     try std.testing.expectEqual(@as(i64, 1), user.id);
     try std.testing.expectEqualStrings("alice", user.name);
     try std.testing.expectEqual(@as(i32, 30), user.age);

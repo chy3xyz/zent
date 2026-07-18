@@ -701,8 +701,8 @@ test "Create table SQL" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "CREATE TABLE") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "PRIMARY KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "AUTOINCREMENT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "name TEXT") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "age INTEGER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"name\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"age\" INTEGER") != null);
 }
 
 test "Migrate schema adds missing columns" {

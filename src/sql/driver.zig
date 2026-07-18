@@ -71,10 +71,14 @@ pub const Rows = struct {
 };
 
 /// Transaction handle.
+///
+/// The caller MUST call `deinit` exactly once, regardless of whether
+/// `commit` or `rollback` was used. After deinit, the handle is invalid.
 pub const Tx = struct {
     inner: Driver,
     commitFn: *const fn (ptr: *anyopaque) anyerror!void,
     rollbackFn: *const fn (ptr: *anyopaque) anyerror!void,
+    deinitFn: *const fn (ptr: *anyopaque) void,
     ptr: *anyopaque,
 
     pub fn commit(self: Tx) !void {
@@ -83,6 +87,10 @@ pub const Tx = struct {
 
     pub fn rollback(self: Tx) !void {
         return self.rollbackFn(self.ptr);
+    }
+
+    pub fn deinit(self: Tx) void {
+        self.deinitFn(self.ptr);
     }
 
     pub fn exec(self: Tx, sql: []const u8, args: []const Value) !Result {

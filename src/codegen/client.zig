@@ -40,7 +40,7 @@ fn EdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
         const edge_count = info.edges.len;
         var field_names: [edge_count][:0]const u8 = undefined;
         var field_types: [edge_count]type = undefined;
-        var field_attrs: [edge_count]std.builtin.Type.StructField.Attributes = undefined;
+        var field_attrs: [edge_count]std.builtin.Type.Struct.FieldAttributes = undefined;
 
         const OrderFn = *const fn (bool) sql.Order;
 
@@ -231,7 +231,7 @@ pub fn Client(comptime infos: []const TypeInfo) type {
         const total_fields = 2 + infos.len; // allocator, driver, + one per entity
         var field_names: [total_fields][:0]const u8 = undefined;
         var field_types: [total_fields]type = undefined;
-        var field_attrs: [total_fields]std.builtin.Type.StructField.Attributes = undefined;
+        var field_attrs: [total_fields]std.builtin.Type.Struct.FieldAttributes = undefined;
 
         // Root fields
         field_names[0] = "allocator";

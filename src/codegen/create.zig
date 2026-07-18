@@ -177,7 +177,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             const q = try builder.query();
             const res = try self.driver.exec(q.sql, q.args);
 
-            var entity: Entity = undefined;
+            var entity: Entity = std.mem.zeroes(Entity);
             entity.id = @intCast(res.last_insert_id orelse 0);
 
             // Fill other fields from mutation values
@@ -253,17 +253,20 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         fn valueToType(comptime T: type, comptime ft: @import("../core/field.zig").FieldType, value: sql.Value, allocator: std.mem.Allocator) !T {
+            _ = ft;
             return switch (@typeInfo(T)) {
                 .int => @intCast(value.int),
                 .bool => value.bool,
                 .float => @floatCast(value.float),
                 else => {
-                    if (T == []const u8) return value.string;
-                    if (ft == .json) {
-                        const parsed = try std.json.parseFromSliceLeaky(T, allocator, value.string, .{});
-                        return parsed;
+                    if (T == []const u8) {
+                        return try allocator.dupe(u8, value.string);
                     }
-                    @compileError("Unsupported type for value conversion: " ++ @typeName(T));
+                    // Struct/JSON: parse with std.json. The parsed value
+                    // holds its own arena; the user should access fields
+                    // through `value.field` (the parsed struct is returned
+                    // by value, so it lives until entity.deinit).
+                    return try std.json.parseFromSliceLeaky(T, allocator, value.string, .{});
                 },
             };
         }

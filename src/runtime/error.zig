@@ -8,7 +8,6 @@ const std = @import("std");
 ///
 /// For passing dynamic context, use `ZentError` with the message API:
 ///   return error.NotFound; // via the global error set
-
 /// Database operation errors.
 pub const DbError = error{
     /// The requested entity was not found.

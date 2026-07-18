@@ -33,7 +33,7 @@ pub const SQLiteDriver = struct {
 
     pub fn exec(self: *SQLiteDriver, sql: []const u8, args: []const Value) !driver.Result {
         var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+        const rc = c.sqlite3_prepare_v2(self.db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&stmt), null);
         if (rc != c.SQLITE_OK or stmt == null) {
             logSqliteError(self.db, "prepare");
             return error.SqlitePrepareFailed;
@@ -53,7 +53,13 @@ pub const SQLiteDriver = struct {
 
     pub fn query(self: *SQLiteDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
         var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(self.db, query_sql.ptr, @intCast(query_sql.len), &stmt, null);
+        const rc = c.sqlite3_prepare_v2(
+            self.db,
+            @ptrCast(query_sql.ptr),
+            @intCast(query_sql.len),
+            @ptrCast(&stmt),
+            null,
+        );
         if (rc != c.SQLITE_OK or stmt == null) {
             logSqliteError(self.db, "prepare query");
             return error.SqlitePrepareFailed;
@@ -80,12 +86,28 @@ pub const SQLiteDriver = struct {
         errdefer self.allocator.destroy(tx_ptr);
         tx_ptr.* = SQLiteTx{
             .driver = self,
-            .committed = false,
+            .state = .active,
         };
         return driver.Tx{
             .inner = self.asDriver(),
-            .commitFn = SQLiteTx.commit,
-            .rollbackFn = SQLiteTx.rollback,
+            .commitFn = struct {
+                fn f(ptr: *anyopaque) anyerror!void {
+                    const self_ptr: *SQLiteTx = @ptrCast(@alignCast(ptr));
+                    return self_ptr.commit();
+                }
+            }.f,
+            .rollbackFn = struct {
+                fn f(ptr: *anyopaque) anyerror!void {
+                    const self_ptr: *SQLiteTx = @ptrCast(@alignCast(ptr));
+                    return self_ptr.rollback();
+                }
+            }.f,
+            .deinitFn = struct {
+                fn f(ptr: *anyopaque) void {
+                    const self_ptr: *SQLiteTx = @ptrCast(@alignCast(ptr));
+                    self_ptr.deinit();
+                }
+            }.f,
             .ptr = tx_ptr,
         };
     }
@@ -132,22 +154,27 @@ pub const SQLiteDriver = struct {
 
 const SQLiteTx = struct {
     driver: *SQLiteDriver,
-    committed: bool,
+    state: enum { active, committed, rolled_back },
 
-    fn commit(ptr: *anyopaque) !void {
-        const self: *SQLiteTx = @ptrCast(@alignCast(ptr));
-        if (self.committed) return;
-        defer self.driver.allocator.destroy(self);
+    fn commit(self: *SQLiteTx) !void {
+        if (self.state != .active) return error.TxNotActive;
+        self.state = .committed;
         _ = try self.driver.exec("COMMIT", &.{});
-        self.committed = true;
     }
 
-    fn rollback(ptr: *anyopaque) !void {
-        const self: *SQLiteTx = @ptrCast(@alignCast(ptr));
-        if (self.committed) return;
-        defer self.driver.allocator.destroy(self);
-        _ = try self.driver.exec("ROLLBACK", &.{});
-        self.committed = true;
+    fn rollback(self: *SQLiteTx) !void {
+        if (self.state != .active) return;
+        self.state = .rolled_back;
+        // Best-effort; ignore failure (driver may have already closed).
+        _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+    }
+
+    fn deinit(self: *SQLiteTx) void {
+        if (self.state == .active) {
+            std.log.warn("sqlite tx deinit without commit/rollback; rolling back", .{});
+            _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+        }
+        self.driver.allocator.destroy(self);
     }
 };
 
@@ -310,6 +337,7 @@ test "SQLite transaction" {
     _ = try drv.exec("CREATE TABLE t (id INTEGER)", &.{});
 
     var tx = try drv.beginTx();
+    defer tx.deinit();
     _ = try tx.exec("INSERT INTO t (id) VALUES (?)", &.{.{ .int = 42 }});
     try tx.commit();
 

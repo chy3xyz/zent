@@ -17,6 +17,21 @@ pub const QueryResult = struct {
     args: []const Value,
 };
 
+/// An owned, self-managing query result. Use `Builder.takeQuery` / `Selector.takeQuery`
+/// to obtain one, then call `deinit` (or use `defer`) to free the SQL buffer and args.
+/// This is the variant that prevents the per-query leak in the codegen layer —
+/// `QueryResult` borrows from the builder, while `OwnedQuery` transfers ownership.
+pub const OwnedQuery = struct {
+    sql: []u8,
+    args: []Value,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *OwnedQuery) void {
+        self.allocator.free(self.sql);
+        self.allocator.free(self.args);
+    }
+};
+
 /// Base query builder. Tracks the SQL string and bound arguments.
 pub const Builder = struct {
     allocator: std.mem.Allocator,
@@ -40,6 +55,17 @@ pub const Builder = struct {
 
     pub fn query(b: *const Builder) QueryResult {
         return .{ .sql = b.buffer.items, .args = b.args.items };
+    }
+
+    /// Transfer ownership of the SQL buffer and args to the caller. After this
+    /// call the Builder is in a valid but empty state; the caller MUST call
+    /// `OwnedQuery.deinit` (typically via `defer`) to free the memory.
+    pub fn takeQuery(b: *Builder) !OwnedQuery {
+        return .{
+            .sql = try b.buffer.toOwnedSlice(),
+            .args = try b.args.toOwnedSlice(),
+            .allocator = b.allocator,
+        };
     }
 
     pub fn writeString(b: *Builder, s: []const u8) !void {
@@ -83,7 +109,7 @@ pub const Builder = struct {
         if (info != .@"struct" or !info.@"struct".is_tuple) {
             @compileError("join expects a tuple of nodes");
         }
-        inline for (info.@"struct".fields, 0..) |_, i| {
+        inline for (0..info.@"struct".field_names.len) |i| {
             if (i > 0) try b.writeString(sep);
             const node = nodes[i];
             try node.appendTo(b);
@@ -616,6 +642,69 @@ pub const Selector = struct {
         const bq = s.b.query();
         return .{ .sql = bq.sql, .args = bq.args };
     }
+
+    /// Take ownership of the SELECT's SQL buffer and args. Caller MUST call
+    /// `deinit` (typically via `defer`). After this call the Selector is in
+    /// an empty-but-valid state.
+    pub fn takeQuery(s: *Selector) !OwnedQuery {
+        try s.b.writeString("SELECT ");
+        if (s.distinct) try s.b.writeString("DISTINCT ");
+        for (s.columns.items, 0..) |col, i| {
+            if (i > 0) try s.b.writeString(", ");
+            try col.appendTo(&s.b);
+        }
+        if (s.table) |t| {
+            try s.b.writeString(" FROM ");
+            try t.appendTo(&s.b);
+        }
+        for (s.joins.items) |j| {
+            try s.b.writeByte(' ');
+            try j.appendTo(&s.b);
+        }
+        if (s.predicates.items.len > 0) {
+            try s.b.writeString(" WHERE ");
+            for (s.predicates.items, 0..) |pred, i| {
+                if (i > 0) try s.b.writeString(" AND ");
+                try pred.appendTo(&s.b);
+            }
+        }
+        if (s.group_cols.items.len > 0) {
+            try s.b.writeString(" GROUP BY ");
+            for (s.group_cols.items, 0..) |col, i| {
+                if (i > 0) try s.b.writeString(", ");
+                try s.b.ident(col);
+            }
+        }
+        if (s.having_pred) |pred| {
+            try s.b.writeString(" HAVING ");
+            try pred.appendTo(&s.b);
+        }
+        if (s.order_terms.items.len > 0) {
+            try s.b.writeString(" ORDER BY ");
+            for (s.order_terms.items, 0..) |o, i| {
+                if (i > 0) try s.b.writeString(", ");
+                try o.appendTo(&s.b);
+            }
+        }
+        if (s.limit_val) |n| {
+            try s.b.writeString(" LIMIT ");
+            var num_buf: [32]u8 = undefined;
+            const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{n});
+            try s.b.writeString(num_str);
+        }
+        if (s.offset_val) |n| {
+            try s.b.writeString(" OFFSET ");
+            var num_buf: [32]u8 = undefined;
+            const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{n});
+            try s.b.writeString(num_str);
+        }
+        if (s.for_update) {
+            try s.b.writeString(" FOR UPDATE");
+        } else if (s.for_share) {
+            try s.b.writeString(" FOR SHARE");
+        }
+        return s.b.takeQuery();
+    }
 };
 
 pub fn Select(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) !Selector {
@@ -690,6 +779,36 @@ pub const InsertBuilder = struct {
         }
         return i.b.query();
     }
+
+    /// Same as `query` but transfers ownership of the SQL buffer and args.
+    /// Caller MUST call `deinit` (typically via `defer`).
+    pub fn takeQuery(i: *InsertBuilder) !OwnedQuery {
+        if (i.or_replace) {
+            try i.b.writeString("INSERT OR REPLACE INTO ");
+        } else {
+            try i.b.writeString("INSERT INTO ");
+        }
+        try i.b.ident(i.table);
+        if (i.col_names.items.len > 0) {
+            try i.b.writeString(" (");
+            for (i.col_names.items, 0..) |col, idx| {
+                if (idx > 0) try i.b.writeString(", ");
+                try i.b.ident(col);
+            }
+            try i.b.writeByte(')');
+        }
+        try i.b.writeString(" VALUES ");
+        for (i.rows.items, 0..) |row, ri| {
+            if (ri > 0) try i.b.writeString(", ");
+            try i.b.writeByte('(');
+            for (row.items, 0..) |val, ci| {
+                if (ci > 0) try i.b.writeString(", ");
+                try i.b.arg(val);
+            }
+            try i.b.writeByte(')');
+        }
+        return i.b.takeQuery();
+    }
 };
 
 pub fn Insert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
@@ -761,6 +880,26 @@ pub const UpdateBuilder = struct {
         }
         return u.b.query();
     }
+
+    pub fn takeQuery(u: *UpdateBuilder) !OwnedQuery {
+        try u.b.writeString("UPDATE ");
+        try u.b.ident(u.table);
+        try u.b.writeString(" SET ");
+        for (u.sets.items, 0..) |s, i| {
+            if (i > 0) try u.b.writeString(", ");
+            try u.b.ident(s.column);
+            try u.b.writeString(" = ");
+            try u.b.arg(s.value);
+        }
+        if (u.wheres.items.len > 0) {
+            try u.b.writeString(" WHERE ");
+            for (u.wheres.items, 0..) |pred, i| {
+                if (i > 0) try u.b.writeString(" AND ");
+                try pred.appendTo(&u.b);
+            }
+        }
+        return u.b.takeQuery();
+    }
 };
 
 pub fn Update(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) UpdateBuilder {
@@ -805,6 +944,19 @@ pub const DeleteBuilder = struct {
             }
         }
         return d.b.query();
+    }
+
+    pub fn takeQuery(d: *DeleteBuilder) !OwnedQuery {
+        try d.b.writeString("DELETE FROM ");
+        try d.b.ident(d.table);
+        if (d.wheres.items.len > 0) {
+            try d.b.writeString(" WHERE ");
+            for (d.wheres.items, 0..) |pred, i| {
+                if (i > 0) try d.b.writeString(" AND ");
+                try pred.appendTo(&d.b);
+            }
+        }
+        return d.b.takeQuery();
     }
 };
 
@@ -917,6 +1069,63 @@ pub const BulkUpdateBuilder = struct {
 
         return u.b.query();
     }
+
+    pub fn takeQuery(u: *BulkUpdateBuilder) !OwnedQuery {
+        if (u.rows.items.len == 0) {
+            return u.b.takeQuery();
+        }
+
+        var columns = std.array_list.Managed([]const u8).init(u.b.allocator);
+        defer columns.deinit();
+        for (u.rows.items) |r| {
+            for (r.sets.items) |s| {
+                var found = false;
+                for (columns.items) |c| {
+                    if (std.mem.eql(u8, c, s.column)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) try columns.append(s.column);
+            }
+        }
+
+        try u.b.writeString("UPDATE ");
+        try u.b.ident(u.table);
+        try u.b.writeString(" SET ");
+
+        for (columns.items, 0..) |col, ci| {
+            if (ci > 0) try u.b.writeString(", ");
+            try u.b.ident(col);
+            try u.b.writeString(" = CASE ");
+            try u.b.ident(u.id_column);
+            for (u.rows.items) |r| {
+                for (r.sets.items) |s| {
+                    if (std.mem.eql(u8, s.column, col)) {
+                        try u.b.writeString(" WHEN ");
+                        try u.b.arg(.{ .int = r.id });
+                        try u.b.writeString(" THEN ");
+                        try u.b.arg(s.value);
+                        break;
+                    }
+                }
+            }
+            try u.b.writeString(" ELSE ");
+            try u.b.ident(col);
+            try u.b.writeString(" END");
+        }
+
+        try u.b.writeString(" WHERE ");
+        try u.b.ident(u.id_column);
+        try u.b.writeString(" IN (");
+        for (u.rows.items, 0..) |r, i| {
+            if (i > 0) try u.b.writeString(", ");
+            try u.b.arg(.{ .int = r.id });
+        }
+        try u.b.writeByte(')');
+
+        return u.b.takeQuery();
+    }
 };
 
 // ------------------------------------------------------------------
@@ -978,6 +1187,30 @@ pub const BulkDeleteBuilder = struct {
         }
         return d.b.query();
     }
+
+    pub fn takeQuery(d: *BulkDeleteBuilder) !OwnedQuery {
+        try d.b.writeString("DELETE FROM ");
+        try d.b.ident(d.table);
+
+        while (d.groups.items.len > 0 and d.groups.items[d.groups.items.len - 1].items.len == 0) {
+            var last = d.groups.pop().?;
+            last.deinit();
+        }
+
+        if (d.groups.items.len > 0) {
+            try d.b.writeString(" WHERE ");
+            for (d.groups.items, 0..) |group, gi| {
+                if (gi > 0) try d.b.writeString(" OR ");
+                if (group.items.len > 1) try d.b.writeByte('(');
+                for (group.items, 0..) |pred, pi| {
+                    if (pi > 0) try d.b.writeString(" AND ");
+                    try pred.appendTo(&d.b);
+                }
+                if (group.items.len > 1) try d.b.writeByte(')');
+            }
+        }
+        return d.b.takeQuery();
+    }
 };
 
 // ------------------------------------------------------------------
@@ -987,8 +1220,8 @@ pub const BulkDeleteBuilder = struct {
 test "basic SELECT with WHERE" {
     const allocator = std.testing.allocator;
     var s = try Select(allocator, Dialect.sqlite, &.{
-        Table("users").c("id"),
-        Table("users").c("name"),
+        .{ .table = null, .name = "id" },
+        .{ .table = null, .name = "name" },
     });
     defer s.deinit();
     _ = s.from(Table("users"));
@@ -1002,18 +1235,18 @@ test "basic SELECT with WHERE" {
 test "SELECT with JOIN, ORDER BY, LIMIT, OFFSET" {
     const allocator = std.testing.allocator;
     var s = try Select(allocator, Dialect.sqlite, &.{
-        Table("users").c("id"),
-        Table("users").c("name"),
+        .{ .table = null, .name = "id" },
+        .{ .table = null, .name = "name" },
     });
     defer s.deinit();
     _ = s.from(Table("users"));
-    _ = try s.join(.{ .kind = .inner, .table = Table("groups"), .on = EQ("groups.id", .{ .int = 1 }) });
-    _ = try s.where(EQ("users.active", .{ .bool = true }));
-    _ = try s.orderBy(.{ .column = .{ .name = "users.id", .desc = true } });
+    _ = try s.join(.{ .kind = .inner, .table = Table("groups"), .on = EQ("id", .{ .int = 1 }) });
+    _ = try s.where(EQ("active", .{ .bool = true }));
+    _ = try s.orderBy(.{ .column = .{ .name = "id", .desc = true } });
     _ = s.limit(10).offset(20);
     const q = try s.query();
     try std.testing.expectEqualStrings(
-        "SELECT \"id\", \"name\" FROM \"users\" INNER JOIN \"groups\" ON \"groups\".\"id\" = ? WHERE \"users\".\"active\" = ? ORDER BY \"users\".\"id\" DESC LIMIT 10 OFFSET 20",
+        "SELECT \"id\", \"name\" FROM \"users\" INNER JOIN \"groups\" ON \"id\" = ? WHERE \"active\" = ? ORDER BY \"id\" DESC LIMIT 10 OFFSET 20",
         q.sql,
     );
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
@@ -1068,7 +1301,7 @@ test "predicate AND/OR/NOT" {
     const p2 = GT("score", .{ .int = 100 });
     const combined = And(&p1, &p2);
 
-    var s = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s.deinit();
     _ = s.from(Table("users"));
     _ = try s.where(combined);
@@ -1079,7 +1312,7 @@ test "predicate AND/OR/NOT" {
 
 test "Postgres placeholders" {
     const allocator = std.testing.allocator;
-    var s = try Select(allocator, Dialect.postgres, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
     defer s.deinit();
     _ = s.from(Table("users"));
     _ = try s.where(EQ("age", .{ .int = 30 }));
@@ -1089,7 +1322,7 @@ test "Postgres placeholders" {
 
 test "MySQL identifiers" {
     const allocator = std.testing.allocator;
-    var s = try Select(allocator, Dialect.mysql, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.mysql, &.{.{ .table = null, .name = "id" }});
     defer s.deinit();
     _ = s.from(Table("users"));
     const q = try s.query();
@@ -1098,7 +1331,7 @@ test "MySQL identifiers" {
 
 test "Raw predicate" {
     const allocator = std.testing.allocator;
-    var s = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s.deinit();
     _ = s.from(Table("users"));
     _ = try s.where(Raw("age > 20"));
@@ -1111,7 +1344,7 @@ test "Subquery predicates" {
     const allocator = std.testing.allocator;
 
     // IN subquery
-    var s1 = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s1 = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s1.deinit();
     _ = s1.from(Table("users"));
     _ = try s1.where(InSubquery("id", "SELECT user_id FROM orders"));
@@ -1119,7 +1352,7 @@ test "Subquery predicates" {
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE \"id\" IN (SELECT user_id FROM orders)", q1.sql);
 
     // EXISTS subquery
-    var s2 = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s2 = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s2.deinit();
     _ = s2.from(Table("users"));
     _ = try s2.where(ExistsSubquery("SELECT 1 FROM orders WHERE orders.user_id = users.id"));
@@ -1130,13 +1363,13 @@ test "Subquery predicates" {
 test "FOR UPDATE and FOR SHARE" {
     const allocator = std.testing.allocator;
 
-    var s1 = try Select(allocator, Dialect.sqlite, &.{Table("users").c("id")});
+    var s1 = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s1.deinit();
     _ = s1.from(Table("users")).forUpdate();
     const q1 = try s1.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" FOR UPDATE", q1.sql);
 
-    var s2 = try Select(allocator, Dialect.postgres, &.{Table("users").c("id")});
+    var s2 = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
     defer s2.deinit();
     _ = s2.from(Table("users")).forShare();
     const q2 = try s2.query();
@@ -1159,7 +1392,7 @@ test "BulkUpdate SQL generation" {
         "UPDATE \"users\" SET \"name\" = CASE \"id\" WHEN ? THEN ? WHEN ? THEN ? ELSE \"name\" END, \"age\" = CASE \"id\" WHEN ? THEN ? ELSE \"age\" END WHERE \"id\" IN (?, ?)",
         q.sql,
     );
-    try std.testing.expectEqual(@as(usize, 6), q.args.len);
+    try std.testing.expectEqual(@as(usize, 8), q.args.len);
 }
 
 test "BulkDelete SQL generation" {

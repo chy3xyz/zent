@@ -172,22 +172,8 @@ const Lexer = struct {
 
             // Check for multi-word keywords (need to look ahead)
             if (std.ascii.eqlIgnoreCase("IS", word)) {
-                self.skipWhitespace();
-                if (self.pos + 3 < self.input.len) {
-                    const rest = self.input[self.pos..];
-                    if (std.ascii.eqlIgnoreCase(rest[0..4], "NULL")) {
-                        self.pos += 4;
-                        return .kw_null;
-                    }
-                    if (std.ascii.eqlIgnoreCase(rest[0..8], "NOT NULL")) {
-                        self.pos += 8;
-                        // We handle IS NOT NULL as a special case in the parser
-                        // Return IS followed by NOT will be consumed later
-                        // Actually for simplicity, let's just return .kw_is here
-                        // and parse the rest in the parser
-                        return .kw_is;
-                    }
-                }
+                // Don't consume trailing tokens; let the parser handle
+                // `IS NULL` and `IS NOT NULL` so both forms work.
                 return .kw_is;
             }
 
@@ -221,6 +207,8 @@ const ParseError = error{
     OutOfMemory,
     UnterminatedString,
     UnknownToken,
+    InvalidCharacter,
+    Overflow,
 };
 
 const ParserContext = struct {
@@ -398,7 +386,7 @@ fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
                 .lparen => _ = try ctx.next(),
                 else => return ParseError.ExpectedLParen,
             }
-            var values = std.ArrayList(sql.Value){};
+            var values = std.array_list.Managed(sql.Value).init(ctx.allocator);
             while (true) {
                 const val = try ctx.expectValue();
                 try values.append(val);
@@ -415,7 +403,7 @@ fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
                     else => return ParseError.ExpectedRParen,
                 }
             }
-            return sql.In(field, try values.toOwnedSlice(ctx.allocator));
+            return sql.In(field, try values.toOwnedSlice());
         },
         .kw_contains => {
             const val = try ctx.expectValue();
@@ -468,10 +456,13 @@ pub const ParsedPredicate = struct {
     }
 };
 
-fn deinitPred(allocator: std.mem.Allocator, pred: *const sql.Predicate) void {
+pub fn deinitPred(allocator: std.mem.Allocator, pred: *const sql.Predicate) void {
     switch (pred.*) {
         .in => |p| {
             allocator.free(p.values);
+        },
+        .like => |p| {
+            allocator.free(p.value.string);
         },
         .and_ => |p| {
             deinitPred(allocator, p.left);
@@ -544,6 +535,7 @@ test "EntQL: CONTAINS (LIKE)" {
     const p = try parse(allocator, "name CONTAINS \"ali\"");
     switch (p) {
         .like => |lp| {
+            defer allocator.free(lp.value.string);
             try std.testing.expectEqualStrings("name", lp.column);
             try std.testing.expectEqualStrings("%ali%", lp.value.string);
         },
@@ -563,6 +555,7 @@ test "EntQL: IS NULL / IS NOT NULL" {
 test "EntQL: AND / OR" {
     const allocator = std.testing.allocator;
     const p = try parse(allocator, "age > 18 AND age < 65");
+    defer deinitPred(allocator, &p);
     switch (p) {
         .and_ => |a| {
             try std.testing.expectEqualDeep(sql.Predicate{ .gt = .{ .column = "age", .value = .{ .int = 18 } } }, a.left.*);
@@ -575,6 +568,7 @@ test "EntQL: AND / OR" {
 test "EntQL: NOT" {
     const allocator = std.testing.allocator;
     const p = try parse(allocator, "NOT name = \"alice\"");
+    defer deinitPred(allocator, &p);
     switch (p) {
         .not_ => |n| {
             try std.testing.expectEqualDeep(sql.Predicate{ .eq = .{ .column = "name", .value = .{ .string = "alice" } } }, n.*);
@@ -586,6 +580,7 @@ test "EntQL: NOT" {
 test "EntQL: parenthesized expression" {
     const allocator = std.testing.allocator;
     const p = try parse(allocator, "(name = \"alice\" OR name = \"bob\") AND age > 18");
+    defer deinitPred(allocator, &p);
     switch (p) {
         .and_ => |a| {
             switch (a.left.*) {
@@ -610,6 +605,7 @@ test "EntQL: SQL builder output" {
     try b.writeString("SELECT * FROM users WHERE ");
 
     const pred = try parse(allocator, "age > 18 AND name CONTAINS \"ali\"");
+    defer deinitPred(allocator, &pred);
     try pred.appendTo(&b);
 
     const q = b.query();

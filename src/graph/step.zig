@@ -113,7 +113,7 @@ test "Step helper methods" {
         .to_column = "id",
         .edge_rel = .m2m,
         .edge_table = "user_group",
-        .edge_columns = &[_][]const u8{"group_id", "user_id"},
+        .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
     try std.testing.expect(!m2m_step.fromEdgeOwner());
@@ -130,7 +130,7 @@ test "Step helper methods" {
         .to_column = "id",
         .edge_rel = .m2m,
         .edge_table = "user_group",
-        .edge_columns = &[_][]const u8{"group_id", "user_id"},
+        .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = true,
     };
     try std.testing.expectEqualStrings("user_id", m2m_inv.targetPK());

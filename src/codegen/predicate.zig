@@ -48,7 +48,7 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
 
         var field_names: [total_fields + edge_count][:0]const u8 = undefined;
         var field_types: [total_fields + edge_count]type = undefined;
-        var field_attrs: [total_fields + edge_count]std.builtin.Type.StructField.Attributes = undefined;
+        var field_attrs: [total_fields + edge_count]std.builtin.Type.Struct.FieldAttributes = undefined;
         var idx: usize = 0;
 
         // Field-based predicates

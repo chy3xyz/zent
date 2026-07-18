@@ -311,7 +311,7 @@ test "appendSetNeighbors M2M" {
         .to_column = "id",
         .edge_rel = .m2m,
         .edge_table = "user_group",
-        .edge_columns = &[_][]const u8{"group_id", "user_id"},
+        .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
@@ -372,7 +372,7 @@ test "appendHasNeighbors M2M" {
         .to_column = "id",
         .edge_rel = .m2m,
         .edge_table = "user_group",
-        .edge_columns = &[_][]const u8{"group_id", "user_id"},
+        .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
@@ -392,7 +392,7 @@ test "appendHasNeighborsWith M2M" {
         .to_column = "id",
         .edge_rel = .m2m,
         .edge_table = "user_group",
-        .edge_columns = &[_][]const u8{"group_id", "user_id"},
+        .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
@@ -435,7 +435,7 @@ test "appendEdgeCount M2M" {
         .to_column = "id",
         .edge_rel = .m2m,
         .edge_table = "user_group",
-        .edge_columns = &[_][]const u8{"group_id", "user_id"},
+        .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });

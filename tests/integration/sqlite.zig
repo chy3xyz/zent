@@ -136,6 +136,7 @@ test "SQLite: transaction commit" {
 
     // Begin transaction
     var tx = try drv.beginTx();
+    defer tx.deinit();
     _ = try tx.exec("INSERT INTO t VALUES (42)", &.{});
     _ = try tx.exec("INSERT INTO t VALUES (99)", &.{});
     try tx.commit();
@@ -157,6 +158,7 @@ test "SQLite: transaction rollback" {
     _ = try drv.exec("CREATE TABLE t (id INTEGER)", &.{});
 
     var tx = try drv.beginTx();
+    defer tx.deinit();
     _ = try tx.exec("INSERT INTO t VALUES (1)", &.{});
     try tx.rollback();
 

@@ -26,7 +26,8 @@ pub const PostgresDriver = struct {
     }
 
     pub fn connectDb(allocator: std.mem.Allocator, host: []const u8, port: u16, dbname: []const u8, user: []const u8, password: []const u8) !PostgresDriver {
-        const conninfo = try std.fmt.allocPrint(allocator,
+        const conninfo = try std.fmt.allocPrint(
+            allocator,
             "host={s} port={d} dbname={s} user={s} password={s}",
             .{ host, port, dbname, user, password },
         );

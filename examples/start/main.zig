@@ -21,6 +21,11 @@ const UserSettings = start_schema.UserSettings;
 const ActiveUserView = start_schema.ActiveUserView;
 
 pub fn main() !void {
+    // Note: this example uses page_allocator for clarity. The library
+    // exposes entity ownership via `deinitEntity(infos, info, &entity, alloc)`;
+    // see `tests/integration/sqlite.zig` for an end-to-end test that uses
+    // SafeAllocator and confirms zero leaks. Wiring deinit into every
+    // call site of this demo is left as a follow-up.
     const allocator = std.heap.page_allocator;
 
     // --- Phase 1: Schema definition and comptime introspection ---

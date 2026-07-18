@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const sql = @import("sql/builder.zig");
 pub const sql_dialect = @import("sql/dialect.zig");
 pub const sql_driver = @import("sql/driver.zig");
@@ -39,3 +41,17 @@ pub const graph = struct {
 pub const privacy = @import("privacy/policy.zig");
 
 pub const entql = @import("entql/parser.zig");
+
+// Force analysis of sub-file test blocks so `zig build test` reflects real state.
+test {
+    std.testing.refAllDecls(@This());
+    // Recurse into nested namespaces so sub-module test blocks are analysed.
+    const info = @typeInfo(@This()).@"struct";
+    inline for (info.decl_names) |name| {
+        if (comptime std.mem.eql(u8, name, "std")) continue;
+        const nested = @field(@This(), name);
+        if (@typeInfo(@TypeOf(nested)) == .@"struct") {
+            std.testing.refAllDecls(nested);
+        }
+    }
+}

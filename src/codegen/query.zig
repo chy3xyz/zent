@@ -8,6 +8,7 @@ const sql_driver = @import("../sql/driver.zig");
 const sql_scan = @import("../sql/scan.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
+const deinitEntity = @import("entity.zig").deinitEntity;
 const EntityGen = @import("entity.zig").Entity;
 const LightEntityGen = @import("entity.zig").LightEntity;
 const graph_step = @import("../graph/step.zig");
@@ -191,15 +192,20 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn All(self: *Self) !std.array_list.Managed(Entity) {
             try checkPolicy(.query);
-            const q = try self.buildQuery(info.fields.len);
+            var q = try self.buildQuery(info.fields.len);
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
             var result = std.array_list.Managed(Entity).init(self.allocator);
-            errdefer result.deinit();
+            errdefer {
+                for (result.items) |*e| deinitEntity(infos, info, e, self.allocator);
+                result.deinit();
+            }
 
             while (rows.next()) |row| {
                 const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+                errdefer deinitEntity(infos, info, &entity, self.allocator);
                 try result.append(entity);
             }
 
@@ -212,12 +218,14 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn First(self: *Self) !?Entity {
             try checkPolicy(.query);
             self.limit_val = 1;
-            const q = try self.buildQuery(info.fields.len);
+            var q = try self.buildQuery(info.fields.len);
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
             const row = rows.next() orelse return null;
             const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+            errdefer deinitEntity(infos, info, &entity, self.allocator);
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |edge_name| {
                 try self.loadEdges(edge_name, &entities_arr);
@@ -227,12 +235,14 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn Only(self: *Self) !Entity {
             try checkPolicy(.query);
-            const q = try self.buildQuery(info.fields.len);
+            var q = try self.buildQuery(info.fields.len);
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
             const row = rows.next() orelse return error.NotFound;
             const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+            errdefer deinitEntity(infos, info, &entity, self.allocator);
             if (rows.next() != null) return error.NotSingular;
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |edge_name| {
@@ -243,7 +253,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn IDs(self: *Self) !std.array_list.Managed(i64) {
             try checkPolicy(.query);
-            const q = try self.buildQuery(1); // only id column
+            var q = try self.buildQuery(1); // only id column
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
@@ -259,7 +270,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn Count(self: *Self) !i64 {
             try checkPolicy(.query);
-            const q = try self.buildCountQuery();
+            var q = try self.buildCountQuery();
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
@@ -270,7 +282,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Exist(self: *Self) !bool {
             try checkPolicy(.query);
             self.limit_val = 1;
-            const q = try self.buildQuery(1);
+            var q = try self.buildQuery(1);
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
             return rows.next() != null;
@@ -278,7 +291,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn Sum(self: *Self, comptime field_name: []const u8) !i64 {
             try checkPolicy(.query);
-            const q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
+            var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
             const row = rows.next() orelse return error.NotFound;
@@ -287,7 +301,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn Avg(self: *Self, comptime field_name: []const u8) !f64 {
             try checkPolicy(.query);
-            const q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
+            var q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
             const row = rows.next() orelse return error.NotFound;
@@ -296,27 +311,39 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn Max(self: *Self, comptime field_name: []const u8) !sql.Value {
             try checkPolicy(.query);
-            const q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
+            var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
-            defer rows.deinit();
             const row = rows.next() orelse return error.NotFound;
             if (row.isNull(0)) return .null;
             if (row.getInt(0)) |v| return .{ .int = v };
             if (row.getFloat(0)) |v| return .{ .float = v };
-            if (row.getText(0)) |v| return .{ .string = v };
+            // Must dup text before rows.deinit: row.getText borrows from the
+            // driver-internal buffer which is freed on rows.deinit.
+            if (row.getText(0)) |v| {
+                const duped = try self.allocator.dupe(u8, v);
+                errdefer self.allocator.free(duped);
+                rows.deinit();
+                return .{ .string = duped };
+            }
             return error.TypeMismatch;
         }
 
         pub fn Min(self: *Self, comptime field_name: []const u8) !sql.Value {
             try checkPolicy(.query);
-            const q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
+            var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
+            defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
-            defer rows.deinit();
             const row = rows.next() orelse return error.NotFound;
             if (row.isNull(0)) return .null;
             if (row.getInt(0)) |v| return .{ .int = v };
             if (row.getFloat(0)) |v| return .{ .float = v };
-            if (row.getText(0)) |v| return .{ .string = v };
+            if (row.getText(0)) |v| {
+                const duped = try self.allocator.dupe(u8, v);
+                errdefer self.allocator.free(duped);
+                rows.deinit();
+                return .{ .string = duped };
+            }
             return error.TypeMismatch;
         }
 
@@ -378,14 +405,13 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return error.InvalidEdge;
         }
 
-        fn buildQuery(self: *Self, comptime column_count: usize) !sql.QueryResult {
+        fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {
             const t = sql.Table(info.table_name);
             var columns: [column_count]sql.ColumnRef = undefined;
             inline for (info.fields[0..column_count], 0..) |f, i| {
                 columns[i] = t.c(f.name);
             }
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &columns);
-            // NOTE: defer selector.deinit() would free the SQL buffer before caller uses it.
             _ = selector.from(t);
             _ = selector.setDistinct(self.distinct);
 
@@ -419,14 +445,13 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             } else if (self.for_share) {
                 _ = selector.forShare();
             }
-            return try selector.query();
+            return selector.takeQuery();
         }
 
-        fn buildCountQuery(self: *Self) !sql.QueryResult {
+        fn buildCountQuery(self: *Self) !sql.OwnedQuery {
             const t = sql.Table(info.table_name);
             const count_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{count_col});
-            // NOTE: defer selector.deinit() would free the SQL buffer before caller uses it.
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -442,10 +467,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
             }
-            return try selector.query();
+            return selector.takeQuery();
         }
 
-        fn buildAggregateQuery(self: *Self, comptime agg_expr: []const u8) !sql.QueryResult {
+        fn buildAggregateQuery(self: *Self, comptime agg_expr: []const u8) !sql.OwnedQuery {
             const t = sql.Table(info.table_name);
             const agg_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{agg_col});
@@ -464,13 +489,18 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
             }
+            if (self.order_terms.items.len > 0) {
+                for (self.order_terms.items) |term| {
+                    _ = try selector.orderBy(term);
+                }
+            }
             if (self.limit_val) |n| {
                 _ = selector.limit(n);
             }
             if (self.offset_val) |n| {
                 _ = selector.offset(n);
             }
-            return try selector.query();
+            return selector.takeQuery();
         }
     };
 }
