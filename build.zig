@@ -140,6 +140,27 @@ pub fn build(b: *std.Build) void {
     start_step.dependOn(&run_start.step);
 
     // ---------------------------------------------------------------
+    // Example: complex (e-commerce demo)
+    // ---------------------------------------------------------------
+    const complex_mod = b.createModule(.{
+        .root_source_file = b.path("examples/complex/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    complex_mod.addImport("zent", zent_mod);
+    complex_mod.addImport("sqlite3_c", sqlite_c_mod);
+    complex_mod.linkSystemLibrary("sqlite3", .{});
+    const complex_exe = b.addExecutable(.{
+        .name = "complex",
+        .root_module = complex_mod,
+    });
+    b.installArtifact(complex_exe);
+
+    const run_complex = b.addRunArtifact(complex_exe);
+    const complex_step = b.step("run-complex", "Run the complex e-commerce example");
+    complex_step.dependOn(&run_complex.step);
+
+    // ---------------------------------------------------------------
     // Top-level test step
     // ---------------------------------------------------------------
     const test_step = b.step("test", "Run unit tests");

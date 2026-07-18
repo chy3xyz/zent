@@ -157,8 +157,9 @@ pub fn Entity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
 pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, self: anytype, allocator: std.mem.Allocator) void {
     inline for (info.fields) |f| {
         if (!comptime isOwningField(f.zig_type)) continue;
-        const fp: *f.zig_type = @constCast(&@field(self, f.name));
-        FreeField(f.zig_type, fp, allocator);
+        const field_type = if (f.optional) ?f.zig_type else f.zig_type;
+        const fp: *field_type = @constCast(&@field(self, f.name));
+        FreeField(field_type, fp, allocator);
     }
     if (comptime info.edges.len > 0) {
         inline for (info.edges) |e| {
@@ -168,8 +169,9 @@ pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, s
                 for (arr) |*item| {
                     inline for (target_info.fields) |tf| {
                         if (!comptime isOwningField(tf.zig_type)) continue;
-                        const item_fp: *tf.zig_type = @constCast(&@field(item, tf.name));
-                        FreeField(tf.zig_type, item_fp, allocator);
+                        const item_field_type = if (tf.optional) ?tf.zig_type else tf.zig_type;
+                        const item_fp: *item_field_type = @constCast(&@field(item, tf.name));
+                        FreeField(item_field_type, item_fp, allocator);
                     }
                 }
                 allocator.free(arr);

@@ -221,6 +221,10 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
         pub fn rollback(self: *@This()) !void {
             return self.tx.rollback();
         }
+
+        pub fn deinit(self: *@This()) void {
+            return self.tx.deinit();
+        }
     };
 }
 
