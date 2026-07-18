@@ -4,6 +4,10 @@ const Row = @import("driver.zig").Row;
 /// Scan a database row into a value of type T.
 /// Supports primitives, optional primitives, and structs.
 /// String slices are duplicated using the provided allocator.
+///
+/// For struct types, columns are assumed to be in declaration order
+/// matching the SELECT projection — no name-based lookup is performed.
+/// This eliminates O(n*m) string comparisons per row.
 pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
     const info = @typeInfo(T);
     switch (info) {
@@ -39,18 +43,40 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
         },
         .@"struct" => |s| {
             var value: T = undefined;
-            inline for (s.field_names, s.field_types) |field_name, field_type| {
-                const col_index = findColumnIndex(row, field_name);
-                if (col_index) |idx| {
-                    @field(value, field_name) = try scanColumn(field_type, allocator, row, idx);
+            inline for (s.field_names, s.field_types, 0..) |field_name, field_type, col_index| {
+                if (comptime std.mem.eql(u8, field_name, "edges")) {
+                    @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
                 } else {
-                    if (@typeInfo(field_type) == .optional) {
-                        @field(value, field_name) = null;
-                    } else if (comptime std.mem.eql(u8, field_name, "edges")) {
-                        @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
-                    } else {
-                        return error.MissingColumn;
-                    }
+                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_index);
+                }
+            }
+            return value;
+        },
+        else => @compileError("Unsupported type for scanning: " ++ @typeName(T)),
+    }
+}
+
+/// Like scanRow but uses the column `offset` to map struct fields to
+/// result-set columns. The struct's i-th non-edge field maps to row
+/// column `offset + i`. Used when the entity is part of a larger
+/// multi-table projection.
+pub fn scanRowOffset(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize) !T {
+    return scanRowInner(T, allocator, row, offset);
+}
+
+fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize) !T {
+    const info = @typeInfo(T);
+    switch (info) {
+        .int, .float, .bool, .pointer, .optional => return scanRow(T, allocator, row),
+        .@"struct" => |s| {
+            var value: T = undefined;
+            var col_idx: usize = offset;
+            inline for (s.field_names, s.field_types) |field_name, field_type| {
+                if (comptime std.mem.eql(u8, field_name, "edges")) {
+                    @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+                } else {
+                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx);
+                    col_idx += 1;
                 }
             }
             return value;

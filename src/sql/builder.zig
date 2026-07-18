@@ -40,10 +40,21 @@ pub const Builder = struct {
     dialect: Dialect,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect) Builder {
-        return .{
+        return initCapacity(allocator, 256, 8, dialect) catch Builder{
             .allocator = allocator,
             .buffer = std.array_list.Managed(u8).init(allocator),
             .args = std.array_list.Managed(Value).init(allocator),
+            .dialect = dialect,
+        };
+    }
+
+    /// Pre-allocate the buffer and args arrays to avoid repeated reallocs
+    /// while the SQL string is being assembled item-by-item.
+    pub fn initCapacity(allocator: std.mem.Allocator, sql_cap: usize, args_cap: usize, dialect: Dialect) !Builder {
+        return .{
+            .allocator = allocator,
+            .buffer = try std.array_list.Managed(u8).initCapacity(allocator, sql_cap),
+            .args = try std.array_list.Managed(Value).initCapacity(allocator, args_cap),
             .dialect = dialect,
         };
     }
@@ -78,9 +89,12 @@ pub const Builder = struct {
 
     pub fn ident(b: *Builder, name: []const u8) !void {
         const quote: u8 = if (std.mem.eql(u8, b.dialect.name, "mysql")) '`' else '"';
-        try b.buffer.append(quote);
-        try b.buffer.appendSlice(name);
-        try b.buffer.append(quote);
+        // Pre-allocate once for quote+name+quote to avoid three separate
+        // capacity checks per identifier call.
+        try b.buffer.ensureUnusedCapacity(name.len + 2);
+        b.buffer.appendAssumeCapacity(quote);
+        b.buffer.appendSliceAssumeCapacity(name);
+        b.buffer.appendAssumeCapacity(quote);
     }
 
     pub fn arg(b: *Builder, value: Value) !void {
@@ -500,8 +514,8 @@ pub const Selector = struct {
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) !Selector {
         var s = Selector{
-            .b = Builder.init(allocator, dialect),
-            .columns = std.array_list.Managed(ColumnRef).init(allocator),
+            .b = try Builder.initCapacity(allocator, 512, 16, dialect),
+            .columns = try std.array_list.Managed(ColumnRef).initCapacity(allocator, columns.len),
             .table = null,
             .joins = std.array_list.Managed(Join).init(allocator),
             .predicates = std.array_list.Managed(Predicate).init(allocator),
