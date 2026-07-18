@@ -28,9 +28,16 @@ jobs:
           key: ${{ runner.os }}-zig-${{ hashFiles('.zig-cache/never_was_here') }}
           enable-cross-os-cache: true
 
-      - name: Install SQLite (Linux)
+      - name: Install native database clients (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libpq-dev libmariadb-dev
+
+      - name: Install native database clients (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install sqlite3 libpq mariadb-connector-c || true
 
       - name: Check formatting
         run: zig fmt --check src examples tests build.zig
@@ -41,5 +48,67 @@ jobs:
       - name: Unit tests
         run: zig build test --summary all
 
-      - name: Integration tests (SQLite)
+      - name: Integration tests (SQLite; Postgres/MySQL skipped when no server)
+        run: zig build test-integration --summary all
+
+  integration-db:
+    name: Integration tests with PostgreSQL and MariaDB
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: zent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      mariadb:
+        image: mariadb:10.11
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: zent_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PG_DSN: "host=localhost dbname=zent_test user=postgres password=postgres"
+      MYSQL_HOST: localhost
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASS: root
+      MYSQL_DB: zent_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.813+2153f8143
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('.zig-cache/never_was_here') }}
+          enable-cross-os-cache: true
+
+      - name: Install native database clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libpq-dev libmariadb-dev
+
+      - name: Integration tests with real databases
         run: zig build test-integration --summary all

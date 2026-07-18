@@ -12,10 +12,10 @@ pub const PostgresDriver = struct {
 
     pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8) !PostgresDriver {
         // libpq expects a null-terminated string
-        const conninfo_z = try allocator.dupeZ(u8, conninfo);
+        const conninfo_z = try allocator.dupeSentinel(u8, conninfo, 0);
         defer allocator.free(conninfo_z);
 
-        const conn = c.PQconnectdb(conninfo_z.ptr);
+        const conn = c.PQconnectdb(conninfo_z.ptr) orelse return error.PostgresConnectFailed;
         if (c.PQstatus(conn) != c.CONNECTION_OK) {
             defer c.PQfinish(conn);
             const msg = c.PQerrorMessage(conn);
@@ -51,7 +51,7 @@ pub const PostgresDriver = struct {
     fn freeParams(
         allocator: std.mem.Allocator,
         paramValues: std.ArrayListUnmanaged(?[*:0]const u8),
-        owned_lens: std.ArrayListUnmanaged(?usize),
+        owned_lens: *std.ArrayListUnmanaged(?usize),
     ) void {
         for (paramValues.items, 0..) |pv, i| {
             if (pv) |_| {
@@ -97,36 +97,36 @@ pub const PostgresDriver = struct {
                     paramValues.items[i] = s.ptr;
                     paramLengths.items[i] = @intCast(s.len - 1); // libpq reads by len, no NUL
                     paramFormats.items[i] = 0;
-                    owned_lens.items[i] = s.len;
+                    owned_lens.items[i] = s.len + 1;
                 },
                 .float => |v| {
                     const s = try std.fmt.allocPrintSentinel(allocator, "{d}\x00", .{v}, 0);
                     paramValues.items[i] = s.ptr;
                     paramLengths.items[i] = @intCast(s.len - 1);
                     paramFormats.items[i] = 0;
-                    owned_lens.items[i] = s.len;
+                    owned_lens.items[i] = s.len + 1;
                 },
                 .string => |v| {
                     // dupeZ appends a NUL; we own the full buffer.
-                    const s = try allocator.dupeZ(u8, v);
+                    const s = try allocator.dupeSentinel(u8, v, 0);
                     paramValues.items[i] = s.ptr;
                     paramLengths.items[i] = @intCast(v.len);
                     paramFormats.items[i] = 0;
-                    owned_lens.items[i] = s.len;
+                    owned_lens.items[i] = s.len + 1;
                 },
                 .bytes => |v| {
-                    const s = try allocator.dupeZ(u8, v);
+                    const s = try allocator.dupeSentinel(u8, v, 0);
                     paramValues.items[i] = s.ptr;
                     paramLengths.items[i] = @intCast(v.len);
                     paramFormats.items[i] = 1; // binary format
-                    owned_lens.items[i] = s.len;
+                    owned_lens.items[i] = s.len + 1;
                 },
             }
         }
     }
 
     pub fn exec(self: *PostgresDriver, sql: []const u8, args: []const Value) !driver.Result {
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var paramValues: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
@@ -134,7 +134,7 @@ pub const PostgresDriver = struct {
         var paramFormats: std.ArrayListUnmanaged(c_int) = .empty;
         var owned_lens: std.ArrayListUnmanaged(?usize) = .empty;
         defer {
-            freeParams(self.allocator, paramValues, owned_lens);
+            freeParams(self.allocator, paramValues, &owned_lens);
             paramValues.deinit(self.allocator);
             paramLengths.deinit(self.allocator);
             paramFormats.deinit(self.allocator);
@@ -186,7 +186,7 @@ pub const PostgresDriver = struct {
     }
 
     pub fn query(self: *PostgresDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
-        const sql_z = try self.allocator.dupeZ(u8, query_sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, query_sql, 0);
         defer self.allocator.free(sql_z);
 
         var paramValues: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
@@ -194,7 +194,7 @@ pub const PostgresDriver = struct {
         var paramFormats: std.ArrayListUnmanaged(c_int) = .empty;
         var owned_lens: std.ArrayListUnmanaged(?usize) = .empty;
         defer {
-            freeParams(self.allocator, paramValues, owned_lens);
+            freeParams(self.allocator, paramValues, &owned_lens);
             paramValues.deinit(self.allocator);
             paramLengths.deinit(self.allocator);
             paramFormats.deinit(self.allocator);
@@ -247,6 +247,12 @@ pub const PostgresDriver = struct {
             logPgError(self.conn, "ping");
             return error.PostgresPingFailed;
         }
+    }
+
+    /// Returns true if the connection currently has an active transaction.
+    pub fn inTransaction(self: *PostgresDriver) bool {
+        const status = c.PQtransactionStatus(self.conn);
+        return status != c.PQTRANS_IDLE and status != c.PQTRANS_UNKNOWN;
     }
 
     pub fn beginTx(self: *PostgresDriver) !driver.Tx {
@@ -309,6 +315,12 @@ pub const PostgresDriver = struct {
             fn f(ptr: *anyopaque) anyerror!void {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
                 return self_ptr.ping();
+            }
+        }.f,
+        .inTransaction = struct {
+            fn f(ptr: *anyopaque) bool {
+                const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.inTransaction();
             }
         }.f,
     };

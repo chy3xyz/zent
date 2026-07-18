@@ -7,6 +7,8 @@ const driver = @import("driver.zig");
 pub const MySQLDriver = struct {
     conn: *c.MYSQL,
     allocator: std.mem.Allocator,
+    /// Tracks whether the connection currently has an active transaction.
+    in_tx: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8) !MySQLDriver {
         const conn = c.mysql_init(null);
@@ -40,54 +42,52 @@ pub const MySQLDriver = struct {
     /// `mysql_stmt_execute` returns; libmysql copies the values internally
     /// so the buffers can be freed immediately after.
     fn bindParams(
+        allocator: std.mem.Allocator,
         args: []const Value,
         binds: []c.MYSQL_BIND,
+        is_nulls: []c.my_bool,
         str_bufs: *std.ArrayListUnmanaged([]u8),
         int_bufs: *std.ArrayListUnmanaged(i64),
         float_bufs: *std.ArrayListUnmanaged(f64),
         bool_bufs: *std.ArrayListUnmanaged(i8),
     ) !void {
         for (args, 0..) |arg, i| {
+            binds[i].is_null = &is_nulls[i];
             switch (arg) {
                 .null => {
                     binds[i].buffer_type = c.MYSQL_TYPE_NULL;
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
+                    is_nulls[i] = 1;
                 },
                 .bool => |v| {
                     binds[i].buffer_type = c.MYSQL_TYPE_TINY;
                     bool_bufs.items[i] = if (v) 1 else 0;
                     binds[i].buffer = &bool_bufs.items[i];
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
                 },
                 .int => |v| {
                     binds[i].buffer_type = c.MYSQL_TYPE_LONGLONG;
                     int_bufs.items[i] = v;
                     binds[i].buffer = &int_bufs.items[i];
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
                 },
                 .float => |v| {
                     binds[i].buffer_type = c.MYSQL_TYPE_DOUBLE;
                     float_bufs.items[i] = v;
                     binds[i].buffer = &float_bufs.items[i];
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
                 },
                 .string => |v| {
                     binds[i].buffer_type = c.MYSQL_TYPE_STRING;
-                    const dup = try str_bufs.allocator.dupe(u8, v);
-                    errdefer str_bufs.allocator.free(dup);
-                    try str_bufs.append(str_bufs.allocator, dup);
+                    const dup = try allocator.dupe(u8, v);
+                    errdefer allocator.free(dup);
+                    try str_bufs.append(allocator, dup);
                     binds[i].buffer = dup.ptr;
                     binds[i].buffer_length = @intCast(dup.len);
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
                 },
                 .bytes => |v| {
                     binds[i].buffer_type = c.MYSQL_TYPE_BLOB;
-                    const dup = try str_bufs.allocator.dupe(u8, v);
-                    errdefer str_bufs.allocator.free(dup);
-                    try str_bufs.append(str_bufs.allocator, dup);
+                    const dup = try allocator.dupe(u8, v);
+                    errdefer allocator.free(dup);
+                    try str_bufs.append(allocator, dup);
                     binds[i].buffer = dup.ptr;
                     binds[i].buffer_length = @intCast(dup.len);
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
                 },
             }
         }
@@ -96,7 +96,7 @@ pub const MySQLDriver = struct {
     pub fn exec(self: *MySQLDriver, sql: []const u8, args: []const Value) !driver.Result {
         if (args.len == 0) {
             // Simple query without parameters
-            const sql_z = try self.allocator.dupeZ(u8, sql);
+            const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
             defer self.allocator.free(sql_z);
 
             if (c.mysql_real_query(self.conn, sql_z.ptr, @intCast(sql_z.len)) != 0) {
@@ -118,7 +118,7 @@ pub const MySQLDriver = struct {
         }
         defer _ = c.mysql_stmt_close(stmt);
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
@@ -135,11 +135,14 @@ pub const MySQLDriver = struct {
 
         const binds = try self.allocator.alloc(c.MYSQL_BIND, @intCast(n_params));
         defer self.allocator.free(binds);
+        const is_nulls = try self.allocator.alloc(c.my_bool, args.len);
+        defer self.allocator.free(is_nulls);
+        @memset(is_nulls, 0);
 
-        var str_bufs = std.ArrayListUnmanaged([]u8){};
-        var int_bufs = std.ArrayListUnmanaged(i64){};
-        var float_bufs = std.ArrayListUnmanaged(f64){};
-        var bool_bufs = std.ArrayListUnmanaged(i8){};
+        var str_bufs = std.ArrayListUnmanaged([]u8).empty;
+        var int_bufs = std.ArrayListUnmanaged(i64).empty;
+        var float_bufs = std.ArrayListUnmanaged(f64).empty;
+        var bool_bufs = std.ArrayListUnmanaged(i8).empty;
         defer {
             for (str_bufs.items) |s| self.allocator.free(s);
             str_bufs.deinit(self.allocator);
@@ -154,7 +157,7 @@ pub const MySQLDriver = struct {
         try bool_bufs.resize(self.allocator, args.len);
         @memset(binds, std.mem.zeroes(c.MYSQL_BIND));
 
-        try bindParams(args, binds, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
+        try bindParams(self.allocator, args, binds, is_nulls, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
 
         if (c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) {
             logMySQLError(self.conn, "stmt_bind_param");
@@ -180,7 +183,7 @@ pub const MySQLDriver = struct {
         }
         errdefer _ = c.mysql_stmt_close(stmt);
 
-        const sql_z = try self.allocator.dupeZ(u8, query_sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, query_sql, 0);
         defer self.allocator.free(sql_z);
 
         if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
@@ -197,11 +200,14 @@ pub const MySQLDriver = struct {
 
         const binds = try self.allocator.alloc(c.MYSQL_BIND, @intCast(n_params));
         defer self.allocator.free(binds);
+        const is_nulls = try self.allocator.alloc(c.my_bool, args.len);
+        defer self.allocator.free(is_nulls);
+        @memset(is_nulls, 0);
 
-        var str_bufs = std.ArrayListUnmanaged([]u8){};
-        var int_bufs = std.ArrayListUnmanaged(i64){};
-        var float_bufs = std.ArrayListUnmanaged(f64){};
-        var bool_bufs = std.ArrayListUnmanaged(i8){};
+        var str_bufs = std.ArrayListUnmanaged([]u8).empty;
+        var int_bufs = std.ArrayListUnmanaged(i64).empty;
+        var float_bufs = std.ArrayListUnmanaged(f64).empty;
+        var bool_bufs = std.ArrayListUnmanaged(i8).empty;
         defer {
             for (str_bufs.items) |s| self.allocator.free(s);
             str_bufs.deinit(self.allocator);
@@ -216,7 +222,7 @@ pub const MySQLDriver = struct {
         try bool_bufs.resize(self.allocator, args.len);
         @memset(binds, std.mem.zeroes(c.MYSQL_BIND));
 
-        try bindParams(args, binds, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
+        try bindParams(self.allocator, args, binds, is_nulls, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
 
         if (c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) {
             logMySQLError(self.conn, "stmt_bind_param");
@@ -269,9 +275,15 @@ pub const MySQLDriver = struct {
         }
     }
 
+    /// Returns true if the connection currently has an active transaction.
+    pub fn inTransaction(self: *MySQLDriver) bool {
+        return self.in_tx;
+    }
+
     pub fn beginTx(self: *MySQLDriver) !driver.Tx {
         // MySQL autocommit is on by default, so BEGIN disables it within the tx
         _ = try self.exec("BEGIN", &.{});
+        self.in_tx = true;
 
         const tx_ptr = try self.allocator.create(MySQLTx);
         errdefer self.allocator.destroy(tx_ptr);
@@ -332,6 +344,12 @@ pub const MySQLDriver = struct {
                 return self_ptr.ping();
             }
         }.f,
+        .inTransaction = struct {
+            fn f(ptr: *anyopaque) bool {
+                const self_ptr: *MySQLDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.inTransaction();
+            }
+        }.f,
     };
 };
 
@@ -343,6 +361,7 @@ const MySQLTx = struct {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
         self.state = .committed;
+        self.driver.in_tx = false;
         _ = try self.driver.exec("COMMIT", &.{});
     }
 
@@ -350,12 +369,14 @@ const MySQLTx = struct {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
         self.state = .rolled_back;
+        self.driver.in_tx = false;
         _ = try self.driver.exec("ROLLBACK", &.{});
     }
 
     fn deinit(ptr: *anyopaque) void {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
         if (self.state == .active) {
+            self.driver.in_tx = false;
             _ = self.driver.exec("ROLLBACK", &.{}) catch {};
         }
         self.driver.allocator.destroy(self);
@@ -376,6 +397,7 @@ const MySQLRows = struct {
     int_buffers: ?std.ArrayListUnmanaged(i64) = null,
     float_buffers: ?std.ArrayListUnmanaged(f64) = null,
     null_indicators: ?std.ArrayListUnmanaged(c.my_bool) = null,
+    error_indicators: ?std.ArrayListUnmanaged(c.my_bool) = null,
     lengths: ?std.ArrayListUnmanaged(c_ulong) = null,
 
     const vtable = driver.Rows.VTable{
@@ -390,16 +412,18 @@ const MySQLRows = struct {
         var binds = try self.allocator.alloc(c.MYSQL_BIND, n);
         errdefer self.allocator.free(binds);
 
-        var str_bufs = std.ArrayListUnmanaged([]u8){};
-        var int_bufs = std.ArrayListUnmanaged(i64){};
-        var float_bufs = std.ArrayListUnmanaged(f64){};
-        var nulls = std.ArrayListUnmanaged(c.my_bool){};
-        var lens = std.ArrayListUnmanaged(c_ulong){};
+        var str_bufs = std.ArrayListUnmanaged([]u8).empty;
+        var int_bufs = std.ArrayListUnmanaged(i64).empty;
+        var float_bufs = std.ArrayListUnmanaged(f64).empty;
+        var nulls = std.ArrayListUnmanaged(c.my_bool).empty;
+        var errors = std.ArrayListUnmanaged(c.my_bool).empty;
+        var lens = std.ArrayListUnmanaged(c_ulong).empty;
 
         try str_bufs.resize(self.allocator, n);
         try int_bufs.resize(self.allocator, n);
         try float_bufs.resize(self.allocator, n);
         try nulls.resize(self.allocator, n);
+        try errors.resize(self.allocator, n);
         try lens.resize(self.allocator, n);
 
         @memset(binds, std.mem.zeroes(c.MYSQL_BIND));
@@ -420,7 +444,7 @@ const MySQLRows = struct {
             binds[i].buffer_length = @intCast(buf_len);
             binds[i].is_null = &nulls.items[i];
             binds[i].length = &lens.items[i];
-            binds[i].@"error" = &std.mem.zeroes(c.my_bool);
+            binds[i].@"error" = &errors.items[i];
         }
 
         if (c.mysql_stmt_bind_result(self.stmt, binds.ptr) != 0) {
@@ -429,6 +453,7 @@ const MySQLRows = struct {
             int_bufs.deinit(self.allocator);
             float_bufs.deinit(self.allocator);
             nulls.deinit(self.allocator);
+            errors.deinit(self.allocator);
             lens.deinit(self.allocator);
             return error.MySQLBindResultFailed;
         }
@@ -438,6 +463,7 @@ const MySQLRows = struct {
         self.int_buffers = int_bufs;
         self.float_buffers = float_bufs;
         self.null_indicators = nulls;
+        self.error_indicators = errors;
         self.lengths = lens;
     }
 
@@ -476,22 +502,31 @@ const MySQLRows = struct {
             self.allocator.free(binds);
         }
         if (self.string_buffers) |sb| {
-            for (sb.items) |s| {
+            var sb_mut = sb;
+            for (sb_mut.items) |s| {
                 self.allocator.free(s);
             }
-            sb.deinit(self.allocator);
+            sb_mut.deinit(self.allocator);
         }
         if (self.int_buffers) |ib| {
-            ib.deinit(self.allocator);
+            var ib_mut = ib;
+            ib_mut.deinit(self.allocator);
         }
         if (self.float_buffers) |fb| {
-            fb.deinit(self.allocator);
+            var fb_mut = fb;
+            fb_mut.deinit(self.allocator);
         }
         if (self.null_indicators) |ni| {
-            ni.deinit(self.allocator);
+            var ni_mut = ni;
+            ni_mut.deinit(self.allocator);
+        }
+        if (self.error_indicators) |ei| {
+            var ei_mut = ei;
+            ei_mut.deinit(self.allocator);
         }
         if (self.lengths) |l| {
-            l.deinit(self.allocator);
+            var l_mut = l;
+            l_mut.deinit(self.allocator);
         }
 
         const alloc = self.allocator;

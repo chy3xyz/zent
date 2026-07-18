@@ -1,4 +1,8 @@
 //! Integration tests for the connection pool (SQLite).
+//!
+//! Each test uses a separate on-disk database file so that multiple
+//! connections opened by the pool share the same database (unlike
+//! ":memory:" databases, which are per-connection).
 
 const std = @import("std");
 const zent = @import("zent");
@@ -7,18 +11,26 @@ const SQLiteDriver = zent.sql_sqlite.SQLiteDriver;
 const ConnPool = zent.sql_pool.ConnPool;
 const testing = std.testing;
 
+fn cleanup(path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+}
+
 test "Pool: transparent driver interface" {
     const allocator = testing.allocator;
+    const path = "tests/integration/.pool_transparent.db";
+    cleanup(path);
+    defer cleanup(path);
 
     var pool = try ConnPool(SQLiteDriver).init(allocator, .{
         .connect = struct {
             fn f(a: std.mem.Allocator) !SQLiteDriver {
-                return SQLiteDriver.open(a, ":memory:");
+                return SQLiteDriver.open(a, path);
             }
         }.f,
         .min_connections = 2,
         .max_connections = 4,
         .health_check_on_borrow = true,
+        .io = testing.io,
     });
     defer pool.deinit();
 
@@ -36,25 +48,31 @@ test "Pool: transparent driver interface" {
 
 test "Pool: transaction holds connection until deinit" {
     const allocator = testing.allocator;
+    const path = "tests/integration/.pool_tx.db";
+    cleanup(path);
+    defer cleanup(path);
 
     var pool = try ConnPool(SQLiteDriver).init(allocator, .{
         .connect = struct {
             fn f(a: std.mem.Allocator) !SQLiteDriver {
-                return SQLiteDriver.open(a, ":memory:");
+                return SQLiteDriver.open(a, path);
             }
         }.f,
         .min_connections = 1,
         .max_connections = 1,
+        .io = testing.io,
     });
     defer pool.deinit();
 
     const drv = pool.asDriver();
     _ = try drv.exec("CREATE TABLE t (id INTEGER)", &.{});
 
-    var tx = try drv.beginTx();
-    defer tx.deinit();
-    _ = try tx.exec("INSERT INTO t (id) VALUES (?)", &.{.{ .int = 7 }});
-    try tx.commit();
+    {
+        var tx = try drv.beginTx();
+        _ = try tx.exec("INSERT INTO t (id) VALUES (?)", &.{.{ .int = 7 }});
+        try tx.commit();
+        tx.deinit();
+    }
 
     // Connection must have been returned after tx.deinit.
     try testing.expectEqual(@as(usize, 1), pool.available.items.len);
@@ -67,15 +85,19 @@ test "Pool: transaction holds connection until deinit" {
 
 test "Pool: concurrent borrows respect max_connections" {
     const allocator = testing.allocator;
+    const path = "tests/integration/.pool_concurrent.db";
+    cleanup(path);
+    defer cleanup(path);
 
     var pool = try ConnPool(SQLiteDriver).init(allocator, .{
         .connect = struct {
             fn f(a: std.mem.Allocator) !SQLiteDriver {
-                return SQLiteDriver.open(a, ":memory:");
+                return SQLiteDriver.open(a, path);
             }
         }.f,
         .min_connections = 1,
         .max_connections = 2,
+        .io = testing.io,
     });
     defer pool.deinit();
 
@@ -84,7 +106,6 @@ test "Pool: concurrent borrows respect max_connections" {
 
     const Ctx = struct {
         drv: zent.sql_driver.Driver,
-        allocator: std.mem.Allocator,
 
         fn run(self: @This()) void {
             var tx = self.drv.beginTx() catch |err| @panic(@errorName(err));
@@ -94,8 +115,8 @@ test "Pool: concurrent borrows respect max_connections" {
         }
     };
 
-    const t1 = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .drv = drv, .allocator = allocator }});
-    const t2 = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .drv = drv, .allocator = allocator }});
+    const t1 = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .drv = drv }});
+    const t2 = try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .drv = drv }});
     t1.join();
     t2.join();
 

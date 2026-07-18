@@ -9,8 +9,11 @@ pub const SQLiteDriver = struct {
     allocator: std.mem.Allocator,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SQLiteDriver {
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(path_z);
+
         var db: ?*c.sqlite3 = null;
-        const rc = c.sqlite3_open(path.ptr, &db);
+        const rc = c.sqlite3_open(path_z.ptr, &db);
         if (rc != c.SQLITE_OK or db == null) {
             if (db) |handle| {
                 const msg = c.sqlite3_errmsg(handle);
@@ -19,6 +22,7 @@ pub const SQLiteDriver = struct {
             }
             return error.SqliteOpenFailed;
         }
+        _ = c.sqlite3_busy_timeout(db.?, 5000);
         return SQLiteDriver{ .db = db.?, .allocator = allocator };
     }
 
@@ -116,6 +120,12 @@ pub const SQLiteDriver = struct {
         _ = try self.exec("SELECT 1", &.{});
     }
 
+    /// Returns true if a transaction is currently active on this connection.
+    /// SQLite is in autocommit mode when not inside an explicit transaction.
+    pub fn inTransaction(self: *SQLiteDriver) bool {
+        return c.sqlite3_get_autocommit(self.db) == 0;
+    }
+
     pub fn asDriver(self: *SQLiteDriver) driver.Driver {
         return driver.Driver{
             .ptr = self,
@@ -157,6 +167,12 @@ pub const SQLiteDriver = struct {
             fn f(ptr: *anyopaque) anyerror!void {
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
                 return self_ptr.ping();
+            }
+        }.f,
+        .inTransaction = struct {
+            fn f(ptr: *anyopaque) bool {
+                const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.inTransaction();
             }
         }.f,
     };

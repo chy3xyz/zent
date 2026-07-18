@@ -114,6 +114,8 @@ pub const Driver = struct {
         close: *const fn (ptr: *anyopaque) void,
         dialect: *const fn (ptr: *anyopaque) Dialect,
         ping: *const fn (ptr: *anyopaque) anyerror!void,
+        /// Returns true if the connection currently has an active transaction.
+        inTransaction: *const fn (ptr: *anyopaque) bool,
     };
 
     pub fn exec(self: Driver, query_sql: []const u8, args: []const Value) !Result {
@@ -138,5 +140,9 @@ pub const Driver = struct {
 
     pub fn ping(self: Driver) !void {
         return self.vtable.ping(self.ptr);
+    }
+
+    pub fn inTransaction(self: Driver) bool {
+        return self.vtable.inTransaction(self.ptr);
     }
 };

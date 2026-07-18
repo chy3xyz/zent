@@ -10,14 +10,13 @@ pub fn main() !void {
     // This file exists as an entry point for the integration test build step.
     _ = @import("sqlite.zig");
     _ = @import("pool.zig");
-
-    // TODO: conditionally add postgres and mysql integration tests
-    // when a test database is available.
-    //
-    //   _ = @import("postgres.zig");
-    //   _ = @import("mysql.zig");
+    _ = @import("postgres.zig");
+    _ = @import("mysql.zig");
 }
 
 test {
     _ = @import("sqlite.zig");
+    _ = @import("pool.zig");
+    _ = @import("postgres.zig");
+    _ = @import("mysql.zig");
 }
