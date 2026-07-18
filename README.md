@@ -9,7 +9,7 @@ A Zig language implementation of an Entity Framework, inspired by [ent](https://
 - **Schema as Code**: Define entities, fields, edges, and indexes directly in Zig code
 - **Full Static Type Safety**: All query and mutation builders are type-safe at compile time
 - **Comptime Driven**: Leverages Zig's comptime meta-programming capabilities, no external code generation tools needed
-- **SQL First**: SQLite support (current), PostgreSQL/MySQL support (placeholder)
+- **SQL First**: SQLite (first-class), PostgreSQL and MySQL drivers present (less exercised)
 - **Graph Traversal Queries**: Elegant abstraction for relational database relationship queries
 - **Fluent API**: Chainable calls, clean and easy to use
 - **Hooks System**: Runtime hooks for before/after operations
@@ -107,17 +107,20 @@ pub fn main() !void {
     // Create user
     var create_builder = client.user.Create();
     defer create_builder.deinit();
-    _ = create_builder.setFieldValue("name", "Alice")
-        .setFieldValue("age", 30)
-        .setFieldValue("status", "active");
+    _ = try create_builder.setFieldValue("name", "Alice");
+    _ = try create_builder.setFieldValue("age", 30);
+    _ = try create_builder.setFieldValue("status", "active");
     const alice = try create_builder.Save();
 
     // Query users
     var qbuilder = client.user.Query();
     defer qbuilder.deinit();
-    _ = qbuilder.Where(.{client.user.predicates.ageEQ(.{ .int = 30 })});
+    _ = try qbuilder.Where(.{client.user.predicates.ageEQ(.{ .int = 30 })});
     var users = try qbuilder.All();
-    defer users.deinit();
+    defer {
+        for (users.items) |*u| deinitEntity(infos, user_info, u, allocator);
+        users.deinit();
+    }
 }
 ```
 
@@ -161,12 +164,12 @@ zent/
 - [x] Phase 2: Code generation - entities and builders
 - [x] Phase 3: SQLGraph and graph traversal
 - [x] Phase 4: Migration engine
-- [x] PostgreSQL support (placeholder)
-- [x] MySQL support (placeholder)
+- [x] PostgreSQL driver (basic)
+- [x] MySQL driver (basic)
 - [x] Hooks system framework
 - [x] Privacy Policy framework
-- [ ] Full PostgreSQL driver implementation
-- [ ] Full MySQL driver implementation
+- [ ] Cross-dialect mutation parity (junction inserts, RETURNING, UPSERT)
+- [ ] CLI tool for SQL→Zig schema generation
 - [ ] More advanced features
 
 ## Comparison with ent
@@ -179,7 +182,7 @@ zent/
 | SQLGraph | ✅ | ✅ |
 | Auto migration | ✅ (Atlas) | ✅ Create-only |
 | SQLite | ✅ | ✅ |
-| PostgreSQL/MySQL | ✅ | ✅ (placeholder) |
+| PostgreSQL/MySQL | ✅ | ✅ (basic; some mutation paths SQLite-only) |
 
 ## Contributing
 
