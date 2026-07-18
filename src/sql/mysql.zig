@@ -35,6 +35,64 @@ pub const MySQLDriver = struct {
         std.log.err("mysql error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
+    /// Bind `args` to `binds`/`str_bufs`/`int_bufs`/`float_bufs`/`bool_bufs`.
+    /// On success, callers MUST keep these arrays alive until
+    /// `mysql_stmt_execute` returns; libmysql copies the values internally
+    /// so the buffers can be freed immediately after.
+    fn bindParams(
+        args: []const Value,
+        binds: []c.MYSQL_BIND,
+        str_bufs: *std.ArrayListUnmanaged([]u8),
+        int_bufs: *std.ArrayListUnmanaged(i64),
+        float_bufs: *std.ArrayListUnmanaged(f64),
+        bool_bufs: *std.ArrayListUnmanaged(i8),
+    ) !void {
+        for (args, 0..) |arg, i| {
+            switch (arg) {
+                .null => {
+                    binds[i].buffer_type = c.MYSQL_TYPE_NULL;
+                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
+                },
+                .bool => |v| {
+                    binds[i].buffer_type = c.MYSQL_TYPE_TINY;
+                    bool_bufs.items[i] = if (v) 1 else 0;
+                    binds[i].buffer = &bool_bufs.items[i];
+                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
+                },
+                .int => |v| {
+                    binds[i].buffer_type = c.MYSQL_TYPE_LONGLONG;
+                    int_bufs.items[i] = v;
+                    binds[i].buffer = &int_bufs.items[i];
+                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
+                },
+                .float => |v| {
+                    binds[i].buffer_type = c.MYSQL_TYPE_DOUBLE;
+                    float_bufs.items[i] = v;
+                    binds[i].buffer = &float_bufs.items[i];
+                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
+                },
+                .string => |v| {
+                    binds[i].buffer_type = c.MYSQL_TYPE_STRING;
+                    const dup = try str_bufs.allocator.dupe(u8, v);
+                    errdefer str_bufs.allocator.free(dup);
+                    try str_bufs.append(str_bufs.allocator, dup);
+                    binds[i].buffer = dup.ptr;
+                    binds[i].buffer_length = @intCast(dup.len);
+                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
+                },
+                .bytes => |v| {
+                    binds[i].buffer_type = c.MYSQL_TYPE_BLOB;
+                    const dup = try str_bufs.allocator.dupe(u8, v);
+                    errdefer str_bufs.allocator.free(dup);
+                    try str_bufs.append(str_bufs.allocator, dup);
+                    binds[i].buffer = dup.ptr;
+                    binds[i].buffer_length = @intCast(dup.len);
+                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
+                },
+            }
+        }
+    }
+
     pub fn exec(self: *MySQLDriver, sql: []const u8, args: []const Value) !driver.Result {
         if (args.len == 0) {
             // Simple query without parameters
@@ -75,74 +133,28 @@ pub const MySQLDriver = struct {
             return error.MySQLParamCountMismatch;
         }
 
-        var binds = try self.allocator.alloc(c.MYSQL_BIND, @intCast(n_params));
+        const binds = try self.allocator.alloc(c.MYSQL_BIND, @intCast(n_params));
         defer self.allocator.free(binds);
 
-        // Storage for string/blob data to keep alive during execute
-        var str_data = std.ArrayListUnmanaged([]const u8){};
-        defer {
-            for (str_data.items) |s| {
-                self.allocator.free(s);
-            }
-            str_data.deinit(self.allocator);
-        }
-
-        // Storage for integer/float buffers to keep alive during execute
+        var str_bufs = std.ArrayListUnmanaged([]u8){};
         var int_bufs = std.ArrayListUnmanaged(i64){};
         var float_bufs = std.ArrayListUnmanaged(f64){};
+        var bool_bufs = std.ArrayListUnmanaged(i8){};
         defer {
+            for (str_bufs.items) |s| self.allocator.free(s);
+            str_bufs.deinit(self.allocator);
             int_bufs.deinit(self.allocator);
             float_bufs.deinit(self.allocator);
+            bool_bufs.deinit(self.allocator);
         }
 
+        try str_bufs.ensureUnusedCapacity(self.allocator, args.len);
         try int_bufs.resize(self.allocator, args.len);
         try float_bufs.resize(self.allocator, args.len);
+        try bool_bufs.resize(self.allocator, args.len);
         @memset(binds, std.mem.zeroes(c.MYSQL_BIND));
 
-        for (args, 0..) |arg, i| {
-            switch (arg) {
-                .null => {
-                    binds[i].buffer_type = c.MYSQL_TYPE_NULL;
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .bool => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_TINY;
-                    const buf = try self.allocator.create(i8);
-                    buf.* = if (v) 1 else 0;
-                    binds[i].buffer = buf;
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                    _ = &buf;
-                },
-                .int => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_LONGLONG;
-                    int_bufs.items[i] = v;
-                    binds[i].buffer = &int_bufs.items[i];
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .float => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_DOUBLE;
-                    float_bufs.items[i] = v;
-                    binds[i].buffer = &float_bufs.items[i];
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .string => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_STRING;
-                    const dup = try self.allocator.dupe(u8, v);
-                    try str_data.append(self.allocator, dup);
-                    binds[i].buffer = dup.ptr;
-                    binds[i].buffer_length = @intCast(dup.len);
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .bytes => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_BLOB;
-                    const dup = try self.allocator.dupe(u8, v);
-                    try str_data.append(self.allocator, dup);
-                    binds[i].buffer = dup.ptr;
-                    binds[i].buffer_length = @intCast(dup.len);
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-            }
-        }
+        try bindParams(args, binds, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
 
         if (c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) {
             logMySQLError(self.conn, "stmt_bind_param");
@@ -183,71 +195,28 @@ pub const MySQLDriver = struct {
             return error.MySQLParamCountMismatch;
         }
 
-        var binds = try self.allocator.alloc(c.MYSQL_BIND, @intCast(n_params));
-        errdefer self.allocator.free(binds);
+        const binds = try self.allocator.alloc(c.MYSQL_BIND, @intCast(n_params));
+        defer self.allocator.free(binds);
 
-        var str_data = std.ArrayListUnmanaged([]const u8){};
-        errdefer {
-            for (str_data.items) |s| {
-                self.allocator.free(s);
-            }
-            str_data.deinit(self.allocator);
-        }
-
+        var str_bufs = std.ArrayListUnmanaged([]u8){};
         var int_bufs = std.ArrayListUnmanaged(i64){};
         var float_bufs = std.ArrayListUnmanaged(f64){};
-        errdefer {
+        var bool_bufs = std.ArrayListUnmanaged(i8){};
+        defer {
+            for (str_bufs.items) |s| self.allocator.free(s);
+            str_bufs.deinit(self.allocator);
             int_bufs.deinit(self.allocator);
             float_bufs.deinit(self.allocator);
+            bool_bufs.deinit(self.allocator);
         }
 
+        try str_bufs.ensureUnusedCapacity(self.allocator, args.len);
         try int_bufs.resize(self.allocator, args.len);
         try float_bufs.resize(self.allocator, args.len);
+        try bool_bufs.resize(self.allocator, args.len);
         @memset(binds, std.mem.zeroes(c.MYSQL_BIND));
 
-        for (args, 0..) |arg, i| {
-            switch (arg) {
-                .null => {
-                    binds[i].buffer_type = c.MYSQL_TYPE_NULL;
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .bool => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_TINY;
-                    const buf = try self.allocator.create(i8);
-                    buf.* = if (v) 1 else 0;
-                    binds[i].buffer = buf;
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .int => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_LONGLONG;
-                    int_bufs.items[i] = v;
-                    binds[i].buffer = &int_bufs.items[i];
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .float => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_DOUBLE;
-                    float_bufs.items[i] = v;
-                    binds[i].buffer = &float_bufs.items[i];
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .string => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_STRING;
-                    const dup = try self.allocator.dupe(u8, v);
-                    try str_data.append(self.allocator, dup);
-                    binds[i].buffer = dup.ptr;
-                    binds[i].buffer_length = @intCast(dup.len);
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-                .bytes => |v| {
-                    binds[i].buffer_type = c.MYSQL_TYPE_BLOB;
-                    const dup = try self.allocator.dupe(u8, v);
-                    try str_data.append(self.allocator, dup);
-                    binds[i].buffer = dup.ptr;
-                    binds[i].buffer_length = @intCast(dup.len);
-                    binds[i].is_null = @ptrCast(&std.mem.zeroes(c.my_bool));
-                },
-            }
-        }
+        try bindParams(args, binds, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
 
         if (c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) {
             logMySQLError(self.conn, "stmt_bind_param");

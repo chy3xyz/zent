@@ -26,7 +26,7 @@ pub const OwnedQuery = struct {
     args: []Value,
     allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *OwnedQuery) void {
+    pub fn deinit(self: *const OwnedQuery) void {
         self.allocator.free(self.sql);
         self.allocator.free(self.args);
     }

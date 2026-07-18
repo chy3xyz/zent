@@ -188,7 +188,14 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
         try buf.appendSlice(col.sql_type);
 
         if (col.primary_key and isSQLiteDialect(dialect)) {
-            try buf.appendSlice(" PRIMARY KEY AUTOINCREMENT");
+            // SQLite AUTOINCREMENT only valid on INTEGER PRIMARY KEY.
+            if (std.ascii.eqlIgnoreCase(col.sql_type, "INTEGER") or
+                std.ascii.eqlIgnoreCase(col.sql_type, "INT"))
+            {
+                try buf.appendSlice(" PRIMARY KEY AUTOINCREMENT");
+            } else {
+                try buf.appendSlice(" PRIMARY KEY");
+            }
         } else if (col.primary_key) {
             try buf.appendSlice(" PRIMARY KEY");
         }
@@ -249,7 +256,7 @@ pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect)
 
     try buf.appendSlice("CREATE ");
     if (index.unique) try buf.appendSlice("UNIQUE ");
-    try buf.appendSlice("INDEX ");
+    try buf.appendSlice("INDEX IF NOT EXISTS ");
     try quoteIdentToBuffer(dialect, &buf, index.name);
     try buf.appendSlice(" ON ");
     try quoteIdentToBuffer(dialect, &buf, table_name);
@@ -606,9 +613,9 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
         try buf.print(" DEFAULT {s}", .{dv});
     }
 
-    if (col.unique and !col.primary_key) {
-        try buf.appendSlice(" UNIQUE");
-    }
+    // UNIQUE is intentionally NOT appended: SQLite's ALTER TABLE ADD
+    // COLUMN does not support it, and for PG/MySQL the createTableSQL
+    // output already carries the UNIQUE constraint on this column.
 
     return buf.toOwnedSlice();
 }

@@ -166,19 +166,108 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 try args.append(fv.value);
             }
 
-            // Insert the entity
-            var builder = if (or_replace)
-                sql.InsertOrReplace(self.allocator, self.driver.dialect(), info.table_name)
-            else
-                sql.Insert(self.allocator, self.driver.dialect(), info.table_name);
-            defer builder.deinit();
-            _ = try builder.columns(columns.items);
-            _ = try builder.values(args.items);
-            const q = try builder.query();
-            const res = try self.driver.exec(q.sql, q.args);
+            // Insert the entity. For dialects that support RETURNING (PostgreSQL,
+            // SQLite 3.35+) we use a query path to fetch the id atomically; for
+            // MySQL we fall back to driver.exec and read last_insert_id.
+            const dialect = self.driver.dialect();
+            const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
+            const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
+            const is_sqlite = std.mem.eql(u8, dialect.name, "sqlite3");
+
+            // Build the upsert suffix per dialect. For SQLite we use the
+            // built-in InsertOrReplace builder. For PG we append ON CONFLICT
+            // (id) DO UPDATE SET col=excluded.col ... For MySQL we use
+            // REPLACE INTO. For plain Save (or_replace=false) the suffix is empty.
+            const upsert_suffix: []const u8 = upsert: {
+                if (!or_replace) break :upsert "";
+                if (is_sqlite) break :upsert ""; // InsertOrReplace builder handles it
+                if (is_postgres) {
+                    // ON CONFLICT (id) DO UPDATE SET <col>=EXCLUDED.<col> for every non-pk col
+                    var buf = std.array_list.Managed(u8).init(self.allocator);
+                    defer buf.deinit();
+                    try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
+                    var first = true;
+                    for (columns.items) |col| {
+                        if (std.mem.eql(u8, col, "id")) continue;
+                        if (!first) try buf.appendSlice(", ");
+                        first = false;
+                        var piece_buf: [128]u8 = undefined;
+                        const piece = std.fmt.bufPrint(
+                            &piece_buf,
+                            "\"{s}\"=EXCLUDED.\"{s}\"",
+                            .{ col, col },
+                        ) catch continue;
+                        try buf.appendSlice(piece);
+                    }
+                    break :upsert buf.items;
+                }
+                // MySQL: REPLACE INTO
+                break :upsert " REPLACE";
+            };
 
             var entity: Entity = std.mem.zeroes(Entity);
-            entity.id = @intCast(res.last_insert_id orelse 0);
+            if (supports_returning) {
+                var builder = if (or_replace and is_sqlite)
+                    sql.InsertOrReplace(self.allocator, dialect, info.table_name)
+                else
+                    sql.Insert(self.allocator, dialect, info.table_name);
+                defer builder.deinit();
+                _ = try builder.columns(columns.items);
+                _ = try builder.values(args.items);
+                var q = try builder.takeQuery();
+                defer q.deinit();
+
+                // Build the full SQL: q.sql + (mysql REPLACE prefix or PG UPSERT suffix) + RETURNING
+                const needs_replace_prefix = or_replace and std.mem.eql(u8, dialect.name, "mysql");
+                const replace_prefix: []const u8 = if (needs_replace_prefix) "REPLACE" else "";
+                const ret_suffix = " RETURNING \"id\"";
+
+                const full_sql_len = replace_prefix.len + 1 + q.sql.len + upsert_suffix.len + ret_suffix.len;
+                const full_sql = try self.allocator.alloc(u8, full_sql_len);
+                defer self.allocator.free(full_sql);
+                var pos: usize = 0;
+                if (needs_replace_prefix) {
+                    @memcpy(full_sql[pos..][0..replace_prefix.len], replace_prefix);
+                    pos += replace_prefix.len;
+                    full_sql[pos] = ' ';
+                    pos += 1;
+                }
+                @memcpy(full_sql[pos..][0..q.sql.len], q.sql);
+                pos += q.sql.len;
+                @memcpy(full_sql[pos..][0..upsert_suffix.len], upsert_suffix);
+                pos += upsert_suffix.len;
+                @memcpy(full_sql[pos..][0..ret_suffix.len], ret_suffix);
+
+                var rows = try self.driver.query(full_sql, q.args);
+                defer rows.deinit();
+                const row = rows.next() orelse return error.NotFound;
+                entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
+            } else {
+                // MySQL path: REPLACE INTO if or_replace
+                const needs_replace_prefix = or_replace;
+                const replace_prefix: []const u8 = if (needs_replace_prefix) "REPLACE" else "";
+                var builder = sql.Insert(self.allocator, dialect, info.table_name);
+                defer builder.deinit();
+                _ = try builder.columns(columns.items);
+                _ = try builder.values(args.items);
+                var q = try builder.takeQuery();
+                defer q.deinit();
+
+                const full_sql_len = replace_prefix.len + 1 + q.sql.len;
+                const full_sql = try self.allocator.alloc(u8, full_sql_len);
+                defer self.allocator.free(full_sql);
+                var pos: usize = 0;
+                if (needs_replace_prefix) {
+                    @memcpy(full_sql[pos..][0..replace_prefix.len], replace_prefix);
+                    pos += replace_prefix.len;
+                    full_sql[pos] = ' ';
+                    pos += 1;
+                }
+                @memcpy(full_sql[pos..][0..q.sql.len], q.sql);
+
+                const res = try self.driver.exec(full_sql, q.args);
+                entity.id = @intCast(res.last_insert_id orelse 0);
+            }
 
             // Fill other fields from mutation values
             for (self.values.items) |fv| {
@@ -224,17 +313,21 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             for (self.edge_values.items) |ev| {
                 inline for (junction_infos) |ji| {
                     if (std.mem.eql(u8, ev.edge, ji.edge_name)) {
-                        const insert_sql = if (or_replace)
-                            try std.fmt.allocPrint(self.allocator, "INSERT OR REPLACE INTO \"{s}\" (\"{s}\", \"{s}\") VALUES (?, ?)", .{ ji.junction_table, ji.source_col, ji.target_col })
-                        else
-                            try std.fmt.allocPrint(self.allocator, "INSERT INTO \"{s}\" (\"{s}\", \"{s}\") VALUES (?, ?)", .{ ji.junction_table, ji.source_col, ji.target_col });
-                        defer self.allocator.free(insert_sql);
-
                         for (ev.ids) |target_id| {
-                            _ = try self.driver.exec(
-                                insert_sql,
-                                &.{ .{ .int = entity.id }, .{ .int = target_id } },
-                            );
+                            // Use the dialect-aware Insert builder so the
+                            // generated SQL has the correct placeholders
+                            // ($1, $2 for PG; ?, ? for SQLite/MySQL) and
+                            // identifier quoting (` for MySQL, " otherwise).
+                            var ib = sql.Insert(self.allocator, self.driver.dialect(), ji.junction_table);
+                            defer ib.deinit();
+                            _ = try ib.columns(&.{ ji.source_col, ji.target_col });
+                            _ = try ib.values(&.{
+                                .{ .int = entity.id },
+                                .{ .int = target_id },
+                            });
+                            var iq = try ib.takeQuery();
+                            defer iq.deinit();
+                            _ = try self.driver.exec(iq.sql, iq.args);
                         }
                     }
                 }

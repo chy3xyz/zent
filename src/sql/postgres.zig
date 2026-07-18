@@ -44,76 +44,108 @@ pub const PostgresDriver = struct {
         std.log.err("postgres error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
+    /// Free all parameters that were allocated (int, float, string, bytes).
+    /// Bool params point to static "t"/"f" strings and are not freed.
+    /// Uses the saved allocation length (NOT std.mem.span) so that values
+    /// containing embedded NULs are freed correctly.
+    fn freeParams(
+        allocator: std.mem.Allocator,
+        paramValues: std.ArrayListUnmanaged(?[*:0]const u8),
+        owned_lens: std.ArrayListUnmanaged(?usize),
+    ) void {
+        for (paramValues.items, 0..) |pv, i| {
+            if (pv) |_| {
+                if (owned_lens.items[i]) |len| {
+                    // The allocated buffer started at pv; we know its size.
+                    const base: [*]u8 = @ptrCast(@constCast(pv));
+                    allocator.free(base[0..len]);
+                }
+            }
+        }
+        owned_lens.deinit(allocator);
+    }
+
+    fn bindParams(
+        allocator: std.mem.Allocator,
+        args: []const Value,
+        paramValues: *std.ArrayListUnmanaged(?[*:0]const u8),
+        paramLengths: *std.ArrayListUnmanaged(c_int),
+        paramFormats: *std.ArrayListUnmanaged(c_int),
+        owned_lens: *std.ArrayListUnmanaged(?usize),
+    ) !void {
+        try paramValues.resize(allocator, args.len);
+        try paramLengths.resize(allocator, args.len);
+        try paramFormats.resize(allocator, args.len);
+        try owned_lens.resize(allocator, args.len);
+        @memset(owned_lens.items, null);
+
+        for (args, 0..) |arg, i| {
+            switch (arg) {
+                .null => {
+                    paramValues.items[i] = null;
+                    paramLengths.items[i] = 0;
+                    paramFormats.items[i] = 0;
+                },
+                .bool => |v| {
+                    const s = if (v) "t" else "f";
+                    paramValues.items[i] = @ptrCast(s.ptr);
+                    paramLengths.items[i] = @intCast(s.len);
+                    paramFormats.items[i] = 0;
+                },
+                .int => |v| {
+                    const s = try std.fmt.allocPrintSentinel(allocator, "{d}\x00", .{v}, 0);
+                    paramValues.items[i] = s.ptr;
+                    paramLengths.items[i] = @intCast(s.len - 1); // libpq reads by len, no NUL
+                    paramFormats.items[i] = 0;
+                    owned_lens.items[i] = s.len;
+                },
+                .float => |v| {
+                    const s = try std.fmt.allocPrintSentinel(allocator, "{d}\x00", .{v}, 0);
+                    paramValues.items[i] = s.ptr;
+                    paramLengths.items[i] = @intCast(s.len - 1);
+                    paramFormats.items[i] = 0;
+                    owned_lens.items[i] = s.len;
+                },
+                .string => |v| {
+                    // dupeZ appends a NUL; we own the full buffer.
+                    const s = try allocator.dupeZ(u8, v);
+                    paramValues.items[i] = s.ptr;
+                    paramLengths.items[i] = @intCast(v.len);
+                    paramFormats.items[i] = 0;
+                    owned_lens.items[i] = s.len;
+                },
+                .bytes => |v| {
+                    const s = try allocator.dupeZ(u8, v);
+                    paramValues.items[i] = s.ptr;
+                    paramLengths.items[i] = @intCast(v.len);
+                    paramFormats.items[i] = 1; // binary format
+                    owned_lens.items[i] = s.len;
+                },
+            }
+        }
+    }
+
     pub fn exec(self: *PostgresDriver, sql: []const u8, args: []const Value) !driver.Result {
         const sql_z = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(sql_z);
 
-        const nParams: c_int = @intCast(args.len);
         var paramValues: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
         var paramLengths: std.ArrayListUnmanaged(c_int) = .empty;
         var paramFormats: std.ArrayListUnmanaged(c_int) = .empty;
+        var owned_lens: std.ArrayListUnmanaged(?usize) = .empty;
         defer {
-            for (paramValues.items, 0..) |pv, i| {
-                if (pv) |p| {
-                    if (args[i] == .string or args[i] == .bytes) {
-                        self.allocator.free(std.mem.span(p));
-                    }
-                }
-            }
+            freeParams(self.allocator, paramValues, owned_lens);
             paramValues.deinit(self.allocator);
             paramLengths.deinit(self.allocator);
             paramFormats.deinit(self.allocator);
         }
 
-        try paramValues.resize(self.allocator, @intCast(nParams));
-        try paramLengths.resize(self.allocator, @intCast(nParams));
-        try paramFormats.resize(self.allocator, @intCast(nParams));
-
-        for (args, 0..) |arg, i| {
-            const idx: usize = i;
-            switch (arg) {
-                .null => {
-                    paramValues.items[idx] = null;
-                    paramLengths.items[idx] = 0;
-                    paramFormats.items[idx] = 0; // text format
-                },
-                .bool => |v| {
-                    const s = if (v) "t" else "f";
-                    paramValues.items[idx] = @ptrCast(s);
-                    paramLengths.items[idx] = @intCast(s.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .int => |v| {
-                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(s.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .float => |v| {
-                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(s.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .string => |v| {
-                    const s = try self.allocator.dupeZ(u8, v);
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(v.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .bytes => |v| {
-                    const s = try self.allocator.dupeZ(u8, v);
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(v.len);
-                    paramFormats.items[idx] = 1; // binary format
-                },
-            }
-        }
+        try bindParams(self.allocator, args, &paramValues, &paramLengths, &paramFormats, &owned_lens);
 
         const res = c.PQexecParams(
             self.conn,
             sql_z.ptr,
-            nParams,
+            @intCast(args.len),
             null, // let libpq infer param types from text
             paramValues.items.ptr,
             paramLengths.items.ptr,
@@ -155,74 +187,25 @@ pub const PostgresDriver = struct {
 
     pub fn query(self: *PostgresDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
         const sql_z = try self.allocator.dupeZ(u8, query_sql);
-        errdefer self.allocator.free(sql_z);
+        defer self.allocator.free(sql_z);
 
-        const nParams: c_int = @intCast(args.len);
         var paramValues: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
         var paramLengths: std.ArrayListUnmanaged(c_int) = .empty;
         var paramFormats: std.ArrayListUnmanaged(c_int) = .empty;
+        var owned_lens: std.ArrayListUnmanaged(?usize) = .empty;
         defer {
-            for (paramValues.items, 0..) |pv, i| {
-                if (pv) |p| {
-                    if (i < args.len and (args[i] == .string or args[i] == .bytes)) {
-                        self.allocator.free(std.mem.span(p));
-                    }
-                }
-            }
+            freeParams(self.allocator, paramValues, owned_lens);
             paramValues.deinit(self.allocator);
             paramLengths.deinit(self.allocator);
             paramFormats.deinit(self.allocator);
         }
 
-        try paramValues.resize(self.allocator, @intCast(nParams));
-        try paramLengths.resize(self.allocator, @intCast(nParams));
-        try paramFormats.resize(self.allocator, @intCast(nParams));
-
-        for (args, 0..) |arg, i| {
-            const idx: usize = i;
-            switch (arg) {
-                .null => {
-                    paramValues.items[idx] = null;
-                    paramLengths.items[idx] = 0;
-                    paramFormats.items[idx] = 0;
-                },
-                .bool => |v| {
-                    const s = if (v) "t" else "f";
-                    paramValues.items[idx] = @ptrCast(s);
-                    paramLengths.items[idx] = @intCast(s.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .int => |v| {
-                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(s.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .float => |v| {
-                    const s = try std.fmt.allocPrintZ(self.allocator, "{d}", .{v});
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(s.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .string => |v| {
-                    const s = try self.allocator.dupeZ(u8, v);
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(v.len);
-                    paramFormats.items[idx] = 0;
-                },
-                .bytes => |v| {
-                    const s = try self.allocator.dupeZ(u8, v);
-                    paramValues.items[idx] = s.ptr;
-                    paramLengths.items[idx] = @intCast(v.len);
-                    paramFormats.items[idx] = 1;
-                },
-            }
-        }
+        try bindParams(self.allocator, args, &paramValues, &paramLengths, &paramFormats, &owned_lens);
 
         const res = c.PQexecParams(
             self.conn,
             sql_z.ptr,
-            nParams,
+            @intCast(args.len),
             null,
             paramValues.items.ptr,
             paramLengths.items.ptr,

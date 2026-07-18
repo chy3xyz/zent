@@ -17,34 +17,46 @@ pub fn build(b: *std.Build) void {
     sqlite_tc.linkSystemLibrary("sqlite3", .{});
     const sqlite_c_mod = sqlite_tc.createModule();
 
-    // libpq (PostgreSQL) — optional, only if headers are installed
+    // libpq (PostgreSQL) — optional, only if headers are installed.
+    // Try the user-supplied version (or "postgresql@<v>" common Homebrew
+    // symlinks) on both Apple Silicon and Intel Homebrew locations.
     const pg_c_mod = blk: {
-        const pg_header = "/usr/local/opt/postgresql@18/include/libpq-fe.h";
-        if (fileExists(pg_header)) {
-            const tc = b.addTranslateC(.{
-                .root_source_file = b.path("src/sql/pg_include.h"),
-                .target = target,
-                .optimize = optimize,
-            });
-            tc.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/postgresql@18/include" });
-            tc.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/postgresql@18/include/postgresql" });
-            break :blk tc.createModule();
+        const pg_versions = [_][]const u8{ "postgresql@18", "postgresql@17", "postgresql@16", "postgresql" };
+        const pg_homes = [_][]const u8{ "/opt/homebrew/opt", "/usr/local/opt" };
+        for (pg_homes) |home| {
+            for (pg_versions) |pkg| {
+                const header = b.fmt("{s}/{s}/include/libpq-fe.h", .{ home, pkg });
+                if (pathExists(header)) {
+                    const tc = b.addTranslateC(.{
+                        .root_source_file = b.path("src/sql/pg_include.h"),
+                        .target = target,
+                        .optimize = optimize,
+                    });
+                    const inc = b.fmt("{s}/{s}/include", .{ home, pkg });
+                    tc.addSystemIncludePath(.{ .cwd_relative = inc });
+                    tc.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/postgresql", .{inc}) });
+                    break :blk tc.createModule();
+                }
+            }
         }
         break :blk null;
     };
 
-    // mariadb — optional, only if headers are installed
+    // mariadb — optional, only if headers are installed.
     const my_c_mod = blk: {
-        const my_header = "/usr/local/opt/mariadb-connector-c/include/mariadb/mysql.h";
-        if (fileExists(my_header)) {
-            const tc = b.addTranslateC(.{
-                .root_source_file = b.path("src/sql/mysql_include.h"),
-                .target = target,
-                .optimize = optimize,
-            });
-            tc.defineCMacro("MYSQL_NO_DATA", "1");
-            tc.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/mariadb-connector-c/include" });
-            break :blk tc.createModule();
+        const my_homes = [_][]const u8{ "/opt/homebrew/opt", "/usr/local/opt" };
+        for (my_homes) |home| {
+            const header = b.fmt("{s}/mariadb-connector-c/include/mariadb/mysql.h", .{home});
+            if (pathExists(header)) {
+                const tc = b.addTranslateC(.{
+                    .root_source_file = b.path("src/sql/mysql_include.h"),
+                    .target = target,
+                    .optimize = optimize,
+                });
+                tc.defineCMacro("MYSQL_NO_DATA", "100");
+                tc.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/mariadb-connector-c/include", .{home}) });
+                break :blk tc.createModule();
+            }
         }
         break :blk null;
     };
@@ -75,13 +87,29 @@ pub fn build(b: *std.Build) void {
     if (my_c_mod) |m| test_mod.addImport("mysql_c", m);
     test_mod.linkSystemLibrary("sqlite3", .{});
     if (pg_c_mod != null) {
-        test_mod.addIncludePath(.{ .cwd_relative = "/usr/local/opt/postgresql@18/include/postgresql" });
-        test_mod.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/postgresql@18/lib/postgresql" });
+        const pg_versions = [_][]const u8{ "postgresql@18", "postgresql@17", "postgresql@16", "postgresql" };
+        const pg_homes = [_][]const u8{ "/opt/homebrew/opt", "/usr/local/opt" };
+        outer: for (pg_homes) |home| {
+            for (pg_versions) |pkg| {
+                const header = b.fmt("{s}/{s}/include/libpq-fe.h", .{ home, pkg });
+                if (pathExists(header)) {
+                    test_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/{s}/include/postgresql", .{ home, pkg }) });
+                    test_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/{s}/lib/postgresql", .{ home, pkg }) });
+                    break :outer;
+                }
+            }
+        }
         test_mod.linkSystemLibrary("pq", .{});
     }
     if (my_c_mod != null) {
-        test_mod.addIncludePath(.{ .cwd_relative = "/usr/local/opt/mariadb-connector-c/include" });
-        test_mod.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/mariadb-connector-c/lib" });
+        const my_homes = [_][]const u8{ "/opt/homebrew/opt", "/usr/local/opt" };
+        for (my_homes) |home| {
+            if (pathExists(b.fmt("{s}/mariadb-connector-c/include/mariadb/mysql.h", .{home}))) {
+                test_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/mariadb-connector-c/include", .{home}) });
+                test_mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/mariadb-connector-c/lib", .{home}) });
+                break;
+            }
+        }
         test_mod.linkSystemLibrary("mariadb", .{});
     }
 
@@ -137,9 +165,23 @@ pub fn build(b: *std.Build) void {
     integ_step.dependOn(&run_integ_tests.step);
 }
 
+/// Returns true if `path` points to an existing regular file. Uses the
+/// classic `stat` via extern (works on macOS; build runner may or may not
+/// link libc on Linux). We keep this limited to a small set of well-known
+/// Homebrew include paths.
 fn fileExists(path: [*:0]const u8) bool {
     var buf: [144]u8 = undefined;
     return stat(path, @ptrCast(&buf)) == 0;
 }
 
 extern "c" fn stat(path: [*:0]const u8, buf: *anyopaque) c_int;
+
+/// Version of `fileExists` that accepts a normal `[]const u8`. The
+/// path MUST be short enough to fit in the small stack buffer we use
+/// for null-termination (Homebrew paths are comfortably within 400B).
+fn pathExists(path: []const u8) bool {
+    var zbuf: [512:0]u8 = undefined;
+    if (path.len >= zbuf.len) return false;
+    @memcpy(zbuf[0..path.len], path);
+    return fileExists(@ptrCast(&zbuf));
+}
