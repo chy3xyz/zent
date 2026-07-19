@@ -163,14 +163,14 @@ test "Max and Min do not leak Rows on null/int/float/text paths" {
 
     for (cases) |value| {
         var mock_max = MockDriver{ .value = value };
-        var q_max = UserQuery.init(allocator, mock_max.asDriver());
+        var q_max = UserQuery.init(allocator, mock_max.asDriver(), null);
         defer q_max.deinit();
         const max = try q_max.Max("name");
         defer if (max == .string) allocator.free(max.string);
         try expectValueEqual(value, max);
 
         var mock_min = MockDriver{ .value = value };
-        var q_min = UserQuery.init(allocator, mock_min.asDriver());
+        var q_min = UserQuery.init(allocator, mock_min.asDriver(), null);
         defer q_min.deinit();
         const min = try q_min.Min("name");
         defer if (min == .string) allocator.free(min.string);

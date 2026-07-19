@@ -45,7 +45,6 @@ const UserBase = Schema("User", .{
         field.JSON("settings", UserSettings),
     },
     .mixins = &.{zent.core.mixin.TimeMixin},
-    .policy = zent.privacy.Policy{ .rules = &.{zent.privacy.Deny} },
 });
 
 pub const UserGroup = Schema("UserGroup", .{

@@ -6,6 +6,7 @@ const sql = @import("../sql/builder.zig");
 const sql_scan = @import("../sql/scan.zig");
 const migrate = @import("../sql/schema/migrate.zig");
 const Hook = @import("../runtime/hook.zig").Hook;
+const privacy = @import("../privacy/policy.zig");
 
 const EntityGen = @import("entity.zig").Entity;
 const CreateGen = @import("create.zig").CreateBuilder;
@@ -115,6 +116,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         predicates: @TypeOf(Predicates),
         orders: @TypeOf(EdgeOrders),
         hooks: []const Hook,
+        privacy_ctx: ?privacy.PrivacyContext = null,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver) Self {
             return .{
@@ -123,6 +125,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
                 .predicates = Predicates,
                 .orders = EdgeOrders,
                 .hooks = &.{},
+                .privacy_ctx = null,
             };
         }
 
@@ -132,38 +135,44 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return copy;
         }
 
+        pub fn withContext(self: Self, ctx: privacy.PrivacyContext) Self {
+            var copy = self;
+            copy.privacy_ctx = ctx;
+            return copy;
+        }
+
         pub fn Query(self: Self) QueryBuilder {
-            return QueryBuilder.init(self.allocator, self.driver);
+            return QueryBuilder.init(self.allocator, self.driver, self.privacy_ctx);
         }
 
         pub fn Create(self: Self) !CreateBuilder {
             if (info.is_view) @compileError("Create is not supported for view entities");
-            return CreateBuilder.init(self.allocator, self.driver, self.hooks);
+            return CreateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
         }
 
         pub fn BulkInsert(self: Self) !BulkInsertBuilder {
             if (info.is_view) @compileError("BulkInsert is not supported for view entities");
-            return try BulkInsertBuilder.init(self.allocator, self.driver, self.hooks);
+            return try BulkInsertBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
         }
 
         pub fn Update(self: Self) UpdateBuilder {
             if (info.is_view) @compileError("Update is not supported for view entities");
-            return UpdateBuilder.init(self.allocator, self.driver, self.hooks);
+            return UpdateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
         }
 
         pub fn Delete(self: Self) DeleteBuilder {
             if (info.is_view) @compileError("Delete is not supported for view entities");
-            return DeleteBuilder.init(self.allocator, self.driver, self.hooks);
+            return DeleteBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
         }
 
         pub fn BulkUpdate(self: Self) BulkUpdateBuilder {
             if (info.is_view) @compileError("BulkUpdate is not supported for view entities");
-            return BulkUpdateBuilder.init(self.allocator, self.driver, self.hooks);
+            return BulkUpdateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
         }
 
         pub fn BulkDelete(self: Self) !BulkDeleteBuilder {
             if (info.is_view) @compileError("BulkDelete is not supported for view entities");
-            return BulkDeleteBuilder.init(self.allocator, self.driver, self.hooks);
+            return BulkDeleteBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
         }
 
         const QueryEdgeError = sql_driver.Error || error{TypeMismatch};

@@ -47,17 +47,19 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         edge_values: std.array_list.Managed(EdgeValue),
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
+        privacy_ctx: ?privacy.PrivacyContext = null,
 
         const EdgeValue = struct {
             edge: []const u8,
             ids: []const i64,
         };
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
+                .privacy_ctx = privacy_ctx,
                 .values = std.array_list.Managed(FieldValue).init(allocator),
                 .edge_values = std.array_list.Managed(EdgeValue).init(allocator),
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
@@ -142,12 +144,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!Entity {
-            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
-            // if (info.policy) |p| {
-            //     if (p.evalMutation(.create, info.table_name) == .deny) {
-            //         return error.PrivacyDenied;
-            //     }
-            // }
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.before) |f| f(.create, info.table_name);
@@ -475,12 +476,14 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         rows: std.array_list.Managed(std.array_list.Managed(FieldValue)),
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
+        privacy_ctx: ?privacy.PrivacyContext = null,
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) !Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) !Self {
             var self = Self{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
+                .privacy_ctx = privacy_ctx,
                 .rows = std.array_list.Managed(std.array_list.Managed(FieldValue)).init(allocator),
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
             };
@@ -550,12 +553,11 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         const SaveError = sql_driver.Error || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
-            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
-            // if (info.policy) |p| {
-            //     if (p.evalMutation(.create, info.table_name) == .deny) {
-            //         return error.PrivacyDenied;
-            //     }
-            // }
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.before) |f| f(.create, info.table_name);
@@ -646,7 +648,7 @@ test "Create builder basic" {
     const UserEntity = comptime EntityGen(infos, info);
     const Builder = CreateBuilder(infos, info, UserEntity);
 
-    var b = Builder.init(std.testing.allocator, undefined);
+    var b = Builder.init(std.testing.allocator, undefined, &.{}, null);
     defer b.deinit();
 
     // Test the internal setValue method
@@ -669,7 +671,7 @@ test "BulkInsert builder basic" {
     const UserEntity = comptime EntityGen(infos, info);
     const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
 
-    var b = BulkBuilder.init(std.testing.allocator, undefined, &.{});
+    var b = BulkBuilder.init(std.testing.allocator, undefined, &.{}, null);
     defer b.deinit();
 
     _ = b.setFieldValue("name", "alice").setFieldValue("age", 30);
@@ -767,7 +769,7 @@ test "Create builder SaveOrUpdate compiles" {
     const UserEntity = comptime EntityGen(infos, info);
     const Builder = CreateBuilder(infos, info, UserEntity);
 
-    var b = Builder.init(std.testing.allocator, undefined, &.{});
+    var b = Builder.init(std.testing.allocator, undefined, &.{}, null);
     defer b.deinit();
 
     _ = b.setFieldValue("name", "alice").setFieldValue("age", 30);

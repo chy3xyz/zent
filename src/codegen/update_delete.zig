@@ -92,12 +92,14 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         predicates: std.array_list.Managed(sql.Predicate),
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
+        privacy_ctx: ?privacy.PrivacyContext = null,
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
+                .privacy_ctx = privacy_ctx,
                 .values = std.array_list.Managed(FieldValue).init(allocator),
                 .predicates = std.array_list.Managed(sql.Predicate).init(allocator),
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
@@ -186,12 +188,11 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
-            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
-            // if (info.policy) |p| {
-            //     if (p.evalMutation(.update, info.table_name) == .deny) {
-            //         return error.PrivacyDenied;
-            //     }
-            // }
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.before) |f| f(.update, info.table_name);
@@ -248,12 +249,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         driver: sql_driver.Driver,
         predicates: std.array_list.Managed(sql.Predicate),
         hooks: []const Hook,
+        privacy_ctx: ?privacy.PrivacyContext = null,
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
+                .privacy_ctx = privacy_ctx,
                 .predicates = std.array_list.Managed(sql.Predicate).init(allocator),
             };
         }
@@ -316,12 +319,11 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execSoftDelete(self: *Self) ExecError!usize {
-            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
-            // if (info.policy) |p| {
-            //     if (p.evalMutation(.delete, info.table_name) == .deny) {
-            //         return error.PrivacyDenied;
-            //     }
-            // }
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| f(.delete, info.table_name);
@@ -351,12 +353,11 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
-            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
-            // if (info.policy) |p| {
-            //     if (p.evalMutation(.delete, info.table_name) == .deny) {
-            //         return error.PrivacyDenied;
-            //     }
-            // }
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| f(.delete, info.table_name);
@@ -395,12 +396,14 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         b: sql.BulkUpdateBuilder,
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
+        privacy_ctx: ?privacy.PrivacyContext = null,
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
+                .privacy_ctx = privacy_ctx,
                 .b = sql.BulkUpdateBuilder.init(allocator, driver.dialect(), info.table_name),
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
             };
@@ -470,12 +473,11 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
-            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
-            // if (info.policy) |p| {
-            //     if (p.evalMutation(.update, info.table_name) == .deny) {
-            //         return error.PrivacyDenied;
-            //     }
-            // }
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.before) |f| f(.update, info.table_name);
@@ -518,12 +520,14 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         driver: sql_driver.Driver,
         b: sql.BulkDeleteBuilder,
         hooks: []const Hook,
+        privacy_ctx: ?privacy.PrivacyContext = null,
 
-        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook) !Self {
+        pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) !Self {
             return .{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
+                .privacy_ctx = privacy_ctx,
                 .b = try sql.BulkDeleteBuilder.init(allocator, driver.dialect(), info.table_name),
             };
         }
@@ -572,12 +576,11 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
-            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
-            // if (info.policy) |p| {
-            //     if (p.evalMutation(.delete, info.table_name) == .deny) {
-            //         return error.PrivacyDenied;
-            //     }
-            // }
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| f(.delete, info.table_name);
@@ -616,7 +619,7 @@ test "Update builder basic" {
     const info = comptime fromSchema(User);
     const Upd = UpdateBuilder(info);
 
-    var u = Upd.init(std.testing.allocator, undefined, &.{});
+    var u = Upd.init(std.testing.allocator, undefined, &.{}, null);
     defer u.deinit();
 
     _ = u.set("name", .{ .string = "bob" });
@@ -638,7 +641,7 @@ test "Delete builder basic" {
     const info = comptime fromSchema(User);
     const Del = DeleteBuilder(info);
 
-    var d = Del.init(std.testing.allocator, undefined, &.{});
+    var d = Del.init(std.testing.allocator, undefined, &.{}, null);
     defer d.deinit();
 
     _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
@@ -658,11 +661,11 @@ test "Update builder SaveOne and Delete builder ExecOne compile" {
     const Upd = UpdateBuilder(info);
     const Del = DeleteBuilder(info);
 
-    var u = Upd.init(std.testing.allocator, undefined, &.{});
+    var u = Upd.init(std.testing.allocator, undefined, &.{}, null);
     defer u.deinit();
     _ = u.set("name", .{ .string = "bob" }).Where(&.{sql.EQ("id", .{ .int = 1 })});
 
-    var d = Del.init(std.testing.allocator, undefined, &.{});
+    var d = Del.init(std.testing.allocator, undefined, &.{}, null);
     defer d.deinit();
     _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
 
@@ -683,7 +686,7 @@ test "BulkUpdate builder basic" {
     const info = comptime fromSchema(User);
     const BulkUpd = BulkUpdateBuilder(info);
 
-    var u = BulkUpd.init(std.testing.allocator, undefined, &.{});
+    var u = BulkUpd.init(std.testing.allocator, undefined, &.{}, null);
     defer u.deinit();
 
     _ = u.Row(1).setFieldValue("name", "alice").setFieldValue("age", 31);
@@ -708,7 +711,7 @@ test "BulkDelete builder basic" {
     const info = comptime fromSchema(User);
     const BulkDel = BulkDeleteBuilder(info);
 
-    var d = BulkDel.init(std.testing.allocator, undefined, &.{});
+    var d = BulkDel.init(std.testing.allocator, undefined, &.{}, null);
     defer d.deinit();
 
     _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
