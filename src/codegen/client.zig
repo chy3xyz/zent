@@ -146,12 +146,16 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         }
 
         pub fn Query(self: Self) QueryBuilder {
-            return QueryBuilder.init(self.allocator, self.driver, self.privacy_ctx);
+            var qb = QueryBuilder.init(self.allocator, self.driver, self.privacy_ctx);
+            qb.logger = self.logger;
+            return qb;
         }
 
         pub fn Create(self: Self) !CreateBuilder {
             if (info.is_view) @compileError("Create is not supported for view entities");
-            return CreateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            var cb = CreateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            cb.logger = self.logger;
+            return cb;
         }
 
         pub fn BulkInsert(self: Self) !BulkInsertBuilder {
@@ -161,12 +165,16 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
 
         pub fn Update(self: Self) UpdateBuilder {
             if (info.is_view) @compileError("Update is not supported for view entities");
-            return UpdateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            var ub = UpdateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            ub.logger = self.logger;
+            return ub;
         }
 
         pub fn Delete(self: Self) DeleteBuilder {
             if (info.is_view) @compileError("Delete is not supported for view entities");
-            return DeleteBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            var db = DeleteBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            db.logger = self.logger;
+            return db;
         }
 
         pub fn BulkUpdate(self: Self) BulkUpdateBuilder {
@@ -310,8 +318,10 @@ pub fn Debug(comptime infos: []const TypeInfo, self: *Client(infos)) void {
 /// Begin a transaction and return a TxClient backed by the transaction.
 pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver.Error!TxClient(infos) {
     const tx = try self.driver.beginTx();
+    var c = makeClient(infos, self.allocator, tx.inner);
+    c.logger = self.logger;
     return TxClient(infos){
-        .client = makeClient(infos, self.allocator, tx.inner),
+        .client = c,
         .tx = tx,
     };
 }

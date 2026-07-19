@@ -10,6 +10,9 @@ const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const privacy = @import("../privacy/policy.zig");
+const Logger = @import("../sql/logger.zig").Logger;
+const LogContext = @import("../sql/logger.zig").LogContext;
+const nowUs = @import("../sql/logger.zig").nowUs;
 
 fn mapBuildError(err: anyerror) sql_driver.Error {
     return switch (err) {
@@ -50,6 +53,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        logger: Logger = .{},
 
         const EdgeValue = struct {
             edge: []const u8,
@@ -232,10 +236,32 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 pos += upsert_suffix.len;
                 @memcpy(full_sql[pos..][0..ret_suffix.len], ret_suffix);
 
+                const start = nowUs();
                 var rows = try self.driver.query(full_sql, q.args);
                 defer rows.deinit();
                 const row = rows.next() orelse return error.NotFound;
                 entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
+                const duration_us: u64 = nowUs() - start;
+
+                if (self.logger.onExec) |log| {
+                    var log_args = try self.allocator.alloc(sql.Value, args.items.len);
+                    defer self.allocator.free(log_args);
+                    @memcpy(log_args, args.items);
+                    for (self.values.items, 0..) |fv, i| {
+                        inline for (info.fields) |f| {
+                            if (std.mem.eql(u8, f.name, fv.name) and f.sensitive) {
+                                log_args[i] = .{ .string = "***" };
+                            }
+                        }
+                    }
+                    log(.{
+                        .sql = full_sql,
+                        .args = log_args,
+                        .duration_us = duration_us,
+                        .rows_affected = 1,
+                        .table_name = info.table_name,
+                    });
+                }
             } else {
                 // MySQL path: REPLACE INTO if or_replace. The Insert builder
                 // always emits "INSERT INTO ..."; replace the leading keyword.
@@ -259,8 +285,30 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     @memcpy(full_sql[0..q.sql.len], q.sql);
                 }
 
+                const start = nowUs();
                 const res = try self.driver.exec(full_sql, q.args);
+                const duration_us: u64 = nowUs() - start;
                 entity.id = @intCast(res.last_insert_id orelse 0);
+
+                if (self.logger.onExec) |log| {
+                    var log_args = try self.allocator.alloc(sql.Value, args.items.len);
+                    defer self.allocator.free(log_args);
+                    @memcpy(log_args, args.items);
+                    for (self.values.items, 0..) |fv, i| {
+                        inline for (info.fields) |f| {
+                            if (std.mem.eql(u8, f.name, fv.name) and f.sensitive) {
+                                log_args[i] = .{ .string = "***" };
+                            }
+                        }
+                    }
+                    log(.{
+                        .sql = full_sql,
+                        .args = log_args,
+                        .duration_us = duration_us,
+                        .rows_affected = 1,
+                        .table_name = info.table_name,
+                    });
+                }
             }
 
             // Fill other fields from mutation values

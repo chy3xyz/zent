@@ -8,6 +8,9 @@ const sql_driver = @import("../sql/driver.zig");
 const sql_scan = @import("../sql/scan.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
+const Logger = @import("../sql/logger.zig").Logger;
+const LogContext = @import("../sql/logger.zig").LogContext;
+const nowUs = @import("../sql/logger.zig").nowUs;
 const deinitEntity = @import("entity.zig").deinitEntity;
 const EntityGen = @import("entity.zig").Entity;
 const LightEntityGen = @import("entity.zig").LightEntity;
@@ -47,6 +50,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         for_update: bool,
         for_share: bool,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        logger: Logger = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
@@ -243,6 +247,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters();
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
+            const start = nowUs();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
@@ -259,6 +264,17 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
             if (rows.nextError()) |e| return e;
 
+            const duration_us: u64 = nowUs() - start;
+            if (self.logger.onQuery) |log| {
+                log(.{
+                    .sql = q.sql,
+                    .args = q.args,
+                    .duration_us = duration_us,
+                    .rows_affected = result.items.len,
+                    .table_name = info.table_name,
+                });
+            }
+
             for (self.with_edges.items) |edge_name| {
                 try self.loadEdges(edge_name, result.items);
             }
@@ -271,6 +287,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             self.limit_val = 1;
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
+            const start = nowUs();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
@@ -280,6 +297,18 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             };
             var entity = try sql_scan.scanRow(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
+
+            const duration_us: u64 = nowUs() - start;
+            if (self.logger.onQuery) |log| {
+                log(.{
+                    .sql = q.sql,
+                    .args = q.args,
+                    .duration_us = duration_us,
+                    .rows_affected = 1,
+                    .table_name = info.table_name,
+                });
+            }
+
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |edge_name| {
                 try self.loadEdges(edge_name, &entities_arr);
@@ -292,6 +321,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters();
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
+            const start = nowUs();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
@@ -303,6 +333,18 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             errdefer deinitEntity(infos, info, &entity, self.allocator);
             if (rows.next()) |_| return error.NotSingular;
             if (rows.nextError()) |e| return e;
+
+            const duration_us: u64 = nowUs() - start;
+            if (self.logger.onQuery) |log| {
+                log(.{
+                    .sql = q.sql,
+                    .args = q.args,
+                    .duration_us = duration_us,
+                    .rows_affected = 1,
+                    .table_name = info.table_name,
+                });
+            }
+
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |edge_name| {
                 try self.loadEdges(edge_name, &entities_arr);

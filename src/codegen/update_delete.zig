@@ -9,6 +9,9 @@ const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const privacy = @import("../privacy/policy.zig");
+const Logger = @import("../sql/logger.zig").Logger;
+const LogContext = @import("../sql/logger.zig").LogContext;
+const nowUs = @import("../sql/logger.zig").nowUs;
 
 fn mapBuildError(err: anyerror) sql_driver.Error {
     return switch (err) {
@@ -95,6 +98,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        logger: Logger = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
@@ -234,13 +238,25 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             }
 
             const q = builder.query() catch |err| return mapBuildError(err);
+            const start = nowUs();
             const res = try self.driver.exec(q.sql, q.args);
+            const duration_us: u64 = nowUs() - start;
 
             // After hooks on success.
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.after) |f| f(&hook_ctx) catch {};
                 }
+            }
+
+            if (self.logger.onExec) |log| {
+                log(.{
+                    .sql = q.sql,
+                    .args = q.args,
+                    .duration_us = duration_us,
+                    .rows_affected = res.rows_affected,
+                    .table_name = info.table_name,
+                });
             }
 
             return res.rows_affected;
@@ -265,6 +281,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         predicates: std.array_list.Managed(sql.Predicate),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        logger: Logger = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
@@ -368,13 +385,25 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             }
 
             const q = builder.query() catch |err| return mapBuildError(err);
+            const start = nowUs();
             const res = try self.driver.exec(q.sql, q.args);
+            const duration_us: u64 = nowUs() - start;
 
             // After hooks on success.
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch {};
                 }
+            }
+
+            if (self.logger.onExec) |log| {
+                log(.{
+                    .sql = q.sql,
+                    .args = q.args,
+                    .duration_us = duration_us,
+                    .rows_affected = res.rows_affected,
+                    .table_name = info.table_name,
+                });
             }
 
             return res.rows_affected;
@@ -412,13 +441,25 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             }
 
             const q = builder.query() catch |err| return mapBuildError(err);
+            const start = nowUs();
             const res = try self.driver.exec(q.sql, q.args);
+            const duration_us: u64 = nowUs() - start;
 
             // After hooks on success.
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch {};
                 }
+            }
+
+            if (self.logger.onExec) |log| {
+                log(.{
+                    .sql = q.sql,
+                    .args = q.args,
+                    .duration_us = duration_us,
+                    .rows_affected = res.rows_affected,
+                    .table_name = info.table_name,
+                });
             }
 
             return res.rows_affected;

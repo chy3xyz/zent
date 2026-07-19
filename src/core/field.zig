@@ -45,6 +45,7 @@ pub const Field = struct {
     validators: []const Validator = &.{},
     enum_values: []const []const u8 = &.{},
     json_schema: ?type = null,
+    sensitive: bool = false,
 
     // Builder methods
     pub fn Optional(self: Field) Field {
@@ -68,6 +69,12 @@ pub const Field = struct {
     pub fn Immutable(self: Field) Field {
         var f = self;
         f.immutable = true;
+        return f;
+    }
+
+    pub fn Sensitive(self: Field) Field {
+        var f = self;
+        f.sensitive = true;
         return f;
     }
 

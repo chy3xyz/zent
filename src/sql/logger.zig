@@ -35,3 +35,11 @@ pub fn debugLogger() Logger {
         }.log,
     };
 }
+
+/// Returns current time as microseconds since an arbitrary epoch.
+/// Suitable for measuring elapsed durations.
+pub fn nowUs() u64 {
+    var tv: std.c.timeval = undefined;
+    _ = std.c.gettimeofday(&tv, null);
+    return @as(u64, @intCast(tv.sec)) * std.time.us_per_s + @as(u64, @intCast(tv.usec));
+}
