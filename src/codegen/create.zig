@@ -219,9 +219,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const row = rows.next() orelse return error.NotFound;
                 entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
             } else {
-                // MySQL path: REPLACE INTO if or_replace
+                // MySQL path: REPLACE INTO if or_replace. The Insert builder
+                // always emits "INSERT INTO ..."; replace the leading keyword.
                 const needs_replace_prefix = or_replace;
-                const replace_prefix: []const u8 = if (needs_replace_prefix) "REPLACE" else "";
+                const insert_keyword = "INSERT";
+                const replace_keyword = "REPLACE";
                 var builder = sql.Insert(self.allocator, dialect, info.table_name);
                 defer builder.deinit();
                 _ = try builder.columns(columns.items);
@@ -229,17 +231,15 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var q = try builder.takeQuery();
                 defer q.deinit();
 
-                const full_sql_len = replace_prefix.len + (if (needs_replace_prefix) @as(usize, 1) else 0) + q.sql.len;
+                const full_sql_len = q.sql.len + if (needs_replace_prefix) @as(usize, replace_keyword.len - insert_keyword.len) else 0;
                 const full_sql = try self.allocator.alloc(u8, full_sql_len);
                 defer self.allocator.free(full_sql);
-                var pos: usize = 0;
                 if (needs_replace_prefix) {
-                    @memcpy(full_sql[pos..][0..replace_prefix.len], replace_prefix);
-                    pos += replace_prefix.len;
-                    full_sql[pos] = ' ';
-                    pos += 1;
+                    @memcpy(full_sql[0..replace_keyword.len], replace_keyword);
+                    @memcpy(full_sql[replace_keyword.len..], q.sql[insert_keyword.len..]);
+                } else {
+                    @memcpy(full_sql[0..q.sql.len], q.sql);
                 }
-                @memcpy(full_sql[pos..][0..q.sql.len], q.sql);
 
                 const res = try self.driver.exec(full_sql, q.args);
                 entity.id = @intCast(res.last_insert_id orelse 0);

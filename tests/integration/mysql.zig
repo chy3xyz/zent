@@ -8,6 +8,10 @@
 const std = @import("std");
 const zent = @import("zent");
 const MySQLDriver = zent.sql_mysql.MySQLDriver;
+const buildGraph = zent.codegen.graph.buildGraph;
+const Client = zent.codegen.client;
+const field = zent.core.field;
+const schema = zent.core.schema.Schema;
 const testing = std.testing;
 
 fn connect(allocator: std.mem.Allocator) !MySQLDriver {
@@ -93,4 +97,40 @@ test "MySQL: transaction commit/rollback" {
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+}
+
+test "MySQL: SaveOrUpdate updates existing row" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyUpsertUser = schema("MyUpsertUser", .{
+        .fields = &.{
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{MyUpsertUser});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_upsert_user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b1 = try client.my_upsert_user.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("id", @as(i64, 99));
+    _ = try b1.setFieldValue("score", @as(i64, 100));
+    _ = try b1.SaveOrUpdate();
+
+    var b2 = try client.my_upsert_user.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("id", @as(i64, 99));
+    _ = try b2.setFieldValue("score", @as(i64, 200));
+    _ = try b2.SaveOrUpdate();
+
+    var rows = try drv.query("SELECT score FROM my_upsert_user WHERE id = ?", &.{.{ .int = 99 }});
+    defer rows.deinit();
+    const r = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 200), r.getInt(0).?);
 }
