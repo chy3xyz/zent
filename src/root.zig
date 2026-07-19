@@ -33,6 +33,7 @@ pub const codegen = struct {
 pub const runtime = struct {
     pub const hook = @import("runtime/hook.zig");
     pub const err = @import("runtime/error.zig");
+    pub const privacy = @import("runtime/privacy.zig");
 };
 
 pub const graph = struct {
