@@ -657,9 +657,9 @@ pub const Selector = struct {
         return .{ .sql = bq.sql, .args = bq.args };
     }
 
-    /// Take ownership of the SELECT's SQL buffer and args. Caller MUST call
-    /// `deinit` (typically via `defer`). After this call the Selector is in
-    /// an empty-but-valid state.
+    /// Take ownership of the SELECT's SQL buffer and args. After this call
+    /// the Selector is in an empty-but-valid state; its auxiliary arrays are
+    /// released so the caller does not need to call `deinit`.
     pub fn takeQuery(s: *Selector) !OwnedQuery {
         try s.b.writeString("SELECT ");
         if (s.distinct) try s.b.writeString("DISTINCT ");
@@ -717,7 +717,18 @@ pub const Selector = struct {
         } else if (s.for_share) {
             try s.b.writeString(" FOR SHARE");
         }
-        return s.b.takeQuery();
+        const result = try s.b.takeQuery();
+        s.columns.deinit();
+        s.columns = std.array_list.Managed(ColumnRef).init(s.b.allocator);
+        s.joins.deinit();
+        s.joins = std.array_list.Managed(Join).init(s.b.allocator);
+        s.predicates.deinit();
+        s.predicates = std.array_list.Managed(Predicate).init(s.b.allocator);
+        s.group_cols.deinit();
+        s.group_cols = std.array_list.Managed([]const u8).init(s.b.allocator);
+        s.order_terms.deinit();
+        s.order_terms = std.array_list.Managed(Order).init(s.b.allocator);
+        return result;
     }
 };
 

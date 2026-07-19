@@ -59,6 +59,9 @@ pub const Rows = struct {
     pub const VTable = struct {
         next: *const fn (ptr: *anyopaque) ?Row,
         deinit: *const fn (ptr: *anyopaque) void,
+        /// Optional accessor for per-iteration errors that are not reported
+        /// through `next()` returning a Row (e.g. MySQL fetch/truncation).
+        nextError: ?*const fn (ptr: *anyopaque) ?anyerror = null,
     };
 
     pub fn next(self: Rows) ?Row {
@@ -67,6 +70,13 @@ pub const Rows = struct {
 
     pub fn deinit(self: Rows) void {
         self.vtable.deinit(self.ptr);
+    }
+
+    /// Returns the last per-iteration error, if the driver exposes one.
+    /// Call after `next()` returns null to distinguish EOF from fetch failures.
+    pub fn nextError(self: Rows) ?anyerror {
+        const f = self.vtable.nextError orelse return null;
+        return f(self.ptr);
     }
 };
 

@@ -179,7 +179,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // (id) DO UPDATE SET col=excluded.col ... For MySQL we use
             // REPLACE INTO. For plain Save (or_replace=false) the suffix is empty.
             const upsert_suffix: []const u8 = try self.buildUpsertSuffix(or_replace, is_postgres, is_sqlite, columns.items);
-            defer self.allocator.free(upsert_suffix);
+            defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             var entity: Entity = std.mem.zeroes(Entity);
             if (supports_returning) {
@@ -313,27 +313,18 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         fn buildUpsertSuffix(self: *Self, or_replace: bool, is_postgres: bool, is_sqlite: bool, columns: []const []const u8) ![]const u8 {
-            if (!or_replace or is_sqlite) return try self.allocator.dupe(u8, "");
-            if (is_postgres) {
-                var buf = std.array_list.Managed(u8).init(self.allocator);
-                errdefer buf.deinit();
-                try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
-                var first = true;
-                for (columns) |col| {
-                    if (std.mem.eql(u8, col, "id")) continue;
-                    if (!first) try buf.appendSlice(", ");
-                    first = false;
-                    var piece_buf: [128]u8 = undefined;
-                    const piece = try std.fmt.bufPrint(
-                        &piece_buf,
-                        "\"{s}\"=EXCLUDED.\"{s}\"",
-                        .{ col, col },
-                    );
-                    try buf.appendSlice(piece);
-                }
-                return try buf.toOwnedSlice();
+            if (!or_replace or is_sqlite or !is_postgres) return "";
+            var buf = std.array_list.Managed(u8).init(self.allocator);
+            errdefer buf.deinit();
+            try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
+            var first = true;
+            for (columns) |col| {
+                if (std.mem.eql(u8, col, "id")) continue;
+                if (!first) try buf.appendSlice(", ");
+                first = false;
+                try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
             }
-            return try self.allocator.dupe(u8, "");
+            return try buf.toOwnedSlice();
         }
 
         fn setEntityField(entity: *Entity, name: []const u8, value: sql.Value, allocator: std.mem.Allocator) !void {

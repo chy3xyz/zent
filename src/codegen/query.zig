@@ -77,15 +77,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const pred_info = @typeInfo(PredT);
             switch (pred_info) {
                 .pointer => |ptr| {
-                    const child_info = @typeInfo(ptr.child);
-                    if (child_info == .@"struct" and child_info.@"struct".is_tuple) {
-                        inline for (predicates.*) |p| {
-                            try self.predicates.append(p);
-                        }
-                    } else {
-                        for (predicates) |p| {
-                            try self.predicates.append(p);
-                        }
+                    switch (@typeInfo(ptr.child)) {
+                        .array => {
+                            for (predicates) |p| {
+                                try self.predicates.append(p);
+                            }
+                        },
+                        .@"struct" => |s| {
+                            if (s.is_tuple) {
+                                inline for (predicates.*) |p| {
+                                    try self.predicates.append(p);
+                                }
+                            } else {
+                                @compileError("Where expects a tuple or slice of sql.Predicate");
+                            }
+                        },
+                        else => @compileError("Where expects a tuple or slice of sql.Predicate"),
                     }
                 },
                 .array => {
@@ -424,7 +431,6 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 columns[i] = t.c(f.name);
             }
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &columns);
-            defer selector.deinit();
             _ = selector.from(t);
             _ = selector.setDistinct(self.distinct);
 
@@ -465,7 +471,6 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const t = sql.Table(info.table_name);
             const count_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{count_col});
-            defer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -488,7 +493,6 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const t = sql.Table(info.table_name);
             const agg_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{agg_col});
-            defer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {

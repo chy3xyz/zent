@@ -16,6 +16,7 @@ const MockRows = struct {
     const vtable = sql_driver.Rows.VTable{
         .next = next,
         .deinit = deinit,
+        .nextError = null,
     };
 
     const row_vtable = sql_driver.Row.VTable{

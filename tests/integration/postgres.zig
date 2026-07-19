@@ -95,6 +95,47 @@ test "Postgres: transaction commit/rollback" {
     try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
 }
 
+test "Postgres: SaveOrUpdate with long column name" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // 70 bytes, longer than PostgreSQL's effective identifier limit; the
+    // point is that formatting the upsert piece no longer overflows a
+    // 128-byte stack buffer before PostgreSQL truncates the identifier.
+    const long_name = "a_very_long_column_name_that_used_to_overflow_the_upsert_piece_buffer_";
+
+    const PgLongCol = schema("PgLongCol", .{
+        .fields = &.{
+            field.Int(long_name),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{PgLongCol});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_long_col", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b1 = try client.pg_long_col.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("id", @as(i64, 99));
+    _ = try b1.setFieldValue(long_name, @as(i64, 100));
+    _ = try b1.SaveOrUpdate();
+
+    var b2 = try client.pg_long_col.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("id", @as(i64, 99));
+    _ = try b2.setFieldValue(long_name, @as(i64, 200));
+    _ = try b2.SaveOrUpdate();
+
+    var rows = try drv.query("SELECT " ++ long_name ++ " FROM pg_long_col WHERE id = $1", &.{.{ .int = 99 }});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 200), row.getInt(0).?);
+}
+
 test "Postgres: SaveOrUpdate updates existing row" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

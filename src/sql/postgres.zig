@@ -363,6 +363,7 @@ const PostgresRows = struct {
     const vtable = driver.Rows.VTable{
         .next = next,
         .deinit = deinit,
+        .nextError = null,
     };
 
     fn next(ptr: *anyopaque) ?driver.Row {

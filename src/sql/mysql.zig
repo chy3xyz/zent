@@ -413,6 +413,7 @@ pub const MySQLRows = struct {
     const vtable = driver.Rows.VTable{
         .next = next,
         .deinit = deinit,
+        .nextError = nextErrorVTable,
     };
 
     fn ensureBuffers(self: *MySQLRows) !void {
@@ -458,6 +459,7 @@ pub const MySQLRows = struct {
 
         if (c.mysql_stmt_bind_result(self.stmt, binds.ptr) != 0) {
             self.allocator.free(binds);
+            for (str_bufs.items) |s| self.allocator.free(s);
             str_bufs.deinit(self.allocator);
             int_bufs.deinit(self.allocator);
             float_bufs.deinit(self.allocator);
@@ -476,9 +478,15 @@ pub const MySQLRows = struct {
         self.lengths = lens;
     }
 
+    fn nextErrorVTable(ptr: *anyopaque) ?anyerror {
+        const self: *MySQLRows = @ptrCast(@alignCast(ptr));
+        return self.nextError();
+    }
+
     fn next(ptr: *anyopaque) ?driver.Row {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
         if (self.done) return null;
+        self.last_error = null;
 
         self.ensureBuffers() catch |err| {
             self.done = true;
