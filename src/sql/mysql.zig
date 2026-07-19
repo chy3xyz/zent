@@ -430,12 +430,21 @@ pub const MySQLRows = struct {
         var errors = std.ArrayListUnmanaged(c.my_bool).empty;
         var lens = std.ArrayListUnmanaged(c_ulong).empty;
 
-        try str_bufs.resize(self.allocator, n);
-        try int_bufs.resize(self.allocator, n);
-        try float_bufs.resize(self.allocator, n);
-        try nulls.resize(self.allocator, n);
-        try errors.resize(self.allocator, n);
-        try lens.resize(self.allocator, n);
+        resize_all: {
+            try str_bufs.resize(self.allocator, n);
+            errdefer str_bufs.deinit(self.allocator);
+            try int_bufs.resize(self.allocator, n);
+            errdefer int_bufs.deinit(self.allocator);
+            try float_bufs.resize(self.allocator, n);
+            errdefer float_bufs.deinit(self.allocator);
+            try nulls.resize(self.allocator, n);
+            errdefer nulls.deinit(self.allocator);
+            try errors.resize(self.allocator, n);
+            errdefer errors.deinit(self.allocator);
+            try lens.resize(self.allocator, n);
+            errdefer lens.deinit(self.allocator);
+            break :resize_all;
+        }
 
         @memset(binds, std.mem.zeroes(c.MYSQL_BIND));
 
@@ -470,7 +479,7 @@ pub const MySQLRows = struct {
         }
 
         if (c.mysql_stmt_bind_result(self.stmt, binds.ptr) != 0) {
-            self.allocator.free(binds);
+            // Let the outer errdefer free `binds`; clean up the rest here.
             for (str_bufs.items) |s| self.allocator.free(s);
             str_bufs.deinit(self.allocator);
             int_bufs.deinit(self.allocator);
