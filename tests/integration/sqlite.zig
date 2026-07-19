@@ -482,3 +482,102 @@ test "SQLite: migrateSchema is idempotent with zent_schema_migrations" {
     }
     try testing.expect(found_idx);
 }
+
+test "SQLite: DDL rolled back on mid-transaction failure" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Helper that mirrors the errdefer tx.deinit() pattern in migrateSchema.
+    // Returns a deliberate error after valid DDL to test that the errdefer
+    // fires and rolls back all operations within the transaction.
+    const run = struct {
+        fn doit(d: *SQLiteDriver) !void {
+            var tx = try d.beginTx();
+            errdefer tx.deinit();
+
+            _ = try tx.exec(
+                "CREATE TABLE should_rollback (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
+                &.{},
+            );
+            _ = try tx.exec(
+                "INSERT INTO should_rollback (name) VALUES (?)",
+                &.{.{ .string = "test-data" }},
+            );
+
+            // Force a mid-transaction failure to trigger the errdefer above.
+            return error.ForceRollback;
+        }
+    }.doit;
+
+    _ = run(&drv) catch {};
+
+    // After the errdefer rollback, the table should not exist.
+    var table_rows = try drv.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='should_rollback'",
+        &.{},
+    );
+    defer table_rows.deinit();
+    try testing.expect(table_rows.next() == null);
+}
+
+test "SQLite: migrateSchema rollback leaves neither schema nor history" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Helper that mimics the structure of migrateSchema: bootstrap the
+    // history table outside the transaction, then run DDL + history writes
+    // inside a transaction. Returns a deliberate error to force errdefer rollback.
+    const doMigrate = struct {
+        fn run(d: *SQLiteDriver) !void {
+            // Bootstrap the history table outside the transaction (idempotent).
+            _ = try d.exec(
+                "CREATE TABLE IF NOT EXISTS zent_schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, checksum TEXT)",
+                &.{},
+            );
+
+            var tx = try d.beginTx();
+            errdefer tx.deinit();
+
+            // Create an entity table (DDL inside transaction).
+            _ = try tx.exec(
+                \\CREATE TABLE IF NOT EXISTS rollback_entity (
+                \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                \\  name TEXT NOT NULL,
+                \\  val INTEGER NOT NULL
+                \\)
+            , &.{});
+
+            // Record a migration history row (DML inside transaction).
+            _ = try tx.exec(
+                "INSERT INTO zent_schema_migrations (version, applied_at, checksum) VALUES (?, ?, ?)",
+                &.{ .{ .int = 100 }, .{ .int = 0 }, .null },
+            );
+
+            // Force a mid-transaction failure to trigger the errdefer above.
+            return error.ForceRollback;
+        }
+    }.run;
+
+    _ = doMigrate(&drv) catch {};
+
+    // After the errdefer rollback:
+    //   1. The entity table should not exist (DDL was rolled back).
+    //   2. The history insert should not be visible (rolled back).
+    var table_rows = try drv.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='rollback_entity'",
+        &.{},
+    );
+    defer table_rows.deinit();
+    try testing.expect(table_rows.next() == null);
+
+    // History table itself exists (created outside the tx), but has zero rows.
+    var hist_rows = try drv.query(
+        "SELECT COUNT(*) FROM zent_schema_migrations",
+        &.{},
+    );
+    defer hist_rows.deinit();
+    const hist_row = hist_rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), hist_row.getInt(0).?);
+}

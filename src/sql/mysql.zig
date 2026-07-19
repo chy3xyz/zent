@@ -382,17 +382,17 @@ const MySQLTx = struct {
     fn commit(ptr: *anyopaque) driver.Error!void {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
+        _ = self.driver.exec("COMMIT", &.{}) catch |err| return toDriverError(err);
         self.state = .committed;
         self.driver.in_tx = false;
-        _ = self.driver.exec("COMMIT", &.{}) catch |err| return toDriverError(err);
     }
 
     fn rollback(ptr: *anyopaque) driver.Error!void {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
+        _ = self.driver.exec("ROLLBACK", &.{}) catch |err| return toDriverError(err);
         self.state = .rolled_back;
         self.driver.in_tx = false;
-        _ = self.driver.exec("ROLLBACK", &.{}) catch |err| return toDriverError(err);
     }
 
     fn deinit(ptr: *anyopaque) void {

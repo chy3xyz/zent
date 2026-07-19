@@ -195,15 +195,15 @@ const SQLiteTx = struct {
 
     fn commit(self: *SQLiteTx) !void {
         if (self.state != .active) return error.TxNotActive;
-        self.state = .committed;
         _ = try self.driver.exec("COMMIT", &.{});
+        self.state = .committed;
     }
 
     fn rollback(self: *SQLiteTx) !void {
         if (self.state != .active) return;
-        self.state = .rolled_back;
         // Best-effort; ignore failure (driver may have already closed).
         _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+        self.state = .rolled_back;
     }
 
     fn deinit(self: *SQLiteTx) void {

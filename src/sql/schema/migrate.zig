@@ -5,10 +5,25 @@ const EdgeInfo = @import("../../codegen/graph.zig").EdgeInfo;
 const Dialect = @import("../dialect.zig").Dialect;
 const sql_driver = @import("../driver.zig");
 const Value = @import("../builder.zig").Value;
-const Crc32 = std.hash.crc.Crc32;
+const Crc32 = std.hash.crc.@"CRC-32/ISO-HDLC";
 
 extern fn time(time_t: [*c]c_long) c_long;
 
+/// Transaction safety by backend
+///
+/// SQLite and PostgreSQL support transactional DDL — a `CREATE TABLE`,
+/// `ALTER TABLE`, or `CREATE INDEX` issued inside a `BEGIN`/`COMMIT` block
+/// is fully atomic and can be rolled back.
+///
+/// MySQL does NOT support transactional DDL. `CREATE TABLE`, `ALTER TABLE`,
+/// `CREATE INDEX`, and similar statements implicitly commit any active
+/// transaction before executing. Therefore, on MySQL the transaction wrapping
+/// in `migrateSchema` only guarantees atomicity for history-table writes
+/// (`zent_schema_migrations` INSERTs). Schema changes on MySQL are applied
+/// immediately and cannot be rolled back by this layer.
+///
+/// This is a known, documented limitation of MySQL — do not attempt to make
+/// DDL transactional on MySQL; the guarantee is best-effort per backend.
 /// Current Unix timestamp in seconds.
 /// Uses libc `time()` because Zig 0.17 removed `std.time.timestamp()`;
 /// `applied_at` is informational and not used by migration logic.
@@ -851,6 +866,10 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
     // `ON CONFLICT DO NOTHING` / `ON DUPLICATE KEY UPDATE`, so re-recording
     // a version (e.g. after a table was dropped out-of-band) never produces
     // duplicates.
+    //
+    // When a version is already in `applied`, we still verify the table
+    // actually exists: if it was dropped out-of-band, the `applied` entry is
+    // stale and we must re-create the table.
     inline for (infos) |info| {
         if (info.is_view) {
             const version = comptime computeMigrationVersion(info.table_name, "create_view", "");
@@ -868,6 +887,20 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
                 defer std.heap.page_allocator.free(sql);
                 _ = try tx_drv.exec(sql, &.{});
                 try recordMigration(tx_drv, version, null);
+            } else {
+                // Version is recorded but the table may have been dropped
+                // out-of-band. If the table no longer exists, re-create it.
+                var existing = try getExistingColumns(allocator, tx_drv, table.name);
+                if (existing.items.len == 0) {
+                    // Table does not exist — re-create it.
+                    existing.deinit();
+                    const sql = try createTableSQL(table, dialect);
+                    defer std.heap.page_allocator.free(sql);
+                    _ = try tx_drv.exec(sql, &.{});
+                    try recordMigration(tx_drv, version, null);
+                } else {
+                    freeExistingColumns(allocator, &existing);
+                }
             }
         }
     }
@@ -885,6 +918,19 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
                     defer std.heap.page_allocator.free(sql);
                     _ = try tx_drv.exec(sql, &.{});
                     try recordMigration(tx_drv, version, null);
+                } else {
+                    // Version is recorded but the junction table may have been
+                    // dropped out-of-band. Re-create it if missing.
+                    var existing = try getExistingColumns(allocator, tx_drv, jtable.name);
+                    if (existing.items.len == 0) {
+                        existing.deinit();
+                        const sql = try createTableSQL(jtable, dialect);
+                        defer std.heap.page_allocator.free(sql);
+                        _ = try tx_drv.exec(sql, &.{});
+                        try recordMigration(tx_drv, version, null);
+                    } else {
+                        freeExistingColumns(allocator, &existing);
+                    }
                 }
             }
         }
@@ -908,8 +954,8 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
         defer freeExistingColumns(allocator, &existing_cols);
 
         inline for (table.columns) |col| {
+            const version = comptime computeMigrationVersion(info.table_name, "add_column", col.name);
             if (!columnExists(existing_cols.items, col.name)) {
-                const version = comptime computeMigrationVersion(info.table_name, "add_column", col.name);
                 const sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect);
                 defer allocator.free(sql);
                 _ = try tx_drv.exec(sql, &.{});
