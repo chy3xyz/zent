@@ -11,6 +11,14 @@ const driver = @import("driver.zig");
 const Dialect = @import("dialect.zig").Dialect;
 const Value = @import("builder.zig").Value;
 
+extern fn time(time_t: [*c]c_long) c_long;
+
+/// Current Unix timestamp in seconds. Uses libc `time()` because Zig 0.17
+/// removed `unixTimestamp()`.
+fn unixTimestamp() i64 {
+    return @as(i64, @intCast(time(null)));
+}
+
 /// Errors returned by the connection pool.
 pub const Error = error{
     PoolClosed,
@@ -77,8 +85,27 @@ pub fn ConnPool(comptime D: type) type {
             /// Maximum time in milliseconds for a single query/exec on a pooled
             /// connection. Zero disables the timeout.
             query_timeout_ms: u32 = 0,
+            /// Max retry attempts for borrowing a connection. 0 = no retry.
+            max_retries: u32 = 3,
+            /// Retry backoff base in milliseconds.
+            retry_backoff_ms: u32 = 100,
+            /// Max idle time for a connection in seconds. 0 = permanent.
+            max_idle_secs: u32 = 300,
+            /// Max total lifetime for a connection in seconds. 0 = permanent.
+            max_lifetime_secs: u32 = 3600,
             /// Optional metrics callbacks.
             metrics: Metrics = .{},
+        };
+
+        /// A pooled connection entry wrapping the driver with bookkeeping metadata.
+        pub const PooledEntry = struct {
+            /// The actual driver instance.
+            conn: D,
+            /// Unix timestamp when this entry was created.
+            created_at: i64,
+            /// Unix timestamp when the connection was last released to the pool,
+            /// or null when currently borrowed.
+            idle_since: ?i64,
         };
 
         allocator: std.mem.Allocator,
@@ -88,8 +115,8 @@ pub fn ConnPool(comptime D: type) type {
         io: std.Io,
         mutex: std.Io.Mutex = .init,
         cond: std.Io.Condition = .init,
-        all: std.ArrayListUnmanaged(D) = .empty,
-        available: std.ArrayListUnmanaged(*D) = .empty,
+        all: std.ArrayListUnmanaged(PooledEntry) = .empty,
+        available: std.ArrayListUnmanaged(*PooledEntry) = .empty,
         closed: bool = false,
 
         /// Open a pool and warm up `min_connections`.
@@ -117,7 +144,7 @@ pub fn ConnPool(comptime D: type) type {
             }
 
             // Cache dialect from the first connection.
-            self.dialect = self.all.items[0].asDriver().dialect();
+            self.dialect = self.all.items[0].conn.asDriver().dialect();
 
             return self;
         }
@@ -129,8 +156,8 @@ pub fn ConnPool(comptime D: type) type {
             self.closed = true;
             // Wake any waiters so they observe the closed state.
             self.cond.broadcast(io);
-            for (self.all.items) |*conn| {
-                conn.close();
+            for (self.all.items) |*entry| {
+                entry.conn.close();
             }
             self.all.deinit(self.allocator);
             self.available.deinit(self.allocator);
@@ -145,7 +172,11 @@ pub fn ConnPool(comptime D: type) type {
                 const p = try self.all.addOne(self.allocator);
                 break :blk p;
             };
-            ptr.* = conn;
+            ptr.* = .{
+                .conn = conn,
+                .created_at = unixTimestamp(),
+                .idle_since = unixTimestamp(),
+            };
             errdefer {
                 _ = self.all.pop(); // remove dangling pointer
                 conn.close();
@@ -155,108 +186,111 @@ pub fn ConnPool(comptime D: type) type {
 
         /// Close a connection and remove it from the pool.
         /// The caller must hold `self.mutex`.
-        fn closeConnection(self: *Self, conn: *D) void {
-            conn.close();
+        fn closeConnection(self: *Self, entry: *PooledEntry) void {
+            entry.conn.close();
             const idx = for (self.all.items, 0..) |*item, i| {
-                if (item == conn) break i;
+                if (item == entry) break i;
             } else unreachable;
 
             const last = &self.all.items[self.all.items.len - 1];
-            if (last != conn) {
+            if (last != entry) {
                 // `swapRemove` moves `last` to `idx`. Fix any available pointer
                 // that still references `last`.
                 for (self.available.items) |*avail| {
                     if (avail.* == last) {
-                        avail.* = conn;
+                        avail.* = entry;
                     }
                 }
             }
             _ = self.all.swapRemove(idx);
         }
 
-        fn makeTimeout(self: *const Self) ?std.Io.Timeout {
-            const ms = self.options.max_wait_ms;
-            if (ms == 0) return null;
-            return .{ .duration = .{
-                .raw = .{ .nanoseconds = @as(i96, ms) * std.time.ns_per_ms },
-                .clock = .awake,
-            } };
-        }
-
-        /// Borrow a connection from the pool.
-        ///
-        /// If the pool is below `max_connections`, a new connection is opened.
-        /// Otherwise the caller waits up to `max_wait_ms` milliseconds for a
-        /// connection to be released. If the timeout expires, `error.PoolExhausted`
-        /// is returned.
-        pub fn borrow(self: *Self) !*D {
-            const io = self.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            if (self.closed) return error.PoolClosed;
-
-            var waited: bool = false;
-            var wait_start: ?std.Io.Clock.Timestamp = null;
-
+        /// Non-blocking borrow attempt. Returns a pooled entry or null when
+        /// the pool is exhausted. The caller must hold `self.mutex`.
+        fn tryBorrowNoLock(self: *Self) ?*PooledEntry {
             while (true) {
-                const conn = self.available.pop() orelse {
+                const entry = self.available.pop() orelse {
                     if (self.all.items.len < self.options.max_connections) {
-                        var new_conn = try self.connect(self.allocator);
+                        // Open a new connection.
+                        var new_conn = self.connect(self.allocator) catch return null;
                         const ptr = blk: {
-                            errdefer new_conn.close(); // only runs if all.addOne fails
-                            const p = try self.all.addOne(self.allocator);
+                            errdefer new_conn.close();
+                            const p = self.all.addOne(self.allocator) catch {
+                                new_conn.close();
+                                return null;
+                            };
                             break :blk p;
                         };
-                        ptr.* = new_conn;
-                        errdefer {
-                            _ = self.all.pop(); // remove dangling pointer
-                            new_conn.close();
-                        }
-                        return self.finishBorrow(ptr, wait_start);
+                        ptr.* = .{
+                            .conn = new_conn,
+                            .created_at = unixTimestamp(),
+                            .idle_since = null,
+                        };
+                        return ptr;
                     }
-
-                    const timeout = self.makeTimeout() orelse {
-                        if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, error.PoolExhausted);
-                        return error.PoolExhausted;
-                    };
-
-                    if (!waited) {
-                        waited = true;
-                        wait_start = std.Io.Clock.Timestamp.now(io, .awake);
-                        if (self.options.metrics.onWait) |cb| cb(self.options.metrics.context);
-                    }
-
-                    self.cond.waitTimeout(io, &self.mutex, timeout) catch |err| {
-                        if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, err);
-                        return error.PoolExhausted;
-                    };
-                    continue;
+                    return null;
                 };
 
+                // Idle eviction: if the connection has been idle too long, close
+                // it and try the next one.
+                if (self.options.max_idle_secs > 0) {
+                    if (entry.idle_since) |idle_since| {
+                        const idle_secs = @divFloor(unixTimestamp() - idle_since, 1);
+                        if (idle_secs > self.options.max_idle_secs) {
+                            self.closeConnection(entry);
+                            continue;
+                        }
+                    }
+                }
+
+                // Health check before handing out.
                 if (self.options.health_check_on_borrow) {
-                    conn.asDriver().ping() catch {
+                    entry.conn.asDriver().ping() catch {
                         // Connection is dead; drop it and try the next one.
-                        self.closeConnection(conn);
+                        self.closeConnection(entry);
                         continue;
                     };
                 }
 
-                return self.finishBorrow(conn, wait_start);
+                // Mark as borrowed (no longer idle).
+                entry.idle_since = null;
+                return entry;
             }
         }
 
-        fn finishBorrow(self: *Self, conn: *D, wait_start: ?std.Io.Clock.Timestamp) *D {
-            const wait_ms: u32 = blk: {
-                const start = wait_start orelse break :blk 0;
-                const elapsed = start.untilNow(self.io).raw.toMilliseconds();
-                break :blk @intCast(@max(0, elapsed));
-            };
-            if (self.options.metrics.onBorrow) |cb| cb(self.options.metrics.context, wait_ms);
-            return conn;
+        /// Borrow a connection from the pool.
+        ///
+        /// Retries up to `max_retries` times with exponential backoff when the
+        /// pool is exhausted. Performs idle eviction and health checks on each
+        /// borrow attempt.
+        pub fn borrow(self: *Self) !*D {
+            const io = self.io;
+            var attempt: u32 = 0;
+            while (true) : (attempt += 1) {
+                {
+                    self.mutex.lockUncancelable(io);
+                    defer self.mutex.unlock(io);
+
+                    if (self.closed) return error.PoolClosed;
+
+                    if (self.tryBorrowNoLock()) |entry| {
+                        if (self.options.metrics.onBorrow) |cb| cb(self.options.metrics.context, 0);
+                        return &entry.conn;
+                    }
+                }
+
+                if (attempt >= self.options.max_retries) break;
+                const backoff_ms: i64 = @as(i64, self.options.retry_backoff_ms) * (@as(i64, attempt) + 1);
+                self.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+            }
+
+            if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, error.PoolExhausted);
+            return error.PoolExhausted;
         }
 
         /// Return a borrowed connection to the pool.
         pub fn release(self: *Self, conn: *D) void {
+            const entry: *PooledEntry = @fieldParentPtr("conn", conn);
             const io = self.io;
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
@@ -264,7 +298,7 @@ pub fn ConnPool(comptime D: type) type {
 
             // Verify the connection still belongs to the pool.
             const found = for (self.all.items) |*item| {
-                if (item == conn) break true;
+                if (item == entry) break true;
             } else false;
             if (!found) return;
 
@@ -280,10 +314,22 @@ pub fn ConnPool(comptime D: type) type {
                 }
             }
 
-            self.available.append(self.allocator, conn) catch {
+            // Max lifetime eviction: close connections that have lived too long.
+            if (self.options.max_lifetime_secs > 0) {
+                const age_secs = @divFloor(unixTimestamp() - entry.created_at, 1);
+                if (age_secs > self.options.max_lifetime_secs) {
+                    self.closeConnection(entry);
+                    self.cond.signal(io);
+                    if (self.options.metrics.onRelease) |cb| cb(self.options.metrics.context);
+                    return;
+                }
+            }
+
+            self.available.append(self.allocator, entry) catch {
                 // If bookkeeping fails, drop the connection.
-                self.closeConnection(conn);
+                self.closeConnection(entry);
             };
+            entry.idle_since = unixTimestamp();
             self.cond.signal(io);
 
             if (self.options.metrics.onRelease) |cb| cb(self.options.metrics.context);
@@ -302,12 +348,7 @@ pub fn ConnPool(comptime D: type) type {
         }
 
         fn borrowForDriver(self: *Self) driver.Error!*D {
-            return self.borrow() catch |err| switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.PoolExhausted => error.PoolExhausted,
-                error.PoolClosed => error.PoolClosed,
-                else => error.ConnectionFailed,
-            };
+            return self.borrow();
         }
 
         const PooledTx = struct {
@@ -556,6 +597,7 @@ test "ConnPool exhausted returns PoolExhausted without wait" {
         .min_connections = 1,
         .max_connections = 1,
         .max_wait_ms = 0,
+        .max_retries = 0,
     });
     defer pool.deinit();
 
@@ -582,6 +624,7 @@ test "ConnPool metrics hooks fire" {
         }.f,
         .min_connections = 1,
         .max_connections = 1,
+        .max_retries = 0,
         .metrics = .{
             .onBorrow = struct {
                 fn f(ctx: ?*anyopaque, _: u32) void {
@@ -783,4 +826,30 @@ test "ConnPool closes connection once when available.append fails" {
     try std.testing.expectEqual(@as(usize, 2), MockDriver.opens);
 
     pool.allocator = allocator;
+}
+
+test "pool retries on exhaustion with backoff" {
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, ":memory:");
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_retries = 2,
+        .retry_backoff_ms = 10,
+    });
+    defer pool.deinit();
+
+    // Borrow the only connection — exhausts the pool.
+    const c1 = try pool.borrow();
+    defer pool.release(c1);
+
+    // Second borrow should retry twice and then fail with PoolExhausted.
+    try std.testing.expectError(error.PoolExhausted, pool.borrow());
 }
