@@ -137,11 +137,14 @@ pub fn ConnPool(comptime D: type) type {
 
         fn addConnection(self: *Self) !void {
             var conn = try self.connect(self.allocator);
-            errdefer conn.close();
-            const ptr = try self.all.addOne(self.allocator);
+            const ptr = blk: {
+                errdefer conn.close(); // only runs if all.addOne fails
+                const p = try self.all.addOne(self.allocator);
+                break :blk p;
+            };
             ptr.* = conn;
             errdefer {
-                _ = self.all.pop();
+                _ = self.all.pop(); // remove dangling pointer
                 conn.close();
             }
             try self.available.append(self.allocator, ptr);
@@ -196,9 +199,16 @@ pub fn ConnPool(comptime D: type) type {
                 const conn = self.available.pop() orelse {
                     if (self.all.items.len < self.options.max_connections) {
                         var new_conn = try self.connect(self.allocator);
-                        errdefer new_conn.close();
-                        const ptr = try self.all.addOne(self.allocator);
+                        const ptr = blk: {
+                            errdefer new_conn.close(); // only runs if all.addOne fails
+                            const p = try self.all.addOne(self.allocator);
+                            break :blk p;
+                        };
                         ptr.* = new_conn;
+                        errdefer {
+                            _ = self.all.pop(); // remove dangling pointer
+                            new_conn.close();
+                        }
                         return self.finishBorrow(ptr, wait_start);
                     }
 
@@ -657,4 +667,90 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
     // The connection opened for the failed bookkeeping allocation must be closed.
     try std.testing.expectEqual(@as(usize, pool.all.items.len + 1), MockDriver.opens);
     try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
+}
+
+test "ConnPool closes connection once when available.append fails" {
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) anyerror!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) anyerror!void {
+            unreachable;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            unreachable;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+        };
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+
+    const allocator = std.testing.allocator;
+    var pool = try ConnPool(MockDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 2,
+        .health_check_on_borrow = false,
+    });
+    defer pool.deinit();
+
+    // Force the next available.append to allocate by freeing the available
+    // buffer. all.addOne will still succeed because capacity was reserved
+    // during init.
+    pool.available.shrinkAndFree(allocator, 0);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    pool.allocator = failing.allocator();
+
+    const all_len_before = pool.all.items.len;
+    try std.testing.expectError(error.OutOfMemory, pool.addConnection());
+
+    // The pointer must be rolled back and the connection closed exactly once.
+    try std.testing.expectEqual(@as(usize, all_len_before), pool.all.items.len);
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.opens);
+
+    pool.allocator = allocator;
 }
