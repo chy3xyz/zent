@@ -39,6 +39,7 @@ const Token = union(enum) {
     op_lt,
     op_gte,
     op_lte,
+    op_eqfold,
     kw_in,
     kw_contains,
     kw_is,
@@ -46,6 +47,8 @@ const Token = union(enum) {
     kw_not,
     kw_and,
     kw_or,
+    kw_has,
+    kw_not_has,
     lparen,
     rparen,
     comma,
@@ -98,6 +101,10 @@ const Lexer = struct {
 
         // Operators starting with special chars
         if (c == '=') {
+            if (self.pos + 1 < self.input.len and self.input[self.pos + 1] == '~') {
+                self.pos += 2;
+                return .op_eqfold;
+            }
             self.pos += 1;
             return .op_eq;
         }
@@ -183,6 +190,8 @@ const Lexer = struct {
             if (std.ascii.eqlIgnoreCase("IN", word)) return .kw_in;
             if (std.ascii.eqlIgnoreCase("NULL", word)) return .kw_null;
             if (std.ascii.eqlIgnoreCase("CONTAINS", word)) return .kw_contains;
+            if (std.ascii.eqlIgnoreCase("has", word)) return .kw_has;
+            if (std.ascii.eqlIgnoreCase("not_has", word)) return .kw_not_has;
 
             return Token{ .ident = word };
         }
@@ -247,7 +256,7 @@ const ParserContext = struct {
     fn expectOp(self: *ParserContext) !Token {
         const tok = try self.next();
         switch (tok) {
-            .op_eq, .op_ne, .op_gt, .op_lt, .op_gte, .op_lte, .kw_in, .kw_contains, .kw_is => return tok,
+            .op_eq, .op_ne, .op_gt, .op_lt, .op_gte, .op_lte, .op_eqfold, .kw_in, .kw_not, .kw_contains, .kw_is => return tok,
             else => return ParseError.ExpectedOperator,
         }
     }
@@ -345,6 +354,59 @@ fn parsePrimary(ctx: *ParserContext) ParseError!sql.Predicate {
                 else => return ParseError.ExpectedRParen,
             }
         },
+        .kw_has => {
+            _ = try ctx.next(); // consume has
+            // expect LPAREN
+            const lparen = ctx.peek();
+            switch (lparen) {
+                .lparen => _ = try ctx.next(),
+                else => return ParseError.ExpectedLParen,
+            }
+            const edge_name = try ctx.expectIdent();
+            // Check for optional comma + expr
+            const after = ctx.peek();
+            switch (after) {
+                .comma => {
+                    _ = try ctx.next(); // consume comma
+                    const pred = try parseExpr(ctx);
+                    const pred_ptr = try ctx.allocator.create(sql.Predicate);
+                    pred_ptr.* = pred;
+                    // expect RPAREN
+                    const rparen = ctx.peek();
+                    switch (rparen) {
+                        .rparen => {
+                            _ = try ctx.next();
+                            return sql.HasEdgePred(edge_name, pred_ptr);
+                        },
+                        else => return ParseError.ExpectedRParen,
+                    }
+                },
+                .rparen => {
+                    _ = try ctx.next();
+                    return sql.HasEdge(edge_name);
+                },
+                else => return ParseError.ExpectedRParen,
+            }
+        },
+        .kw_not_has => {
+            _ = try ctx.next(); // consume not_has
+            // expect LPAREN
+            const lparen = ctx.peek();
+            switch (lparen) {
+                .lparen => _ = try ctx.next(),
+                else => return ParseError.ExpectedLParen,
+            }
+            const edge_name = try ctx.expectIdent();
+            // expect RPAREN
+            const rparen = ctx.peek();
+            switch (rparen) {
+                .rparen => {
+                    _ = try ctx.next();
+                    return sql.NotHasEdge(edge_name);
+                },
+                else => return ParseError.ExpectedRParen,
+            }
+        },
         .ident => return try parseComparison(ctx),
         else => return ParseError.ExpectedExpression,
     }
@@ -379,6 +441,10 @@ fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
             const val = try ctx.expectValue();
             return sql.LTE(field, val);
         },
+        .op_eqfold => {
+            const val = try ctx.expectValue();
+            return sql.EQFold(field, val);
+        },
         .kw_in => {
             // expect LPAREN, values, RPAREN
             const lparen = ctx.peek();
@@ -404,6 +470,39 @@ fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
                 }
             }
             return sql.In(field, try values.toOwnedSlice());
+        },
+        .kw_not => {
+            // NOT IN: expect kw_in followed by LPAREN, values, RPAREN
+            const next_tok = ctx.peek();
+            switch (next_tok) {
+                .kw_in => {
+                    _ = try ctx.next(); // consume IN
+                    const lparen = ctx.peek();
+                    switch (lparen) {
+                        .lparen => _ = try ctx.next(),
+                        else => return ParseError.ExpectedLParen,
+                    }
+                    var values = std.array_list.Managed(sql.Value).init(ctx.allocator);
+                    while (true) {
+                        const val = try ctx.expectValue();
+                        try values.append(val);
+                        const after_val = ctx.peek();
+                        switch (after_val) {
+                            .comma => {
+                                _ = try ctx.next();
+                                continue;
+                            },
+                            .rparen => {
+                                _ = try ctx.next();
+                                break;
+                            },
+                            else => return ParseError.ExpectedRParen,
+                        }
+                    }
+                    return sql.NotIn(field, try values.toOwnedSlice());
+                },
+                else => return ParseError.ExpectedOperator,
+            }
         },
         .kw_contains => {
             const val = try ctx.expectValue();
@@ -461,8 +560,17 @@ pub fn deinitPred(allocator: std.mem.Allocator, pred: *const sql.Predicate) void
         .in => |p| {
             allocator.free(p.values);
         },
+        .not_in => |p| {
+            allocator.free(p.values);
+        },
         .like => |p| {
             allocator.free(p.value.string);
+        },
+        .has_edge => |h| {
+            if (h.pred) |p| {
+                deinitPred(allocator, p);
+                allocator.destroy(p);
+            }
         },
         .and_ => |p| {
             deinitPred(allocator, p.left);
@@ -613,4 +721,132 @@ test "EntQL: SQL builder output" {
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
     try std.testing.expectEqual(@as(i64, 18), q.args[0].int);
     try std.testing.expectEqualStrings("%ali%", q.args[1].string);
+}
+
+test "EntQL: NOT IN" {
+    const allocator = std.testing.allocator;
+    const p = try parse(allocator, "status NOT IN (\"active\", \"deleted\")");
+    switch (p) {
+        .not_in => |np| {
+            defer allocator.free(np.values);
+            try std.testing.expectEqualStrings("status", np.column);
+            try std.testing.expectEqual(@as(usize, 2), np.values.len);
+            try std.testing.expectEqualStrings("active", np.values[0].string);
+            try std.testing.expectEqualStrings("deleted", np.values[1].string);
+        },
+        else => @panic("expected NOT_IN predicate"),
+    }
+}
+
+test "EntQL: EQFold =~" {
+    const allocator = std.testing.allocator;
+    const p = try parse(allocator, "name =~ \"Alice\"");
+    try std.testing.expectEqualDeep(sql.Predicate{
+        .eq_fold = .{ .column = "name", .value = .{ .string = "Alice" } },
+    }, p);
+}
+
+test "EntQL: has(edge)" {
+    const allocator = std.testing.allocator;
+    const p = try parse(allocator, "has(pets)");
+    switch (p) {
+        .has_edge => |h| {
+            try std.testing.expectEqualStrings("pets", h.edge_name);
+            try std.testing.expectEqual(@as(?*const sql.Predicate, null), h.pred);
+        },
+        else => @panic("expected has_edge predicate"),
+    }
+}
+
+test "EntQL: has(edge, expr)" {
+    const allocator = std.testing.allocator;
+    const p = try parse(allocator, "has(pets, name = \"fido\")");
+    defer deinitPred(allocator, &p);
+    switch (p) {
+        .has_edge => |h| {
+            try std.testing.expectEqualStrings("pets", h.edge_name);
+            try std.testing.expect(h.pred != null);
+            try std.testing.expectEqualDeep(
+                sql.Predicate{ .eq = .{ .column = "name", .value = .{ .string = "fido" } } },
+                h.pred.?.*,
+            );
+        },
+        else => @panic("expected has_edge predicate"),
+    }
+}
+
+test "EntQL: not_has(edge)" {
+    const allocator = std.testing.allocator;
+    const p = try parse(allocator, "not_has(pets)");
+    try std.testing.expectEqualDeep(sql.Predicate{ .not_has_edge = "pets" }, p);
+}
+
+test "EntQL: has and not_has with SQL builder" {
+    const allocator = std.testing.allocator;
+    const Dialect = @import("../sql/dialect.zig").Dialect;
+
+    // Test has(edge) → EXISTS
+    {
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try b.writeString("SELECT * FROM users WHERE ");
+        const pred = try parse(allocator, "has(pets)");
+        defer deinitPred(allocator, &pred);
+        try pred.appendTo(&b);
+        const q = b.query();
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\")", q.sql);
+    }
+
+    // Test not_has(edge) → NOT EXISTS
+    {
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try b.writeString("SELECT * FROM users WHERE ");
+        const pred = try parse(allocator, "not_has(pets)");
+        defer deinitPred(allocator, &pred);
+        try pred.appendTo(&b);
+        const q = b.query();
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE NOT EXISTS (SELECT 1 FROM \"pets\")", q.sql);
+    }
+
+    // Test has(edge, expr) → EXISTS with predicate
+    {
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try b.writeString("SELECT * FROM users WHERE ");
+        const pred = try parse(allocator, "has(pets, name = \"fido\")");
+        defer deinitPred(allocator, &pred);
+        try pred.appendTo(&b);
+        const q = b.query();
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\" WHERE \"name\" = ?)", q.sql);
+        try std.testing.expectEqual(@as(usize, 1), q.args.len);
+        try std.testing.expectEqualStrings("fido", q.args[0].string);
+    }
+
+    // Test NOT IN
+    {
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try b.writeString("SELECT * FROM users WHERE ");
+        const pred = try parse(allocator, "status NOT IN (\"a\", \"b\")");
+        defer deinitPred(allocator, &pred);
+        try pred.appendTo(&b);
+        const q = b.query();
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE \"status\" NOT IN (?, ?)", q.sql);
+        try std.testing.expectEqual(@as(usize, 2), q.args.len);
+    }
+
+    // Test EQFold
+    {
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try b.writeString("SELECT * FROM users WHERE ");
+        const pred = try parse(allocator, "name =~ \"Alice\"");
+        defer deinitPred(allocator, &pred);
+        try pred.appendTo(&b);
+        const q = b.query();
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE LOWER(\"name\") = LOWER(?)", q.sql);
+        try std.testing.expectEqual(@as(usize, 1), q.args.len);
+        try std.testing.expectEqualStrings("Alice", q.args[0].string);
+    }
 }

@@ -191,6 +191,8 @@ pub const Predicate = union(enum) {
     lte: BinOp,
     like: BinOp,
     in: InOp,
+    not_in: InOp,
+    eq_fold: BinOp,
     is_null: []const u8,
     is_not_null: []const u8,
     raw: []const u8,
@@ -204,6 +206,11 @@ pub const Predicate = union(enum) {
     /// The step describes the edge to traverse; preds are applied as AND
     /// conditions inside the subquery.
     has_neighbors_with: struct { step: Step, preds: []const Predicate },
+    /// EntQL `has(edge)` — EXISTS subquery on the edge table.
+    /// edge_name is the table name of the related entity.
+    has_edge: struct { edge_name: []const u8, pred: ?*const Predicate },
+    /// EntQL `not_has(edge)` — NOT EXISTS subquery on the edge table.
+    not_has_edge: []const u8,
     and_: struct { left: *const Predicate, right: *const Predicate },
     or_: struct { left: *const Predicate, right: *const Predicate },
     not_: *const Predicate,
@@ -256,6 +263,23 @@ pub const Predicate = union(enum) {
                     if (i > 0) try b.writeString(", ");
                     try b.arg(v);
                 }
+                try b.writeByte(')');
+            },
+            .not_in => |p| {
+                try b.ident(p.column);
+                try b.writeString(" NOT IN ");
+                try b.writeByte('(');
+                for (p.values, 0..) |v, i| {
+                    if (i > 0) try b.writeString(", ");
+                    try b.arg(v);
+                }
+                try b.writeByte(')');
+            },
+            .eq_fold => |p| {
+                try b.writeString("LOWER(");
+                try b.ident(p.column);
+                try b.writeString(") = LOWER(");
+                try b.arg(p.value);
                 try b.writeByte(')');
             },
             .is_null => |col| {
@@ -337,6 +361,20 @@ pub const Predicate = union(enum) {
                     }
                     try b.writeByte(')');
                 }
+                try b.writeByte(')');
+            },
+            .has_edge => |h| {
+                try b.writeString("EXISTS (SELECT 1 FROM ");
+                try b.ident(h.edge_name);
+                if (h.pred) |pred| {
+                    try b.writeString(" WHERE ");
+                    try pred.appendTo(b);
+                }
+                try b.writeByte(')');
+            },
+            .not_has_edge => |name| {
+                try b.writeString("NOT EXISTS (SELECT 1 FROM ");
+                try b.ident(name);
                 try b.writeByte(')');
             },
             .and_ => |p| {
@@ -423,6 +461,26 @@ pub fn InSubquery(column: []const u8, sql_text: []const u8) Predicate {
 
 pub fn ExistsSubquery(sql_text: []const u8) Predicate {
     return .{ .exists_subquery = sql_text };
+}
+
+pub fn NotIn(column: []const u8, values: []const Value) Predicate {
+    return .{ .not_in = .{ .column = column, .values = values } };
+}
+
+pub fn EQFold(column: []const u8, value: Value) Predicate {
+    return .{ .eq_fold = .{ .column = column, .value = value } };
+}
+
+pub fn HasEdge(edge_name: []const u8) Predicate {
+    return .{ .has_edge = .{ .edge_name = edge_name, .pred = null } };
+}
+
+pub fn HasEdgePred(edge_name: []const u8, pred: *const Predicate) Predicate {
+    return .{ .has_edge = .{ .edge_name = edge_name, .pred = pred } };
+}
+
+pub fn NotHasEdge(edge_name: []const u8) Predicate {
+    return .{ .not_has_edge = edge_name };
 }
 
 // ------------------------------------------------------------------
