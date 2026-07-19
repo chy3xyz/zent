@@ -3,10 +3,14 @@ const c = @import("sqlite3_c");
 const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
+const cache = @import("cache.zig");
 
 pub const SQLiteDriver = struct {
     db: *c.sqlite3,
     allocator: std.mem.Allocator,
+    /// Optional prepared-statement cache. Set this field after `open()` to
+    /// enable caching; null (the default) disables it.
+    cache: ?cache.PreparedCache(16, *c.sqlite3_stmt) = null,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SQLiteDriver {
         const path_z = try allocator.dupeSentinel(u8, path, 0);
@@ -27,6 +31,9 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn close(self: *SQLiteDriver) void {
+        if (self.cache) |*cached| {
+            cached.evictAll({}, finalizeStmt);
+        }
         _ = c.sqlite3_close(self.db);
     }
 
@@ -47,15 +54,30 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn exec(self: *SQLiteDriver, sql: []const u8, args: []const Value) !driver.Result {
-        var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(self.db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&stmt), null);
-        if (rc != c.SQLITE_OK or stmt == null) {
-            logSqliteError(self.db, "prepare");
-            return error.SqlitePrepareFailed;
+        // DDL invalidates cached prepared statements.
+        if (self.cache) |*cached| {
+            if (cache.isDDL(sql)) {
+                cached.evictAll({}, finalizeStmt);
+            }
         }
-        defer _ = c.sqlite3_finalize(stmt);
-        try bindArgs(stmt.?, args);
-        const step_rc = c.sqlite3_step(stmt.?);
+
+        const stmt = if (self.cache) |*cached|
+            try cached.getOrPrepare(sql, self.db, prepareStmt, {}, finalizeStmt)
+        else blk: {
+            var out: ?*c.sqlite3_stmt = null;
+            const rc = c.sqlite3_prepare_v2(self.db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&out), null);
+            if (rc != c.SQLITE_OK or out == null) {
+                logSqliteError(self.db, "prepare");
+                return error.SqlitePrepareFailed;
+            }
+            break :blk out.?;
+        };
+
+        // Reset before rebinding (needed when stmt came from cache).
+        _ = c.sqlite3_reset(stmt);
+        _ = c.sqlite3_clear_bindings(stmt);
+        try bindArgs(stmt, args);
+        const step_rc = c.sqlite3_step(stmt);
         if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
             logSqliteError(self.db, "exec");
             return error.SqliteExecFailed;
@@ -67,24 +89,33 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn query(self: *SQLiteDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
-        var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(
-            self.db,
-            @ptrCast(query_sql.ptr),
-            @intCast(query_sql.len),
-            @ptrCast(&stmt),
-            null,
-        );
-        if (rc != c.SQLITE_OK or stmt == null) {
-            logSqliteError(self.db, "prepare query");
-            return error.SqlitePrepareFailed;
-        }
-        try bindArgs(stmt.?, args);
+        const stmt = if (self.cache) |*cached|
+            try cached.takeOrPrepare(query_sql, self.db, prepareStmtQuery)
+        else blk: {
+            var out: ?*c.sqlite3_stmt = null;
+            const rc = c.sqlite3_prepare_v2(
+                self.db,
+                @ptrCast(query_sql.ptr),
+                @intCast(query_sql.len),
+                @ptrCast(&out),
+                null,
+            );
+            if (rc != c.SQLITE_OK or out == null) {
+                logSqliteError(self.db, "prepare query");
+                return error.SqlitePrepareFailed;
+            }
+            break :blk out.?;
+        };
+
+        // Reset before rebinding (needed when stmt came from cache).
+        _ = c.sqlite3_reset(stmt);
+        _ = c.sqlite3_clear_bindings(stmt);
+        try bindArgs(stmt, args);
 
         const rows_ptr = try self.allocator.create(SQLiteRows);
         errdefer self.allocator.destroy(rows_ptr);
         rows_ptr.* = SQLiteRows{
-            .stmt = stmt.?,
+            .stmt = stmt,
             .allocator = self.allocator,
             .done = false,
         };
@@ -308,6 +339,30 @@ const SQLiteRows = struct {
         return c.sqlite3_column_type(self.stmt, @intCast(index)) == c.SQLITE_NULL;
     }
 };
+
+fn finalizeStmt(_: void, stmt: *c.sqlite3_stmt) void {
+    _ = c.sqlite3_finalize(stmt);
+}
+
+fn prepareStmt(db: *c.sqlite3, sql: []const u8) !*c.sqlite3_stmt {
+    var out: ?*c.sqlite3_stmt = null;
+    const rc = c.sqlite3_prepare_v2(db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&out), null);
+    if (rc != c.SQLITE_OK or out == null) {
+        SQLiteDriver.logSqliteError(db, "prepare");
+        return error.SqlitePrepareFailed;
+    }
+    return out.?;
+}
+
+fn prepareStmtQuery(db: *c.sqlite3, sql: []const u8) !*c.sqlite3_stmt {
+    var out: ?*c.sqlite3_stmt = null;
+    const rc = c.sqlite3_prepare_v2(db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&out), null);
+    if (rc != c.SQLITE_OK or out == null) {
+        SQLiteDriver.logSqliteError(db, "prepare query");
+        return error.SqlitePrepareFailed;
+    }
+    return out.?;
+}
 
 fn bindArgs(stmt: *c.sqlite3_stmt, args: []const Value) !void {
     for (args, 0..) |arg, i| {

@@ -3,6 +3,7 @@ const c = @import("mysql_c");
 const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
+const cache = @import("cache.zig");
 
 fn toDriverError(err: anyerror) driver.Error {
     return switch (err) {
@@ -22,6 +23,9 @@ pub const MySQLDriver = struct {
     allocator: std.mem.Allocator,
     /// Tracks whether the connection currently has an active transaction.
     in_tx: bool = false,
+    /// Optional prepared-statement cache. Set this field after `connect()` to
+    /// enable caching; null (the default) disables it.
+    cache: ?cache.PreparedCache(16, *c.MYSQL_STMT) = null,
 
     pub fn connect(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8) !MySQLDriver {
         const conn = c.mysql_init(null);
@@ -42,6 +46,9 @@ pub const MySQLDriver = struct {
     }
 
     pub fn close(self: *MySQLDriver) void {
+        if (self.cache) |*cached| {
+            cached.evictAll({}, closeStmt);
+        }
         c.mysql_close(self.conn);
     }
 
@@ -124,20 +131,20 @@ pub const MySQLDriver = struct {
         }
 
         // Use prepared statement for parameterized query
-        const stmt = c.mysql_stmt_init(self.conn);
-        if (stmt == null) {
-            logMySQLError(self.conn, "stmt_init");
-            return error.MySQLStmtFailed;
+        // DDL invalidates cached prepared statements.
+        if (self.cache) |*cached| {
+            if (cache.isDDL(sql)) {
+                cached.evictAll({}, closeStmt);
+            }
         }
-        defer _ = c.mysql_stmt_close(stmt);
 
-        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
-        defer self.allocator.free(sql_z);
+        const stmt = if (self.cache) |*cached|
+            try cached.getOrPrepare(sql, self, prepareMySQLStmt, {}, closeStmt)
+        else
+            try prepareMySQLStmt(self, sql);
 
-        if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
-            logMySQLError(self.conn, "stmt_prepare");
-            return error.MySQLStmtFailed;
-        }
+        // Reset before rebinding (needed when stmt came from cache).
+        _ = c.mysql_stmt_reset(stmt);
 
         // Bind parameters
         const n_params = c.mysql_stmt_param_count(stmt);
@@ -189,20 +196,15 @@ pub const MySQLDriver = struct {
     }
 
     pub fn query(self: *MySQLDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
-        const stmt = c.mysql_stmt_init(self.conn);
-        if (stmt == null) {
-            logMySQLError(self.conn, "stmt_init");
-            return error.MySQLStmtFailed;
-        }
+        const stmt = if (self.cache) |*cached|
+            try cached.takeOrPrepare(query_sql, self, prepareMySQLStmt)
+        else
+            try prepareMySQLStmt(self, query_sql);
         errdefer _ = c.mysql_stmt_close(stmt);
 
-        const sql_z = try self.allocator.dupeSentinel(u8, query_sql, 0);
-        defer self.allocator.free(sql_z);
-
-        if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
-            logMySQLError(self.conn, "stmt_prepare");
-            return error.MySQLStmtFailed;
-        }
+        // Reset before rebinding (needed when stmt came from cache).
+        _ = c.mysql_stmt_free_result(stmt);
+        _ = c.mysql_stmt_reset(stmt);
 
         // Bind parameters
         const n_params = c.mysql_stmt_param_count(stmt);
@@ -664,6 +666,32 @@ pub const MySQLRows = struct {
         return ni.items[index] != 0;
     }
 };
+
+// ------------------------------------------------------------------
+// Prepared-statement cache helpers
+// ------------------------------------------------------------------
+
+fn closeStmt(_: void, stmt: *c.MYSQL_STMT) void {
+    _ = c.mysql_stmt_close(stmt);
+}
+
+fn prepareMySQLStmt(drv: *MySQLDriver, sql: []const u8) !*c.MYSQL_STMT {
+    const stmt = c.mysql_stmt_init(drv.conn);
+    if (stmt == null) {
+        MySQLDriver.logMySQLError(drv.conn, "stmt_init");
+        return error.MySQLStmtFailed;
+    }
+    errdefer _ = c.mysql_stmt_close(stmt);
+
+    const sql_z = try drv.allocator.dupeSentinel(u8, sql, 0);
+    defer drv.allocator.free(sql_z);
+
+    if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
+        MySQLDriver.logMySQLError(drv.conn, "stmt_prepare");
+        return error.MySQLStmtFailed;
+    }
+    return stmt;
+}
 
 // ------------------------------------------------------------------
 // Tests
