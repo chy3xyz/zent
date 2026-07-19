@@ -262,13 +262,17 @@ const SQLiteRows = struct {
 
     fn getInt(ptr: *anyopaque, index: usize) ?i64 {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
-        if (c.sqlite3_column_type(self.stmt, @intCast(index)) == c.SQLITE_NULL) return null;
+        const typ = c.sqlite3_column_type(self.stmt, @intCast(index));
+        if (typ == c.SQLITE_NULL) return null;
+        if (typ != c.SQLITE_INTEGER) return null;
         return c.sqlite3_column_int64(self.stmt, @intCast(index));
     }
 
     fn getFloat(ptr: *anyopaque, index: usize) ?f64 {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
-        if (c.sqlite3_column_type(self.stmt, @intCast(index)) == c.SQLITE_NULL) return null;
+        const typ = c.sqlite3_column_type(self.stmt, @intCast(index));
+        if (typ == c.SQLITE_NULL) return null;
+        if (typ != c.SQLITE_FLOAT) return null;
         return c.sqlite3_column_double(self.stmt, @intCast(index));
     }
 

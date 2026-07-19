@@ -277,3 +277,92 @@ test "SQLite: SaveOrUpdate updates existing row" {
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 200), row.getInt(0).?);
 }
+
+test "SQLite: Max/Min Rows deinit on string, numeric and empty paths" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Product = schema("Product", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("qty"),
+            field.Float("price"),
+        },
+    });
+    const EmptyProduct = schema("EmptyProduct", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("qty"),
+            field.Float("price"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{ Product, EmptyProduct });
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Insert rows directly via SQL to avoid Entity cleanup.
+    _ = try drv.exec("INSERT INTO product (name, qty, price) VALUES (?, ?, ?)", &.{
+        .{ .string = "alice" },
+        .{ .int = 3 },
+        .{ .float = 1.50 },
+    });
+    _ = try drv.exec("INSERT INTO product (name, qty, price) VALUES (?, ?, ?)", &.{
+        .{ .string = "charlie" },
+        .{ .int = 7 },
+        .{ .float = 9.99 },
+    });
+    _ = try drv.exec("INSERT INTO product (name, qty, price) VALUES (?, ?, ?)", &.{
+        .{ .string = "bob" },
+        .{ .int = 5 },
+        .{ .float = 4.50 },
+    });
+
+    // String aggregate: returned string must be freed by the caller.
+    {
+        var q = client.product.Query();
+        defer q.deinit();
+        const max_name = try q.Max("name");
+        defer if (max_name == .string) allocator.free(max_name.string);
+        try testing.expect(max_name == .string);
+        try testing.expectEqualStrings("charlie", max_name.string);
+
+        var q2 = client.product.Query();
+        defer q2.deinit();
+        const min_name = try q2.Min("name");
+        defer if (min_name == .string) allocator.free(min_name.string);
+        try testing.expect(min_name == .string);
+        try testing.expectEqualStrings("alice", min_name.string);
+    }
+
+    // Numeric aggregates.
+    {
+        var q = client.product.Query();
+        defer q.deinit();
+        const max_qty = try q.Max("qty");
+        try testing.expect(max_qty == .int);
+        try testing.expectEqual(@as(i64, 7), max_qty.int);
+
+        var q2 = client.product.Query();
+        defer q2.deinit();
+        const min_price = try q2.Min("price");
+        try testing.expect(min_price == .float);
+        try testing.expectApproxEqAbs(@as(f64, 1.50), min_price.float, 0.001);
+    }
+
+    // Empty aggregate returns null.
+    {
+        var q = client.empty_product.Query();
+        defer q.deinit();
+        const max_name = try q.Max("name");
+        try testing.expect(max_name == .null);
+
+        var q2 = client.empty_product.Query();
+        defer q2.deinit();
+        const min_qty = try q2.Min("qty");
+        try testing.expect(min_qty == .null);
+    }
+}

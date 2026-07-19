@@ -55,4 +55,7 @@ test {
             std.testing.refAllDecls(nested);
         }
     }
+    // Regression tests for generated query helpers live in a dedicated file
+    // because the modules above expose generated types rather than namespaces.
+    _ = @import("codegen/query_aggregate_test.zig");
 }

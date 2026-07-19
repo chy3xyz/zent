@@ -73,8 +73,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Where(self: *Self, predicates: anytype) !*Self {
-            switch (@typeInfo(@TypeOf(predicates))) {
-                .pointer, .array => {
+            const PredT = @TypeOf(predicates);
+            const pred_info = @typeInfo(PredT);
+            switch (pred_info) {
+                .pointer => |ptr| {
+                    const child_info = @typeInfo(ptr.child);
+                    if (child_info == .@"struct" and child_info.@"struct".is_tuple) {
+                        inline for (predicates.*) |p| {
+                            try self.predicates.append(p);
+                        }
+                    } else {
+                        for (predicates) |p| {
+                            try self.predicates.append(p);
+                        }
+                    }
+                },
+                .array => {
                     for (predicates) |p| {
                         try self.predicates.append(p);
                     }
@@ -314,16 +328,15 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
+            defer rows.deinit();
             const row = rows.next() orelse return error.NotFound;
             if (row.isNull(0)) return .null;
             if (row.getInt(0)) |v| return .{ .int = v };
             if (row.getFloat(0)) |v| return .{ .float = v };
-            // Must dup text before rows.deinit: row.getText borrows from the
+            // Dup text while rows is still alive: row.getText borrows from the
             // driver-internal buffer which is freed on rows.deinit.
             if (row.getText(0)) |v| {
                 const duped = try self.allocator.dupe(u8, v);
-                errdefer self.allocator.free(duped);
-                rows.deinit();
                 return .{ .string = duped };
             }
             return error.TypeMismatch;
@@ -334,14 +347,13 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
+            defer rows.deinit();
             const row = rows.next() orelse return error.NotFound;
             if (row.isNull(0)) return .null;
             if (row.getInt(0)) |v| return .{ .int = v };
             if (row.getFloat(0)) |v| return .{ .float = v };
             if (row.getText(0)) |v| {
                 const duped = try self.allocator.dupe(u8, v);
-                errdefer self.allocator.free(duped);
-                rows.deinit();
                 return .{ .string = duped };
             }
             return error.TypeMismatch;
@@ -412,6 +424,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 columns[i] = t.c(f.name);
             }
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &columns);
+            defer selector.deinit();
             _ = selector.from(t);
             _ = selector.setDistinct(self.distinct);
 
@@ -452,6 +465,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const t = sql.Table(info.table_name);
             const count_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{count_col});
+            defer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -474,6 +488,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const t = sql.Table(info.table_name);
             const agg_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{agg_col});
+            defer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -527,7 +542,7 @@ test "Query builder basic" {
     var q = UserQuery.init(std.testing.allocator, undefined);
     defer q.deinit();
 
-    _ = q.Where(&.{sql.EQ("age", .{ .int = 30 })});
+    _ = try q.Where(&.{sql.EQ("age", .{ .int = 30 })});
     try std.testing.expectEqual(@as(usize, 1), q.predicates.items.len);
 }
 
@@ -556,7 +571,7 @@ test "Query builder WithEdge compiles" {
     var q = UserQuery.init(std.testing.allocator, undefined);
     defer q.deinit();
 
-    _ = q.WithEdge("cars");
+    _ = try q.WithEdge("cars");
     try std.testing.expectEqual(@as(usize, 1), q.with_edges.items.len);
     try std.testing.expectEqualStrings("cars", q.with_edges.items[0]);
 }
@@ -579,7 +594,7 @@ test "Query builder GroupBy and Having" {
     var q = UserQuery.init(std.testing.allocator, undefined);
     defer q.deinit();
 
-    _ = q.GroupBy(&.{"age"}).Having(sql.GT("COUNT(*)", .{ .int = 1 }));
+    _ = (try q.GroupBy(&.{"age"})).Having(sql.GT("COUNT(*)", .{ .int = 1 }));
     try std.testing.expectEqual(@as(usize, 1), q.group_cols.items.len);
     try std.testing.expectEqualStrings("age", q.group_cols.items[0]);
 }
