@@ -6,6 +6,8 @@ const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const Hook = @import("../runtime/hook.zig").Hook;
+const HookContext = @import("../runtime/hook.zig").HookContext;
+const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const privacy = @import("../privacy/policy.zig");
 
@@ -133,7 +135,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self;
         }
 
-        const SaveError = sql_driver.Error || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!Entity {
             return self.saveInternal(false);
@@ -149,15 +151,20 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            var hook_ctx = HookContext{
+                .op = .create,
+                .table_name = info.table_name,
+                .privacy = self.privacy_ctx orelse .{},
+            };
             for (self.hooks) |h| {
                 if (h.op == .create) {
-                    if (h.before) |f| f(.create, info.table_name);
+                    if (h.before) |f| try f(&hook_ctx);
                 }
             }
-            defer {
+            errdefer {
                 for (self.hooks) |h| {
                     if (h.op == .create) {
-                        if (h.after) |f| f(.create, info.table_name);
+                        if (h.after) |f| f(&hook_ctx) catch {};
                     }
                 }
             }
@@ -317,6 +324,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                             _ = try self.driver.exec(iq.sql, iq.args);
                         }
                     }
+                }
+            }
+
+            // After hooks on success: entity is fully populated.
+            hook_ctx.entity = &entity;
+            for (self.hooks) |h| {
+                if (h.op == .create) {
+                    if (h.after) |f| f(&hook_ctx) catch {};
                 }
             }
 
@@ -550,7 +565,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             return try self.setValue(field_name, toSqlValue(value));
         }
 
-        const SaveError = sql_driver.Error || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
             if (info.policy) |p| {
@@ -558,15 +573,20 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            var hook_ctx = HookContext{
+                .op = .create,
+                .table_name = info.table_name,
+                .privacy = self.privacy_ctx orelse .{},
+            };
             for (self.hooks) |h| {
                 if (h.op == .create) {
-                    if (h.before) |f| f(.create, info.table_name);
+                    if (h.before) |f| try f(&hook_ctx);
                 }
             }
-            defer {
+            errdefer {
                 for (self.hooks) |h| {
                     if (h.op == .create) {
-                        if (h.after) |f| f(.create, info.table_name);
+                        if (h.after) |f| f(&hook_ctx) catch {};
                     }
                 }
             }
@@ -624,6 +644,14 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 const id = row.getInt(0) orelse return error.TypeMismatch;
                 try ids.append(id);
             }
+
+            // After hooks on success.
+            for (self.hooks) |h| {
+                if (h.op == .create) {
+                    if (h.after) |f| f(&hook_ctx) catch {};
+                }
+            }
+
             return ids;
         }
     };
@@ -793,8 +821,8 @@ test "Create builders expose explicit driver error unions" {
     const UserEntity = comptime EntityGen(infos, info);
     const Builder = CreateBuilder(infos, info, UserEntity);
     const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
-    const SaveError = sql_driver.Error || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
-    const BulkSaveError = sql_driver.Error || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
+    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
 
     comptime {
         const save_return = @typeInfo(@TypeOf(Builder.Save)).@"fn".return_type.?;

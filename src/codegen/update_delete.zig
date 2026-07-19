@@ -5,6 +5,8 @@ const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const Hook = @import("../runtime/hook.zig").Hook;
+const HookContext = @import("../runtime/hook.zig").HookContext;
+const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const privacy = @import("../privacy/policy.zig");
 
@@ -183,7 +185,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
-        const SaveError = sql_driver.Error || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed };
         const SaveOneError = SaveError || error{ NotFound, NotSingular };
 
         /// Execute the UPDATE and return rows affected.
@@ -193,15 +195,20 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            var hook_ctx = HookContext{
+                .op = .update,
+                .table_name = info.table_name,
+                .privacy = self.privacy_ctx orelse .{},
+            };
             for (self.hooks) |h| {
                 if (h.op == .update) {
-                    if (h.before) |f| f(.update, info.table_name);
+                    if (h.before) |f| try f(&hook_ctx);
                 }
             }
-            defer {
+            errdefer {
                 for (self.hooks) |h| {
                     if (h.op == .update) {
-                        if (h.after) |f| f(.update, info.table_name);
+                        if (h.after) |f| f(&hook_ctx) catch {};
                     }
                 }
             }
@@ -228,6 +235,14 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
 
             const q = builder.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
+
+            // After hooks on success.
+            for (self.hooks) |h| {
+                if (h.op == .update) {
+                    if (h.after) |f| f(&hook_ctx) catch {};
+                }
+            }
+
             return res.rows_affected;
         }
 
@@ -287,7 +302,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
-        const ExecError = sql_driver.Error || error{PrivacyDenied};
+        const ExecError = sql_driver.Error || HookError || error{PrivacyDenied};
         const ExecOneError = ExecError || error{ NotFound, NotSingular };
 
         /// Execute the DELETE and return rows affected.
@@ -324,15 +339,20 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            var hook_ctx = HookContext{
+                .op = .delete,
+                .table_name = info.table_name,
+                .privacy = self.privacy_ctx orelse .{},
+            };
             for (self.hooks) |h| {
                 if (h.op == .delete) {
-                    if (h.before) |f| f(.delete, info.table_name);
+                    if (h.before) |f| try f(&hook_ctx);
                 }
             }
-            defer {
+            errdefer {
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
-                        if (h.after) |f| f(.delete, info.table_name);
+                        if (h.after) |f| f(&hook_ctx) catch {};
                     }
                 }
             }
@@ -349,6 +369,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
             const q = builder.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
+
+            // After hooks on success.
+            for (self.hooks) |h| {
+                if (h.op == .delete) {
+                    if (h.after) |f| f(&hook_ctx) catch {};
+                }
+            }
+
             return res.rows_affected;
         }
 
@@ -358,15 +386,20 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            var hook_ctx = HookContext{
+                .op = .delete,
+                .table_name = info.table_name,
+                .privacy = self.privacy_ctx orelse .{},
+            };
             for (self.hooks) |h| {
                 if (h.op == .delete) {
-                    if (h.before) |f| f(.delete, info.table_name);
+                    if (h.before) |f| try f(&hook_ctx);
                 }
             }
-            defer {
+            errdefer {
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
-                        if (h.after) |f| f(.delete, info.table_name);
+                        if (h.after) |f| f(&hook_ctx) catch {};
                     }
                 }
             }
@@ -380,6 +413,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
             const q = builder.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
+
+            // After hooks on success.
+            for (self.hooks) |h| {
+                if (h.op == .delete) {
+                    if (h.after) |f| f(&hook_ctx) catch {};
+                }
+            }
+
             return res.rows_affected;
         }
     };
@@ -469,7 +510,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             return try self.set(field_name, toSqlValue(value));
         }
 
-        const SaveError = sql_driver.Error || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed };
 
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
@@ -478,15 +519,20 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            var hook_ctx = HookContext{
+                .op = .update,
+                .table_name = info.table_name,
+                .privacy = self.privacy_ctx orelse .{},
+            };
             for (self.hooks) |h| {
                 if (h.op == .update) {
-                    if (h.before) |f| f(.update, info.table_name);
+                    if (h.before) |f| try f(&hook_ctx);
                 }
             }
-            defer {
+            errdefer {
                 for (self.hooks) |h| {
                     if (h.op == .update) {
-                        if (h.after) |f| f(.update, info.table_name);
+                        if (h.after) |f| f(&hook_ctx) catch {};
                     }
                 }
             }
@@ -506,6 +552,14 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
 
             const q = self.b.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
+
+            // After hooks on success.
+            for (self.hooks) |h| {
+                if (h.op == .update) {
+                    if (h.after) |f| f(&hook_ctx) catch {};
+                }
+            }
+
             return res.rows_affected;
         }
     };
@@ -565,7 +619,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
-        const ExecError = sql_driver.Error || error{PrivacyDenied};
+        const ExecError = sql_driver.Error || HookError || error{PrivacyDenied};
 
         /// Execute the bulk DELETE and return rows affected.
         pub fn Exec(self: *Self) ExecError!usize {
@@ -581,15 +635,20 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            var hook_ctx = HookContext{
+                .op = .delete,
+                .table_name = info.table_name,
+                .privacy = self.privacy_ctx orelse .{},
+            };
             for (self.hooks) |h| {
                 if (h.op == .delete) {
-                    if (h.before) |f| f(.delete, info.table_name);
+                    if (h.before) |f| try f(&hook_ctx);
                 }
             }
-            defer {
+            errdefer {
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
-                        if (h.after) |f| f(.delete, info.table_name);
+                        if (h.after) |f| f(&hook_ctx) catch {};
                     }
                 }
             }
@@ -598,6 +657,14 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
 
             const q = self.b.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
+
+            // After hooks on success.
+            for (self.hooks) |h| {
+                if (h.op == .delete) {
+                    if (h.after) |f| f(&hook_ctx) catch {};
+                }
+            }
+
             return res.rows_affected;
         }
     };
@@ -736,9 +803,9 @@ test "Update and delete execution methods expose explicit driver error unions" {
     const Del = DeleteBuilder(info);
     const BulkUpd = BulkUpdateBuilder(info);
     const BulkDel = BulkDeleteBuilder(info);
-    const SaveError = sql_driver.Error || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed };
     const SaveOneError = SaveError || error{ NotFound, NotSingular };
-    const ExecError = sql_driver.Error || error{PrivacyDenied};
+    const ExecError = sql_driver.Error || HookError || error{PrivacyDenied};
     const ExecOneError = ExecError || error{ NotFound, NotSingular };
 
     comptime {

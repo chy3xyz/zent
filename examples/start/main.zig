@@ -108,13 +108,13 @@ pub fn main() !void {
     // Attach a simple hook to the user client for demonstration
     const user_hooks = &[_]zent.runtime.hook.Hook{
         .{ .op = .create, .before = struct {
-            fn f(op: zent.runtime.hook.Op, table: []const u8) void {
-                std.debug.print("[HOOK] Before {s} on {s}\n", .{ @tagName(op), table });
+            fn f(ctx: *zent.runtime.hook.HookContext) zent.runtime.hook.HookError!void {
+                std.debug.print("[HOOK] Before {s} on {s}\n", .{ @tagName(ctx.op), ctx.table_name });
             }
         }.f },
         .{ .op = .create, .after = struct {
-            fn f(op: zent.runtime.hook.Op, table: []const u8) void {
-                std.debug.print("[HOOK] After {s} on {s}\n", .{ @tagName(op), table });
+            fn f(ctx: *zent.runtime.hook.HookContext) zent.runtime.hook.HookError!void {
+                std.debug.print("[HOOK] After {s} on {s}\n", .{ @tagName(ctx.op), ctx.table_name });
             }
         }.f },
     };

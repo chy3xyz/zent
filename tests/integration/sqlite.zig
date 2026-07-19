@@ -801,3 +801,92 @@ test "SQLite: privacy denies all operations without WithContext" {
         }
     }
 }
+
+test "SQLite: before hook abort prevents creation" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const HookEntity = schema("HookEntity", .{
+        .fields = &.{field.String("name")},
+    });
+
+    const graph = comptime buildGraph(&.{HookEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    const before_fn = struct {
+        fn f(ctx: *zent.runtime.hook.HookContext) zent.runtime.hook.HookError!void {
+            _ = ctx;
+            return error.Forbidden;
+        }
+    }.f;
+
+    const hooks = &[_]zent.runtime.hook.Hook{
+        zent.runtime.hook.Hook.initBefore(.create, before_fn),
+    };
+    client.hook_entity = client.hook_entity.withHooks(hooks);
+
+    // Try to create — should be rejected by before hook.
+    var b = try client.hook_entity.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "should-not-exist");
+    if (b.Save()) |_| {
+        return error.UnexpectedAllow;
+    } else |err| {
+        try testing.expectEqual(error.Forbidden, err);
+    }
+
+    // Verify no row was inserted.
+    var q = client.hook_entity.Query();
+    defer q.deinit();
+    const count = try q.Count();
+    try testing.expectEqual(@as(i64, 0), count);
+}
+
+test "SQLite: after hook sees created entity" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const HookEntity = schema("HookEntity", .{
+        .fields = &.{field.String("name")},
+    });
+
+    const graph = comptime buildGraph(&.{HookEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Container-level variable for communicating between hook and test body.
+    const H = struct {
+        var saw_id: i64 = 0;
+        fn afterFn(ctx: *zent.runtime.hook.HookContext) zent.runtime.hook.HookError!void {
+            if (ctx.entity) |entity_ptr| {
+                const ptr: *align(@alignOf(i64)) i64 = @ptrCast(@alignCast(entity_ptr));
+                saw_id = ptr.*;
+            }
+        }
+    };
+    H.saw_id = 0;
+
+    const hooks = &[_]zent.runtime.hook.Hook{
+        zent.runtime.hook.Hook.initAfter(.create, H.afterFn),
+    };
+    client.hook_entity = client.hook_entity.withHooks(hooks);
+
+    var b = try client.hook_entity.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "test-entity");
+    var entity = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+
+    try testing.expect(entity.id > 0);
+    try testing.expectEqualStrings("test-entity", entity.name);
+    // After hook should have seen the entity id.
+    try testing.expect(H.saw_id > 0);
+    try testing.expectEqual(entity.id, H.saw_id);
+}
