@@ -142,6 +142,9 @@ pub const MySQLDriver = struct {
             try cached.getOrPrepare(sql, self, prepareMySQLStmt, {}, closeStmt)
         else
             try prepareMySQLStmt(self, sql);
+        if (self.cache == null) {
+            errdefer _ = c.mysql_stmt_close(stmt);
+        }
 
         // Reset before rebinding (needed when stmt came from cache).
         _ = c.mysql_stmt_reset(stmt);

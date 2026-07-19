@@ -72,6 +72,9 @@ pub const SQLiteDriver = struct {
             }
             break :blk out.?;
         };
+        if (self.cache == null) {
+            errdefer _ = c.sqlite3_finalize(stmt);
+        }
 
         // Reset before rebinding (needed when stmt came from cache).
         _ = c.sqlite3_reset(stmt);
@@ -106,6 +109,7 @@ pub const SQLiteDriver = struct {
             }
             break :blk out.?;
         };
+        errdefer _ = c.sqlite3_finalize(stmt);
 
         // Reset before rebinding (needed when stmt came from cache).
         _ = c.sqlite3_reset(stmt);

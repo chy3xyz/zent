@@ -11,6 +11,7 @@ pub fn PreparedCache(comptime capacity: usize, comptime Handle: type) type {
 
         const Entry = struct {
             sql_hash: u64,
+            sql_len: usize,
             stmt: Handle,
         };
 
@@ -37,7 +38,7 @@ pub fn PreparedCache(comptime capacity: usize, comptime Handle: type) type {
 
             // Linear scan (small capacity; fine for ≤ ~64 entries).
             for (self.entries[0..self.len], 0..) |*e, i| {
-                if (e.sql_hash == hash) {
+                if (e.sql_hash == hash and e.sql_len == sql.len) {
                     self.moveToFront(i);
                     return e.stmt;
                 }
@@ -46,7 +47,7 @@ pub fn PreparedCache(comptime capacity: usize, comptime Handle: type) type {
             // Cache miss — prepare.
             const stmt = try prepareFn(prepareCtx, sql);
             if (self.len < capacity) {
-                self.entries[self.len] = .{ .sql_hash = hash, .stmt = stmt };
+                self.entries[self.len] = .{ .sql_hash = hash, .sql_len = sql.len, .stmt = stmt };
                 // Newest entry is MRU; shift existing order right.
                 var j: usize = self.len;
                 while (j > 0) : (j -= 1) {
@@ -58,7 +59,7 @@ pub fn PreparedCache(comptime capacity: usize, comptime Handle: type) type {
                 // Evict LRU entry.
                 const evict_idx = self.order[self.len - 1];
                 deinitFn(deinitCtx, self.entries[evict_idx].stmt);
-                self.entries[evict_idx] = .{ .sql_hash = hash, .stmt = stmt };
+                self.entries[evict_idx] = .{ .sql_hash = hash, .sql_len = sql.len, .stmt = stmt };
                 self.moveToFront(evict_idx);
             }
             return stmt;
@@ -76,7 +77,7 @@ pub fn PreparedCache(comptime capacity: usize, comptime Handle: type) type {
             const hash = std.hash.Wyhash.hash(0, sql);
 
             for (self.entries[0..self.len], 0..) |*e, i| {
-                if (e.sql_hash == hash) {
+                if (e.sql_hash == hash and e.sql_len == sql.len) {
                     const stmt = e.stmt;
                     self.removeEntry(i);
                     return stmt;
