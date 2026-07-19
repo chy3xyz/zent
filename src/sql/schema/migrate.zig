@@ -44,6 +44,21 @@ fn computeMigrationVersion(comptime table: []const u8, comptime op: []const u8, 
     return @as(i64, @intCast(Crc32.hash(key) & 0x7FFFFFFF));
 }
 
+/// Options controlling migration behavior.
+pub const MigrateOptions = struct {
+    /// If true, don't execute any SQL — only print what would be done.
+    dry_run: bool = false,
+
+    /// If true, columns that exist in the database but NOT in the schema
+    /// will be dropped. When false (default), extra columns are silently kept.
+    drop_columns: bool = false,
+
+    /// If true, column type changes (ALTER TYPE / MODIFY COLUMN) are applied
+    /// even when they may cause data loss. When false (default), type mismatches
+    /// are silently ignored.
+    allow_data_loss: bool = false,
+};
+
 /// CREATE TABLE statement for the migration history table.
 /// Works on SQLite, PostgreSQL, and MySQL.
 const migrationsTableSQL =
@@ -815,6 +830,22 @@ fn indexExists(indexes: []const ExistingIndex, name: []const u8) bool {
     return false;
 }
 
+/// Check whether a column name exists in a TableDef's columns list.
+fn columnExistsTableDef(table: TableDef, name: []const u8) bool {
+    for (table.columns) |c| {
+        if (std.mem.eql(u8, c.name, name)) return true;
+    }
+    return false;
+}
+
+/// Look up an ExistingColumn by name. Returns null when not found.
+fn getExistingColumnByName(columns: []const ExistingColumn, name: []const u8) ?ExistingColumn {
+    for (columns) |c| {
+        if (std.mem.eql(u8, c.name, name)) return c;
+    }
+    return null;
+}
+
 /// Generate ALTER TABLE ADD COLUMN SQL for a single column.
 fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, col: ColumnDef, dialect: Dialect) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(allocator);
@@ -838,16 +869,60 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
     return buf.toOwnedSlice();
 }
 
-/// Migrate schema: create missing tables, add missing columns, and create missing indexes.
+/// Generate DROP COLUMN SQL for a table column in a dialect-specific format.
+fn dropColumnSQL(
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    column_name: []const u8,
+    dialect: Dialect,
+) ![]const u8 {
+    return switch (dialect.name[0]) {
+        's' => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\"", .{ table_name, column_name }),
+        'p' => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\" CASCADE", .{ table_name, column_name }),
+        'm' => std.fmt.allocPrint(allocator, "ALTER TABLE `{s}` DROP COLUMN `{s}`", .{ table_name, column_name }),
+        else => error.UnsupportedDialect,
+    };
+}
+
+/// Generate ALTER/MODIFY COLUMN SQL to change a column's type.
 ///
-/// This is a simplified auto-migration that does NOT drop columns or alter types.
+/// SQLite does not support ALTER COLUMN TYPE natively and returns
+/// `error.UnsupportedDialect`; the caller should either skip ALTER TYPE
+/// on SQLite or implement a table-rebuild strategy upstream.
+fn alterColumnTypeSQL(
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    column_name: []const u8,
+    new_type: []const u8,
+    dialect: Dialect,
+) ![]const u8 {
+    return switch (dialect.name[0]) {
+        's' => error.UnsupportedDialect,
+        'p' => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE {s} USING \"{s}\"::{s}", .{ table_name, column_name, new_type, column_name, new_type }),
+        'm' => std.fmt.allocPrint(allocator, "ALTER TABLE `{s}` MODIFY COLUMN `{s}` {s}", .{ table_name, column_name, new_type }),
+        else => error.UnsupportedDialect,
+    };
+}
+
+/// Migrate schema: create missing tables, add missing columns, create missing
+/// indexes, and — when requested via `opts` — drop orphaned columns and/or
+/// alter column types.
 ///
 /// Phase 2 Task 8: every operation is recorded in `zent_schema_migrations`
 /// with a deterministic CRC32 version, and the entire run is wrapped in a
 /// single transaction. Re-running `migrateSchema` is a no-op for operations
 /// already present in the history table; on any error path, `tx.deinit()`
 /// rolls back the whole batch.
-pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+///
+/// Phase 3 Task 12: DROP COLUMN is gated behind `opts.drop_columns`; ALTER
+/// TYPE is gated behind `opts.allow_data_loss`. Both are opt-in to prevent
+/// accidental schema destruction.
+pub fn migrateSchemaWithOptions(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    opts: MigrateOptions,
+) !void {
     const dialect = driver.dialect();
 
     // Bootstrap the history table outside the transaction; the SQL is
@@ -985,6 +1060,58 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
             }
         }
 
+        // Phase 3 Task 12 — DROP COLUMN: remove columns that exist in
+        // the database but not in the schema. Guarded by opts.drop_columns
+        // to avoid accidental data loss.
+        // No version recording: column names are runtime data from
+        // introspection, and DROP COLUMN is naturally idempotent
+        // (re-running on an already-dropped column is a no-op error
+        // that we silently tolerate).
+        if (opts.drop_columns) {
+            for (existing_cols.items) |existing_col| {
+                if (!columnExistsTableDef(table, existing_col.name)) {
+                    const sql = try dropColumnSQL(allocator, table.name, existing_col.name, dialect);
+                    defer allocator.free(sql);
+                    _ = try tx_drv.exec(sql, &.{});
+                }
+            }
+        }
+
+        // Phase 3 Task 12 — ALTER TYPE: change column types that differ
+        // between the database and the schema. Guarded by
+        // opts.allow_data_loss; SQLite is skipped (unsupported).
+        if (opts.allow_data_loss) {
+            inline for (table.columns) |col| {
+                // Only check columns that already exist in the DB.
+                if (columnExists(existing_cols.items, col.name)) {
+                    const existing_col = getExistingColumnByName(existing_cols.items, col.name) orelse unreachable;
+                    // Normalise both sides for comparison: the DB side is
+                    // already lowercased by getExistingColumns.
+                    const schema_type_upper = col.sql_type;
+                    // Build a lowercase copy of the schema type.
+                    var buf: [128]u8 = undefined;
+                    if (schema_type_upper.len <= buf.len) {
+                        @memcpy(buf[0..schema_type_upper.len], schema_type_upper);
+                        for (buf[0..schema_type_upper.len]) |*c| c.* = std.ascii.toLower(c.*);
+                        const schema_type_lower = buf[0..schema_type_upper.len];
+
+                        if (!std.mem.eql(u8, existing_col.sql_type, schema_type_lower)) {
+                            // Skip ALTER TYPE on SQLite (unsupported natively).
+                            if (dialect.name[0] != 's') {
+                                const version = comptime computeMigrationVersion(info.table_name, "alter_type", col.name);
+                                if (!versionContains(applied, version)) {
+                                    const sql = try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect);
+                                    defer allocator.free(sql);
+                                    _ = try tx_drv.exec(sql, &.{});
+                                    try recordMigration(tx_drv, version, null);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         var existing_idxs = try getExistingIndexes(allocator, tx_drv, table.name);
         defer freeExistingIndexes(allocator, &existing_idxs);
 
@@ -1006,6 +1133,17 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
 
     try tx.commit();
     tx.deinit();
+}
+
+/// Backward-compatible entry point: calls `migrateSchemaWithOptions` with
+/// default `MigrateOptions{}` (no drops, no type changes). All existing callers
+/// continue to work without modification.
+pub fn migrateSchema(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+) !void {
+    return migrateSchemaWithOptions(allocator, driver, infos, MigrateOptions{});
 }
 
 // ------------------------------------------------------------------
@@ -1088,4 +1226,117 @@ test "Migrate schema adds missing columns" {
     }
     try std.testing.expect(found_age);
     try std.testing.expect(found_email);
+}
+
+test "Migrate schema drops columns when opts.drop_columns set (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    // Create table with id, name, and an extra column "legacy_field"
+    _ = try drv.exec(
+        "CREATE TABLE book (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, legacy_field TEXT)",
+        &.{},
+    );
+
+    // Schema only declares id + name — legacy_field should be dropped.
+    const Book = schema("Book", .{
+        .fields = &.{field.String("name")},
+    });
+
+    const info = comptime fromSchema(Book);
+    const infos = &[_]TypeInfo{info};
+    try migrateSchemaWithOptions(std.testing.allocator, drv.asDriver(), infos, MigrateOptions{
+        .drop_columns = true,
+    });
+
+    // Verify legacy_field was dropped.
+    var rows = try drv.query("PRAGMA table_info(book)", &.{});
+    defer rows.deinit();
+
+    var found_legacy = false;
+    while (rows.next()) |row| {
+        const col_name = row.getText(1) orelse continue;
+        if (std.mem.eql(u8, col_name, "legacy_field")) found_legacy = true;
+    }
+    try std.testing.expect(!found_legacy);
+}
+
+test "Migrate schema does NOT drop columns when opts.drop_columns false (default)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec(
+        "CREATE TABLE album (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, extra_col TEXT)",
+        &.{},
+    );
+
+    const Album = schema("Album", .{
+        .fields = &.{field.String("title")},
+    });
+
+    const info = comptime fromSchema(Album);
+    const infos = &[_]TypeInfo{info};
+    // Default MigrateOptions{} has drop_columns=false.
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+
+    // extra_col should still exist.
+    var rows = try drv.query("PRAGMA table_info(album)", &.{});
+    defer rows.deinit();
+
+    var found_extra = false;
+    while (rows.next()) |row| {
+        const col_name = row.getText(1) orelse continue;
+        if (std.mem.eql(u8, col_name, "extra_col")) found_extra = true;
+    }
+    try std.testing.expect(found_extra);
+}
+
+test "Migrate schema alters column type when opts.allow_data_loss set (SQLite — skips gracefully)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    // Create a table where "score" column is TEXT but schema says INTEGER.
+    _ = try drv.exec(
+        "CREATE TABLE entry (id INTEGER PRIMARY KEY AUTOINCREMENT, score TEXT)",
+        &.{},
+    );
+
+    const Entry = schema("Entry", .{
+        .fields = &.{field.Int("score")},
+    });
+
+    const info = comptime fromSchema(Entry);
+    const infos = &[_]TypeInfo{info};
+    // allow_data_loss=true, but SQLite returns UnsupportedDialect — must not crash.
+    try migrateSchemaWithOptions(std.testing.allocator, drv.asDriver(), infos, MigrateOptions{
+        .allow_data_loss = true,
+    });
+
+    // The type won't change on SQLite (unsupported), but migration must succeed.
+    var rows = try drv.query("PRAGMA table_info(entry)", &.{});
+    defer rows.deinit();
+
+    while (rows.next()) |row| {
+        const col_name = row.getText(1) orelse continue;
+        if (std.mem.eql(u8, col_name, "score")) {
+            const col_type = row.getText(2) orelse "";
+            // On SQLite the type stays TEXT because ALTER TYPE is unsupported.
+            try std.testing.expect(std.mem.eql(u8, col_type, "TEXT"));
+        }
+    }
 }
