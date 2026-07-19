@@ -42,6 +42,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         order_terms: std.array_list.Managed(sql.Order),
         limit_val: ?usize,
         offset_val: ?usize,
+        cursor_col: ?[]const u8 = null,
+        cursor_val: ?sql.Value = null,
         distinct: bool,
         with_trashed: bool,
         with_edges: std.ArrayListUnmanaged([]const u8),
@@ -156,6 +158,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Page(self: *Self, page_num: usize, per_page: usize) *Self {
             self.limit_val = per_page;
             self.offset_val = (page_num - 1) * per_page;
+            return self;
+        }
+
+        /// Set a cursor column and value for keyset/cursor-based pagination.
+        /// When set, the generated query appends `WHERE (col > ?) ORDER BY col ASC`
+        /// and uses `limit_val` as the page size. Mutually exclusive with `Offset`/`Page`.
+        pub fn Cursor(self: *Self, column: []const u8, value: sql.Value) *Self {
+            self.cursor_col = column;
+            self.cursor_val = value;
+            return self;
+        }
+
+        /// Set a cursor to page after a given entity, using its `id` field.
+        pub fn CursorAfter(self: *Self, entity: Entity) *Self {
+            self.cursor_col = "id";
+            self.cursor_val = .{ .int = entity.id };
             return self;
         }
 
@@ -548,6 +566,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     _ = try selector.where(pred);
                 }
             }
+            if (self.cursor_col) |col| {
+                if (self.cursor_val) |val| {
+                    _ = try selector.where(sql.GT(col, val));
+                }
+            }
             if (info.soft_delete and !self.with_trashed) {
                 _ = try selector.where(sql.IsNull("deleted_at"));
             }
@@ -556,6 +579,12 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
+            }
+            if (self.cursor_col) |col| {
+                // When cursor pagination is active, ensure ORDER BY col ASC is present.
+                if (self.order_terms.items.len == 0) {
+                    _ = try selector.orderBy(sql.OrderAsc(col));
+                }
             }
             if (self.order_terms.items.len > 0) {
                 for (self.order_terms.items) |term| {
@@ -737,4 +766,52 @@ test "Query builder execution methods expose explicit driver error union" {
             }
         }
     }
+}
+
+test "Query builder cursor pagination" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGenerator(infos, info);
+    const UserQuery = QueryBuilder(infos, info, UserEntity);
+
+    var q = UserQuery.init(std.testing.allocator, undefined, null);
+    defer q.deinit();
+
+    _ = q.Cursor("id", .{ .int = 42 }).Limit(10);
+    try std.testing.expectEqualStrings("id", q.cursor_col.?);
+    try std.testing.expectEqual(@as(i64, 42), q.cursor_val.?.int);
+    try std.testing.expectEqual(@as(usize, 10), q.limit_val.?);
+}
+
+test "Query builder CursorAfter sets id" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGenerator(infos, info);
+    const UserQuery = QueryBuilder(infos, info, UserEntity);
+
+    var q = UserQuery.init(std.testing.allocator, undefined, null);
+    defer q.deinit();
+
+    const entity = UserEntity{ .id = 99, .name = "", .age = 0 };
+    _ = q.CursorAfter(entity).Limit(5);
+    try std.testing.expectEqualStrings("id", q.cursor_col.?);
+    try std.testing.expectEqual(@as(i64, 99), q.cursor_val.?.int);
 }

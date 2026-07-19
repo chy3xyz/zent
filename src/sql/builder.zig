@@ -497,6 +497,13 @@ pub const Join = struct {
 // SELECT
 // ------------------------------------------------------------------
 
+pub const CTE = struct {
+    name: []const u8,
+    columns: ?[]const []const u8 = null,
+    query: OwnedQuery,
+    materialized: ?bool = null,
+};
+
 pub const Selector = struct {
     b: Builder,
     columns: std.array_list.Managed(ColumnRef),
@@ -511,6 +518,7 @@ pub const Selector = struct {
     distinct: bool,
     for_update: bool,
     for_share: bool,
+    ctes: std.array_list.Managed(CTE),
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) !Selector {
         var s = Selector{
@@ -527,6 +535,7 @@ pub const Selector = struct {
             .distinct = false,
             .for_update = false,
             .for_share = false,
+            .ctes = std.array_list.Managed(CTE).init(allocator),
         };
         try s.columns.appendSlice(columns);
         return s;
@@ -539,6 +548,8 @@ pub const Selector = struct {
         s.predicates.deinit();
         s.group_cols.deinit();
         s.order_terms.deinit();
+        for (s.ctes.items) |*cte| cte.query.deinit();
+        s.ctes.deinit();
     }
 
     pub fn from(s: *Selector, table: TableBuilder) *Selector {
@@ -596,7 +607,27 @@ pub const Selector = struct {
         return s;
     }
 
+    /// Add a Common Table Expression (CTE) to the SELECT.
+    /// The subquery is an OwnedQuery; its SQL and args will be merged into
+    /// the main query at build time. Caller transfers ownership of the subquery.
+    pub fn with(s: *Selector, name: []const u8, subquery: OwnedQuery) !void {
+        try s.ctes.append(.{ .name = name, .columns = null, .query = subquery });
+    }
+
     pub fn query(s: *Selector) !QueryResult {
+        if (s.ctes.items.len > 0) {
+            try s.b.writeString("WITH ");
+            for (s.ctes.items, 0..) |cte, i| {
+                if (i > 0) try s.b.writeString(", ");
+                try s.b.ident(cte.name);
+                try s.b.writeString(" AS (");
+                // Merge the subquery's args first so placeholders align.
+                try s.b.args.appendSlice(cte.query.args);
+                try s.b.writeString(cte.query.sql);
+                try s.b.writeByte(')');
+            }
+            try s.b.writeByte(' ');
+        }
         try s.b.writeString("SELECT ");
         if (s.distinct) try s.b.writeString("DISTINCT ");
         for (s.columns.items, 0..) |col, i| {
@@ -661,6 +692,19 @@ pub const Selector = struct {
     /// the Selector is in an empty-but-valid state; its auxiliary arrays are
     /// released so the caller does not need to call `deinit`.
     pub fn takeQuery(s: *Selector) !OwnedQuery {
+        if (s.ctes.items.len > 0) {
+            try s.b.writeString("WITH ");
+            for (s.ctes.items, 0..) |cte, i| {
+                if (i > 0) try s.b.writeString(", ");
+                try s.b.ident(cte.name);
+                try s.b.writeString(" AS (");
+                // Merge the subquery's args first so placeholders align.
+                try s.b.args.appendSlice(cte.query.args);
+                try s.b.writeString(cte.query.sql);
+                try s.b.writeByte(')');
+            }
+            try s.b.writeByte(' ');
+        }
         try s.b.writeString("SELECT ");
         if (s.distinct) try s.b.writeString("DISTINCT ");
         for (s.columns.items, 0..) |col, i| {
@@ -728,6 +772,9 @@ pub const Selector = struct {
         s.group_cols = std.array_list.Managed([]const u8).init(s.b.allocator);
         s.order_terms.deinit();
         s.order_terms = std.array_list.Managed(Order).init(s.b.allocator);
+        for (s.ctes.items) |*cte| cte.query.deinit();
+        s.ctes.deinit();
+        s.ctes = std.array_list.Managed(CTE).init(s.b.allocator);
         return result;
     }
 };
@@ -1447,4 +1494,38 @@ test "BulkDelete with predicate groups" {
     const q = try d.query();
     try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE (\"status\" = ? AND \"age\" > ?) OR \"status\" = ?", q.sql);
     try std.testing.expectEqual(@as(usize, 3), q.args.len);
+}
+
+test "CTE WITH clause" {
+    const allocator = std.testing.allocator;
+
+    // Build a subquery to use as CTE
+    var inner = try Select(allocator, Dialect.sqlite, &.{
+        .{ .table = null, .name = "id" },
+        .{ .table = null, .name = "name" },
+    });
+    defer inner.deinit();
+    _ = inner.from(Table("users"));
+    _ = try inner.where(GT("age", .{ .int = 18 }));
+    const inner_query = try inner.takeQuery();
+
+    // Build main query with CTE
+    var s = try Select(allocator, Dialect.sqlite, &.{
+        .{ .table = null, .name = "id" },
+        .{ .table = null, .name = "name" },
+    });
+    defer s.deinit();
+    try s.with("adults", inner_query);
+    _ = s.from(Table("adults"));
+    _ = try s.where(EQ("name", .{ .string = "alice" }));
+
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "WITH \"adults\" AS (SELECT \"id\", \"name\" FROM \"users\" WHERE \"age\" > ?) SELECT \"id\", \"name\" FROM \"adults\" WHERE \"name\" = ?",
+        q.sql,
+    );
+    // 2 args: 1 from CTE subquery (age > 18) + 1 from main (name = alice)
+    try std.testing.expectEqual(@as(usize, 2), q.args.len);
+    try std.testing.expectEqual(@as(i64, 18), q.args[0].int);
+    try std.testing.expectEqualStrings("alice", q.args[1].string);
 }
