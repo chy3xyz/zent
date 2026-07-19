@@ -140,6 +140,10 @@ pub fn ConnPool(comptime D: type) type {
             errdefer conn.close();
             const ptr = try self.all.addOne(self.allocator);
             ptr.* = conn;
+            errdefer {
+                _ = self.all.pop();
+                conn.close();
+            }
             try self.available.append(self.allocator, ptr);
         }
 
