@@ -925,6 +925,68 @@ pub fn migrateSchemaWithOptions(
 ) !void {
     const dialect = driver.dialect();
 
+    // Dry-run: collect all generated SQL and print without executing.
+    if (opts.dry_run) {
+        var sqls = std.array_list.Managed([]const u8).init(allocator);
+        defer {
+            for (sqls.items) |s| allocator.free(s);
+            sqls.deinit();
+        }
+
+        // CREATE TABLE for non-view entities.
+        inline for (infos) |info| {
+            if (!info.is_view) {
+                const table = comptime tableFromTypeInfoCrossRef(info, infos);
+                const sql = try createTableSQL(table, dialect);
+                try sqls.append(try allocator.dupe(u8, sql));
+                std.heap.page_allocator.free(sql);
+            }
+        }
+
+        // CREATE VIEW.
+        inline for (infos) |info| {
+            if (info.is_view) {
+                const sql = try createViewSQL(info, dialect);
+                try sqls.append(try allocator.dupe(u8, sql));
+                std.heap.page_allocator.free(sql);
+            }
+        }
+
+        // M2M junction tables.
+        inline for (infos) |info| {
+            if (info.is_view) continue;
+            inline for (info.edges) |e| {
+                if (e.relation == .m2m and e.through == null) {
+                    const jtable = comptime junctionTableForEdge(e, info);
+                    const sql = try createTableSQL(jtable, dialect);
+                    try sqls.append(try allocator.dupe(u8, sql));
+                    std.heap.page_allocator.free(sql);
+                }
+            }
+        }
+
+        // CREATE INDEX for non-view entities.
+        inline for (infos) |info| {
+            if (info.is_view or info.indexes.len == 0) continue;
+            inline for (info.indexes) |idx| {
+                const idx_def = IndexDef{
+                    .name = idx.name,
+                    .columns = idx.columns,
+                    .unique = idx.unique,
+                };
+                const sql = try createIndexSQL(idx_def, info.table_name, dialect);
+                try sqls.append(try allocator.dupe(u8, sql));
+                std.heap.page_allocator.free(sql);
+            }
+        }
+
+        // Print collected SQL.
+        for (sqls.items) |s| {
+            std.debug.print("{s};\n", .{s});
+        }
+        return;
+    }
+
     // Bootstrap the history table outside the transaction; the SQL is
     // already idempotent (CREATE TABLE IF NOT EXISTS) and there's no
     // point rolling it back if a later step fails.

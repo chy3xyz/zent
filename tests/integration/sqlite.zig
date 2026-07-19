@@ -890,3 +890,84 @@ test "SQLite: after hook sees created entity" {
     try testing.expect(H.saw_id > 0);
     try testing.expectEqual(entity.id, H.saw_id);
 }
+
+test "SQLite: migrateSchema drops removed column" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Create legacy table with an extra 'obsolete' column not in the schema.
+    _ = try drv.exec(
+        "CREATE TABLE drop_test (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, value INTEGER, obsolete TEXT)",
+        &.{},
+    );
+
+    const DropTest = schema("DropTest", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("value"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{DropTest});
+    const infos = graph.types;
+
+    // Run with drop_columns: false (default) → column remains.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    {
+        var rows = try drv.query("PRAGMA table_info(drop_test)", &.{});
+        defer rows.deinit();
+        var found_obsolete = false;
+        while (rows.next()) |row| {
+            if (std.mem.eql(u8, row.getText(1) orelse "", "obsolete")) found_obsolete = true;
+        }
+        try testing.expect(found_obsolete);
+    }
+
+    // Run with drop_columns: true → column gone.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .drop_columns = true,
+    });
+    {
+        var rows = try drv.query("PRAGMA table_info(drop_test)", &.{});
+        defer rows.deinit();
+        var found_obsolete = false;
+        while (rows.next()) |row| {
+            if (std.mem.eql(u8, row.getText(1) orelse "", "obsolete")) found_obsolete = true;
+        }
+        try testing.expect(!found_obsolete);
+    }
+}
+
+test "SQLite: migrateSchema dry-run outputs SQL without executing" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const DREntity = schema("DREntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("value"),
+        },
+        .indexes = &.{
+            index.Named("idx_drentity_name", &.{"name"}),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{DREntity});
+    const infos = graph.types;
+
+    // Run with dry_run: true — should NOT create any tables.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .dry_run = true,
+    });
+
+    // Verify no tables were created.
+    var rows = try drv.query("SELECT name FROM sqlite_master WHERE type='table'", &.{});
+    defer rows.deinit();
+    var table_count: usize = 0;
+    while (rows.next()) |_| {
+        table_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), table_count);
+}
