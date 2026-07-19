@@ -229,6 +229,14 @@ pub const MySQLDriver = struct {
             return error.MySQLStmtFailed;
         }
 
+        // Ask the client to compute the actual max length of each column so
+        // we can size row buffers accurately and avoid silent truncation.
+        var update_max_length: c.my_bool = 1;
+        if (c.mysql_stmt_attr_set(stmt, c.STMT_ATTR_UPDATE_MAX_LENGTH, &update_max_length) != 0) {
+            logMySQLError(self.conn, "stmt_attr_set");
+            return error.MySQLStmtFailed;
+        }
+
         if (c.mysql_stmt_execute(stmt) != 0) {
             logMySQLError(self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
@@ -260,6 +268,7 @@ pub const MySQLDriver = struct {
             .num_fields = @intCast(num_fields),
             .allocator = self.allocator,
             .done = false,
+            .last_error = null,
         };
 
         return driver.Rows{
@@ -383,13 +392,14 @@ const MySQLTx = struct {
     }
 };
 
-const MySQLRows = struct {
+pub const MySQLRows = struct {
     stmt: *c.MYSQL_STMT,
     metadata: *c.MYSQL_RES,
     fields: [*c]c.MYSQL_FIELD,
     num_fields: usize,
     allocator: std.mem.Allocator,
     done: bool,
+    last_error: ?anyerror = null,
 
     // Per-row buffer
     row_bind: ?[]c.MYSQL_BIND = null,
@@ -430,12 +440,11 @@ const MySQLRows = struct {
 
         for (0..n) |i| {
             const field = &self.fields[i];
-            _ = field;
 
-            // We allocate per-row buffers for each column
-            // For simplicity, use string-based fetching for all types
-            // then parse in getInt/getFloat/getText
-            const buf_len: usize = 256;
+            // Size buffers from field metadata when available; fallback to a
+            // conservative default. Long TEXT/BLOB values previously truncated
+            // silently because this was hard-coded to 256 bytes.
+            const buf_len: usize = if (field.max_length > 0) field.max_length else 256;
             const buf = try self.allocator.alloc(u8, buf_len);
             str_bufs.items[i] = buf;
 
@@ -471,8 +480,9 @@ const MySQLRows = struct {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
         if (self.done) return null;
 
-        self.ensureBuffers() catch {
+        self.ensureBuffers() catch |err| {
             self.done = true;
+            self.last_error = err;
             return null;
         };
 
@@ -481,7 +491,13 @@ const MySQLRows = struct {
             self.done = true;
             return null;
         }
+        if (rc == c.MYSQL_DATA_TRUNCATED) {
+            self.last_error = error.MySQLDataTruncated;
+            self.done = true;
+            return null;
+        }
         if (rc != 0) {
+            self.last_error = error.MySQLFetchFailed;
             self.done = true;
             return null;
         }
@@ -490,6 +506,13 @@ const MySQLRows = struct {
             .ptr = self,
             .vtable = &row_vtable,
         };
+    }
+
+    /// Returns the last error encountered while iterating, if any. Consumers
+    /// should check this after `next()` returns null to distinguish normal
+    /// end-of-results from fetch failures or silent data truncation.
+    pub fn nextError(self: *MySQLRows) ?anyerror {
+        return self.last_error;
     }
 
     fn deinit(ptr: *anyopaque) void {

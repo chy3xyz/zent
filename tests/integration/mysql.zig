@@ -134,3 +134,25 @@ test "MySQL: SaveOrUpdate updates existing row" {
     const r = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 200), r.getInt(0).?);
 }
+
+test "MySQL returns long strings without truncation" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_long_test", &.{});
+    _ = try drv.exec("CREATE TABLE zent_long_test (id INTEGER PRIMARY KEY, payload TEXT)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_long_test", &.{}) catch {};
+
+    const long = try allocator.alloc(u8, 300);
+    defer allocator.free(long);
+    @memset(long, 'a');
+    _ = try drv.exec("INSERT INTO zent_long_test (id, payload) VALUES (?, ?)", &.{ .{ .int = 1 }, .{ .string = long } });
+
+    var rows = try drv.query("SELECT payload FROM zent_long_test", &.{});
+    defer rows.deinit();
+
+    const row = rows.next() orelse return error.NoRow;
+    const got = row.getText(0) orelse return error.NoText;
+    try testing.expectEqualStrings(long, got);
+}
