@@ -1,3 +1,10 @@
+/// Schema-level metadata. String-keyed annotations attach arbitrary
+/// `key -> value` labels to a schema (e.g. owner, retention policy, doc URL).
+pub const Annotation = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 /// Merge field arrays from mixins into a single array.
 fn mergeMixinFields(comptime base: []const @import("field.zig").Field, comptime mixins: []const type) []const @import("field.zig").Field {
     comptime {
@@ -61,6 +68,7 @@ pub fn Schema(comptime name: []const u8, comptime config: struct {
     view: bool = false,
     view_sql: ?[]const u8 = null,
     soft_delete: bool = false,
+    annotations: []const Annotation = &.{},
 }) type {
     const all_fields = mergeMixinFields(config.fields, config.mixins);
     const all_edges = mergeMixinEdges(config.edges, config.mixins);
@@ -76,6 +84,7 @@ pub fn Schema(comptime name: []const u8, comptime config: struct {
         pub const is_view = config.view;
         pub const view_sql = config.view_sql;
         pub const soft_delete = config.soft_delete;
+        pub const annotations = config.annotations;
     };
 }
 

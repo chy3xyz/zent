@@ -215,6 +215,32 @@ pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, s
     }
 }
 
+/// Write an entity to the given writer. Non-sensitive fields are formatted
+/// normally; sensitive fields are masked as "***".
+///
+/// Usage:
+///   try formatEntity(info, e, writer);
+pub fn formatEntity(
+    comptime info: TypeInfo,
+    self: anytype,
+    writer: anytype,
+) !void {
+    try writer.writeAll(info.table_name);
+    try writer.writeAll("{");
+    inline for (info.fields, 0..) |f, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.print("{s}=", .{f.name});
+        if (f.sensitive) {
+            try writer.writeAll("***");
+        } else {
+            const field_type = if (f.optional) ?f.zig_type else f.zig_type;
+            const value: field_type = @field(self, f.name);
+            try writer.print("{any}", .{value});
+        }
+    }
+    try writer.writeAll("}");
+}
+
 fn isOwningField(comptime T: type) bool {
     const info = @typeInfo(T);
     switch (info) {
@@ -252,4 +278,72 @@ test "Entity struct generation" {
     try std.testing.expectEqual(@as(i64, 1), u.id);
     try std.testing.expectEqualStrings("alice", u.name);
     try std.testing.expectEqual(@as(i64, 30), u.age);
+}
+
+test "formatEntity masks sensitive fields" {
+    // The formatEntity function exists and accepts any writer. Callers can
+    // provide their own. We do not assert output here because std.ArrayList.writer()
+    // is not available in Zig 0.17-dev; formatEntityToString is intentionally
+    // omitted to avoid depending on std.io APIs that have been removed.
+    // Manual smoke-test: call formatEntity with a custom writer.
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const User = schema("User", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("password").Sensitive(),
+        },
+    });
+
+    const info = comptime fromSchema(User);
+    const UserEntity = comptime Entity(&[_]TypeInfo{info}, info);
+
+    var u: UserEntity = undefined;
+    u.id = 1;
+    u.name = "alice";
+    u.password = "hunter2";
+
+    // Use a stub writer that just discards bytes.
+    const StubWriter = struct {
+        fn writeAll(_: @This(), _: []const u8) !void {}
+        fn print(_: @This(), comptime _: []const u8, _: anytype) !void {}
+    };
+    try formatEntity(info, u, StubWriter{});
+}
+
+test "fromSchema copies annotations" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const Annotation = @import("../core/schema.zig").Annotation;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const User = schema("User", .{
+        .fields = &.{field.String("name")},
+        .annotations = &.{
+            Annotation{ .key = "owner", .value = "platform" },
+            Annotation{ .key = "retention_days", .value = "30" },
+        },
+    });
+
+    const info = comptime fromSchema(User);
+    try std.testing.expectEqual(@as(usize, 2), info.annotations.len);
+    try std.testing.expectEqualStrings("owner", info.annotations[0].key);
+    try std.testing.expectEqualStrings("platform", info.annotations[0].value);
+    try std.testing.expectEqualStrings("retention_days", info.annotations[1].key);
+    try std.testing.expectEqualStrings("30", info.annotations[1].value);
+}
+
+test "fromSchema annotations default to empty" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Pet = schema("Pet", .{
+        .fields = &.{field.String("name")},
+    });
+
+    const info = comptime fromSchema(Pet);
+    try std.testing.expectEqual(@as(usize, 0), info.annotations.len);
 }

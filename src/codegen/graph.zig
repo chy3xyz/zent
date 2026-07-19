@@ -4,6 +4,7 @@ const edge_mod = @import("../core/edge.zig");
 const index_mod = @import("../core/index.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const Policy = @import("../privacy/policy.zig").Policy;
+const Annotation = @import("../core/schema.zig").Annotation;
 const graph_step = @import("../graph/step.zig");
 
 pub const FieldInfo = struct {
@@ -54,6 +55,7 @@ pub const TypeInfo = struct {
     is_view: bool = false,
     view_sql: ?[]const u8 = null,
     soft_delete: bool = false,
+    annotations: []const Annotation = &.{},
 };
 
 /// Build a TypeInfo from a schema type at comptime.
@@ -66,6 +68,7 @@ pub fn fromSchema(comptime S: type) TypeInfo {
         const schema_is_view = if (@hasDecl(S, "is_view")) S.is_view else false;
         const schema_view_sql = if (@hasDecl(S, "view_sql")) S.view_sql else null;
         const schema_soft_delete = if (@hasDecl(S, "soft_delete")) S.soft_delete else false;
+        const schema_annotations = if (@hasDecl(S, "annotations")) S.annotations else &.{};
         const name = S.schema_name;
 
         // Auto-inject ID if not present.
@@ -101,6 +104,7 @@ pub fn fromSchema(comptime S: type) TypeInfo {
             .is_view = schema_is_view,
             .view_sql = schema_view_sql,
             .soft_delete = schema_soft_delete,
+            .annotations = schema_annotations,
         };
     }
 }
@@ -312,6 +316,7 @@ pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
                 .is_view = info.is_view,
                 .view_sql = info.view_sql,
                 .soft_delete = info.soft_delete,
+                .annotations = info.annotations,
             }};
         }
         return result;
@@ -407,6 +412,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) 
             .is_view = info.is_view,
             .view_sql = info.view_sql,
             .soft_delete = info.soft_delete,
+            .annotations = info.annotations,
         };
     }
 }
