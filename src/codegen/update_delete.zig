@@ -204,9 +204,16 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                     try self.predicates.append(pred.*);
                 }
             }
+            // Build mutated slice from field values for hook context.
+            const mutated = try self.allocator.alloc(sql.Value, self.values.items.len);
+            defer self.allocator.free(mutated);
+            for (self.values.items, 0..) |fv, i| {
+                mutated[i] = fv.value;
+            }
             var hook_ctx = HookContext{
                 .op = .update,
                 .table_name = info.table_name,
+                .mutated = mutated,
                 .privacy = self.privacy_ctx orelse .{},
             };
             for (self.hooks) |h| {

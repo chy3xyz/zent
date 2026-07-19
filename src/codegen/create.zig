@@ -155,9 +155,16 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            // Build mutated slice from field values for hook context.
+            const mutated = try self.allocator.alloc(sql.Value, self.values.items.len);
+            defer self.allocator.free(mutated);
+            for (self.values.items, 0..) |fv, i| {
+                mutated[i] = fv.value;
+            }
             var hook_ctx = HookContext{
                 .op = .create,
                 .table_name = info.table_name,
+                .mutated = mutated,
                 .privacy = self.privacy_ctx orelse .{},
             };
             for (self.hooks) |h| {

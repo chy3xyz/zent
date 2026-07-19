@@ -25,6 +25,7 @@ pub const OwnedQuery = struct {
     sql: []u8,
     args: []Value,
     allocator: std.mem.Allocator,
+    dialect: Dialect,
 
     pub fn deinit(self: *const OwnedQuery) void {
         self.allocator.free(self.sql);
@@ -76,6 +77,7 @@ pub const Builder = struct {
             .sql = try b.buffer.toOwnedSlice(),
             .args = try b.args.toOwnedSlice(),
             .allocator = b.allocator,
+            .dialect = b.dialect,
         };
     }
 
@@ -552,6 +554,34 @@ pub const CTE = struct {
     materialized: ?bool = null,
 };
 
+/// Append a SQL string, rebasing PostgreSQL $N placeholders by `offset`.
+/// For non-PostgreSQL dialects or offset == 0, this is a direct copy.
+fn appendRebasedSql(b: *Builder, sql: []const u8, offset: usize) !void {
+    if (!std.mem.eql(u8, b.dialect.name, "postgres") or offset == 0) {
+        return b.writeString(sql);
+    }
+    var i: usize = 0;
+    while (i < sql.len) {
+        if (sql[i] == '$') {
+            const j = i + 1;
+            if (j < sql.len and std.ascii.isDigit(sql[j])) {
+                var num: usize = 0;
+                var k = j;
+                while (k < sql.len and std.ascii.isDigit(sql[k])) : (k += 1) {
+                    num = num * 10 + (sql[k] - '0');
+                }
+                var buf: [16]u8 = undefined;
+                const rebased = try std.fmt.bufPrint(&buf, "${d}", .{num + offset});
+                try b.writeString(rebased);
+                i = k;
+                continue;
+            }
+        }
+        try b.writeByte(sql[i]);
+        i += 1;
+    }
+}
+
 pub const Selector = struct {
     b: Builder,
     columns: std.array_list.Managed(ColumnRef),
@@ -567,6 +597,7 @@ pub const Selector = struct {
     for_update: bool,
     for_share: bool,
     ctes: std.array_list.Managed(CTE),
+    cte_dialect: ?Dialect = null,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) !Selector {
         var s = Selector{
@@ -584,6 +615,7 @@ pub const Selector = struct {
             .for_update = false,
             .for_share = false,
             .ctes = std.array_list.Managed(CTE).init(allocator),
+            .cte_dialect = null,
         };
         try s.columns.appendSlice(columns);
         return s;
@@ -658,7 +690,12 @@ pub const Selector = struct {
     /// Add a Common Table Expression (CTE) to the SELECT.
     /// The subquery is an OwnedQuery; its SQL and args will be merged into
     /// the main query at build time. Caller transfers ownership of the subquery.
+    /// Rejects mixed-dialect CTE composition.
     pub fn with(s: *Selector, name: []const u8, subquery: OwnedQuery) !void {
+        if (s.cte_dialect != null and !std.mem.eql(u8, subquery.dialect.name, s.cte_dialect.?.name)) {
+            return error.DialectMismatch;
+        }
+        s.cte_dialect = subquery.dialect;
         try s.ctes.append(.{ .name = name, .columns = null, .query = subquery });
     }
 
@@ -669,9 +706,11 @@ pub const Selector = struct {
                 if (i > 0) try s.b.writeString(", ");
                 try s.b.ident(cte.name);
                 try s.b.writeString(" AS (");
-                // Merge the subquery's args first so placeholders align.
+                // Merge the subquery's args first so placeholders align,
+                // then rebase PostgreSQL $N placeholders in the CTE SQL.
+                const arg_offset = s.b.args.items.len;
                 try s.b.args.appendSlice(cte.query.args);
-                try s.b.writeString(cte.query.sql);
+                try appendRebasedSql(&s.b, cte.query.sql, arg_offset);
                 try s.b.writeByte(')');
             }
             try s.b.writeByte(' ');
@@ -746,9 +785,11 @@ pub const Selector = struct {
                 if (i > 0) try s.b.writeString(", ");
                 try s.b.ident(cte.name);
                 try s.b.writeString(" AS (");
-                // Merge the subquery's args first so placeholders align.
+                // Merge the subquery's args first so placeholders align,
+                // then rebase PostgreSQL $N placeholders in the CTE SQL.
+                const arg_offset = s.b.args.items.len;
                 try s.b.args.appendSlice(cte.query.args);
-                try s.b.writeString(cte.query.sql);
+                try appendRebasedSql(&s.b, cte.query.sql, arg_offset);
                 try s.b.writeByte(')');
             }
             try s.b.writeByte(' ');

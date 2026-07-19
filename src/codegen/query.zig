@@ -44,6 +44,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         offset_val: ?usize,
         cursor_col: ?[]const u8 = null,
         cursor_val: ?sql.Value = null,
+        cursor_desc: bool = false,
         distinct: bool,
         with_trashed: bool,
         with_edges: std.ArrayListUnmanaged([]const u8),
@@ -163,10 +164,23 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         /// Set a cursor column and value for keyset/cursor-based pagination.
         /// When set, the generated query appends `WHERE (col > ?) ORDER BY col ASC`
-        /// and uses `limit_val` as the page size. Mutually exclusive with `Offset`/`Page`.
+        /// and uses `limit_val` as the page size. Offset is cleared to enforce
+        /// mutual exclusion with offset pagination.
         pub fn Cursor(self: *Self, column: []const u8, value: sql.Value) *Self {
             self.cursor_col = column;
             self.cursor_val = value;
+            self.cursor_desc = false;
+            self.offset_val = null;
+            return self;
+        }
+
+        /// Set a descending cursor column and value for reverse keyset pagination.
+        /// Uses `WHERE (col < ?) ORDER BY col DESC` instead of the ascending variant.
+        pub fn CursorDesc(self: *Self, column: []const u8, value: sql.Value) *Self {
+            self.cursor_col = column;
+            self.cursor_val = value;
+            self.cursor_desc = true;
+            self.offset_val = null;
             return self;
         }
 
@@ -174,6 +188,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn CursorAfter(self: *Self, entity: Entity) *Self {
             self.cursor_col = "id";
             self.cursor_val = .{ .int = entity.id };
+            self.cursor_desc = false;
+            self.offset_val = null;
             return self;
         }
 
@@ -227,7 +243,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
-        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed };
+        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
 
         fn mapBuildError(err: anyerror) BuildError {
@@ -564,7 +580,21 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
             if (self.cursor_col) |col| {
                 if (self.cursor_val) |val| {
-                    _ = try selector.where(sql.GT(col, val));
+                    if (val == .null) return error.InvalidCursor;
+                    // Validate cursor column against entity fields
+                    var col_valid = false;
+                    inline for (info.fields) |f| {
+                        if (std.mem.eql(u8, f.name, col)) {
+                            col_valid = true;
+                            break;
+                        }
+                    }
+                    if (!col_valid) return error.InvalidCursor;
+                    if (self.cursor_desc) {
+                        _ = try selector.where(sql.LT(col, val));
+                    } else {
+                        _ = try selector.where(sql.GT(col, val));
+                    }
                 }
             }
             if (info.soft_delete and !self.with_trashed) {
@@ -577,9 +607,35 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 _ = selector.having(pred);
             }
             if (self.cursor_col) |col| {
-                // When cursor pagination is active, ensure ORDER BY col ASC is present.
+                // When cursor pagination is active, ensure ORDER BY col ASC/DESC is present.
                 if (self.order_terms.items.len == 0) {
-                    _ = try selector.orderBy(sql.OrderAsc(col));
+                    if (self.cursor_desc) {
+                        _ = try selector.orderBy(sql.OrderDesc(col));
+                    } else {
+                        _ = try selector.orderBy(sql.OrderAsc(col));
+                    }
+                }
+                // Auto-add id tie-breaker for stable keyset pagination
+                if (!std.mem.eql(u8, col, "id")) {
+                    var has_id: bool = false;
+                    for (self.order_terms.items) |term| {
+                        switch (term) {
+                            .column => |o| {
+                                if (std.mem.eql(u8, o.name, "id")) {
+                                    has_id = true;
+                                    break;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    if (!has_id) {
+                        if (self.cursor_desc) {
+                            _ = try selector.orderBy(sql.OrderDesc("id"));
+                        } else {
+                            _ = try selector.orderBy(sql.OrderAsc("id"));
+                        }
+                    }
                 }
             }
             if (self.order_terms.items.len > 0) {
@@ -751,7 +807,7 @@ test "Query builder execution methods expose explicit driver error union" {
     const infos = &[_]TypeInfo{info};
     const UserEntity = comptime EntityGenerator(infos, info);
     const UserQuery = QueryBuilder(infos, info, UserEntity);
-    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed };
+    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed };
 
     comptime {
         const method_names = .{ "All", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
