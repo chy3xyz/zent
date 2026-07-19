@@ -10,6 +10,10 @@ pub const Result = struct {
 /// Unified error set returned by all driver implementations.
 pub const Error = error{
     OutOfMemory,
+    /// The pool has no idle connections and has reached its maximum size.
+    PoolExhausted,
+    /// The pool has been shut down and cannot serve new requests.
+    PoolClosed,
     ConnectionFailed,
     ExecFailed,
     QueryFailed,

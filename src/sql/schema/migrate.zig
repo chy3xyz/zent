@@ -105,7 +105,7 @@ fn appliedVersions(allocator: std.mem.Allocator, drv: sql_driver.Driver) ![]i64 
 /// Insert a row into the migration history table.
 fn recordMigration(drv: sql_driver.Driver, version: i64, checksum: ?[]const u8) !void {
     const now = unixTimestamp();
-    var sql_buf: [256]u8 = undefined;
+    var sql_buf: [384]u8 = undefined;
     const sql = try buildRecordInsertSQL(drv.dialect(), &sql_buf);
     _ = try drv.exec(
         sql,
@@ -454,6 +454,12 @@ fn createTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo)
 }
 
 /// Create all tables and indexes for a set of TypeInfos.
+///
+/// NOTE: This is a legacy helper that creates tables/indexes directly without
+/// recording migration history or wrapping in a transaction. Prefer
+/// `migrateSchema` for production use — it provides transactional atomicity
+/// (SQLite, PostgreSQL), idempotency via `zent_schema_migrations`, and
+/// automatic column/index additions on re-run.
 pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver_drv.dialect();
     try createTables(driver_drv, infos);
@@ -466,6 +472,8 @@ pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const Ty
             existing_mysql_indexes = getExistingIndexes(std.heap.page_allocator, driver_drv, info.table_name) catch |err| switch (err) {
                 error.UnsupportedDialect => unreachable, // The dialect was checked immediately above.
                 error.OutOfMemory => return error.OutOfMemory,
+                error.PoolExhausted => return error.PoolExhausted,
+                error.PoolClosed => return error.PoolClosed,
                 error.ConnectionFailed => return error.ConnectionFailed,
                 error.ExecFailed => return error.ExecFailed,
                 error.QueryFailed => return error.QueryFailed,

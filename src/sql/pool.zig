@@ -301,6 +301,8 @@ pub fn ConnPool(comptime D: type) type {
         fn borrowForDriver(self: *Self) driver.Error!*D {
             return self.borrow() catch |err| switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
+                error.PoolExhausted => error.PoolExhausted,
+                error.PoolClosed => error.PoolClosed,
                 else => error.ConnectionFailed,
             };
         }
