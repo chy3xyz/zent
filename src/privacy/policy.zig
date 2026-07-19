@@ -1,82 +1,108 @@
 const std = @import("std");
+const rtp = @import("../runtime/privacy.zig");
 
-/// Operation kind for privacy evaluation.
-pub const Op = enum {
-    query,
-    create,
-    update,
-    delete,
-};
+// Re-export types from runtime/privacy.zig (canonical definitions).
+pub const PrivacyContext = rtp.PrivacyContext;
+pub const Decision = rtp.Decision;
+pub const DecisionSet = rtp.DecisionSet;
+pub const FilterRule = rtp.FilterRule;
+pub const Rule = rtp.Rule;
 
-/// Decision returned by a privacy rule.
-pub const Decision = enum {
-    allow,
-    deny,
-};
+// Convenience rule constants.
+pub const Allow = Rule.allow;
+pub const Deny = Rule.deny;
+pub const Skip = Rule.skip;
 
-/// Backward compatibility: old-style rule function.
-pub const OldRule = *const fn (op: Op, table: []const u8) Decision;
+/// Create a filter rule from a comptime predicate function.
+/// The predicate receives a PrivacyContext and returns an optional
+/// opaque filter pointer (null = filter not applicable).
+pub fn Filter(comptime predicate: anytype) Rule {
+    return .{ .filter = .{ .predicate = struct {
+        fn call(ctx: PrivacyContext) ?*const anyopaque {
+            return predicate(ctx);
+        }
+    }.call } };
+}
 
 /// Privacy policy that can be attached to a schema.
-/// Backward compatible format with separate query and mutation rules.
+/// Carries an ordered list of rules evaluated with AND semantics
+/// via runtime.privacy.evalPolicy.
 pub const Policy = struct {
-    query: ?OldRule = null,
-    mutation: ?OldRule = null,
+    rules: []const Rule,
 
-    pub fn evalQuery(self: Policy, op: Op, table: []const u8) Decision {
-        if (self.query) |rule| return rule(op, table);
-        return .allow;
-    }
-
-    pub fn evalMutation(self: Policy, op: Op, table: []const u8) Decision {
-        if (self.mutation) |rule| return rule(op, table);
-        return .allow;
+    pub fn eval(self: Policy, ctx: PrivacyContext) DecisionSet {
+        return rtp.evalPolicy(ctx, self.rules);
     }
 };
 
 // ------------------------------------------------------------------
-// Built-in rules
+// Built-in policies
 // ------------------------------------------------------------------
 
-pub fn AlwaysAllow(_: Op, _: []const u8) Decision {
-    return .allow;
-}
+/// Always allow — no restrictions.
+pub const AlwaysAllow = Policy{ .rules = &.{Allow} };
 
-pub fn AlwaysDeny(_: Op, _: []const u8) Decision {
-    return .deny;
-}
+/// Always deny — blocks all access.
+pub const AlwaysDeny = Policy{ .rules = &.{Deny} };
 
-pub fn OnCreate(op: Op, _: []const u8) Decision {
-    return if (op == .create) .allow else .deny;
-}
-
-pub fn OnUpdate(op: Op, _: []const u8) Decision {
-    return if (op == .update) .allow else .deny;
-}
-
-pub fn OnDelete(op: Op, _: []const u8) Decision {
-    return if (op == .delete) .allow else .deny;
-}
-
-pub fn OnQuery(op: Op, _: []const u8) Decision {
-    return if (op == .query) .allow else .deny;
-}
+/// Deny all — used as placeholders for operation-specific policies
+/// that will be wired by Task 3 (codegen layer).
+pub const OnCreate = Policy{ .rules = &.{Deny} };
+pub const OnUpdate = Policy{ .rules = &.{Deny} };
+pub const OnDelete = Policy{ .rules = &.{Deny} };
+pub const OnQuery = Policy{ .rules = &.{Deny} };
 
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
 
-test "Built-in rules" {
-    try std.testing.expectEqual(Decision.allow, OnCreate(.create, "user"));
-    try std.testing.expectEqual(Decision.deny, OnCreate(.update, "user"));
-
-    try std.testing.expectEqual(Decision.allow, OnQuery(.query, "user"));
-    try std.testing.expectEqual(Decision.deny, OnQuery(.create, "user"));
+test "Policy: AlwaysAllow" {
+    const ctx = PrivacyContext{};
+    const result = AlwaysAllow.eval(ctx);
+    try std.testing.expectEqual(Decision.allow, result.decision);
+    try std.testing.expectEqual(@as(usize, 0), result.filters.len);
 }
 
-test "Policy evaluation" {
-    const p = Policy{ .mutation = OnCreate };
-    try std.testing.expectEqual(Decision.allow, p.evalMutation(.create, "user"));
-    try std.testing.expectEqual(Decision.deny, p.evalMutation(.update, "user"));
-    try std.testing.expectEqual(Decision.allow, p.evalQuery(.query, "user"));
+test "Policy: AlwaysDeny" {
+    const ctx = PrivacyContext{};
+    const result = AlwaysDeny.eval(ctx);
+    try std.testing.expectEqual(Decision.deny, result.decision);
+}
+
+test "Policy: OnCreate/OnUpdate/OnDelete/OnQuery all deny" {
+    const ctx = PrivacyContext{};
+    try std.testing.expectEqual(Decision.deny, OnCreate.eval(ctx).decision);
+    try std.testing.expectEqual(Decision.deny, OnUpdate.eval(ctx).decision);
+    try std.testing.expectEqual(Decision.deny, OnDelete.eval(ctx).decision);
+    try std.testing.expectEqual(Decision.deny, OnQuery.eval(ctx).decision);
+}
+
+test "Filter factory creates valid rule" {
+    const ctx = PrivacyContext{ .user_id = 42 };
+    const rule = Filter(struct {
+        fn p(c: PrivacyContext) ?*const anyopaque {
+            if (c.user_id) |_| {
+                return @ptrCast(&struct { uid: i64 = 1 });
+            }
+            return null;
+        }
+    }.p);
+    const policy = Policy{ .rules = &.{ Allow, rule } };
+    const result = policy.eval(ctx);
+    try std.testing.expectEqual(Decision.allow, result.decision);
+    try std.testing.expectEqual(@as(usize, 1), result.filters.len);
+}
+
+test "Policy with multiple rules: deny short-circuits" {
+    const ctx = PrivacyContext{};
+    const policy = Policy{ .rules = &.{ Allow, Deny, Allow } };
+    const result = policy.eval(ctx);
+    try std.testing.expectEqual(Decision.deny, result.decision);
+}
+
+test "Policy with empty rules defaults to allow" {
+    const ctx = PrivacyContext{};
+    const policy = Policy{ .rules = &.{} };
+    const result = policy.eval(ctx);
+    try std.testing.expectEqual(Decision.allow, result.decision);
 }

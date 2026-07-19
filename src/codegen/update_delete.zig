@@ -186,11 +186,12 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
-            if (info.policy) |p| {
-                if (p.evalMutation(.update, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalMutation(.update, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.before) |f| f(.update, info.table_name);
@@ -315,11 +316,12 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execSoftDelete(self: *Self) ExecError!usize {
-            if (info.policy) |p| {
-                if (p.evalMutation(.delete, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalMutation(.delete, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| f(.delete, info.table_name);
@@ -349,11 +351,12 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
-            if (info.policy) |p| {
-                if (p.evalMutation(.delete, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalMutation(.delete, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| f(.delete, info.table_name);
@@ -467,11 +470,12 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
-            if (info.policy) |p| {
-                if (p.evalMutation(.update, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalMutation(.update, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.before) |f| f(.update, info.table_name);
@@ -568,11 +572,12 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
-            if (info.policy) |p| {
-                if (p.evalMutation(.delete, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalMutation(.delete, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| f(.delete, info.table_name);

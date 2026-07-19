@@ -56,15 +56,15 @@ pub const Rule = union(enum) {
 /// - .allow → lock in .allow; remaining rules are still scanned for filters.
 /// - .filter → invoke predicate(ctx); if non-null, accumulate the opaque pointer.
 ///
-/// `rules` must be a comptime-known array or tuple of `Rule`.
+/// `rules` is a runtime slice of `Rule`.
 pub fn evalPolicy(
     ctx: PrivacyContext,
-    comptime rules: anytype,
+    rules: []const Rule,
 ) DecisionSet {
     var filters_buf: [max_filters]*const anyopaque = undefined;
     var filter_count: usize = 0;
 
-    inline for (rules) |rule| {
+    for (rules) |rule| {
         switch (rule) {
             .skip => continue,
             .deny => return .{ .decision = .deny, .filters = &.{} },
@@ -116,7 +116,7 @@ test "evalPolicy: deny wins immediately" {
         .deny,
         .allow,
     };
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.deny, result.decision);
     try std.testing.expectEqual(@as(usize, 0), result.filters.len);
 }
@@ -128,7 +128,7 @@ test "evalPolicy: allow after skip" {
         .skip,
         .allow,
     };
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
 }
 
@@ -138,14 +138,14 @@ test "evalPolicy: deny before allow" {
         .allow,
         .deny,
     };
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.deny, result.decision);
 }
 
 test "evalPolicy: pure allow" {
     const ctx = PrivacyContext{};
     const rules = comptime [_]Rule{.allow};
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
     try std.testing.expectEqual(@as(usize, 0), result.filters.len);
 }
@@ -175,7 +175,7 @@ test "evalPolicy: filter accumulates" {
             },
         },
     };
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
     try std.testing.expectEqual(@as(usize, 2), result.filters.len);
 }
@@ -195,7 +195,7 @@ test "evalPolicy: filter returning null is skipped" {
             },
         },
     };
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
     try std.testing.expectEqual(@as(usize, 0), result.filters.len);
 }
@@ -215,7 +215,7 @@ test "evalPolicy: deny short-circuits before filters" {
         },
         .deny,
     };
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.deny, result.decision);
     try std.testing.expectEqual(@as(usize, 0), result.filters.len);
 }
@@ -238,7 +238,7 @@ test "evalPolicy: context-dependent filter" {
             },
         },
     };
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
     try std.testing.expectEqual(@as(usize, 1), result.filters.len);
 }
@@ -246,7 +246,7 @@ test "evalPolicy: context-dependent filter" {
 test "evalPolicy: empty rules defaults to allow" {
     const ctx = PrivacyContext{};
     const rules = comptime [_]Rule{};
-    const result = evalPolicy(ctx, rules);
+    const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
     try std.testing.expectEqual(@as(usize, 0), result.filters.len);
 }

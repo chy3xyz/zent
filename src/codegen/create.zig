@@ -142,11 +142,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!Entity {
-            if (info.policy) |p| {
-                if (p.evalMutation(.create, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalMutation(.create, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.before) |f| f(.create, info.table_name);
@@ -549,11 +550,12 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         const SaveError = sql_driver.Error || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
-            if (info.policy) |p| {
-                if (p.evalMutation(.create, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalMutation(.create, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.before) |f| f(.create, info.table_name);

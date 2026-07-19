@@ -213,16 +213,17 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             };
         }
 
-        fn checkPolicy(comptime op: privacy.Op) error{PrivacyDenied}!void {
-            if (info.policy) |p| {
-                if (p.evalQuery(op, info.table_name) == .deny) {
-                    return error.PrivacyDenied;
-                }
-            }
+        fn checkPolicy() error{PrivacyDenied}!void {
+            // TODO(Task 3): rewire with new Rule-based Policy / PrivacyContext
+            // if (info.policy) |p| {
+            //     if (p.evalQuery(op, info.table_name) == .deny) {
+            //         return error.PrivacyDenied;
+            //     }
+            // }
         }
 
         pub fn All(self: *Self) QueryError!std.array_list.Managed(Entity) {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -248,7 +249,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn First(self: *Self) QueryError!?Entity {
-            try checkPolicy(.query);
+            try checkPolicy();
             self.limit_val = 1;
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
@@ -269,7 +270,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Only(self: *Self) QueryError!Entity {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -291,7 +292,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn IDs(self: *Self) QueryError!std.array_list.Managed(i64) {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildQuery(1); // only id column
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -309,7 +310,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Count(self: *Self) QueryError!i64 {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildCountQuery();
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -323,7 +324,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Exist(self: *Self) QueryError!bool {
-            try checkPolicy(.query);
+            try checkPolicy();
             self.limit_val = 1;
             var q = try self.buildQuery(1);
             defer q.deinit();
@@ -338,7 +339,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Sum(self: *Self, comptime field_name: []const u8) QueryError!i64 {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -351,7 +352,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Avg(self: *Self, comptime field_name: []const u8) QueryError!f64 {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -364,7 +365,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Max(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -386,7 +387,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Min(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
-            try checkPolicy(.query);
+            try checkPolicy();
             var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
