@@ -581,3 +581,70 @@ test "SQLite: migrateSchema rollback leaves neither schema nor history" {
     const hist_row = hist_rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 0), hist_row.getInt(0).?);
 }
+
+test "SQLite: Deny policy blocks query and create" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Schema with AlwaysDeny policy
+    const DenyEntity = schema("DenyEntity", .{
+        .fields = &.{
+            field.String("name"),
+        },
+        .policy = zent.privacy.AlwaysDeny,
+    });
+
+    const graph = comptime buildGraph(&.{DenyEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Query should be denied (no privacy_ctx → null context triggers deny)
+    {
+        var q = client.deny_entity.Query();
+        defer q.deinit();
+        if (q.All()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // Create should be denied
+    {
+        var b = try client.deny_entity.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "test");
+        if (b.Save()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // Delete should be denied
+    {
+        var d = client.deny_entity.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{client.deny_entity.predicates.nameEQ(.{ .string = "test" })});
+        if (d.Exec()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // Update should be denied
+    {
+        var u = client.deny_entity.Update();
+        defer u.deinit();
+        _ = try u.set("name", .{ .string = "x" });
+        if (u.Save()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+}

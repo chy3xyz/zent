@@ -224,11 +224,18 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         /// Inject privacy row-level filters (DecisionSet.filters) into the query predicates.
-        /// NOTE: Full filter injection requires a type-resolution layer from opaque pointers
-        /// to sql.Predicate. The allow/deny gate (checkPolicy) is fully functional;
-        /// filter accumulation is deferred to a follow-up codegen pass.
+        /// Filter rules are not yet supported; if any filter rule is present in the policy
+        /// this emits a compile-time error to prevent silent security failures.
+        /// The allow/deny gate (checkPolicy) is fully functional.
         fn injectPrivacyFilters(self: *Self) !void {
             _ = self;
+            if (info.policy) |p| {
+                inline for (p.rules) |rule| {
+                    if (rule == .filter) {
+                        @compileError("privacy filter injection is not yet implemented; policies with filter rules are unsupported in this build");
+                    }
+                }
+            }
         }
 
         pub fn All(self: *Self) QueryError!std.array_list.Managed(Entity) {
