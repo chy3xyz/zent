@@ -887,8 +887,9 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
                     const sql = try createViewSQL(info, dialect);
                     defer std.heap.page_allocator.free(sql);
                     _ = try tx_drv.exec(sql, &.{});
+                    try recordMigration(tx_drv, version, null);
                 } else {
-                    existing.deinit();
+                    freeExistingColumns(allocator, &existing);
                 }
             }
         } else {
