@@ -8,6 +8,10 @@
 const std = @import("std");
 const zent = @import("zent");
 const PostgresDriver = zent.sql_postgres.PostgresDriver;
+const buildGraph = zent.codegen.graph.buildGraph;
+const Client = zent.codegen.client;
+const field = zent.core.field;
+const schema = zent.core.schema.Schema;
 const testing = std.testing;
 
 fn connect(allocator: std.mem.Allocator) !PostgresDriver {
@@ -89,4 +93,40 @@ test "Postgres: transaction commit/rollback" {
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+}
+
+test "Postgres: SaveOrUpdate updates existing row" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const PgUpsertUser = schema("PgUpsertUser", .{
+        .fields = &.{
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{PgUpsertUser});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_upsert_user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b1 = try client.pg_upsert_user.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("id", @as(i64, 99));
+    _ = try b1.setFieldValue("score", @as(i64, 100));
+    _ = try b1.SaveOrUpdate();
+
+    var b2 = try client.pg_upsert_user.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("id", @as(i64, 99));
+    _ = try b2.setFieldValue("score", @as(i64, 200));
+    _ = try b2.SaveOrUpdate();
+
+    var rows = try drv.query("SELECT score FROM pg_upsert_user WHERE id = $1", &.{.{ .int = 99 }});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 200), row.getInt(0).?);
 }

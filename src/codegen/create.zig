@@ -198,7 +198,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const replace_prefix: []const u8 = if (needs_replace_prefix) "REPLACE" else "";
                 const ret_suffix = " RETURNING \"id\"";
 
-                const full_sql_len = replace_prefix.len + 1 + q.sql.len + upsert_suffix.len + ret_suffix.len;
+                const full_sql_len = replace_prefix.len + (if (needs_replace_prefix) @as(usize, 1) else 0) + q.sql.len + upsert_suffix.len + ret_suffix.len;
                 const full_sql = try self.allocator.alloc(u8, full_sql_len);
                 defer self.allocator.free(full_sql);
                 var pos: usize = 0;
@@ -229,7 +229,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var q = try builder.takeQuery();
                 defer q.deinit();
 
-                const full_sql_len = replace_prefix.len + 1 + q.sql.len;
+                const full_sql_len = replace_prefix.len + (if (needs_replace_prefix) @as(usize, 1) else 0) + q.sql.len;
                 const full_sql = try self.allocator.alloc(u8, full_sql_len);
                 defer self.allocator.free(full_sql);
                 var pos: usize = 0;
