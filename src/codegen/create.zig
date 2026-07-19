@@ -178,32 +178,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // built-in InsertOrReplace builder. For PG we append ON CONFLICT
             // (id) DO UPDATE SET col=excluded.col ... For MySQL we use
             // REPLACE INTO. For plain Save (or_replace=false) the suffix is empty.
-            const upsert_suffix: []const u8 = upsert: {
-                if (!or_replace) break :upsert "";
-                if (is_sqlite) break :upsert ""; // InsertOrReplace builder handles it
-                if (is_postgres) {
-                    // ON CONFLICT (id) DO UPDATE SET <col>=EXCLUDED.<col> for every non-pk col
-                    var buf = std.array_list.Managed(u8).init(self.allocator);
-                    defer buf.deinit();
-                    try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
-                    var first = true;
-                    for (columns.items) |col| {
-                        if (std.mem.eql(u8, col, "id")) continue;
-                        if (!first) try buf.appendSlice(", ");
-                        first = false;
-                        var piece_buf: [128]u8 = undefined;
-                        const piece = std.fmt.bufPrint(
-                            &piece_buf,
-                            "\"{s}\"=EXCLUDED.\"{s}\"",
-                            .{ col, col },
-                        ) catch continue;
-                        try buf.appendSlice(piece);
-                    }
-                    break :upsert buf.items;
-                }
-                // MySQL: REPLACE INTO
-                break :upsert " REPLACE";
-            };
+            const upsert_suffix: []const u8 = try self.buildUpsertSuffix(or_replace, is_postgres, is_sqlite, columns.items);
+            defer self.allocator.free(upsert_suffix);
 
             var entity: Entity = std.mem.zeroes(Entity);
             if (supports_returning) {
@@ -334,6 +310,30 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             }
 
             return entity;
+        }
+
+        fn buildUpsertSuffix(self: *Self, or_replace: bool, is_postgres: bool, is_sqlite: bool, columns: []const []const u8) ![]const u8 {
+            if (!or_replace or is_sqlite) return try self.allocator.dupe(u8, "");
+            if (is_postgres) {
+                var buf = std.array_list.Managed(u8).init(self.allocator);
+                errdefer buf.deinit();
+                try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
+                var first = true;
+                for (columns) |col| {
+                    if (std.mem.eql(u8, col, "id")) continue;
+                    if (!first) try buf.appendSlice(", ");
+                    first = false;
+                    var piece_buf: [128]u8 = undefined;
+                    const piece = try std.fmt.bufPrint(
+                        &piece_buf,
+                        "\"{s}\"=EXCLUDED.\"{s}\"",
+                        .{ col, col },
+                    );
+                    try buf.appendSlice(piece);
+                }
+                return try buf.toOwnedSlice();
+            }
+            return try self.allocator.dupe(u8, "");
         }
 
         fn setEntityField(entity: *Entity, name: []const u8, value: sql.Value, allocator: std.mem.Allocator) !void {

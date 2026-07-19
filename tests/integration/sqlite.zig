@@ -6,7 +6,10 @@ const zent = @import("zent");
 const SQLiteDriver = zent.sql_sqlite.SQLiteDriver;
 const Dialect = zent.sql_dialect.Dialect;
 const scanRow = zent.sql_scan.scanRow;
-
+const buildGraph = zent.codegen.graph.buildGraph;
+const Client = zent.codegen.client;
+const field = zent.core.field;
+const schema = zent.core.schema.Schema;
 const testing = std.testing;
 
 test "SQLite: CREATE TABLE and INSERT" {
@@ -238,4 +241,39 @@ test "SQLite: column names" {
     try testing.expectEqualStrings("a", row.columnName(0));
     try testing.expectEqualStrings("b", row.columnName(1));
     try testing.expectEqualStrings("c", row.columnName(2));
+}
+
+test "SQLite: SaveOrUpdate updates existing row" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const UpsertUser = schema("UpsertUser", .{
+        .fields = &.{
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{UpsertUser});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b1 = try client.upsert_user.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("id", @as(i64, 99));
+    _ = try b1.setFieldValue("score", @as(i64, 100));
+    _ = try b1.SaveOrUpdate();
+
+    var b2 = try client.upsert_user.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("id", @as(i64, 99));
+    _ = try b2.setFieldValue("score", @as(i64, 200));
+    _ = try b2.SaveOrUpdate();
+
+    var rows = try drv.query("SELECT score FROM upsert_user WHERE id = ?", &.{.{ .int = 99 }});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 200), row.getInt(0).?);
 }
