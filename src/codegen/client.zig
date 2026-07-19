@@ -4,6 +4,8 @@ const EdgeInfo = @import("graph.zig").EdgeInfo;
 const sql_driver = @import("../sql/driver.zig");
 const sql = @import("../sql/builder.zig");
 const sql_scan = @import("../sql/scan.zig");
+const Logger = @import("../sql/logger.zig").Logger;
+const debugLogger = @import("../sql/logger.zig").debugLogger;
 const migrate = @import("../sql/schema/migrate.zig");
 const Hook = @import("../runtime/hook.zig").Hook;
 const privacy = @import("../privacy/policy.zig");
@@ -113,6 +115,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
 
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
+        logger: Logger = .{},
         predicates: @TypeOf(Predicates),
         orders: @TypeOf(EdgeOrders),
         hooks: []const Hook,
@@ -122,6 +125,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return .{
                 .allocator = allocator,
                 .driver = driver,
+                .logger = .{},
                 .predicates = Predicates,
                 .orders = EdgeOrders,
                 .hooks = &.{},
@@ -243,7 +247,7 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
 /// The Client holds entity sub-clients and per-edge query helpers.
 pub fn Client(comptime infos: []const TypeInfo) type {
     comptime {
-        const total_fields = 2 + infos.len; // allocator, driver, + one per entity
+        const total_fields = 3 + infos.len; // allocator, driver, logger, + one per entity
         var field_names: [total_fields][:0]const u8 = undefined;
         var field_types: [total_fields]type = undefined;
         var field_attrs: [total_fields]std.builtin.Type.Struct.FieldAttributes = undefined;
@@ -257,8 +261,12 @@ pub fn Client(comptime infos: []const TypeInfo) type {
         field_types[1] = sql_driver.Driver;
         field_attrs[1] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(sql_driver.Driver) };
 
+        field_names[2] = "logger";
+        field_types[2] = Logger;
+        field_attrs[2] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(Logger) };
+
         // Entity sub-clients (user, car, group, ...)
-        for (infos, 2..) |info, i| {
+        for (infos, 3..) |info, i| {
             const ClientType = EntityClient(infos, info);
             const name = structFieldName(info.name);
             field_names[i] = name;
@@ -276,12 +284,27 @@ pub fn makeClient(comptime infos: []const TypeInfo, allocator: std.mem.Allocator
     var result: Client(infos) = undefined;
     result.allocator = allocator;
     result.driver = driver;
+    result.logger = .{};
     inline for (infos) |info| {
         const ClientType = EntityClient(infos, info);
         const field_name = comptime toSnakeCase(info.name);
         @field(result, field_name) = ClientType.init(allocator, driver);
     }
     return result;
+}
+
+/// Set the logger on the root client and propagate to all entity sub-clients.
+pub fn SetLogger(comptime infos: []const TypeInfo, self: *Client(infos), logger: Logger) void {
+    self.logger = logger;
+    inline for (infos) |info| {
+        const field_name = comptime structFieldName(info.name);
+        @field(self, field_name).logger = logger;
+    }
+}
+
+/// Enable debug logging on the client (writes to std.log).
+pub fn Debug(comptime infos: []const TypeInfo, self: *Client(infos)) void {
+    SetLogger(infos, self, debugLogger());
 }
 
 /// Begin a transaction and return a TxClient backed by the transaction.
