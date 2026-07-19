@@ -136,7 +136,8 @@ pub fn ConnPool(comptime D: type) type {
         }
 
         fn addConnection(self: *Self) !void {
-            const conn = try self.connect(self.allocator);
+            var conn = try self.connect(self.allocator);
+            errdefer conn.close();
             const ptr = try self.all.addOne(self.allocator);
             ptr.* = conn;
             try self.available.append(self.allocator, ptr);
@@ -190,7 +191,8 @@ pub fn ConnPool(comptime D: type) type {
             while (true) {
                 const conn = self.available.pop() orelse {
                     if (self.all.items.len < self.options.max_connections) {
-                        const new_conn = try self.connect(self.allocator);
+                        var new_conn = try self.connect(self.allocator);
+                        errdefer new_conn.close();
                         const ptr = try self.all.addOne(self.allocator);
                         ptr.* = new_conn;
                         return self.finishBorrow(ptr, wait_start);
@@ -561,4 +563,94 @@ test "ConnPool metrics hooks fire" {
     pool.release(c1);
     try std.testing.expectEqual(@as(usize, 1), counters.borrow);
     try std.testing.expectEqual(@as(usize, 1), counters.release);
+}
+
+test "ConnPool closes connection when bookkeeping allocation fails" {
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) anyerror!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) anyerror!void {
+            unreachable;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            unreachable;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+        };
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+
+    // fail_index = 2: init performs two capacity allocations (all, available),
+    // then the next allocation inside addConnection's all.addOne must fail.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 2,
+    });
+    const allocator = failing.allocator();
+
+    var pool = try ConnPool(MockDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 2,
+        .health_check_on_borrow = false,
+    });
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.opens);
+    try std.testing.expectEqual(@as(usize, 0), MockDriver.closes);
+
+    // Fill the pre-allocated capacity so the next addConnection is forced to
+    // grow self.all, which triggers the FailingAllocator.
+    pool.options.max_connections = 100;
+    while (pool.all.items.len < pool.all.capacity) {
+        try pool.addConnection();
+    }
+
+    try std.testing.expectError(error.OutOfMemory, pool.addConnection());
+
+    // The connection opened for the failed bookkeeping allocation must be closed.
+    try std.testing.expectEqual(@as(usize, pool.all.items.len + 1), MockDriver.opens);
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
 }
