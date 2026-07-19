@@ -213,12 +213,20 @@ const ParseError = error{
     ExpectedLParen,
     ExpectedRParen,
     MismatchedTypes,
+    UnimplementedHasEdge,
     OutOfMemory,
     UnterminatedString,
     UnknownToken,
     InvalidCharacter,
     Overflow,
 };
+
+fn unimplementedHasEdge() ParseError {
+    if (@inComptime()) {
+        @compileError("EntQL 'has'/'not_has' requires schema-aware codegen; not yet supported");
+    }
+    return ParseError.UnimplementedHasEdge;
+}
 
 const ParserContext = struct {
     lexer: Lexer,
@@ -354,59 +362,7 @@ fn parsePrimary(ctx: *ParserContext) ParseError!sql.Predicate {
                 else => return ParseError.ExpectedRParen,
             }
         },
-        .kw_has => {
-            _ = try ctx.next(); // consume has
-            // expect LPAREN
-            const lparen = ctx.peek();
-            switch (lparen) {
-                .lparen => _ = try ctx.next(),
-                else => return ParseError.ExpectedLParen,
-            }
-            const edge_name = try ctx.expectIdent();
-            // Check for optional comma + expr
-            const after = ctx.peek();
-            switch (after) {
-                .comma => {
-                    _ = try ctx.next(); // consume comma
-                    const pred = try parseExpr(ctx);
-                    const pred_ptr = try ctx.allocator.create(sql.Predicate);
-                    pred_ptr.* = pred;
-                    // expect RPAREN
-                    const rparen = ctx.peek();
-                    switch (rparen) {
-                        .rparen => {
-                            _ = try ctx.next();
-                            return sql.HasEdgePred(edge_name, "fk_col", pred_ptr);
-                        },
-                        else => return ParseError.ExpectedRParen,
-                    }
-                },
-                .rparen => {
-                    _ = try ctx.next();
-                    return sql.HasEdge(edge_name, "fk_col");
-                },
-                else => return ParseError.ExpectedRParen,
-            }
-        },
-        .kw_not_has => {
-            _ = try ctx.next(); // consume not_has
-            // expect LPAREN
-            const lparen = ctx.peek();
-            switch (lparen) {
-                .lparen => _ = try ctx.next(),
-                else => return ParseError.ExpectedLParen,
-            }
-            const edge_name = try ctx.expectIdent();
-            // expect RPAREN
-            const rparen = ctx.peek();
-            switch (rparen) {
-                .rparen => {
-                    _ = try ctx.next();
-                    return sql.NotHasEdge(edge_name, "fk_col");
-                },
-                else => return ParseError.ExpectedRParen,
-            }
-        },
+        .kw_has, .kw_not_has => return unimplementedHasEdge(),
         .ident => return try parseComparison(ctx),
         else => return ParseError.ExpectedExpression,
     }
@@ -746,86 +702,28 @@ test "EntQL: EQFold =~" {
     }, p);
 }
 
-test "EntQL: has(edge)" {
+test "EntQL: has and not_has require schema-aware codegen" {
     const allocator = std.testing.allocator;
-    const p = try parse(allocator, "has(pets)");
-    switch (p) {
-        .has_edge => |h| {
-            try std.testing.expectEqualStrings("pets", h.edge_name);
-            try std.testing.expectEqualStrings("fk_col", h.fk_col);
-            try std.testing.expectEqual(@as(?*const sql.Predicate, null), h.pred);
-        },
-        else => @panic("expected has_edge predicate"),
-    }
+
+    try std.testing.expectError(error.UnimplementedHasEdge, parse(allocator, "has(pets)"));
+    try std.testing.expectError(error.UnimplementedHasEdge, parse(allocator, "has(pets, name = \"fido\")"));
+    try std.testing.expectError(error.UnimplementedHasEdge, parse(allocator, "not_has(pets)"));
 }
 
-test "EntQL: has(edge, expr)" {
-    const allocator = std.testing.allocator;
-    const p = try parse(allocator, "has(pets, name = \"fido\")");
-    defer deinitPred(allocator, &p);
-    switch (p) {
-        .has_edge => |h| {
-            try std.testing.expectEqualStrings("pets", h.edge_name);
-            try std.testing.expectEqualStrings("fk_col", h.fk_col);
-            try std.testing.expect(h.pred != null);
-            try std.testing.expectEqualDeep(
-                sql.Predicate{ .eq = .{ .column = "name", .value = .{ .string = "fido" } } },
-                h.pred.?.*,
-            );
-        },
-        else => @panic("expected has_edge predicate"),
-    }
-}
-
-test "EntQL: not_has(edge)" {
-    const allocator = std.testing.allocator;
-    const p = try parse(allocator, "not_has(pets)");
-    try std.testing.expectEqualDeep(sql.Predicate{ .not_has_edge = .{ .edge_name = "pets", .fk_col = "fk_col" } }, p);
-}
-
-test "EntQL: has and not_has with SQL builder" {
+test "EntQL: SQL builder rejects schema-unaware edge predicates" {
     const allocator = std.testing.allocator;
     const Dialect = @import("../sql/dialect.zig").Dialect;
 
-    // Test has(edge) → EXISTS
-    {
-        var b = sql.Builder.init(allocator, Dialect.sqlite);
-        defer b.deinit();
-        try b.writeString("SELECT * FROM users WHERE ");
-        const pred = try parse(allocator, "has(pets)");
-        defer deinitPred(allocator, &pred);
-        try pred.appendTo(&b);
-        const q = b.query();
-        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\" WHERE \"pets\".\"fk_col\" = ?)", q.sql);
-        try std.testing.expectEqual(@as(usize, 1), q.args.len);
-    }
+    var b = sql.Builder.init(allocator, Dialect.sqlite);
+    defer b.deinit();
 
-    // Test not_has(edge) → NOT EXISTS
-    {
-        var b = sql.Builder.init(allocator, Dialect.sqlite);
-        defer b.deinit();
-        try b.writeString("SELECT * FROM users WHERE ");
-        const pred = try parse(allocator, "not_has(pets)");
-        defer deinitPred(allocator, &pred);
-        try pred.appendTo(&b);
-        const q = b.query();
-        try std.testing.expectEqualStrings("SELECT * FROM users WHERE NOT EXISTS (SELECT 1 FROM \"pets\" WHERE \"pets\".\"fk_col\" = ?)", q.sql);
-        try std.testing.expectEqual(@as(usize, 1), q.args.len);
-    }
+    try std.testing.expectError(error.UnimplementedHasEdge, sql.HasEdge("pets", "user_id").appendTo(&b));
+    try std.testing.expectError(error.UnimplementedHasEdge, sql.NotHasEdge("pets", "user_id").appendTo(&b));
+}
 
-    // Test has(edge, expr) → EXISTS with predicate
-    {
-        var b = sql.Builder.init(allocator, Dialect.sqlite);
-        defer b.deinit();
-        try b.writeString("SELECT * FROM users WHERE ");
-        const pred = try parse(allocator, "has(pets, name = \"fido\")");
-        defer deinitPred(allocator, &pred);
-        try pred.appendTo(&b);
-        const q = b.query();
-        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\" WHERE \"pets\".\"fk_col\" = ? AND \"name\" = ?)", q.sql);
-        try std.testing.expectEqual(@as(usize, 2), q.args.len);
-        try std.testing.expectEqualStrings("fido", q.args[1].string);
-    }
+test "EntQL: NOT IN and EQFold with SQL builder" {
+    const allocator = std.testing.allocator;
+    const Dialect = @import("../sql/dialect.zig").Dialect;
 
     // Test NOT IN
     {

@@ -1,11 +1,11 @@
 const std = @import("std");
+const field_mod = @import("../../core/field.zig");
 const TypeInfo = @import("../../codegen/graph.zig").TypeInfo;
 const FieldInfo = @import("../../codegen/graph.zig").FieldInfo;
 const EdgeInfo = @import("../../codegen/graph.zig").EdgeInfo;
 const Dialect = @import("../dialect.zig").Dialect;
 const sql_driver = @import("../driver.zig");
 const Value = @import("../builder.zig").Value;
-const Crc32 = std.hash.crc.@"CRC-32/ISO-HDLC";
 
 extern fn time(time_t: [*c]c_long) c_long;
 
@@ -33,15 +33,18 @@ fn unixTimestamp() i64 {
 
 /// Version scheme for migration operations.
 ///
-/// For this milestone, the version is the lower 31 bits of a CRC32
-/// over `"table_name:operation:target"`. The 31-bit mask keeps the
-/// value positive and within MySQL's signed INTEGER range (32-bit).
-/// The scheme is deterministic, stable across runs, and may be
-/// replaced with monotonic counters or content-hashed migration
-/// files once versioning files are introduced.
+/// The version is the lower 31 bits of an FNV-1a hash over
+/// `"table_name:operation:target"`. The manual loop is inexpensive to evaluate
+/// at comptime, unlike the standard CRC implementation, and the 31-bit mask
+/// keeps the value positive and within MySQL's signed INTEGER range (32-bit).
 fn computeMigrationVersion(comptime table: []const u8, comptime op: []const u8, comptime target: []const u8) i64 {
     const key = table ++ ":" ++ op ++ ":" ++ target;
-    return @as(i64, @intCast(Crc32.hash(key) & 0x7FFFFFFF));
+    var hash: u64 = 14_695_981_039_346_656_037;
+    for (key) |byte| {
+        hash ^= byte;
+        hash *%= 1_099_511_628_211;
+    }
+    return @as(i64, @intCast(hash & 0x7FFF_FFFF));
 }
 
 /// Options controlling migration behavior.
@@ -143,13 +146,26 @@ fn versionContains(versions: []const i64, version: i64) bool {
 /// Column definition for CREATE TABLE.
 pub const ColumnDef = struct {
     name: []const u8,
+    /// Explicit SQL type for synthetic columns and backwards-compatible callers.
     sql_type: []const u8,
+    /// Logical schema type. When present, migration SQL resolves it through the
+    /// active dialect instead of reusing the SQLite-oriented `sql_type` value.
+    logical_type: ?field_mod.FieldType = null,
     primary_key: bool = false,
     not_null: bool = false,
     unique: bool = false,
     default_value: ?[]const u8 = null,
     auto_increment: bool = false,
 };
+
+fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
+    if (column.logical_type) |logical_type| {
+        return switch (logical_type) {
+            inline else => |field_type| field_mod.sqlType(field_type, dialect),
+        };
+    }
+    return column.sql_type;
+}
 
 /// Foreign key definition.
 pub const ForeignKeyDef = struct {
@@ -186,6 +202,7 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
             const col = ColumnDef{
                 .name = f.name,
                 .sql_type = f.sql_type,
+                .logical_type = f.field_type,
                 .primary_key = f.is_id,
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
@@ -316,16 +333,17 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
     try buf.appendSlice(" (\n");
 
     for (table.columns, 0..) |col, i| {
+        const sql_type = columnSQLType(col, dialect);
         if (i > 0) try buf.appendSlice(",\n");
         try buf.appendSlice("  ");
         try quoteIdentToBuffer(dialect, &buf, col.name);
         try buf.appendSlice(" ");
-        try buf.appendSlice(col.sql_type);
+        try buf.appendSlice(sql_type);
 
         if (col.primary_key and isSQLiteDialect(dialect)) {
             // SQLite AUTOINCREMENT only valid on INTEGER PRIMARY KEY.
-            if (std.ascii.eqlIgnoreCase(col.sql_type, "INTEGER") or
-                std.ascii.eqlIgnoreCase(col.sql_type, "INT"))
+            if (std.ascii.eqlIgnoreCase(sql_type, "INTEGER") or
+                std.ascii.eqlIgnoreCase(sql_type, "INT"))
             {
                 try buf.appendSlice(" PRIMARY KEY AUTOINCREMENT");
             } else {
@@ -537,6 +555,7 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
             const col = ColumnDef{
                 .name = f.name,
                 .sql_type = f.sql_type,
+                .logical_type = f.field_type,
                 .primary_key = f.is_id,
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
@@ -855,7 +874,7 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
     try quoteIdentToBuffer(dialect, &buf, table_name);
     try buf.appendSlice(" ADD COLUMN ");
     try quoteIdentToBuffer(dialect, &buf, col.name);
-    try buf.print(" {s}", .{col.sql_type});
+    try buf.print(" {s}", .{columnSQLType(col, dialect)});
 
     // For ALTER ADD COLUMN, avoid NOT NULL without a default to keep SQLite happy.
     if (col.default_value) |dv| {
@@ -884,11 +903,12 @@ fn dropColumnSQL(
     };
 }
 
-/// Generate ALTER/MODIFY COLUMN SQL to change a column's type.
+/// Generate ALTER COLUMN SQL to change a column's type.
 ///
-/// SQLite does not support ALTER COLUMN TYPE natively and returns
-/// `error.UnsupportedDialect`; the caller should either skip ALTER TYPE
-/// on SQLite or implement a table-rebuild strategy upstream.
+/// SQLite has no native ALTER TYPE. MySQL's `MODIFY COLUMN name type` replaces
+/// the full column definition and can silently strip NOT NULL, DEFAULT, UNIQUE,
+/// and AUTO_INCREMENT attributes. Until the migration layer can reproduce the
+/// complete existing definition, MySQL type changes fail closed.
 fn alterColumnTypeSQL(
     allocator: std.mem.Allocator,
     table_name: []const u8,
@@ -899,7 +919,7 @@ fn alterColumnTypeSQL(
     return switch (dialect.name[0]) {
         's' => error.UnsupportedDialect,
         'p' => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE {s} USING \"{s}\"::{s}", .{ table_name, column_name, new_type, column_name, new_type }),
-        'm' => std.fmt.allocPrint(allocator, "ALTER TABLE `{s}` MODIFY COLUMN `{s}` {s}", .{ table_name, column_name, new_type }),
+        'm' => error.MySQLTypeChangeUnsafe,
         else => error.UnsupportedDialect,
     };
 }
@@ -1212,6 +1232,13 @@ pub fn migrateSchema(
 // Tests
 // ------------------------------------------------------------------
 
+test "Migration version uses stable positive FNV-1a hash" {
+    const version = comptime computeMigrationVersion("user", "add_column", "email");
+    try std.testing.expectEqual(@as(i64, 1_537_368_564), version);
+    try std.testing.expect(version >= 0);
+    try std.testing.expect(version <= std.math.maxInt(i32));
+}
+
 test "TableDef from TypeInfo" {
     const field = @import("../../core/field.zig");
     const schema = @import("../../core/schema.zig").Schema;
@@ -1253,6 +1280,36 @@ test "Create table SQL" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "AUTOINCREMENT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"name\" TEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"age\" INTEGER") != null);
+}
+
+test "PostgreSQL migration SQL resolves logical field types" {
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    const Payload = struct { value: i64 };
+    const Event = schema("DialectEvent", .{
+        .fields = &.{ field.Time("occurred_at"), field.JSON("payload", Payload), field.UUID("external_id") },
+    });
+
+    const info = comptime fromSchema(Event);
+    const table = comptime tableFromTypeInfo(info);
+    const sql = try createTableSQL(table, Dialect.postgres);
+    defer std.heap.page_allocator.free(sql);
+
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"occurred_at\" TIMESTAMPTZ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"payload\" JSONB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"external_id\" UUID") != null);
+}
+
+test "MySQL type-only ALTER is rejected as unsafe" {
+    const result = alterColumnTypeSQL(std.testing.allocator, "user", "name", "TEXT", Dialect.mysql);
+    if (result) |sql| {
+        std.testing.allocator.free(sql);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.MySQLTypeChangeUnsafe, err);
+    }
 }
 
 test "Migrate schema adds missing columns" {

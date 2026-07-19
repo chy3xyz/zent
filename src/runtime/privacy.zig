@@ -1,9 +1,7 @@
 const std = @import("std");
 
-/// Maximum number of filter predicates that can be accumulated
-/// during a single evalPolicy call. Sufficient for most policies;
-/// codegen will validate at comptime.
-const max_filters = 16;
+/// Maximum number of filter predicates retained inline by a DecisionSet.
+const max_filters = 8;
 
 /// Carries caller identity through the query/mutation pipeline.
 /// Value-type, copy-passed; immutable after construction.
@@ -20,13 +18,12 @@ pub const Decision = enum {
     deny,
 };
 
-/// Result of evaluating a set of privacy rules.
-/// - decision: overall allow/deny verdict.
-/// - filters: opaque filter predicates accumulated from filter rules;
-///   resolved to concrete SQL predicates by the codegen layer.
+/// Result of evaluating a set of privacy rules. Filter pointers are stored
+/// inline so returning DecisionSet by value never exposes a stack-backed slice.
 pub const DecisionSet = struct {
     decision: Decision,
-    filters: []const *const anyopaque,
+    filters: [max_filters]*const anyopaque = undefined,
+    filter_count: usize = 0,
 };
 
 /// A filter rule: carries a predicate function that, given a PrivacyContext,
@@ -51,7 +48,7 @@ pub const Rule = union(enum) {
 ///
 /// Rules are processed sequentially:
 /// - .skip → continue to next rule.
-/// - .deny → return DecisionSet{.decision = .deny, .filters = &.{}} immediately.
+/// - .deny → return a deny DecisionSet with no filters immediately.
 /// - .allow → lock in .allow; remaining rules are still scanned for filters.
 /// - .filter → invoke predicate(ctx); if non-null, accumulate the opaque pointer.
 ///
@@ -60,29 +57,25 @@ pub fn evalPolicy(
     ctx: PrivacyContext,
     rules: []const Rule,
 ) DecisionSet {
-    var filters_buf: [max_filters]*const anyopaque = undefined;
-    var filter_count: usize = 0;
+    var result = DecisionSet{ .decision = .allow };
 
     for (rules) |rule| {
         switch (rule) {
             .skip => continue,
-            .deny => return .{ .decision = .deny, .filters = &.{} },
+            .deny => return .{ .decision = .deny },
             .allow => {
                 // Lock in allow; continue collecting remaining filters.
             },
             .filter => |fr| {
                 if (fr.predicate(ctx)) |pred| {
-                    std.debug.assert(filter_count < max_filters); // filter overflow — raise max_filters
-                    filters_buf[filter_count] = pred;
-                    filter_count += 1;
+                    std.debug.assert(result.filter_count < result.filters.len);
+                    result.filters[result.filter_count] = pred;
+                    result.filter_count += 1;
                 }
             },
         }
     }
-    return .{
-        .decision = .allow,
-        .filters = filters_buf[0..filter_count],
-    };
+    return result;
 }
 
 // ------------------------------------------------------------------
@@ -116,7 +109,7 @@ test "evalPolicy: deny wins immediately" {
     };
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.deny, result.decision);
-    try std.testing.expectEqual(@as(usize, 0), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 0), result.filter_count);
 }
 
 test "evalPolicy: allow after skip" {
@@ -145,7 +138,7 @@ test "evalPolicy: pure allow" {
     const rules = comptime [_]Rule{.allow};
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
-    try std.testing.expectEqual(@as(usize, 0), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 0), result.filter_count);
 }
 
 test "evalPolicy: filter accumulates" {
@@ -175,7 +168,7 @@ test "evalPolicy: filter accumulates" {
     };
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
-    try std.testing.expectEqual(@as(usize, 2), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 2), result.filter_count);
 }
 
 test "evalPolicy: filter returning null is skipped" {
@@ -195,7 +188,7 @@ test "evalPolicy: filter returning null is skipped" {
     };
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
-    try std.testing.expectEqual(@as(usize, 0), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 0), result.filter_count);
 }
 
 test "evalPolicy: deny short-circuits before filters" {
@@ -215,7 +208,7 @@ test "evalPolicy: deny short-circuits before filters" {
     };
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.deny, result.decision);
-    try std.testing.expectEqual(@as(usize, 0), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 0), result.filter_count);
 }
 
 test "evalPolicy: context-dependent filter" {
@@ -238,7 +231,7 @@ test "evalPolicy: context-dependent filter" {
     };
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
-    try std.testing.expectEqual(@as(usize, 1), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 1), result.filter_count);
 }
 
 test "evalPolicy: empty rules defaults to allow" {
@@ -246,5 +239,5 @@ test "evalPolicy: empty rules defaults to allow" {
     const rules = comptime [_]Rule{};
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
-    try std.testing.expectEqual(@as(usize, 0), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 0), result.filter_count);
 }

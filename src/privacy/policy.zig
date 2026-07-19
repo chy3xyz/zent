@@ -60,7 +60,7 @@ test "Policy: AlwaysAllow" {
     const ctx = PrivacyContext{};
     const result = AlwaysAllow.eval(ctx);
     try std.testing.expectEqual(Decision.allow, result.decision);
-    try std.testing.expectEqual(@as(usize, 0), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 0), result.filter_count);
 }
 
 test "Policy: AlwaysDeny" {
@@ -90,7 +90,7 @@ test "Filter factory creates valid rule" {
     const policy = Policy{ .rules = &.{ Allow, rule } };
     const result = policy.eval(ctx);
     try std.testing.expectEqual(Decision.allow, result.decision);
-    try std.testing.expectEqual(@as(usize, 1), result.filters.len);
+    try std.testing.expectEqual(@as(usize, 1), result.filter_count);
 }
 
 test "Policy with multiple rules: deny short-circuits" {

@@ -11,6 +11,8 @@ pub const FieldInfo = struct {
     name: []const u8,
     field_type: field_mod.FieldType,
     zig_type: type,
+    /// Legacy SQLite-oriented type string retained for API compatibility.
+    /// Migration SQL must call `sqlType` with the active dialect.
     sql_type: []const u8,
     optional: bool,
     nillable: bool,
@@ -21,6 +23,10 @@ pub const FieldInfo = struct {
     enum_values: []const []const u8,
     is_id: bool,
     sensitive: bool = false,
+
+    pub fn sqlType(comptime self: FieldInfo, dialect: Dialect) []const u8 {
+        return field_mod.sqlType(self.field_type, dialect);
+    }
 };
 
 pub const EdgeInfo = struct {

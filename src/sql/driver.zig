@@ -23,7 +23,8 @@ pub const Error = error{
     PrepareFailed,
     ProtocolError,
     DriverFailed,
-    /// A pooled query exceeded the configured query_timeout_ms.
+    /// Retained for source compatibility; pooled operations no longer synthesize
+    /// timeout errors after a driver operation has already completed.
     QueryTimeout,
 };
 

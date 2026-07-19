@@ -20,6 +20,16 @@ fn mapBuildError(err: anyerror) sql_driver.Error {
     };
 }
 
+fn assertNoPrivacyFilters(comptime info: TypeInfo) void {
+    if (info.policy) |policy| {
+        for (policy.rules) |rule| {
+            if (rule == .filter) {
+                @compileError("privacy filter injection is not yet implemented; mutation policies with filter rules are unsupported in this build");
+            }
+        }
+    }
+}
+
 const FieldValue = @import("create.zig").FieldValue;
 
 // C time() — libc is linked via build.zig
@@ -194,6 +204,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
+            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
@@ -351,6 +362,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execSoftDelete(self: *Self) ExecError!usize {
+            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
@@ -410,6 +422,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
+            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
@@ -555,6 +568,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
+            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
@@ -671,6 +685,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
+            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);

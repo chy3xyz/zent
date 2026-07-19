@@ -21,6 +21,16 @@ fn mapBuildError(err: anyerror) sql_driver.Error {
     };
 }
 
+fn assertNoPrivacyFilters(comptime info: TypeInfo) void {
+    if (info.policy) |policy| {
+        for (policy.rules) |rule| {
+            if (rule == .filter) {
+                @compileError("privacy filter injection is not yet implemented; mutation policies with filter rules are unsupported in this build");
+            }
+        }
+    }
+}
+
 /// A runtime field value entry.
 pub const FieldValue = struct {
     name: []const u8,
@@ -150,6 +160,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!Entity {
+            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
@@ -616,6 +627,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
+            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);

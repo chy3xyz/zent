@@ -229,5 +229,8 @@ test "Field builders" {
 test "SQL type mapping" {
     try std.testing.expectEqualStrings("INTEGER", sqlType(.int, .{ .name = "sqlite3" }));
     try std.testing.expectEqualStrings("TEXT", sqlType(.string, .{ .name = "sqlite3" }));
+    try std.testing.expectEqualStrings("DATETIME", sqlType(.time, .{ .name = "mysql" }));
+    try std.testing.expectEqualStrings("TIMESTAMPTZ", sqlType(.time, .{ .name = "postgres" }));
     try std.testing.expectEqualStrings("JSONB", sqlType(.json, .{ .name = "postgres" }));
+    try std.testing.expectEqualStrings("UUID", sqlType(.uuid, .{ .name = "postgres" }));
 }

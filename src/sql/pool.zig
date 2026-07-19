@@ -48,8 +48,9 @@ pub fn ConnPool(comptime D: type) type {
         /// Factory used to create a new `D` instance.
         pub const ConnectFn = *const fn (allocator: std.mem.Allocator) anyerror!D;
 
-        /// Optional metrics callbacks. All callbacks are invoked while holding
-        /// the pool mutex, so they should be fast and non-blocking.
+        /// Optional metrics callbacks. Borrow/release callbacks run while the
+        /// pool mutex is held; slow-query callbacks run after the driver call.
+        /// All callbacks should be fast and non-blocking.
         pub const Metrics = struct {
             /// Called when a connection is successfully borrowed.
             /// `wait_ms` is the total time spent waiting for a connection.
@@ -60,6 +61,8 @@ pub fn ConnPool(comptime D: type) type {
             onWait: ?*const fn (ctx: ?*anyopaque) void = null,
             /// Called when borrow fails with a pool-level or connection error.
             onError: ?*const fn (ctx: ?*anyopaque, err: anyerror) void = null,
+            /// Called after a query or exec reaches the configured slow-query threshold.
+            onSlowQuery: ?*const fn (ctx: ?*anyopaque, sql: []const u8, elapsed_ms: u64) void = null,
             /// User context passed to every callback.
             context: ?*anyopaque = null,
         };
@@ -83,9 +86,9 @@ pub fn ConnPool(comptime D: type) type {
             /// pool is exhausted. Zero means non-blocking (returns
             /// `error.PoolExhausted` immediately).
             max_wait_ms: u32 = 0,
-            /// Maximum time in milliseconds for a single query/exec on a pooled
-            /// connection. Zero disables the timeout.
-            query_timeout_ms: u32 = 0,
+            /// Elapsed time in milliseconds at which a pooled query/exec is
+            /// reported through `Metrics.onSlowQuery`. Zero disables reporting.
+            slow_query_threshold_ms: u32 = 0,
             /// Max retry attempts for borrowing a connection. 0 = no retry.
             max_retries: u32 = 3,
             /// Retry backoff base in milliseconds.
@@ -384,12 +387,14 @@ pub fn ConnPool(comptime D: type) type {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             const conn = try pool.borrowForDriver();
             defer pool.release(conn);
-            if (pool.options.query_timeout_ms > 0) {
+            if (pool.options.slow_query_threshold_ms > 0) {
                 const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
                 const result = conn.asDriver().exec(query_sql, args);
-                const elapsed_ms = start.untilNow(pool.io).raw.toMilliseconds();
-                if (elapsed_ms > pool.options.query_timeout_ms) {
-                    return error.QueryTimeout;
+                const elapsed_ms: u64 = @intCast(start.untilNow(pool.io).raw.toMilliseconds());
+                if (elapsed_ms >= pool.options.slow_query_threshold_ms) {
+                    if (pool.options.metrics.onSlowQuery) |cb| {
+                        cb(pool.options.metrics.context, query_sql, elapsed_ms);
+                    }
                 }
                 return result;
             }
@@ -400,14 +405,16 @@ pub fn ConnPool(comptime D: type) type {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             const conn = try pool.borrowForDriver();
             defer pool.release(conn);
-            if (pool.options.query_timeout_ms > 0) {
+            if (pool.options.slow_query_threshold_ms > 0) {
                 const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
-                const rows = conn.asDriver().query(query_sql, args);
-                const elapsed_ms = start.untilNow(pool.io).raw.toMilliseconds();
-                if (elapsed_ms > pool.options.query_timeout_ms) {
-                    return error.QueryTimeout;
+                const result = conn.asDriver().query(query_sql, args);
+                const elapsed_ms: u64 = @intCast(start.untilNow(pool.io).raw.toMilliseconds());
+                if (elapsed_ms >= pool.options.slow_query_threshold_ms) {
+                    if (pool.options.metrics.onSlowQuery) |cb| {
+                        cb(pool.options.metrics.context, query_sql, elapsed_ms);
+                    }
                 }
-                return rows;
+                return result;
             }
             return conn.asDriver().query(query_sql, args);
         }
@@ -614,6 +621,7 @@ test "ConnPool metrics hooks fire" {
     const Counters = struct {
         borrow: usize = 0,
         release: usize = 0,
+        slow_query: usize = 0,
     };
     var counters = Counters{};
 
@@ -626,6 +634,7 @@ test "ConnPool metrics hooks fire" {
         .min_connections = 1,
         .max_connections = 1,
         .max_retries = 0,
+        .slow_query_threshold_ms = 1,
         .metrics = .{
             .onBorrow = struct {
                 fn f(ctx: ?*anyopaque, _: u32) void {
@@ -637,6 +646,12 @@ test "ConnPool metrics hooks fire" {
                 fn f(ctx: ?*anyopaque) void {
                     const c: *Counters = @ptrCast(@alignCast(ctx));
                     c.release += 1;
+                }
+            }.f,
+            .onSlowQuery = struct {
+                fn f(ctx: ?*anyopaque, _: []const u8, _: u64) void {
+                    const c: *Counters = @ptrCast(@alignCast(ctx));
+                    c.slow_query += 1;
                 }
             }.f,
             .context = &counters,
@@ -651,6 +666,13 @@ test "ConnPool metrics hooks fire" {
     pool.release(c1);
     try std.testing.expectEqual(@as(usize, 1), counters.borrow);
     try std.testing.expectEqual(@as(usize, 1), counters.release);
+
+    const drv = pool.asDriver();
+    _ = try drv.exec(
+        "WITH RECURSIVE cnt(x) AS (VALUES(0) UNION ALL SELECT x + 1 FROM cnt WHERE x < 100000) SELECT sum(x) FROM cnt",
+        &.{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), counters.slow_query);
 }
 
 test "ConnPool closes connection when bookkeeping allocation fails" {

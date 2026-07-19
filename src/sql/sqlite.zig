@@ -72,8 +72,8 @@ pub const SQLiteDriver = struct {
             }
             break :blk out.?;
         };
-        if (self.cache == null) {
-            errdefer _ = c.sqlite3_finalize(stmt);
+        defer {
+            if (self.cache == null) _ = c.sqlite3_finalize(stmt);
         }
 
         // Reset before rebinding (needed when stmt came from cache).
@@ -442,4 +442,13 @@ test "SQLite transaction" {
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try std.testing.expectEqual(@as(i64, 42), row.getInt(0).?);
+}
+
+test "SQLite uncached exec finalizes statements after success" {
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE t (id INTEGER)", &.{});
+
+    try std.testing.expect(c.sqlite3_next_stmt(drv.db, null) == null);
 }
