@@ -7,6 +7,20 @@ pub const Result = struct {
     last_insert_id: ?i64,
 };
 
+/// Unified error set returned by all driver implementations.
+pub const Error = error{
+    OutOfMemory,
+    ConnectionFailed,
+    ExecFailed,
+    QueryFailed,
+    TxFailed,
+    PingFailed,
+    BindFailed,
+    PrepareFailed,
+    ProtocolError,
+    DriverFailed,
+};
+
 /// A single database row exposed for scanning.
 pub const Row = struct {
     ptr: *anyopaque,
@@ -86,8 +100,8 @@ pub const Rows = struct {
 /// `commit` or `rollback` was used. After deinit, the handle is invalid.
 pub const Tx = struct {
     inner: Driver,
-    commitFn: *const fn (ptr: *anyopaque) anyerror!void,
-    rollbackFn: *const fn (ptr: *anyopaque) anyerror!void,
+    commitFn: *const fn (ptr: *anyopaque) Error!void,
+    rollbackFn: *const fn (ptr: *anyopaque) Error!void,
     deinitFn: *const fn (ptr: *anyopaque) void,
     ptr: *anyopaque,
 
@@ -118,12 +132,12 @@ pub const Driver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        exec: *const fn (ptr: *anyopaque, query: []const u8, args: []const Value) anyerror!Result,
-        query: *const fn (ptr: *anyopaque, query: []const u8, args: []const Value) anyerror!Rows,
-        beginTx: *const fn (ptr: *anyopaque) anyerror!Tx,
+        exec: *const fn (ptr: *anyopaque, query: []const u8, args: []const Value) Error!Result,
+        query: *const fn (ptr: *anyopaque, query: []const u8, args: []const Value) Error!Rows,
+        beginTx: *const fn (ptr: *anyopaque) Error!Tx,
         close: *const fn (ptr: *anyopaque) void,
         dialect: *const fn (ptr: *anyopaque) Dialect,
-        ping: *const fn (ptr: *anyopaque) anyerror!void,
+        ping: *const fn (ptr: *anyopaque) Error!void,
         /// Returns true if the connection currently has an active transaction.
         inTransaction: *const fn (ptr: *anyopaque) bool,
     };
