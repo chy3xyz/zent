@@ -8,7 +8,9 @@ const Dialect = zent.sql_dialect.Dialect;
 const scanRow = zent.sql_scan.scanRow;
 const buildGraph = zent.codegen.graph.buildGraph;
 const Client = zent.codegen.client;
+const migrate = zent.sql_schema;
 const field = zent.core.field;
+const index = zent.core.index;
 const schema = zent.core.schema.Schema;
 const testing = std.testing;
 
@@ -388,4 +390,95 @@ test "SQLite: JSON struct field arena is freed by deinitEntity" {
     try testing.expect(entity.json_arena != null);
 
     zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+}
+
+test "SQLite: migrateSchema is idempotent with zent_schema_migrations" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Pre-existing legacy table that needs columns added.
+    _ = try drv.exec(
+        "CREATE TABLE zent_sqlite_migration (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER NOT NULL)",
+        &.{},
+    );
+
+    const SqliteMigration = schema("ZentSqliteMigration", .{
+        .fields = &.{
+            field.Int("score"),
+            field.String("label"),
+        },
+        .indexes = &.{
+            index.Named("idx_zent_sqlite_migration_score", &.{"score"}),
+        },
+    });
+    const graph = comptime buildGraph(&.{SqliteMigration});
+
+    // First migration adds the missing column and the missing index.
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+
+    // Count the rows recorded after the first run.
+    var rows1 = try drv.query("SELECT COUNT(*) FROM zent_schema_migrations", &.{});
+    defer rows1.deinit();
+    const row1 = rows1.next() orelse return error.NoRow;
+    const count_after_first: i64 = row1.getInt(0).?;
+    try testing.expect(count_after_first > 0);
+
+    // Capture every recorded version after the first run.
+    var rows_versions1 = try drv.query(
+        "SELECT version FROM zent_schema_migrations ORDER BY version",
+        &.{},
+    );
+    defer rows_versions1.deinit();
+    var first_versions = std.array_list.Managed(i64).init(allocator);
+    defer first_versions.deinit();
+    while (rows_versions1.next()) |r| {
+        if (r.getInt(0)) |v| try first_versions.append(v);
+    }
+    const first_count = first_versions.items.len;
+    const first_slice = try allocator.dupe(i64, first_versions.items);
+    defer allocator.free(first_slice);
+
+    // Second migration must not produce additional history rows for objects
+    // that already exist; the live schema is authoritative, so duplicate
+    // INSERTs are suppressed by ON CONFLICT DO NOTHING.
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+
+    var rows2 = try drv.query("SELECT COUNT(*) FROM zent_schema_migrations", &.{});
+    defer rows2.deinit();
+    const row2 = rows2.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, @intCast(first_count)), row2.getInt(0).?);
+
+    // Versions recorded on the second run must match the first exactly.
+    var rows_versions2 = try drv.query(
+        "SELECT version FROM zent_schema_migrations ORDER BY version",
+        &.{},
+    );
+    defer rows_versions2.deinit();
+    var second_versions = std.array_list.Managed(i64).init(allocator);
+    defer second_versions.deinit();
+    while (rows_versions2.next()) |r| {
+        if (r.getInt(0)) |v| try second_versions.append(v);
+    }
+    try testing.expectEqual(first_slice.len, second_versions.items.len);
+    for (first_slice, second_versions.items) |a, b| {
+        try testing.expectEqual(a, b);
+    }
+
+    // Confirm the actual schema is still as expected after two runs.
+    var cols = try drv.query("PRAGMA table_info(zent_sqlite_migration)", &.{});
+    defer cols.deinit();
+    var found_label = false;
+    while (cols.next()) |r| {
+        if (std.mem.eql(u8, r.getText(1) orelse "", "label")) found_label = true;
+    }
+    try testing.expect(found_label);
+
+    var idxs = try drv.query("PRAGMA index_list(zent_sqlite_migration)", &.{});
+    defer idxs.deinit();
+    var found_idx = false;
+    while (idxs.next()) |r| {
+        if (std.mem.eql(u8, r.getText(1) orelse "", "idx_zent_sqlite_migration_score")) found_idx = true;
+    }
+    try testing.expect(found_idx);
 }

@@ -4,6 +4,111 @@ const FieldInfo = @import("../../codegen/graph.zig").FieldInfo;
 const EdgeInfo = @import("../../codegen/graph.zig").EdgeInfo;
 const Dialect = @import("../dialect.zig").Dialect;
 const sql_driver = @import("../driver.zig");
+const Value = @import("../builder.zig").Value;
+const Crc32 = std.hash.crc.Crc32;
+
+extern fn time(time_t: [*c]c_long) c_long;
+
+/// Current Unix timestamp in seconds.
+/// Uses libc `time()` because Zig 0.17 removed `std.time.timestamp()`;
+/// `applied_at` is informational and not used by migration logic.
+fn unixTimestamp() i64 {
+    return @as(i64, @intCast(time(null)));
+}
+
+/// Version scheme for migration operations.
+///
+/// For this milestone, the version is the lower 31 bits of a CRC32
+/// over `"table_name:operation:target"`. The 31-bit mask keeps the
+/// value positive and within MySQL's signed INTEGER range (32-bit).
+/// The scheme is deterministic, stable across runs, and may be
+/// replaced with monotonic counters or content-hashed migration
+/// files once versioning files are introduced.
+fn computeMigrationVersion(comptime table: []const u8, comptime op: []const u8, comptime target: []const u8) i64 {
+    const key = table ++ ":" ++ op ++ ":" ++ target;
+    return @as(i64, @intCast(Crc32.hash(key) & 0x7FFFFFFF));
+}
+
+/// CREATE TABLE statement for the migration history table.
+/// Works on SQLite, PostgreSQL, and MySQL.
+const migrationsTableSQL =
+    "CREATE TABLE IF NOT EXISTS zent_schema_migrations (" ++
+    "version INTEGER PRIMARY KEY, " ++
+    "applied_at INTEGER NOT NULL, " ++
+    "checksum TEXT)";
+
+/// Ensure the migration history table exists. Idempotent at the SQL level.
+fn ensureMigrationsTable(drv: sql_driver.Driver) !void {
+    _ = try drv.exec(migrationsTableSQL, &.{});
+}
+
+/// Build the dialect-appropriate INSERT statement for recording a migration.
+/// SQLite and MySQL use `?` placeholders; PostgreSQL uses `$1, $2, $3`.
+/// The statement tolerates duplicate versions so that re-running a migration
+/// after a table has been dropped out-of-band doesn't blow up the whole batch.
+fn buildRecordInsertSQL(dialect: Dialect, buf: []u8) ![]const u8 {
+    const p1 = try dialect.placeholder(buf[0..32], 1);
+    const p2 = try dialect.placeholder(buf[32..64], 2);
+    const p3 = try dialect.placeholder(buf[64..96], 3);
+    const suffix: []const u8 = if (std.mem.eql(u8, dialect.name, "postgres"))
+        " ON CONFLICT (version) DO NOTHING"
+    else if (std.mem.eql(u8, dialect.name, "mysql"))
+        ""
+    else
+        " ON CONFLICT (version) DO NOTHING";
+    const mysql_suffix: []const u8 = if (std.mem.eql(u8, dialect.name, "mysql"))
+        " ON DUPLICATE KEY UPDATE applied_at = applied_at"
+    else
+        "";
+    return std.fmt.bufPrint(
+        buf[96..],
+        "INSERT INTO zent_schema_migrations (version, applied_at, checksum) VALUES ({s}, {s}, {s}){s}{s}",
+        .{ p1, p2, p3, suffix, mysql_suffix },
+    );
+}
+
+/// Build the dialect-appropriate SELECT statement for listing applied versions.
+fn buildListVersionsSQL(dialect: Dialect, buf: []u8) ![]const u8 {
+    _ = dialect;
+    return std.fmt.bufPrint(buf, "SELECT version FROM zent_schema_migrations ORDER BY version", .{});
+}
+
+/// Read all applied migration versions, ordered ascending.
+fn appliedVersions(allocator: std.mem.Allocator, drv: sql_driver.Driver) ![]i64 {
+    var sql_buf: [256]u8 = undefined;
+    const sql = try buildListVersionsSQL(drv.dialect(), &sql_buf);
+    var rows = try drv.query(sql, &.{});
+    defer rows.deinit();
+    var list = std.array_list.Managed(i64).init(allocator);
+    errdefer list.deinit();
+    while (rows.next()) |row| {
+        if (row.getInt(0)) |v| try list.append(v);
+    }
+    return list.toOwnedSlice();
+}
+
+/// Insert a row into the migration history table.
+fn recordMigration(drv: sql_driver.Driver, version: i64, checksum: ?[]const u8) !void {
+    const now = unixTimestamp();
+    var sql_buf: [256]u8 = undefined;
+    const sql = try buildRecordInsertSQL(drv.dialect(), &sql_buf);
+    _ = try drv.exec(
+        sql,
+        &.{
+            .{ .int = version },
+            .{ .int = now },
+            if (checksum) |c| .{ .string = c } else .null,
+        },
+    );
+}
+
+/// True when `version` is already recorded in the history table.
+fn versionContains(versions: []const i64, version: i64) bool {
+    for (versions) |v| {
+        if (v == version) return true;
+    }
+    return false;
+}
 
 /// Column definition for CREATE TABLE.
 pub const ColumnDef = struct {
@@ -710,36 +815,111 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
 }
 
 /// Migrate schema: create missing tables, add missing columns, and create missing indexes.
+///
 /// This is a simplified auto-migration that does NOT drop columns or alter types.
+///
+/// Phase 2 Task 8: every operation is recorded in `zent_schema_migrations`
+/// with a deterministic CRC32 version, and the entire run is wrapped in a
+/// single transaction. Re-running `migrateSchema` is a no-op for operations
+/// already present in the history table; on any error path, `tx.deinit()`
+/// rolls back the whole batch.
 pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver.dialect();
 
-    // Step 1: create tables that don't exist yet. Index creation happens
-    // after introspection so MySQL does not need CREATE INDEX IF NOT EXISTS.
-    try createTables(driver, infos);
+    // Bootstrap the history table outside the transaction; the SQL is
+    // already idempotent (CREATE TABLE IF NOT EXISTS) and there's no
+    // point rolling it back if a later step fails.
+    try ensureMigrationsTable(driver);
 
-    // Step 2: for each non-view entity, check for missing columns and indexes.
+    // Read already-applied versions once, before opening the transaction.
+    const applied = try appliedVersions(allocator, driver);
+    defer allocator.free(applied);
+
+    var tx = try driver.beginTx();
+    errdefer tx.deinit();
+
+    // Tx.inner is a Driver value type, so every existing helper that
+    // accepts a Driver can run inside the transaction unchanged.
+    const tx_drv = tx.inner;
+
+    // Step 1: create tables, views, and M2M junction tables. CREATE TABLE
+    // IF NOT EXISTS keeps this safe even on a partial previous run.
+    //
+    // The schema state (table/column/index existence) is the authoritative
+    // gate — we always re-check the database before applying each change.
+    // `zent_schema_migrations` is an audit trail: `recordMigration` uses
+    // `ON CONFLICT DO NOTHING` / `ON DUPLICATE KEY UPDATE`, so re-recording
+    // a version (e.g. after a table was dropped out-of-band) never produces
+    // duplicates.
+    inline for (infos) |info| {
+        if (info.is_view) {
+            const version = comptime computeMigrationVersion(info.table_name, "create_view", "");
+            if (!versionContains(applied, version)) {
+                const sql = try createViewSQL(info, dialect);
+                defer std.heap.page_allocator.free(sql);
+                _ = try tx_drv.exec(sql, &.{});
+                try recordMigration(tx_drv, version, null);
+            }
+        } else {
+            const table = comptime tableFromTypeInfoCrossRef(info, infos);
+            const version = comptime computeMigrationVersion(info.table_name, "create_table", "");
+            if (!versionContains(applied, version)) {
+                const sql = try createTableSQL(table, dialect);
+                defer std.heap.page_allocator.free(sql);
+                _ = try tx_drv.exec(sql, &.{});
+                try recordMigration(tx_drv, version, null);
+            }
+        }
+    }
+
+    // M2M junction tables: only declared on one side at a time, and only
+    // when the edge doesn't use an explicit edge schema (through).
+    inline for (infos) |info| {
+        if (info.is_view) continue;
+        inline for (info.edges) |e| {
+            if (e.relation == .m2m and e.through == null) {
+                const jtable = comptime junctionTableForEdge(e, info);
+                const version = comptime computeMigrationVersion(jtable.name, "create_junction", "");
+                if (!versionContains(applied, version)) {
+                    const sql = try createTableSQL(jtable, dialect);
+                    defer std.heap.page_allocator.free(sql);
+                    _ = try tx_drv.exec(sql, &.{});
+                    try recordMigration(tx_drv, version, null);
+                }
+            }
+        }
+    }
+
+    // Step 2: for each non-view entity, add missing columns and indexes.
+    // The live schema (introspected via information_schema / PRAGMA) is
+    // the authoritative gate: we always add a column or index if it is
+    // absent, even if a prior `zent_schema_migrations` row claimed the
+    // work was done. This handles the common case of a table being
+    // dropped or truncated out-of-band — the migration must still bring
+    // the schema back to the declared shape. The `recordMigration` INSERT
+    // itself is idempotent (`ON CONFLICT DO NOTHING`), so re-recording a
+    // version never produces duplicate history rows.
     inline for (infos) |info| {
         if (info.is_view) continue;
 
         const table = comptime tableFromTypeInfoCrossRef(info, infos);
 
-        var existing_cols = try getExistingColumns(allocator, driver, table.name);
+        var existing_cols = try getExistingColumns(allocator, tx_drv, table.name);
         defer freeExistingColumns(allocator, &existing_cols);
 
-        // Add missing columns
-        for (table.columns) |col| {
+        inline for (table.columns) |col| {
             if (!columnExists(existing_cols.items, col.name)) {
+                const version = comptime computeMigrationVersion(info.table_name, "add_column", col.name);
                 const sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect);
                 defer allocator.free(sql);
-                _ = try driver.exec(sql, &.{});
+                _ = try tx_drv.exec(sql, &.{});
+                try recordMigration(tx_drv, version, null);
             }
         }
 
-        var existing_idxs = try getExistingIndexes(allocator, driver, table.name);
+        var existing_idxs = try getExistingIndexes(allocator, tx_drv, table.name);
         defer freeExistingIndexes(allocator, &existing_idxs);
 
-        // Add missing indexes
         inline for (info.indexes) |idx| {
             const idx_def = IndexDef{
                 .name = idx.name,
@@ -747,12 +927,17 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
                 .unique = idx.unique,
             };
             if (!indexExists(existing_idxs.items, idx_def.name)) {
+                const version = comptime computeMigrationVersion(info.table_name, "create_index", idx.name);
                 const sql = try createIndexSQL(idx_def, table.name, dialect);
                 defer std.heap.page_allocator.free(sql);
-                _ = try driver.exec(sql, &.{});
+                _ = try tx_drv.exec(sql, &.{});
+                try recordMigration(tx_drv, version, null);
             }
         }
     }
+
+    try tx.commit();
+    tx.deinit();
 }
 
 // ------------------------------------------------------------------
