@@ -79,6 +79,7 @@ pub fn ConnPool(comptime D: type) type {
             /// `std.Io` (e.g. `std.Io.Threaded.init(...).io()`).
             io: ?std.Io = null,
             /// Maximum time in milliseconds to wait for a connection when the
+            /// DEPRECATED: replaced by `max_retries` + `retry_backoff_ms`.
             /// pool is exhausted. Zero means non-blocking (returns
             /// `error.PoolExhausted` immediately).
             max_wait_ms: u32 = 0,
@@ -235,7 +236,7 @@ pub fn ConnPool(comptime D: type) type {
                 // it and try the next one.
                 if (self.options.max_idle_secs > 0) {
                     if (entry.idle_since) |idle_since| {
-                        const idle_secs = @divFloor(unixTimestamp() - idle_since, 1);
+                        const idle_secs = unixTimestamp() - idle_since;
                         if (idle_secs > self.options.max_idle_secs) {
                             self.closeConnection(entry);
                             continue;
@@ -260,7 +261,7 @@ pub fn ConnPool(comptime D: type) type {
 
         /// Borrow a connection from the pool.
         ///
-        /// Retries up to `max_retries` times with exponential backoff when the
+        /// Retries up to `max_retries` times with linear backoff when the
         /// pool is exhausted. Performs idle eviction and health checks on each
         /// borrow attempt.
         pub fn borrow(self: *Self) !*D {
@@ -316,7 +317,7 @@ pub fn ConnPool(comptime D: type) type {
 
             // Max lifetime eviction: close connections that have lived too long.
             if (self.options.max_lifetime_secs > 0) {
-                const age_secs = @divFloor(unixTimestamp() - entry.created_at, 1);
+                const age_secs = unixTimestamp() - entry.created_at;
                 if (age_secs > self.options.max_lifetime_secs) {
                     self.closeConnection(entry);
                     self.cond.signal(io);
