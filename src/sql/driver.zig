@@ -75,7 +75,7 @@ pub const Rows = struct {
         deinit: *const fn (ptr: *anyopaque) void,
         /// Optional accessor for per-iteration errors that are not reported
         /// through `next()` returning a Row (e.g. MySQL fetch/truncation).
-        nextError: ?*const fn (ptr: *anyopaque) ?anyerror = null,
+        nextError: ?*const fn (ptr: *anyopaque) ?Error = null,
     };
 
     pub fn next(self: Rows) ?Row {
@@ -88,7 +88,7 @@ pub const Rows = struct {
 
     /// Returns the last per-iteration error, if the driver exposes one.
     /// Call after `next()` returns null to distinguish EOF from fetch failures.
-    pub fn nextError(self: Rows) ?anyerror {
+    pub fn nextError(self: Rows) ?Error {
         const f = self.vtable.nextError orelse return null;
         return f(self.ptr);
     }

@@ -203,7 +203,17 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
-        fn checkPolicy(comptime op: privacy.Op) !void {
+        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed };
+        const BuildError = error{ OutOfMemory, BuildFailed };
+
+        fn mapBuildError(err: anyerror) BuildError {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.BuildFailed,
+            };
+        }
+
+        fn checkPolicy(comptime op: privacy.Op) error{PrivacyDenied}!void {
             if (info.policy) |p| {
                 if (p.evalQuery(op, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -211,7 +221,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
-        pub fn All(self: *Self) !std.array_list.Managed(Entity) {
+        pub fn All(self: *Self) QueryError!std.array_list.Managed(Entity) {
             try checkPolicy(.query);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
@@ -237,7 +247,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return result;
         }
 
-        pub fn First(self: *Self) !?Entity {
+        pub fn First(self: *Self) QueryError!?Entity {
             try checkPolicy(.query);
             self.limit_val = 1;
             var q = try self.buildQuery(info.fields.len);
@@ -258,7 +268,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return entities_arr[0];
         }
 
-        pub fn Only(self: *Self) !Entity {
+        pub fn Only(self: *Self) QueryError!Entity {
             try checkPolicy(.query);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
@@ -280,7 +290,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return entities_arr[0];
         }
 
-        pub fn IDs(self: *Self) !std.array_list.Managed(i64) {
+        pub fn IDs(self: *Self) QueryError!std.array_list.Managed(i64) {
             try checkPolicy(.query);
             var q = try self.buildQuery(1); // only id column
             defer q.deinit();
@@ -298,7 +308,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return result;
         }
 
-        pub fn Count(self: *Self) !i64 {
+        pub fn Count(self: *Self) QueryError!i64 {
             try checkPolicy(.query);
             var q = try self.buildCountQuery();
             defer q.deinit();
@@ -312,7 +322,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return row.getInt(0) orelse return error.TypeMismatch;
         }
 
-        pub fn Exist(self: *Self) !bool {
+        pub fn Exist(self: *Self) QueryError!bool {
             try checkPolicy(.query);
             self.limit_val = 1;
             var q = try self.buildQuery(1);
@@ -327,7 +337,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return true;
         }
 
-        pub fn Sum(self: *Self, comptime field_name: []const u8) !i64 {
+        pub fn Sum(self: *Self, comptime field_name: []const u8) QueryError!i64 {
             try checkPolicy(.query);
             var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
             defer q.deinit();
@@ -340,7 +350,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return row.getInt(0) orelse return error.TypeMismatch;
         }
 
-        pub fn Avg(self: *Self, comptime field_name: []const u8) !f64 {
+        pub fn Avg(self: *Self, comptime field_name: []const u8) QueryError!f64 {
             try checkPolicy(.query);
             var q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
             defer q.deinit();
@@ -353,7 +363,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return row.getFloat(0) orelse return error.TypeMismatch;
         }
 
-        pub fn Max(self: *Self, comptime field_name: []const u8) !sql.Value {
+        pub fn Max(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
             try checkPolicy(.query);
             var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
             defer q.deinit();
@@ -375,7 +385,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return error.TypeMismatch;
         }
 
-        pub fn Min(self: *Self, comptime field_name: []const u8) !sql.Value {
+        pub fn Min(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
             try checkPolicy(.query);
             var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
             defer q.deinit();
@@ -414,7 +424,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     // Use the graph layer to build the neighbor query
                     var b = sql.Builder.init(self.allocator, self.driver.dialect());
                     defer b.deinit();
-                    try graph_neighbors.appendSetNeighbors(&b, step, parent_id_values);
+                    graph_neighbors.appendSetNeighbors(&b, step, parent_id_values) catch |err| return mapBuildError(err);
                     const qr = b.query();
 
                     var rows = try self.driver.query(qr.sql, qr.args);
@@ -494,7 +504,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             } else if (self.for_share) {
                 _ = selector.forShare();
             }
-            return selector.takeQuery();
+            return selector.takeQuery() catch |err| return mapBuildError(err);
         }
 
         fn buildCountQuery(self: *Self) !sql.OwnedQuery {
@@ -516,7 +526,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
             }
-            return selector.takeQuery();
+            return selector.takeQuery() catch |err| return mapBuildError(err);
         }
 
         fn buildAggregateQuery(self: *Self, comptime agg_expr: []const u8) !sql.OwnedQuery {
@@ -549,7 +559,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (self.offset_val) |n| {
                 _ = selector.offset(n);
             }
-            return selector.takeQuery();
+            return selector.takeQuery() catch |err| return mapBuildError(err);
         }
     };
 }
@@ -631,4 +641,31 @@ test "Query builder GroupBy and Having" {
     _ = (try q.GroupBy(&.{"age"})).Having(sql.GT("COUNT(*)", .{ .int = 1 }));
     try std.testing.expectEqual(@as(usize, 1), q.group_cols.items.len);
     try std.testing.expectEqualStrings("age", q.group_cols.items[0]);
+}
+
+test "Query builder execution methods expose explicit driver error union" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGenerator(infos, info);
+    const UserQuery = QueryBuilder(infos, info, UserEntity);
+    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed };
+
+    comptime {
+        const method_names = .{ "All", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
+        for (method_names) |method_name| {
+            const return_type = @typeInfo(@TypeOf(@field(UserQuery, method_name))).@"fn".return_type.?;
+            if (@typeInfo(return_type).error_union.error_set != QueryError) {
+                @compileError("QueryBuilder." ++ method_name ++ " error set is not explicit");
+            }
+        }
+    }
 }

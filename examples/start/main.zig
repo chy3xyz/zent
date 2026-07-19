@@ -304,7 +304,7 @@ pub fn main() !void {
     if (qlock.Only()) |locked_alice| {
         std.debug.print("Locked Alice: id={d}, name={s}\n", .{ locked_alice.id, locked_alice.name });
     } else |err| switch (err) {
-        error.SqlitePrepareFailed => std.debug.print("SELECT FOR UPDATE is not supported by SQLite (expected)\n", .{}),
+        error.PrepareFailed => std.debug.print("SELECT FOR UPDATE is not supported by SQLite (expected)\n", .{}),
         else => return err,
     }
 

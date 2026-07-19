@@ -91,19 +91,19 @@ const MockDriver = struct {
         return sql_driver.Driver{ .ptr = self, .vtable = &vtable };
     }
 
-    fn exec(_: *anyopaque, _: []const u8, _: []const sql.Value) anyerror!sql_driver.Result {
+    fn exec(_: *anyopaque, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
         return .{ .rows_affected = 0, .last_insert_id = null };
     }
 
-    fn query(ptr: *anyopaque, _: []const u8, _: []const sql.Value) anyerror!sql_driver.Rows {
+    fn query(ptr: *anyopaque, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
         const self: *MockDriver = @ptrCast(@alignCast(ptr));
         const rows = try std.testing.allocator.create(MockRows);
         rows.* = .{ .value = self.value, .returned = false };
         return sql_driver.Rows{ .ptr = rows, .vtable = &MockRows.vtable };
     }
 
-    fn beginTx(_: *anyopaque) anyerror!sql_driver.Tx {
-        return error.Unsupported;
+    fn beginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
     }
 
     fn close(_: *anyopaque) void {}
@@ -112,7 +112,7 @@ const MockDriver = struct {
         return .sqlite;
     }
 
-    fn ping(_: *anyopaque) anyerror!void {}
+    fn ping(_: *anyopaque) sql_driver.Error!void {}
 
     fn inTransaction(_: *anyopaque) bool {
         return false;

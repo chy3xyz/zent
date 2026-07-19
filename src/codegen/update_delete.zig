@@ -8,6 +8,13 @@ const Hook = @import("../runtime/hook.zig").Hook;
 const Op = @import("../runtime/hook.zig").Op;
 const privacy = @import("../privacy/policy.zig");
 
+fn mapBuildError(err: anyerror) sql_driver.Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.DriverFailed,
+    };
+}
+
 const FieldValue = @import("create.zig").FieldValue;
 
 // C time() — libc is linked via build.zig
@@ -174,8 +181,11 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
+        const SaveError = sql_driver.Error || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+        const SaveOneError = SaveError || error{ NotFound, NotSingular };
+
         /// Execute the UPDATE and return rows affected.
-        pub fn Save(self: *Self) !usize {
+        pub fn Save(self: *Self) SaveError!usize {
             if (info.policy) |p| {
                 if (p.evalMutation(.update, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -214,13 +224,13 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 _ = try builder.where(pred);
             }
 
-            const q = try builder.query();
+            const q = builder.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
             return res.rows_affected;
         }
 
         /// Execute the UPDATE and expect exactly one row to be affected.
-        pub fn SaveOne(self: *Self) !void {
+        pub fn SaveOne(self: *Self) SaveOneError!void {
             const affected = try self.Save();
             if (affected == 0) return error.NotFound;
             if (affected > 1) return error.NotSingular;
@@ -273,9 +283,12 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
+        const ExecError = sql_driver.Error || error{PrivacyDenied};
+        const ExecOneError = ExecError || error{ NotFound, NotSingular };
+
         /// Execute the DELETE and return rows affected.
         /// If the entity has soft_delete enabled, this updates deleted_at instead.
-        pub fn Exec(self: *Self) !usize {
+        pub fn Exec(self: *Self) ExecError!usize {
             if (info.soft_delete) {
                 return self.execSoftDelete();
             }
@@ -283,25 +296,25 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         /// Force a hard DELETE even if soft_delete is enabled.
-        pub fn ForceExec(self: *Self) !usize {
+        pub fn ForceExec(self: *Self) ExecError!usize {
             return self.execHardDelete();
         }
 
         /// Execute the DELETE and expect exactly one row to be affected.
-        pub fn ExecOne(self: *Self) !void {
+        pub fn ExecOne(self: *Self) ExecOneError!void {
             const affected = try self.Exec();
             if (affected == 0) return error.NotFound;
             if (affected > 1) return error.NotSingular;
         }
 
         /// Force a hard DELETE and expect exactly one row to be affected.
-        pub fn ForceExecOne(self: *Self) !void {
+        pub fn ForceExecOne(self: *Self) ExecOneError!void {
             const affected = try self.ForceExec();
             if (affected == 0) return error.NotFound;
             if (affected > 1) return error.NotSingular;
         }
 
-        fn execSoftDelete(self: *Self) !usize {
+        fn execSoftDelete(self: *Self) ExecError!usize {
             if (info.policy) |p| {
                 if (p.evalMutation(.delete, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -330,12 +343,12 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 _ = try builder.where(pred);
             }
 
-            const q = try builder.query();
+            const q = builder.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
             return res.rows_affected;
         }
 
-        fn execHardDelete(self: *Self) !usize {
+        fn execHardDelete(self: *Self) ExecError!usize {
             if (info.policy) |p| {
                 if (p.evalMutation(.delete, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -361,7 +374,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 _ = try builder.where(pred);
             }
 
-            const q = try builder.query();
+            const q = builder.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
             return res.rows_affected;
         }
@@ -450,8 +463,10 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             return try self.set(field_name, toSqlValue(value));
         }
 
+        const SaveError = sql_driver.Error || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+
         /// Execute the bulk UPDATE and return rows affected.
-        pub fn Save(self: *Self) !usize {
+        pub fn Save(self: *Self) SaveError!usize {
             if (info.policy) |p| {
                 if (p.evalMutation(.update, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -483,7 +498,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 }
             }
 
-            const q = try self.b.query();
+            const q = self.b.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
             return res.rows_affected;
         }
@@ -542,15 +557,17 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
+        const ExecError = sql_driver.Error || error{PrivacyDenied};
+
         /// Execute the bulk DELETE and return rows affected.
-        pub fn Exec(self: *Self) !usize {
+        pub fn Exec(self: *Self) ExecError!usize {
             if (info.soft_delete) {
                 @compileError("BulkDelete does not support soft_delete entities; use Update or individual Delete");
             }
             return self.execHardDelete();
         }
 
-        fn execHardDelete(self: *Self) !usize {
+        fn execHardDelete(self: *Self) ExecError!usize {
             if (info.policy) |p| {
                 if (p.evalMutation(.delete, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -571,7 +588,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
 
             if (self.b.groups.items.len == 0) return 0;
 
-            const q = try self.b.query();
+            const q = self.b.query() catch |err| return mapBuildError(err);
             const res = try self.driver.exec(q.sql, q.args);
             return res.rows_affected;
         }
@@ -695,4 +712,35 @@ test "BulkDelete builder basic" {
     try std.testing.expectEqual(@as(usize, 2), d.b.groups.items.len);
     try std.testing.expectEqual(@as(usize, 1), d.b.groups.items[0].items.len);
     try std.testing.expectEqual(@as(usize, 1), d.b.groups.items[1].items.len);
+}
+
+test "Update and delete execution methods expose explicit driver error unions" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const Upd = UpdateBuilder(info);
+    const Del = DeleteBuilder(info);
+    const BulkUpd = BulkUpdateBuilder(info);
+    const BulkDel = BulkDeleteBuilder(info);
+    const SaveError = sql_driver.Error || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+    const SaveOneError = SaveError || error{ NotFound, NotSingular };
+    const ExecError = sql_driver.Error || error{PrivacyDenied};
+    const ExecOneError = ExecError || error{ NotFound, NotSingular };
+
+    comptime {
+        if (@typeInfo(@typeInfo(@TypeOf(Upd.Save)).@"fn".return_type.?).error_union.error_set != SaveError) @compileError("Update.Save error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(Upd.SaveOne)).@"fn".return_type.?).error_union.error_set != SaveOneError) @compileError("Update.SaveOne error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(Del.Exec)).@"fn".return_type.?).error_union.error_set != ExecError) @compileError("Delete.Exec error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(Del.ForceExec)).@"fn".return_type.?).error_union.error_set != ExecError) @compileError("Delete.ForceExec error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(Del.ExecOne)).@"fn".return_type.?).error_union.error_set != ExecOneError) @compileError("Delete.ExecOne error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(Del.ForceExecOne)).@"fn".return_type.?).error_union.error_set != ExecOneError) @compileError("Delete.ForceExecOne error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(BulkUpd.Save)).@"fn".return_type.?).error_union.error_set != SaveError) @compileError("BulkUpdate.Save error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(BulkDel.Exec)).@"fn".return_type.?).error_union.error_set != ExecError) @compileError("BulkDelete.Exec error set is not explicit");
+    }
 }

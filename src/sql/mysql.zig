@@ -384,7 +384,7 @@ const MySQLTx = struct {
         if (self.state != .active) return;
         self.state = .committed;
         self.driver.in_tx = false;
-        self.driver.exec("COMMIT", &.{}) catch |err| return toDriverError(err);
+        _ = self.driver.exec("COMMIT", &.{}) catch |err| return toDriverError(err);
     }
 
     fn rollback(ptr: *anyopaque) driver.Error!void {
@@ -392,7 +392,7 @@ const MySQLTx = struct {
         if (self.state != .active) return;
         self.state = .rolled_back;
         self.driver.in_tx = false;
-        self.driver.exec("ROLLBACK", &.{}) catch |err| return toDriverError(err);
+        _ = self.driver.exec("ROLLBACK", &.{}) catch |err| return toDriverError(err);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -512,7 +512,7 @@ pub const MySQLRows = struct {
         self.lengths = lens;
     }
 
-    fn nextErrorVTable(ptr: *anyopaque) ?anyerror {
+    fn nextErrorVTable(ptr: *anyopaque) ?driver.Error {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
         return self.nextError();
     }
@@ -553,8 +553,9 @@ pub const MySQLRows = struct {
     /// Returns the last error encountered while iterating, if any. Consumers
     /// should check this after `next()` returns null to distinguish normal
     /// end-of-results from fetch failures or silent data truncation.
-    pub fn nextError(self: *MySQLRows) ?anyerror {
-        return self.last_error;
+    pub fn nextError(self: *MySQLRows) ?driver.Error {
+        const err = self.last_error orelse return null;
+        return toDriverError(err);
     }
 
     fn deinit(ptr: *anyopaque) void {

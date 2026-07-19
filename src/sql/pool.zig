@@ -298,6 +298,13 @@ pub fn ConnPool(comptime D: type) type {
             };
         }
 
+        fn borrowForDriver(self: *Self) driver.Error!*D {
+            return self.borrow() catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.ConnectionFailed,
+            };
+        }
+
         const PooledTx = struct {
             pool: *Self,
             conn: *D,
@@ -305,14 +312,14 @@ pub fn ConnPool(comptime D: type) type {
             finished: bool = false,
         };
 
-        fn pooledCommit(ptr: *anyopaque) anyerror!void {
+        fn pooledCommit(ptr: *anyopaque) driver.Error!void {
             const wrapper: *PooledTx = @ptrCast(@alignCast(ptr));
             if (wrapper.finished) return;
             try wrapper.tx.commit();
             wrapper.finished = true;
         }
 
-        fn pooledRollback(ptr: *anyopaque) anyerror!void {
+        fn pooledRollback(ptr: *anyopaque) driver.Error!void {
             const wrapper: *PooledTx = @ptrCast(@alignCast(ptr));
             if (wrapper.finished) return;
             try wrapper.tx.rollback();
@@ -326,23 +333,23 @@ pub fn ConnPool(comptime D: type) type {
             wrapper.pool.allocator.destroy(wrapper);
         }
 
-        fn driverExec(ptr: *anyopaque, query_sql: []const u8, args: []const Value) anyerror!driver.Result {
+        fn driverExec(ptr: *anyopaque, query_sql: []const u8, args: []const Value) driver.Error!driver.Result {
             const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrow();
+            const conn = try pool.borrowForDriver();
             defer pool.release(conn);
             return conn.asDriver().exec(query_sql, args);
         }
 
-        fn driverQuery(ptr: *anyopaque, query_sql: []const u8, args: []const Value) anyerror!driver.Rows {
+        fn driverQuery(ptr: *anyopaque, query_sql: []const u8, args: []const Value) driver.Error!driver.Rows {
             const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrow();
+            const conn = try pool.borrowForDriver();
             defer pool.release(conn);
             return conn.asDriver().query(query_sql, args);
         }
 
-        fn driverBeginTx(ptr: *anyopaque) anyerror!driver.Tx {
+        fn driverBeginTx(ptr: *anyopaque) driver.Error!driver.Tx {
             const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrow();
+            const conn = try pool.borrowForDriver();
             errdefer pool.release(conn);
 
             const tx = try conn.asDriver().beginTx();
@@ -376,9 +383,9 @@ pub fn ConnPool(comptime D: type) type {
             return pool.dialect;
         }
 
-        fn driverPing(ptr: *anyopaque) anyerror!void {
+        fn driverPing(ptr: *anyopaque) driver.Error!void {
             const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrow();
+            const conn = try pool.borrowForDriver();
             defer pool.release(conn);
             return conn.asDriver().ping();
         }
@@ -595,13 +602,13 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
             closes += 1;
         }
 
-        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Result {
+        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
             unreachable;
         }
-        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Rows {
+        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
             unreachable;
         }
-        fn mockBeginTx(_: *anyopaque) anyerror!driver.Tx {
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
             unreachable;
         }
         fn mockClose(_: *anyopaque) void {
@@ -610,7 +617,7 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
         fn mockDialect(_: *anyopaque) Dialect {
             return .sqlite;
         }
-        fn mockPing(_: *anyopaque) anyerror!void {
+        fn mockPing(_: *anyopaque) driver.Error!void {
             unreachable;
         }
         fn mockInTransaction(_: *anyopaque) bool {
@@ -685,13 +692,13 @@ test "ConnPool closes connection once when available.append fails" {
             closes += 1;
         }
 
-        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Result {
+        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
             unreachable;
         }
-        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) anyerror!driver.Rows {
+        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
             unreachable;
         }
-        fn mockBeginTx(_: *anyopaque) anyerror!driver.Tx {
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
             unreachable;
         }
         fn mockClose(_: *anyopaque) void {
@@ -700,7 +707,7 @@ test "ConnPool closes connection once when available.append fails" {
         fn mockDialect(_: *anyopaque) Dialect {
             return .sqlite;
         }
-        fn mockPing(_: *anyopaque) anyerror!void {
+        fn mockPing(_: *anyopaque) driver.Error!void {
             unreachable;
         }
         fn mockInTransaction(_: *anyopaque) bool {

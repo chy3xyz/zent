@@ -345,14 +345,14 @@ const PostgresTx = struct {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
         self.state = .committed;
-        self.driver.exec("COMMIT", &.{}) catch |err| return toDriverError(err);
+        _ = self.driver.exec("COMMIT", &.{}) catch |err| return toDriverError(err);
     }
 
     fn rollback(ptr: *anyopaque) driver.Error!void {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
         self.state = .rolled_back;
-        self.driver.exec("ROLLBACK", &.{}) catch |err| return toDriverError(err);
+        _ = self.driver.exec("ROLLBACK", &.{}) catch |err| return toDriverError(err);
     }
 
     fn deinit(ptr: *anyopaque) void {

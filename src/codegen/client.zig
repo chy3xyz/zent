@@ -166,9 +166,11 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return BulkDeleteBuilder.init(self.allocator, self.driver, self.hooks);
         }
 
+        const QueryEdgeError = sql_driver.Error || error{TypeMismatch};
+
         /// Query target entities via an edge.
         /// Example: user_client.QueryEdge("cars", &.{alice.id}) returns Car entities.
-        pub fn QueryEdge(self: Self, comptime edge_name: []const u8, parent_ids: []const i64) !QueryTargetsResult(infos, info.name, edge_name) {
+        pub fn QueryEdge(self: Self, comptime edge_name: []const u8, parent_ids: []const i64) QueryEdgeError!QueryTargetsResult(infos, info.name, edge_name) {
             if (info.is_view) @compileError("QueryEdge is not supported for view entities");
             return queryTargets(infos, info.name, edge_name, parent_ids, self.allocator, self.driver);
         }
@@ -214,11 +216,11 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
         client: Client(infos),
         tx: sql_driver.Tx,
 
-        pub fn commit(self: *@This()) !void {
+        pub fn commit(self: *@This()) sql_driver.Error!void {
             return self.tx.commit();
         }
 
-        pub fn rollback(self: *@This()) !void {
+        pub fn rollback(self: *@This()) sql_driver.Error!void {
             return self.tx.rollback();
         }
 
@@ -274,7 +276,7 @@ pub fn makeClient(comptime infos: []const TypeInfo, allocator: std.mem.Allocator
 }
 
 /// Begin a transaction and return a TxClient backed by the transaction.
-pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) !TxClient(infos) {
+pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver.Error!TxClient(infos) {
     const tx = try self.driver.beginTx();
     return TxClient(infos){
         .client = makeClient(infos, self.allocator, tx.inner),
@@ -282,9 +284,11 @@ pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) !TxClient(
     };
 }
 
+const CreateTablesError = sql_driver.Error || error{MissingViewSQL};
+
 /// Create all database tables (create-only migration).
 /// Creates entity tables and junction tables for M2M edges.
-pub fn createAllTables(comptime infos: []const TypeInfo, driver: sql_driver.Driver) !void {
+pub fn createAllTables(comptime infos: []const TypeInfo, driver: sql_driver.Driver) CreateTablesError!void {
     return migrate.createAllTables(driver, infos);
 }
 
@@ -332,6 +336,8 @@ fn QueryTargetsResult(
     return std.array_list.Managed(EntityGen(infos, target_info));
 }
 
+const QueryTargetsError = sql_driver.Error || error{TypeMismatch};
+
 /// Query target entities via an O2M/M2M edge.
 /// For example: queryTargets(infos, "User", "cars", &[1], allocator, driver) returns Car entities for user 1.
 pub fn queryTargets(
@@ -341,7 +347,7 @@ pub fn queryTargets(
     parent_ids: []const i64,
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
-) !QueryTargetsResult(infos, source_name, edge_name) {
+) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
     const source_info = comptime findTypeInfo(infos, source_name);
     const edge = comptime findEdgeInfo(source_info, edge_name);
     const target_info = comptime findTypeInfo(infos, edge.target_name);
@@ -490,4 +496,33 @@ test "Client type generation" {
     var client = makeClient(infos, c, undefined);
     _ = client.user.Create();
     _ = client.car.Create();
+}
+
+test "Client driver operations expose explicit driver error unions" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Car = schema("Car", .{
+        .fields = &.{field.String("model")},
+    });
+    const User = schema("User", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{@import("../core/edge.zig").To("cars", Car)},
+    });
+
+    const user_info = comptime fromSchema(User);
+    const car_info = comptime fromSchema(Car);
+    const infos = &[_]TypeInfo{ user_info, car_info };
+    const RootClient = Client(infos);
+    const UserClient = EntityClient(infos, user_info);
+    const TransactionClient = TxClient(infos);
+    const ExpectedQueryTargetsError = sql_driver.Error || error{TypeMismatch};
+
+    comptime {
+        if (@typeInfo(@typeInfo(@TypeOf(beginTx(infos, @as(RootClient, undefined)))).error_union).error_set != sql_driver.Error) @compileError("beginTx error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(UserClient.QueryEdge)).@"fn".return_type.?).error_union.error_set != ExpectedQueryTargetsError) @compileError("EntityClient.QueryEdge error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.commit)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.commit error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.rollback)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.rollback error set is not explicit");
+    }
 }

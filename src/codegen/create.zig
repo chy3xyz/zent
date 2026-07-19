@@ -9,6 +9,13 @@ const Hook = @import("../runtime/hook.zig").Hook;
 const Op = @import("../runtime/hook.zig").Op;
 const privacy = @import("../privacy/policy.zig");
 
+fn mapBuildError(err: anyerror) sql_driver.Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.DriverFailed,
+    };
+}
+
 /// A runtime field value entry.
 pub const FieldValue = struct {
     name: []const u8,
@@ -124,15 +131,17 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self;
         }
 
-        pub fn Save(self: *Self) !Entity {
+        const SaveError = sql_driver.Error || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
+
+        pub fn Save(self: *Self) SaveError!Entity {
             return self.saveInternal(false);
         }
 
-        pub fn SaveOrUpdate(self: *Self) !Entity {
+        pub fn SaveOrUpdate(self: *Self) SaveError!Entity {
             return self.saveInternal(true);
         }
 
-        fn saveInternal(self: *Self, comptime or_replace: bool) !Entity {
+        fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!Entity {
             if (info.policy) |p| {
                 if (p.evalMutation(.create, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -190,7 +199,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 defer builder.deinit();
                 _ = try builder.columns(columns.items);
                 _ = try builder.values(args.items);
-                var q = try builder.takeQuery();
+                var q = builder.takeQuery() catch |err| return mapBuildError(err);
                 defer q.deinit();
 
                 // Build the full SQL: q.sql + (mysql REPLACE prefix or PG UPSERT suffix) + RETURNING
@@ -228,7 +237,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 defer builder.deinit();
                 _ = try builder.columns(columns.items);
                 _ = try builder.values(args.items);
-                var q = try builder.takeQuery();
+                var q = builder.takeQuery() catch |err| return mapBuildError(err);
                 defer q.deinit();
 
                 const full_sql_len = q.sql.len + if (needs_replace_prefix) @as(usize, replace_keyword.len - insert_keyword.len) else 0;
@@ -301,7 +310,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                                 .{ .int = entity.id },
                                 .{ .int = target_id },
                             });
-                            var iq = try ib.takeQuery();
+                            var iq = ib.takeQuery() catch |err| return mapBuildError(err);
                             defer iq.deinit();
                             _ = try self.driver.exec(iq.sql, iq.args);
                         }
@@ -336,7 +345,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             }
         }
 
-        fn valueToType(comptime T: type, comptime ft: @import("../core/field.zig").FieldType, value: sql.Value, allocator: std.mem.Allocator, entity: *Entity) !T {
+        fn valueToType(comptime T: type, comptime ft: @import("../core/field.zig").FieldType, value: sql.Value, allocator: std.mem.Allocator, entity: *Entity) error{ OutOfMemory, TypeMismatch }!T {
             _ = ft;
             return switch (@typeInfo(T)) {
                 .int => @intCast(value.int),
@@ -355,10 +364,16 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                             entity.json_arena = a;
                             break :blk a;
                         };
-                        return try std.json.parseFromSliceLeaky(T, arena.allocator(), value.string, .{});
+                        return std.json.parseFromSliceLeaky(T, arena.allocator(), value.string, .{}) catch |err| switch (err) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            else => error.TypeMismatch,
+                        };
                     }
                     // Fallback for entities without a json_arena field (non-JSON structs).
-                    return try std.json.parseFromSliceLeaky(T, allocator, value.string, .{});
+                    return std.json.parseFromSliceLeaky(T, allocator, value.string, .{}) catch |err| switch (err) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => error.TypeMismatch,
+                    };
                 },
             };
         }
@@ -531,7 +546,9 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             return try self.setValue(field_name, toSqlValue(value));
         }
 
-        pub fn Save(self: *Self) !std.array_list.Managed(i64) {
+        const SaveError = sql_driver.Error || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
+
+        pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
             if (info.policy) |p| {
                 if (p.evalMutation(.create, info.table_name) == .deny) {
                     return error.PrivacyDenied;
@@ -587,7 +604,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 for (row.items) |fv| try sql_values.append(fv.value);
                 _ = try builder.values(sql_values.items);
             }
-            const base = try builder.query();
+            const base = builder.query() catch |err| return mapBuildError(err);
 
             var sql_buf = std.array_list.Managed(u8).init(self.allocator);
             defer sql_buf.deinit();
@@ -755,4 +772,32 @@ test "Create builder SaveOrUpdate compiles" {
     // We can't actually execute SaveOrUpdate without a real driver,
     // but we verify the method exists and compiles.
     try std.testing.expectEqual(@as(usize, 2), b.values.items.len);
+}
+
+test "Create builders expose explicit driver error unions" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, UserEntity);
+    const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
+    const SaveError = sql_driver.Error || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
+    const BulkSaveError = sql_driver.Error || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
+
+    comptime {
+        const save_return = @typeInfo(@TypeOf(Builder.Save)).@"fn".return_type.?;
+        const save_or_update_return = @typeInfo(@TypeOf(Builder.SaveOrUpdate)).@"fn".return_type.?;
+        const bulk_save_return = @typeInfo(@TypeOf(BulkBuilder.Save)).@"fn".return_type.?;
+        if (@typeInfo(save_return).error_union.error_set != SaveError) @compileError("Create.Save error set is not explicit");
+        if (@typeInfo(save_or_update_return).error_union.error_set != SaveError) @compileError("Create.SaveOrUpdate error set is not explicit");
+        if (@typeInfo(bulk_save_return).error_union.error_set != BulkSaveError) @compileError("BulkInsert.Save error set is not explicit");
+    }
 }
