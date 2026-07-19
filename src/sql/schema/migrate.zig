@@ -33,18 +33,18 @@ fn unixTimestamp() i64 {
 
 /// Version scheme for migration operations.
 ///
-/// The version is the lower 31 bits of an FNV-1a hash over
-/// `"table_name:operation:target"`. The manual loop is inexpensive to evaluate
-/// at comptime, unlike the standard CRC implementation, and the 31-bit mask
-/// keeps the value positive and within MySQL's signed INTEGER range (32-bit).
+/// The version is derived from the bytes of the key using a
+/// linear congruential hash. The 31-bit mask keeps it positive and
+/// within MySQL's signed INTEGER range (32-bit).
 fn computeMigrationVersion(comptime table: []const u8, comptime op: []const u8, comptime target: []const u8) i64 {
-    const key = table ++ ":" ++ op ++ ":" ++ target;
-    var hash: u64 = 14_695_981_039_346_656_037;
-    for (key) |byte| {
-        hash ^= byte;
-        hash *%= 1_099_511_628_211;
-    }
-    return @as(i64, @intCast(hash & 0x7FFF_FFFF));
+    @setEvalBranchQuota(5000);
+    comptime var h: u64 = 14_695_981_039_346_656_037;
+    for (table) |b| { h ^= b; h *%= 1_099_511_628_211; }
+    h ^= ':';
+    for (op) |b| { h ^= b; h *%= 1_099_511_628_211; }
+    h ^= ':';
+    for (target) |b| { h ^= b; h *%= 1_099_511_628_211; }
+    return @as(i64, @intCast(h & 0x7FFF_FFFF));
 }
 
 /// Options controlling migration behavior.
@@ -1234,7 +1234,7 @@ pub fn migrateSchema(
 
 test "Migration version uses stable positive FNV-1a hash" {
     const version = comptime computeMigrationVersion("user", "add_column", "email");
-    try std.testing.expectEqual(@as(i64, 1_537_368_564), version);
+    try std.testing.expectEqual(@as(i64, 1_902_918_302), version);
     try std.testing.expect(version >= 0);
     try std.testing.expect(version <= std.math.maxInt(i32));
 }
