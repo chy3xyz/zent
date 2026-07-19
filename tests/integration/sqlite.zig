@@ -648,3 +648,156 @@ test "SQLite: Deny policy blocks query and create" {
         }
     }
 }
+
+test "SQLite: privacy WithContext propagates context to allow/deny decisions" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Two entities: one with AlwaysAllow, one with AlwaysDeny.
+    // Both have a policy, so both require WithContext.
+    const AllowEntity = schema("AllowEntity", .{
+        .fields = &.{field.String("name")},
+        .policy = zent.privacy.AlwaysAllow,
+    });
+    const DenyEntity = schema("DenyEntity", .{
+        .fields = &.{field.String("name")},
+        .policy = zent.privacy.AlwaysDeny,
+    });
+
+    const graph = comptime buildGraph(&.{ AllowEntity, DenyEntity });
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    const tenant1 = zent.privacy.PrivacyContext{ .tenant_id = 1 };
+    const tenant2 = zent.privacy.PrivacyContext{ .tenant_id = 2 };
+
+    // --- AlwaysAllow: Query with context succeeds for both tenants ---
+    {
+        var c1 = client.allow_entity.withContext(tenant1);
+        var q1 = c1.Query();
+        defer q1.deinit();
+        const results = try q1.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 0), results.items.len);
+    }
+    {
+        var c2 = client.allow_entity.withContext(tenant2);
+        var q2 = c2.Query();
+        defer q2.deinit();
+        const results = try q2.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 0), results.items.len);
+    }
+
+    // --- AlwaysAllow: Create with context succeeds ---
+    {
+        var c = client.allow_entity.withContext(tenant1);
+        var b = try c.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "tenant1-item");
+        var entity = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+        try testing.expectEqualStrings("tenant1-item", entity.name);
+        try testing.expect(entity.id > 0);
+    }
+
+    // --- AlwaysDeny: Query with context still fails ---
+    {
+        var c = client.deny_entity.withContext(tenant1);
+        var q = c.Query();
+        defer q.deinit();
+        if (q.All()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // --- AlwaysDeny: Create with context still fails ---
+    {
+        var c = client.deny_entity.withContext(tenant2);
+        var b = try c.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "should-not-save");
+        if (b.Save()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+}
+
+test "SQLite: privacy denies all operations without WithContext" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Any entity with a policy must have WithContext called;
+    // using the builder without it should return PrivacyDenied.
+    const SecureEntity = schema("SecureEntity", .{
+        .fields = &.{field.String("name")},
+        .policy = zent.privacy.AlwaysAllow,
+    });
+
+    const graph = comptime buildGraph(&.{SecureEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Query without WithContext → PrivacyDenied
+    {
+        var q = client.secure_entity.Query();
+        defer q.deinit();
+        if (q.All()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // Create without WithContext → PrivacyDenied
+    {
+        var b = try client.secure_entity.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "no-ctx");
+        if (b.Save()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // Update without WithContext → PrivacyDenied
+    {
+        var u = client.secure_entity.Update();
+        defer u.deinit();
+        _ = try u.set("name", .{ .string = "x" });
+        if (u.Save()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // Delete without WithContext → PrivacyDenied
+    {
+        var d = client.secure_entity.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{client.secure_entity.predicates.nameEQ(.{ .string = "no-ctx" })});
+        if (d.Exec()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+}
