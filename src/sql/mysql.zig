@@ -439,22 +439,34 @@ pub const MySQLRows = struct {
 
         @memset(binds, std.mem.zeroes(c.MYSQL_BIND));
 
-        for (0..n) |i| {
-            const field = &self.fields[i];
+        {
+            var i: usize = 0;
+            errdefer {
+                for (str_bufs.items[0..i]) |s| self.allocator.free(s);
+                str_bufs.deinit(self.allocator);
+                int_bufs.deinit(self.allocator);
+                float_bufs.deinit(self.allocator);
+                nulls.deinit(self.allocator);
+                errors.deinit(self.allocator);
+                lens.deinit(self.allocator);
+            }
+            while (i < n) : (i += 1) {
+                const field = &self.fields[i];
 
-            // Size buffers from field metadata when available; fallback to a
-            // conservative default. Long TEXT/BLOB values previously truncated
-            // silently because this was hard-coded to 256 bytes.
-            const buf_len: usize = if (field.max_length > 0) field.max_length else 256;
-            const buf = try self.allocator.alloc(u8, buf_len);
-            str_bufs.items[i] = buf;
+                // Size buffers from field metadata when available; fallback to a
+                // conservative default. Long TEXT/BLOB values previously truncated
+                // silently because this was hard-coded to 256 bytes.
+                const buf_len: usize = if (field.max_length > 0) field.max_length else 256;
+                const buf = try self.allocator.alloc(u8, buf_len);
+                str_bufs.items[i] = buf;
 
-            binds[i].buffer_type = c.MYSQL_TYPE_STRING;
-            binds[i].buffer = buf.ptr;
-            binds[i].buffer_length = @intCast(buf_len);
-            binds[i].is_null = &nulls.items[i];
-            binds[i].length = &lens.items[i];
-            binds[i].@"error" = &errors.items[i];
+                binds[i].buffer_type = c.MYSQL_TYPE_STRING;
+                binds[i].buffer = buf.ptr;
+                binds[i].buffer_length = @intCast(buf_len);
+                binds[i].is_null = &nulls.items[i];
+                binds[i].length = &lens.items[i];
+                binds[i].@"error" = &errors.items[i];
+            }
         }
 
         if (c.mysql_stmt_bind_result(self.stmt, binds.ptr) != 0) {

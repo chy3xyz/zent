@@ -229,6 +229,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 errdefer deinitEntity(infos, info, &entity, self.allocator);
                 try result.append(entity);
             }
+            if (rows.nextError()) |e| return e;
 
             for (self.with_edges.items) |edge_name| {
                 try self.loadEdges(edge_name, result.items);
@@ -244,7 +245,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
-            const row = rows.next() orelse return null;
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return null;
+            };
             const entity = try sql_scan.scanRow(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
             var entities_arr = [_]Entity{entity};
@@ -261,10 +265,14 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
-            const row = rows.next() orelse return error.NotFound;
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
             const entity = try sql_scan.scanRow(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
-            if (rows.next() != null) return error.NotSingular;
+            if (rows.next()) |_| return error.NotSingular;
+            if (rows.nextError()) |e| return e;
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |edge_name| {
                 try self.loadEdges(edge_name, &entities_arr);
@@ -286,6 +294,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 const id = row.getInt(0) orelse return error.TypeMismatch;
                 try result.append(id);
             }
+            if (rows.nextError()) |e| return e;
             return result;
         }
 
@@ -296,7 +305,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
 
-            const row = rows.next() orelse return error.NotFound;
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
             return row.getInt(0) orelse return error.TypeMismatch;
         }
 
@@ -307,7 +319,12 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
-            return rows.next() != null;
+            const maybe_row = rows.next();
+            if (maybe_row == null) {
+                if (rows.nextError()) |e| return e;
+                return false;
+            }
+            return true;
         }
 
         pub fn Sum(self: *Self, comptime field_name: []const u8) !i64 {
@@ -316,7 +333,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
-            const row = rows.next() orelse return error.NotFound;
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
             return row.getInt(0) orelse return error.TypeMismatch;
         }
 
@@ -326,7 +346,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
-            const row = rows.next() orelse return error.NotFound;
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
             return row.getFloat(0) orelse return error.TypeMismatch;
         }
 
@@ -336,7 +359,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
-            const row = rows.next() orelse return error.NotFound;
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
             if (row.isNull(0)) return .null;
             if (row.getInt(0)) |v| return .{ .int = v };
             if (row.getFloat(0)) |v| return .{ .float = v };
@@ -355,7 +381,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
             defer rows.deinit();
-            const row = rows.next() orelse return error.NotFound;
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
             if (row.isNull(0)) return .null;
             if (row.getInt(0)) |v| return .{ .int = v };
             if (row.getFloat(0)) |v| return .{ .float = v };
@@ -411,6 +440,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                         }
                         try gop.value_ptr.append(self.allocator, target);
                     }
+                    if (rows.nextError()) |e| return e;
 
                     for (entities) |*e| {
                         if (map.get(e.id)) |list| {
