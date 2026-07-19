@@ -254,7 +254,9 @@ pub const PostgresDriver = struct {
     }
 
     pub fn ping(self: *PostgresDriver) !void {
-        if (c.PQstatus(self.conn) != c.CONNECTION_OK) {
+        const result = c.PQexec(self.conn, "SELECT 1");
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
             logPgError(self.conn, "ping");
             return error.PostgresPingFailed;
         }

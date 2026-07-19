@@ -74,6 +74,9 @@ pub fn ConnPool(comptime D: type) type {
             /// pool is exhausted. Zero means non-blocking (returns
             /// `error.PoolExhausted` immediately).
             max_wait_ms: u32 = 0,
+            /// Maximum time in milliseconds for a single query/exec on a pooled
+            /// connection. Zero disables the timeout.
+            query_timeout_ms: u32 = 0,
             /// Optional metrics callbacks.
             metrics: Metrics = .{},
         };
@@ -339,6 +342,15 @@ pub fn ConnPool(comptime D: type) type {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             const conn = try pool.borrowForDriver();
             defer pool.release(conn);
+            if (pool.options.query_timeout_ms > 0) {
+                const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
+                const result = conn.asDriver().exec(query_sql, args);
+                const elapsed_ms = start.untilNow(pool.io).raw.toMilliseconds();
+                if (elapsed_ms > pool.options.query_timeout_ms) {
+                    return error.QueryTimeout;
+                }
+                return result;
+            }
             return conn.asDriver().exec(query_sql, args);
         }
 
@@ -346,6 +358,15 @@ pub fn ConnPool(comptime D: type) type {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             const conn = try pool.borrowForDriver();
             defer pool.release(conn);
+            if (pool.options.query_timeout_ms > 0) {
+                const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
+                const rows = conn.asDriver().query(query_sql, args);
+                const elapsed_ms = start.untilNow(pool.io).raw.toMilliseconds();
+                if (elapsed_ms > pool.options.query_timeout_ms) {
+                    return error.QueryTimeout;
+                }
+                return rows;
+            }
             return conn.asDriver().query(query_sql, args);
         }
 

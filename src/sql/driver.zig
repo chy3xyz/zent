@@ -23,6 +23,8 @@ pub const Error = error{
     PrepareFailed,
     ProtocolError,
     DriverFailed,
+    /// A pooled query exceeded the configured query_timeout_ms.
+    QueryTimeout,
 };
 
 /// A single database row exposed for scanning.
