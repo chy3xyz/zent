@@ -6,6 +6,17 @@ const driver = @import("driver.zig");
 
 const PG_ERRBUF_SIZE = 256;
 
+fn toDriverError(err: anyerror) driver.Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.PostgresConnectFailed => error.ConnectionFailed,
+        error.PostgresExecFailed => error.ExecFailed,
+        error.PostgresQueryFailed => error.QueryFailed,
+        error.PostgresPingFailed => error.PingFailed,
+        else => error.DriverFailed,
+    };
+}
+
 pub const PostgresDriver = struct {
     conn: *c.PGconn,
     allocator: std.mem.Allocator,
@@ -283,21 +294,21 @@ pub const PostgresDriver = struct {
 
     const vtable = driver.Driver.VTable{
         .exec = struct {
-            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) anyerror!driver.Result {
+            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) driver.Error!driver.Result {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.exec(q, a);
+                return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
-            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) anyerror!driver.Rows {
+            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) driver.Error!driver.Rows {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.query(q, a);
+                return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .beginTx = struct {
-            fn f(ptr: *anyopaque) anyerror!driver.Tx {
+            fn f(ptr: *anyopaque) driver.Error!driver.Tx {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.beginTx();
+                return self_ptr.beginTx() catch |err| return toDriverError(err);
             }
         }.f,
         .close = struct {
@@ -312,9 +323,9 @@ pub const PostgresDriver = struct {
             }
         }.f,
         .ping = struct {
-            fn f(ptr: *anyopaque) anyerror!void {
+            fn f(ptr: *anyopaque) driver.Error!void {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.ping();
+                return self_ptr.ping() catch |err| return toDriverError(err);
             }
         }.f,
         .inTransaction = struct {
@@ -330,18 +341,18 @@ const PostgresTx = struct {
     driver: *PostgresDriver,
     state: enum { active, committed, rolled_back },
 
-    fn commit(ptr: *anyopaque) !void {
+    fn commit(ptr: *anyopaque) driver.Error!void {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
         self.state = .committed;
-        _ = try self.driver.exec("COMMIT", &.{});
+        self.driver.exec("COMMIT", &.{}) catch |err| return toDriverError(err);
     }
 
-    fn rollback(ptr: *anyopaque) !void {
+    fn rollback(ptr: *anyopaque) driver.Error!void {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
         if (self.state != .active) return;
         self.state = .rolled_back;
-        _ = try self.driver.exec("ROLLBACK", &.{});
+        self.driver.exec("ROLLBACK", &.{}) catch |err| return toDriverError(err);
     }
 
     fn deinit(ptr: *anyopaque) void {

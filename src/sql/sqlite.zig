@@ -35,6 +35,17 @@ pub const SQLiteDriver = struct {
         std.log.err("SQLite error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
+    fn toDriverError(err: anyerror) driver.Error {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.SqliteOpenFailed => error.ConnectionFailed,
+            error.SqlitePrepareFailed => error.PrepareFailed,
+            error.SqliteExecFailed => error.ExecFailed,
+            error.TxNotActive => error.TxFailed,
+            else => error.DriverFailed,
+        };
+    }
+
     pub fn exec(self: *SQLiteDriver, sql: []const u8, args: []const Value) !driver.Result {
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&stmt), null);
@@ -95,15 +106,15 @@ pub const SQLiteDriver = struct {
         return driver.Tx{
             .inner = self.asDriver(),
             .commitFn = struct {
-                fn f(ptr: *anyopaque) anyerror!void {
+                fn f(ptr: *anyopaque) driver.Error!void {
                     const self_ptr: *SQLiteTx = @ptrCast(@alignCast(ptr));
-                    return self_ptr.commit();
+                    return self_ptr.commit() catch |err| return toDriverError(err);
                 }
             }.f,
             .rollbackFn = struct {
-                fn f(ptr: *anyopaque) anyerror!void {
+                fn f(ptr: *anyopaque) driver.Error!void {
                     const self_ptr: *SQLiteTx = @ptrCast(@alignCast(ptr));
-                    return self_ptr.rollback();
+                    return self_ptr.rollback() catch |err| return toDriverError(err);
                 }
             }.f,
             .deinitFn = struct {
@@ -135,21 +146,21 @@ pub const SQLiteDriver = struct {
 
     const vtable = driver.Driver.VTable{
         .exec = struct {
-            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) anyerror!driver.Result {
+            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) driver.Error!driver.Result {
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.exec(q, a);
+                return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
-            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) anyerror!driver.Rows {
+            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) driver.Error!driver.Rows {
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.query(q, a);
+                return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .beginTx = struct {
-            fn f(ptr: *anyopaque) anyerror!driver.Tx {
+            fn f(ptr: *anyopaque) driver.Error!driver.Tx {
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.beginTx();
+                return self_ptr.beginTx() catch |err| return toDriverError(err);
             }
         }.f,
         .close = struct {
@@ -164,9 +175,9 @@ pub const SQLiteDriver = struct {
             }
         }.f,
         .ping = struct {
-            fn f(ptr: *anyopaque) anyerror!void {
+            fn f(ptr: *anyopaque) driver.Error!void {
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
-                return self_ptr.ping();
+                return self_ptr.ping() catch |err| return toDriverError(err);
             }
         }.f,
         .inTransaction = struct {
