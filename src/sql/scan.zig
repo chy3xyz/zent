@@ -8,6 +8,11 @@ const Row = @import("driver.zig").Row;
 /// For struct types, columns are assumed to be in declaration order
 /// matching the SELECT projection — no name-based lookup is performed.
 /// This eliminates O(n*m) string comparisons per row.
+///
+/// NOTE: scanRow does not have access to the entity, so JSON struct fields
+/// parsed here are allocated directly into `allocator` and are NOT freed by
+/// deinitEntity. The caller must free them manually, or use the codegen Create
+/// path which stores parsed JSON in the entity's json_arena.
 pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
     const info = @typeInfo(T);
     switch (info) {
@@ -43,11 +48,15 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
         },
         .@"struct" => |s| {
             var value: T = undefined;
-            inline for (s.field_names, s.field_types, 0..) |field_name, field_type, col_index| {
+            var col_idx: usize = 0;
+            inline for (s.field_names, s.field_types) |field_name, field_type| {
                 if (comptime std.mem.eql(u8, field_name, "edges")) {
                     @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+                } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
+                    @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), null);
                 } else {
-                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_index);
+                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx);
+                    col_idx += 1;
                 }
             }
             return value;
@@ -134,6 +143,8 @@ fn scanRowInnerNoAlloc(comptime T: type, row: Row, comptime offset: usize) !T {
     inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
         if (comptime std.mem.eql(u8, field_name, "edges")) {
             @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+        } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
+            @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), null);
         } else {
             @field(value, field_name) = try scanColumnNoAlloc(field_type, row, col_idx);
             col_idx += 1;
@@ -152,6 +163,8 @@ fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, compti
             inline for (s.field_names, s.field_types) |field_name, field_type| {
                 if (comptime std.mem.eql(u8, field_name, "edges")) {
                     @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+                } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
+                    @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), null);
                 } else {
                     @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx);
                     col_idx += 1;
@@ -208,6 +221,9 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
         },
         .@"struct" => {
             const text = row.getText(index) orelse return error.TypeMismatch;
+            // NOTE: scanRow does not have access to the entity, so JSON structs
+            // parsed here are allocated directly into `allocator`. Ownership is
+            // leaked to the caller unless they free the data manually.
             return std.json.parseFromSliceLeaky(T, allocator, text, .{}) catch return error.TypeMismatch;
         },
         else => @compileError("Unsupported column type for scanning: " ++ @typeName(T)),

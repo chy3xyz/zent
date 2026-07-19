@@ -225,7 +225,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
 
             while (rows.next()) |row| {
-                const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+                var entity = try sql_scan.scanRow(Entity, self.allocator, row);
                 errdefer deinitEntity(infos, info, &entity, self.allocator);
                 try result.append(entity);
             }
@@ -249,7 +249,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (rows.nextError()) |e| return e;
                 return null;
             };
-            const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+            var entity = try sql_scan.scanRow(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |edge_name| {
@@ -269,7 +269,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (rows.nextError()) |e| return e;
                 return error.NotFound;
             };
-            const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+            var entity = try sql_scan.scanRow(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
             if (rows.next()) |_| return error.NotSingular;
             if (rows.nextError()) |e| return e;

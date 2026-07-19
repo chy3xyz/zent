@@ -352,3 +352,40 @@ test "SQLite: Max/Min Rows deinit on numeric and empty paths" {
         try testing.expect(min_qty == .null);
     }
 }
+
+test "SQLite: JSON struct field arena is freed by deinitEntity" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Settings = struct {
+        theme: []const u8,
+        notifications: bool,
+    };
+
+    const JsonUser = schema("JsonUser", .{
+        .fields = &.{
+            field.String("name"),
+            field.JSON("settings", Settings),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{JsonUser});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.json_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("settings", Settings{ .theme = "dark", .notifications = true });
+    var entity = try b.Save();
+
+    try testing.expectEqualStrings("alice", entity.name);
+    try testing.expectEqualStrings("dark", entity.settings.theme);
+    try testing.expectEqual(true, entity.settings.notifications);
+    try testing.expect(entity.json_arena != null);
+
+    zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+}

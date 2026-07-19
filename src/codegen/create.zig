@@ -330,13 +330,13 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         fn setEntityField(entity: *Entity, name: []const u8, value: sql.Value, allocator: std.mem.Allocator) !void {
             inline for (info.fields) |f| {
                 if (std.mem.eql(u8, f.name, name)) {
-                    @field(entity, f.name) = try valueToType(f.zig_type, f.field_type, value, allocator);
+                    @field(entity, f.name) = try valueToType(f.zig_type, f.field_type, value, allocator, entity);
                     return;
                 }
             }
         }
 
-        fn valueToType(comptime T: type, comptime ft: @import("../core/field.zig").FieldType, value: sql.Value, allocator: std.mem.Allocator) !T {
+        fn valueToType(comptime T: type, comptime ft: @import("../core/field.zig").FieldType, value: sql.Value, allocator: std.mem.Allocator, entity: *Entity) !T {
             _ = ft;
             return switch (@typeInfo(T)) {
                 .int => @intCast(value.int),
@@ -346,10 +346,18 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     if (T == []const u8) {
                         return try allocator.dupe(u8, value.string);
                     }
-                    // Struct/JSON: parse with std.json. The parsed value
-                    // holds its own arena; the user should access fields
-                    // through `value.field` (the parsed struct is returned
-                    // by value, so it lives until entity.deinit).
+                    // Struct/JSON: parse into a per-entity arena so deinitEntity can free it.
+                    if (comptime @hasField(Entity, "json_arena")) {
+                        const arena = if (entity.json_arena) |a| a else blk: {
+                            const a = try allocator.create(std.heap.ArenaAllocator);
+                            a.* = std.heap.ArenaAllocator.init(allocator);
+                            errdefer allocator.destroy(a);
+                            entity.json_arena = a;
+                            break :blk a;
+                        };
+                        return try std.json.parseFromSliceLeaky(T, arena.allocator(), value.string, .{});
+                    }
+                    // Fallback for entities without a json_arena field (non-JSON structs).
                     return try std.json.parseFromSliceLeaky(T, allocator, value.string, .{});
                 },
             };

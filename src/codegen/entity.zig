@@ -123,14 +123,23 @@ fn FreeField(comptime FieldType: type, field_ptr: *FieldType, allocator: std.mem
     }
 }
 
+fn hasJsonStructField(comptime info: TypeInfo) bool {
+    inline for (info.fields) |f| {
+        if (f.field_type == .json and @typeInfo(f.zig_type) == .@"struct") return true;
+    }
+    return false;
+}
+
 /// Generate an entity struct from TypeInfo.
 pub fn Entity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     comptime {
         const ET = EdgesType(infos, info);
         const edges_default: ET = .{};
-        var field_names: [info.fields.len + 1][:0]const u8 = undefined;
-        var field_types: [info.fields.len + 1]type = undefined;
-        var field_attrs: [info.fields.len + 1]std.builtin.Type.Struct.FieldAttributes = undefined;
+        const needs_arena = hasJsonStructField(info);
+        const extra_count = 1 + @as(usize, @intFromBool(needs_arena));
+        var field_names: [info.fields.len + extra_count][:0]const u8 = undefined;
+        var field_types: [info.fields.len + extra_count]type = undefined;
+        var field_attrs: [info.fields.len + extra_count]std.builtin.Type.Struct.FieldAttributes = undefined;
         for (info.fields, 0..) |f, i| {
             const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
             field_names[i] = (f.name)[0..f.name.len :0];
@@ -141,20 +150,46 @@ pub fn Entity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
                 .@"align" = @alignOf(FieldType),
             };
         }
-        field_names[info.fields.len] = "edges";
-        field_types[info.fields.len] = ET;
-        field_attrs[info.fields.len] = .{
+        const arena_idx = info.fields.len;
+        const edges_idx = info.fields.len + @as(usize, @intFromBool(needs_arena));
+        if (needs_arena) {
+            field_names[arena_idx] = "json_arena";
+            field_types[arena_idx] = ?*std.heap.ArenaAllocator;
+            field_attrs[arena_idx] = .{
+                .default_value_ptr = null,
+                .@"comptime" = false,
+                .@"align" = @alignOf(?*std.heap.ArenaAllocator),
+            };
+        }
+        field_names[edges_idx] = "edges";
+        field_types[edges_idx] = ET;
+        field_attrs[edges_idx] = .{
             .default_value_ptr = &edges_default,
             .@"comptime" = false,
             .@"align" = @alignOf(ET),
         };
-        return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+        return @Struct(.auto, null, field_names[0 .. edges_idx + 1], field_types[0 .. edges_idx + 1], field_attrs[0 .. edges_idx + 1]);
     }
 }
 
 /// Recursively free heap allocations owned by an entity (fields + eager-loaded
 /// edges). The caller still owns the entity itself and the outer `[]Entity` slice.
 pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, self: anytype, allocator: std.mem.Allocator) void {
+    // Reject immutable pointers at compile time.
+    comptime {
+        const T = @TypeOf(self);
+        const ptr_info = @typeInfo(T).pointer;
+        if (ptr_info.attrs.@"const") @compileError("deinitEntity requires a mutable entity pointer");
+    }
+
+    if (comptime hasJsonStructField(info)) {
+        if (self.json_arena) |arena| {
+            arena.deinit();
+            allocator.destroy(arena);
+            self.json_arena = null;
+        }
+    }
+
     inline for (info.fields) |f| {
         if (!comptime isOwningField(f.zig_type)) continue;
         const field_type = if (f.optional) ?f.zig_type else f.zig_type;

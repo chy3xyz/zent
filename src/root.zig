@@ -21,6 +21,7 @@ pub const core = struct {
 pub const codegen = struct {
     pub const graph = @import("codegen/graph.zig");
     pub const entity = @import("codegen/entity.zig").Entity;
+    pub const deinitEntity = @import("codegen/entity.zig").deinitEntity;
     pub const meta = @import("codegen/meta.zig").Meta;
     pub const predicate = @import("codegen/predicate.zig");
     pub const create = @import("codegen/create.zig").CreateBuilder;
