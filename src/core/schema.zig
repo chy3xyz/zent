@@ -41,8 +41,7 @@ fn mergeMixinPolicies(comptime base: ?@import("../privacy/policy.zig").Policy, c
         for (mixins) |M| {
             if (@hasDecl(M, "policy")) {
                 if (result) |*r| {
-                    if (M.policy.query) |q| r.query = q;
-                    if (M.policy.mutation) |m| r.mutation = m;
+                    r.rules = r.rules ++ M.policy.rules;
                 } else {
                     result = M.policy;
                 }

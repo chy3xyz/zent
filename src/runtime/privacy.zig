@@ -18,7 +18,6 @@ pub const PrivacyContext = struct {
 pub const Decision = enum {
     allow,
     deny,
-    skip,
 };
 
 /// Result of evaluating a set of privacy rules.
@@ -73,10 +72,9 @@ pub fn evalPolicy(
             },
             .filter => |fr| {
                 if (fr.predicate(ctx)) |pred| {
-                    if (filter_count < max_filters) {
-                        filters_buf[filter_count] = pred;
-                        filter_count += 1;
-                    }
+                    std.debug.assert(filter_count < max_filters); // filter overflow — raise max_filters
+                    filters_buf[filter_count] = pred;
+                    filter_count += 1;
                 }
             },
         }

@@ -9,10 +9,6 @@ pub const UserSettings = struct {
     notifications: bool,
 };
 
-fn denyDelete(op: zent.privacy.Op, _: []const u8) zent.privacy.Decision {
-    return if (op == .delete) .deny else .allow;
-}
-
 fn withEdges(comptime Base: type, comptime es: []const edge.Edge) type {
     return struct {
         pub const schema_name = Base.schema_name;
@@ -49,9 +45,7 @@ const UserBase = Schema("User", .{
         field.JSON("settings", UserSettings),
     },
     .mixins = &.{zent.core.mixin.TimeMixin},
-    .policy = zent.privacy.Policy{
-        .mutation = denyDelete,
-    },
+    .policy = zent.privacy.Policy{ .rules = &.{zent.privacy.Deny} },
 });
 
 pub const UserGroup = Schema("UserGroup", .{
