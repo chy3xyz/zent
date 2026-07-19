@@ -878,6 +878,18 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
                 defer std.heap.page_allocator.free(sql);
                 _ = try tx_drv.exec(sql, &.{});
                 try recordMigration(tx_drv, version, null);
+            } else {
+                // Version is recorded but the view may have been dropped
+                // out-of-band. If the view no longer exists, re-create it.
+                var existing = try getExistingColumns(allocator, tx_drv, info.table_name);
+                if (existing.items.len == 0) {
+                    existing.deinit();
+                    const sql = try createViewSQL(info, dialect);
+                    defer std.heap.page_allocator.free(sql);
+                    _ = try tx_drv.exec(sql, &.{});
+                } else {
+                    existing.deinit();
+                }
             }
         } else {
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
