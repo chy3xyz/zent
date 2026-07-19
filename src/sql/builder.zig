@@ -1103,6 +1103,7 @@ pub const BulkUpdateBuilder = struct {
     table: []const u8,
     id_column: []const u8,
     rows: std.array_list.Managed(BulkUpdateRow),
+    predicates: std.array_list.Managed(Predicate),
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) BulkUpdateBuilder {
         return .{
@@ -1110,6 +1111,7 @@ pub const BulkUpdateBuilder = struct {
             .table = table,
             .id_column = "id",
             .rows = std.array_list.Managed(BulkUpdateRow).init(allocator),
+            .predicates = std.array_list.Managed(Predicate).init(allocator),
         };
     }
 
@@ -1117,6 +1119,13 @@ pub const BulkUpdateBuilder = struct {
         u.b.deinit();
         for (u.rows.items) |*r| r.sets.deinit();
         u.rows.deinit();
+        u.predicates.deinit();
+    }
+
+    /// Add a global WHERE predicate that ANDs with the generated `id IN (...)` clause.
+    pub fn where(u: *BulkUpdateBuilder, pred: Predicate) !*BulkUpdateBuilder {
+        try u.predicates.append(pred);
+        return u;
     }
 
     pub fn row(u: *BulkUpdateBuilder, id: i64) !*BulkUpdateBuilder {
@@ -1179,6 +1188,11 @@ pub const BulkUpdateBuilder = struct {
         }
 
         try u.b.writeString(" WHERE ");
+        for (u.predicates.items, 0..) |pred, pi| {
+            if (pi > 0) try u.b.writeString(" AND ");
+            try pred.appendTo(&u.b);
+        }
+        if (u.predicates.items.len > 0) try u.b.writeString(" AND ");
         try u.b.ident(u.id_column);
         try u.b.writeString(" IN (");
         for (u.rows.items, 0..) |r, i| {
@@ -1236,6 +1250,11 @@ pub const BulkUpdateBuilder = struct {
         }
 
         try u.b.writeString(" WHERE ");
+        for (u.predicates.items, 0..) |pred, pi| {
+            if (pi > 0) try u.b.writeString(" AND ");
+            try pred.appendTo(&u.b);
+        }
+        if (u.predicates.items.len > 0) try u.b.writeString(" AND ");
         try u.b.ident(u.id_column);
         try u.b.writeString(" IN (");
         for (u.rows.items, 0..) |r, i| {

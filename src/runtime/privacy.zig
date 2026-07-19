@@ -24,6 +24,11 @@ pub const DecisionSet = struct {
     decision: Decision,
     filters: [max_filters]*const anyopaque = undefined,
     filter_count: usize = 0,
+
+    /// Return the accumulated filter pointers as a slice.
+    pub fn getFilters(self: *const DecisionSet) []*const anyopaque {
+        return @constCast(self.filters[0..self.filter_count]);
+    }
 };
 
 /// A filter rule: carries a predicate function that, given a PrivacyContext,

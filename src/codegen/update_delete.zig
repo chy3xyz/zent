@@ -20,16 +20,6 @@ fn mapBuildError(err: anyerror) sql_driver.Error {
     };
 }
 
-fn assertNoPrivacyFilters(comptime info: TypeInfo) void {
-    if (info.policy) |policy| {
-        for (policy.rules) |rule| {
-            if (rule == .filter) {
-                @compileError("privacy filter injection is not yet implemented; mutation policies with filter rules are unsupported in this build");
-            }
-        }
-    }
-}
-
 const FieldValue = @import("create.zig").FieldValue;
 
 // C time() — libc is linked via build.zig
@@ -204,11 +194,15 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
-            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                const filters = result.getFilters();
+                for (filters) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    try self.predicates.append(pred.*);
+                }
             }
             var hook_ctx = HookContext{
                 .op = .update,
@@ -362,11 +356,15 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execSoftDelete(self: *Self) ExecError!usize {
-            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                const filters = result.getFilters();
+                for (filters) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    try self.predicates.append(pred.*);
+                }
             }
             var hook_ctx = HookContext{
                 .op = .delete,
@@ -422,11 +420,15 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
-            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                const filters = result.getFilters();
+                for (filters) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    try self.predicates.append(pred.*);
+                }
             }
             var hook_ctx = HookContext{
                 .op = .delete,
@@ -568,11 +570,15 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
 
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
-            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                const filters = result.getFilters();
+                for (filters) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    try self.b.where(pred.*);
+                }
             }
             var hook_ctx = HookContext{
                 .op = .update,
@@ -685,11 +691,17 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
-            comptime assertNoPrivacyFilters(info);
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                const filters = result.getFilters();
+                for (filters) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    for (self.b.groups.items) |*group| {
+                        try group.append(pred.*);
+                    }
+                }
             }
             var hook_ctx = HookContext{
                 .op = .delete,

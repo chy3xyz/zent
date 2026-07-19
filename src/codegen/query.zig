@@ -237,32 +237,28 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             };
         }
 
-        fn checkPolicy(self: *const Self) error{PrivacyDenied}!void {
+        fn checkPolicy(self: *const Self) error{PrivacyDenied}!privacy.DecisionSet {
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                return result;
             }
+            return privacy.DecisionSet{ .decision = .allow };
         }
 
         /// Inject privacy row-level filters (DecisionSet.filters) into the query predicates.
-        /// Filter rules are not yet supported; if any filter rule is present in the policy
-        /// this emits a compile-time error to prevent silent security failures.
-        /// The allow/deny gate (checkPolicy) is fully functional.
-        fn injectPrivacyFilters(self: *Self) !void {
-            _ = self;
-            if (info.policy) |p| {
-                inline for (p.rules) |rule| {
-                    if (rule == .filter) {
-                        @compileError("privacy filter injection is not yet implemented; policies with filter rules are unsupported in this build");
-                    }
-                }
+        fn injectPrivacyFilters(self: *Self, decision_set: privacy.DecisionSet) !void {
+            const filters = decision_set.getFilters();
+            for (filters) |opaque_ptr| {
+                const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                try self.predicates.append(pred.*);
             }
         }
 
         pub fn All(self: *Self) QueryError!std.array_list.Managed(Entity) {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
             const start = nowUs();
@@ -300,8 +296,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn First(self: *Self) QueryError!?Entity {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             self.limit_val = 1;
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
@@ -335,8 +331,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Only(self: *Self) QueryError!Entity {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
             const start = nowUs();
@@ -371,8 +367,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn IDs(self: *Self) QueryError!std.array_list.Managed(i64) {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildQuery(1); // only id column
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -390,8 +386,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Count(self: *Self) QueryError!i64 {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildCountQuery();
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -405,8 +401,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Exist(self: *Self) QueryError!bool {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             self.limit_val = 1;
             var q = try self.buildQuery(1);
             defer q.deinit();
@@ -421,8 +417,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Sum(self: *Self, comptime field_name: []const u8) QueryError!i64 {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -435,8 +431,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Avg(self: *Self, comptime field_name: []const u8) QueryError!f64 {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -449,8 +445,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Max(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);
@@ -472,8 +468,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn Min(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
-            try self.checkPolicy();
-            try self.injectPrivacyFilters();
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
             defer q.deinit();
             var rows = try self.driver.query(q.sql, q.args);

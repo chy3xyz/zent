@@ -971,3 +971,184 @@ test "SQLite: migrateSchema dry-run outputs SQL without executing" {
     }
     try testing.expectEqual(@as(usize, 0), table_count);
 }
+
+// Module-level storage for the filter predicate so the opaque pointer
+// returned by the Filter rule remains valid through injectPrivacyFilters.
+var filter_pred: zent.sql.Predicate = undefined;
+
+fn ownerFilter(ctx: zent.privacy.PrivacyContext) ?*const anyopaque {
+    if (ctx.user_id) |uid| {
+        filter_pred = zent.sql.EQ("owner_id", .{ .int = uid });
+        return @ptrCast(&filter_pred);
+    }
+    return null;
+}
+
+test "SQLite: privacy filter restricts rows by owner_id" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Schema with owner_id field and a Filter-based privacy policy.
+    const FilteredEntity = schema("FilteredEntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("owner_id"),
+        },
+        .policy = zent.privacy.Policy{
+            .rules = &.{
+                zent.privacy.Allow,
+                zent.privacy.Filter(ownerFilter),
+            },
+        },
+    });
+
+    const graph = comptime buildGraph(&.{FilteredEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Insert two rows: one owned by user 1, one owned by user 2.
+    {
+        var c1 = client.filtered_entity.withContext(.{ .user_id = 1 });
+        var b1 = try c1.Create();
+        defer b1.deinit();
+        _ = try b1.setFieldValue("name", "alice-item");
+        _ = try b1.setFieldValue("owner_id", @as(i64, 1));
+        var e1 = try b1.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e1, allocator);
+        try testing.expect(e1.id > 0);
+    }
+    {
+        var c2 = client.filtered_entity.withContext(.{ .user_id = 2 });
+        var b2 = try c2.Create();
+        defer b2.deinit();
+        _ = try b2.setFieldValue("name", "bob-item");
+        _ = try b2.setFieldValue("owner_id", @as(i64, 2));
+        var e2 = try b2.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e2, allocator);
+        try testing.expect(e2.id > 0);
+    }
+
+    // User 1 can only see their own row.
+    {
+        var c1 = client.filtered_entity.withContext(.{ .user_id = 1 });
+        var q = c1.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), results.items.len);
+        try testing.expectEqualStrings("alice-item", results.items[0].name);
+        try testing.expectEqual(@as(i64, 1), results.items[0].owner_id);
+    }
+
+    // User 2 can only see their own row.
+    {
+        var c2 = client.filtered_entity.withContext(.{ .user_id = 2 });
+        var q = c2.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), results.items.len);
+        try testing.expectEqualStrings("bob-item", results.items[0].name);
+        try testing.expectEqual(@as(i64, 2), results.items[0].owner_id);
+    }
+
+    // User 3 sees nothing (filter doesn't match any row).
+    {
+        var c3 = client.filtered_entity.withContext(.{ .user_id = 999 });
+        var q = c3.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 0), results.items.len);
+    }
+
+    // Anonymous user (no user_id) gets null from filter → no filter applied, sees all.
+    {
+        var c_anon = client.filtered_entity.withContext(.{});
+        var q = c_anon.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), results.items.len);
+    }
+}
+
+test "SQLite: beginTx propagates hooks and privacy_ctx to transaction entity clients" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Entity with AlwaysAllow policy (requires privacy context to be set)
+    // and hooks to verify propagation.
+    const TxPropEntity = schema("TxPropEntity", .{
+        .fields = &.{field.String("name")},
+        .policy = zent.privacy.AlwaysAllow,
+    });
+
+    const graph = comptime buildGraph(&.{TxPropEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Container for verifying hook fired.
+    const H = struct {
+        var before_called: bool = false;
+        fn beforeFn(ctx: *zent.runtime.hook.HookContext) zent.runtime.hook.HookError!void {
+            _ = ctx;
+            before_called = true;
+        }
+    };
+    H.before_called = false;
+
+    const hooks = &[_]zent.runtime.hook.Hook{
+        zent.runtime.hook.Hook.initBefore(.create, H.beforeFn),
+    };
+
+    // Set hooks and privacy context on the entity client.
+    client.tx_prop_entity = client.tx_prop_entity.withHooks(hooks);
+    client.tx_prop_entity = client.tx_prop_entity.withContext(zent.privacy.PrivacyContext{ .user_id = 42 });
+
+    // Verify hooks slice is non-empty on the parent client (precondition).
+    try testing.expectEqual(@as(usize, 1), client.tx_prop_entity.hooks.len);
+
+    // Begin a transaction.
+    var tx = try Client.beginTx(infos, client);
+    defer tx.deinit();
+
+    // Verify hooks propagated to tx client.
+    try testing.expectEqual(@as(usize, 1), tx.client.tx_prop_entity.hooks.len);
+
+    // Verify privacy_ctx propagated to tx client.
+    try testing.expect(tx.client.tx_prop_entity.privacy_ctx != null);
+    try testing.expectEqual(@as(i64, 42), tx.client.tx_prop_entity.privacy_ctx.?.user_id);
+
+    // Perform a create inside the transaction — should succeed (privacy allows)
+    // and the before hook should fire.
+    var b = try tx.client.tx_prop_entity.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "tx-hook-test");
+    var entity = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+
+    try testing.expect(entity.id > 0);
+    try testing.expect(H.before_called);
+    try testing.expectEqualStrings("tx-hook-test", entity.name);
+
+    try tx.commit();
+}

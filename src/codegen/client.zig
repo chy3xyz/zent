@@ -316,10 +316,19 @@ pub fn Debug(comptime infos: []const TypeInfo, self: *Client(infos)) void {
 }
 
 /// Begin a transaction and return a TxClient backed by the transaction.
+/// Copies logger, hooks, and privacy_ctx from the parent entity clients
+/// so that transactional operations retain hook callbacks, privacy rules,
+/// and logging configuration.
 pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver.Error!TxClient(infos) {
     const tx = try self.driver.beginTx();
     var c = makeClient(infos, self.allocator, tx.inner);
     c.logger = self.logger;
+    inline for (infos) |info| {
+        const field_name = comptime structFieldName(info.name);
+        @field(c, field_name).logger = @field(self, field_name).logger;
+        @field(c, field_name).hooks = @field(self, field_name).hooks;
+        @field(c, field_name).privacy_ctx = @field(self, field_name).privacy_ctx;
+    }
     return TxClient(infos){
         .client = c,
         .tx = tx,
