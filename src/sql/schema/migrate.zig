@@ -256,7 +256,11 @@ pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect)
 
     try buf.appendSlice("CREATE ");
     if (index.unique) try buf.appendSlice("UNIQUE ");
-    try buf.appendSlice("INDEX IF NOT EXISTS ");
+    if (std.mem.eql(u8, dialect.name, "mysql")) {
+        try buf.appendSlice("INDEX ");
+    } else {
+        try buf.appendSlice("INDEX IF NOT EXISTS ");
+    }
     try quoteIdentToBuffer(dialect, &buf, index.name);
     try buf.appendSlice(" ON ");
     try quoteIdentToBuffer(dialect, &buf, table_name);
@@ -285,11 +289,9 @@ pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
     return std.heap.page_allocator.dupe(u8, buf.items);
 }
 
-/// Create all tables for a set of TypeInfos (create-only migration).
-/// This creates tables in dependency order and also creates junction tables for M2M edges.
-/// For O2M/M2O To edges, it adds the FK column to the source entity's table.
-pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
-    const dialect = driver.dialect();
+/// Create entity and junction tables without creating indexes.
+fn createTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+    const dialect = driver_drv.dialect();
 
     // Create main entity tables (skip views)
     // For each entity, also check if any OTHER entity has a From edge pointing here,
@@ -300,7 +302,7 @@ pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeIn
         if (info.is_view) {
             const sql = try createViewSQL(info, dialect);
             defer std.heap.page_allocator.free(sql);
-            _ = try driver.exec(
+            _ = try driver_drv.exec(
                 sql,
                 &.{},
             );
@@ -308,7 +310,7 @@ pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeIn
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
             const sql = try createTableSQL(table, dialect);
             defer std.heap.page_allocator.free(sql);
-            _ = try driver.exec(sql, &.{});
+            _ = try driver_drv.exec(sql, &.{});
         }
     }
 
@@ -322,26 +324,58 @@ pub fn createAllTables(driver: sql_driver.Driver, comptime infos: []const TypeIn
                 const jtable = comptime junctionTableForEdge(e, info);
                 const sql = try createTableSQL(jtable, dialect);
                 defer std.heap.page_allocator.free(sql);
-                _ = try driver.exec(
+                _ = try driver_drv.exec(
                     sql,
                     &.{},
                 );
             }
         }
     }
+}
 
-    // Create indexes (skip views)
+/// Create all tables and indexes for a set of TypeInfos.
+pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+    const dialect = driver_drv.dialect();
+    try createTables(driver_drv, infos);
+
     inline for (infos) |info| {
-        if (info.is_view) continue;
+        if (info.is_view or info.indexes.len == 0) continue;
+
+        var existing_mysql_indexes: ?std.array_list.Managed(ExistingIndex) = null;
+        if (std.mem.eql(u8, dialect.name, "mysql")) {
+            existing_mysql_indexes = getExistingIndexes(std.heap.page_allocator, driver_drv, info.table_name) catch |err| switch (err) {
+                error.UnsupportedDialect => unreachable, // The dialect was checked immediately above.
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ConnectionFailed => return error.ConnectionFailed,
+                error.ExecFailed => return error.ExecFailed,
+                error.QueryFailed => return error.QueryFailed,
+                error.TxFailed => return error.TxFailed,
+                error.PingFailed => return error.PingFailed,
+                error.BindFailed => return error.BindFailed,
+                error.PrepareFailed => return error.PrepareFailed,
+                error.ProtocolError => return error.ProtocolError,
+                error.DriverFailed => return error.DriverFailed,
+            };
+        }
+        defer if (existing_mysql_indexes) |*indexes| {
+            freeExistingIndexes(std.heap.page_allocator, indexes);
+        };
+
         inline for (info.indexes) |idx| {
             const idx_def = IndexDef{
                 .name = idx.name,
                 .columns = idx.columns,
                 .unique = idx.unique,
             };
-            const sql = try createIndexSQL(idx_def, info.table_name, dialect);
-            defer std.heap.page_allocator.free(sql);
-            _ = try driver.exec(sql, &.{});
+            const already_exists = if (existing_mysql_indexes) |indexes|
+                indexExists(indexes.items, idx_def.name)
+            else
+                false;
+            if (!already_exists) {
+                const sql = try createIndexSQL(idx_def, info.table_name, dialect);
+                defer std.heap.page_allocator.free(sql);
+                _ = try driver_drv.exec(sql, &.{});
+            }
         }
     }
 }
@@ -520,29 +554,58 @@ pub const ExistingIndex = struct {
     unique: bool,
 };
 
-/// Query existing columns for a table (SQLite: PRAGMA table_info).
-fn getExistingColumns(allocator: std.mem.Allocator, driver: sql_driver.Driver, table_name: []const u8) !std.array_list.Managed(ExistingColumn) {
+const IntrospectionError = sql_driver.Error || error{UnsupportedDialect};
+
+/// Query existing columns for a table using dialect-specific metadata.
+fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingColumn) {
     var result = std.array_list.Managed(ExistingColumn).init(allocator);
-    errdefer result.deinit();
+    errdefer freeExistingColumns(allocator, &result);
 
-    var buf: [256]u8 = undefined;
-    const sql_text = try std.fmt.bufPrint(&buf, "PRAGMA table_info(\"{s}\")", .{table_name});
+    const dialect = driver_drv.dialect();
+    const sql_text = if (std.mem.eql(u8, dialect.name, "sqlite3"))
+        try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table_name})
+    else if (std.mem.eql(u8, dialect.name, "postgres"))
+        try std.fmt.allocPrint(
+            allocator,
+            "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = '{s}' AND table_schema = current_schema()",
+            .{table_name},
+        )
+    else if (std.mem.eql(u8, dialect.name, "mysql"))
+        try allocator.dupe(u8, "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = ? AND table_schema = DATABASE()")
+    else
+        return error.UnsupportedDialect;
+    defer allocator.free(sql_text);
 
-    var rows = try driver.query(sql_text, &.{});
+    var rows = if (std.mem.eql(u8, dialect.name, "mysql"))
+        try driver_drv.query(sql_text, &.{.{ .string = table_name }})
+    else
+        try driver_drv.query(sql_text, &.{});
     defer rows.deinit();
 
     while (rows.next()) |row| {
-        const name = row.getText(1) orelse continue;
-        const sql_type = row.getText(2) orelse "";
-        const not_null = (row.getInt(3) orelse 0) != 0;
-        const pk = (row.getInt(5) orelse 0) != 0;
+        const is_sqlite = std.mem.eql(u8, dialect.name, "sqlite3");
+        const name = row.getText(if (is_sqlite) 1 else 0) orelse continue;
+        const sql_type = row.getText(if (is_sqlite) 2 else 1) orelse "";
+        const not_null = if (is_sqlite)
+            (row.getInt(3) orelse 0) != 0
+        else
+            std.ascii.eqlIgnoreCase(row.getText(2) orelse "YES", "NO");
+        const pk = is_sqlite and (row.getInt(5) orelse 0) != 0;
+
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        const owned_type = try allocator.alloc(u8, sql_type.len);
+        errdefer allocator.free(owned_type);
+        for (sql_type, owned_type) |byte, *dest| dest.* = std.ascii.toLower(byte);
+
         try result.append(.{
-            .name = try allocator.dupe(u8, name),
-            .sql_type = try allocator.dupe(u8, sql_type),
+            .name = owned_name,
+            .sql_type = owned_type,
             .not_null = not_null,
             .pk = pk,
         });
     }
+    if (rows.nextError()) |err| return err;
     return result;
 }
 
@@ -554,25 +617,51 @@ fn freeExistingColumns(allocator: std.mem.Allocator, columns: *std.array_list.Ma
     columns.deinit();
 }
 
-/// Query existing indexes for a table (SQLite: PRAGMA index_list).
-fn getExistingIndexes(allocator: std.mem.Allocator, driver: sql_driver.Driver, table_name: []const u8) !std.array_list.Managed(ExistingIndex) {
+/// Query existing indexes for a table using dialect-specific metadata.
+fn getExistingIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
-    errdefer result.deinit();
+    errdefer freeExistingIndexes(allocator, &result);
 
-    var buf: [256]u8 = undefined;
-    const sql_text = try std.fmt.bufPrint(&buf, "PRAGMA index_list(\"{s}\")", .{table_name});
+    const dialect = driver_drv.dialect();
+    const sql_text = if (std.mem.eql(u8, dialect.name, "sqlite3"))
+        try std.fmt.allocPrint(allocator, "PRAGMA index_list(\"{s}\")", .{table_name})
+    else if (std.mem.eql(u8, dialect.name, "postgres"))
+        try std.fmt.allocPrint(
+            allocator,
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = '{s}' AND schemaname = current_schema()",
+            .{table_name},
+        )
+    else if (std.mem.eql(u8, dialect.name, "mysql"))
+        try allocator.dupe(u8, "SELECT index_name, non_unique FROM information_schema.statistics WHERE table_name = ? AND table_schema = DATABASE()")
+    else
+        return error.UnsupportedDialect;
+    defer allocator.free(sql_text);
 
-    var rows = try driver.query(sql_text, &.{});
+    var rows = if (std.mem.eql(u8, dialect.name, "mysql"))
+        try driver_drv.query(sql_text, &.{.{ .string = table_name }})
+    else
+        try driver_drv.query(sql_text, &.{});
     defer rows.deinit();
 
     while (rows.next()) |row| {
-        const name = row.getText(1) orelse continue;
-        const unique = (row.getInt(2) orelse 0) != 0;
+        const is_sqlite = std.mem.eql(u8, dialect.name, "sqlite3");
+        const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
+        const name = row.getText(if (is_sqlite) 1 else 0) orelse continue;
+        const unique = if (is_sqlite)
+            (row.getInt(2) orelse 0) != 0
+        else if (is_postgres)
+            std.mem.startsWith(u8, row.getText(1) orelse "", "CREATE UNIQUE INDEX")
+        else
+            (row.getInt(1) orelse 1) == 0;
+
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
         try result.append(.{
-            .name = try allocator.dupe(u8, name),
+            .name = owned_name,
             .unique = unique,
         });
     }
+    if (rows.nextError()) |err| return err;
     return result;
 }
 
@@ -625,8 +714,9 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
 pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver.dialect();
 
-    // Step 1: create tables and indexes that don't exist yet.
-    try createAllTables(driver, infos);
+    // Step 1: create tables that don't exist yet. Index creation happens
+    // after introspection so MySQL does not need CREATE INDEX IF NOT EXISTS.
+    try createTables(driver, infos);
 
     // Step 2: for each non-view entity, check for missing columns and indexes.
     inline for (infos) |info| {
@@ -658,7 +748,7 @@ pub fn migrateSchema(allocator: std.mem.Allocator, driver: sql_driver.Driver, co
             };
             if (!indexExists(existing_idxs.items, idx_def.name)) {
                 const sql = try createIndexSQL(idx_def, table.name, dialect);
-                defer allocator.free(sql);
+                defer std.heap.page_allocator.free(sql);
                 _ = try driver.exec(sql, &.{});
             }
         }

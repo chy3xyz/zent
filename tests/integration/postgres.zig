@@ -11,6 +11,8 @@ const PostgresDriver = zent.sql_postgres.PostgresDriver;
 const buildGraph = zent.codegen.graph.buildGraph;
 const Client = zent.codegen.client;
 const field = zent.core.field;
+const index = zent.core.index;
+const migrate = zent.sql_schema;
 const schema = zent.core.schema.Schema;
 const testing = std.testing;
 
@@ -170,4 +172,44 @@ test "Postgres: SaveOrUpdate updates existing row" {
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 200), row.getInt(0).?);
+}
+
+test "Postgres: migrateSchema is idempotent with existing table" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_migration", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_migration", &.{}) catch {};
+    _ = try drv.exec("CREATE TABLE pg_migration (id INTEGER PRIMARY KEY, score INTEGER NOT NULL)", &.{});
+
+    const PgMigration = schema("PgMigration", .{
+        .fields = &.{
+            field.Int("score"),
+            field.String("label"),
+        },
+        .indexes = &.{
+            index.Named("idx_pg_migration_score", &.{"score"}),
+        },
+    });
+    const graph = comptime buildGraph(&.{PgMigration});
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+
+    var column_rows = try drv.query(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema() AND column_name = $2",
+        &.{ .{ .string = "pg_migration" }, .{ .string = "label" } },
+    );
+    defer column_rows.deinit();
+    const column_row = column_rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), column_row.getInt(0).?);
+
+    var index_rows = try drv.query(
+        "SELECT COUNT(*) FROM pg_indexes WHERE tablename = $1 AND schemaname = current_schema() AND indexname = $2",
+        &.{ .{ .string = "pg_migration" }, .{ .string = "idx_pg_migration_score" } },
+    );
+    defer index_rows.deinit();
+    const index_row = index_rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), index_row.getInt(0).?);
 }

@@ -11,6 +11,8 @@ const MySQLDriver = zent.sql_mysql.MySQLDriver;
 const buildGraph = zent.codegen.graph.buildGraph;
 const Client = zent.codegen.client;
 const field = zent.core.field;
+const index = zent.core.index;
+const migrate = zent.sql_schema;
 const schema = zent.core.schema.Schema;
 const testing = std.testing;
 
@@ -155,4 +157,48 @@ test "MySQL returns long strings without truncation" {
     const row = rows.next() orelse return error.NoRow;
     const got = row.getText(0) orelse return error.NoText;
     try testing.expectEqualStrings(long, got);
+}
+
+test "MySQL: migrateSchema is idempotent with existing table" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_migration", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_migration", &.{}) catch {};
+    _ = try drv.exec("CREATE TABLE my_migration (id INTEGER PRIMARY KEY, score INTEGER NOT NULL)", &.{});
+
+    const MyMigration = schema("MyMigration", .{
+        .fields = &.{
+            field.Int("score"),
+            field.String("label"),
+        },
+        .indexes = &.{
+            index.Named("idx_my_migration_score", &.{"score"}),
+        },
+    });
+    const graph = comptime buildGraph(&.{MyMigration});
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+
+    var column_rows = try drv.query(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = ? AND table_schema = DATABASE() AND column_name = ?",
+        &.{ .{ .string = "my_migration" }, .{ .string = "label" } },
+    );
+    defer column_rows.deinit();
+    const column_row = column_rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), column_row.getInt(0).?);
+
+    var index_rows = try drv.query(
+        "SELECT COUNT(*) FROM information_schema.statistics WHERE table_name = ? AND table_schema = DATABASE() AND index_name = ?",
+        &.{ .{ .string = "my_migration" }, .{ .string = "idx_my_migration_score" } },
+    );
+    defer index_rows.deinit();
+    const index_row = index_rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), index_row.getInt(0).?);
+
+    // The create-only API must also tolerate an existing MySQL index.
+    try Client.createAllTables(graph.types, drv.asDriver());
+    try Client.createAllTables(graph.types, drv.asDriver());
 }
