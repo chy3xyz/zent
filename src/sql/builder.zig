@@ -12,6 +12,13 @@ pub const Value = union(enum) {
     bytes: []const u8,
 };
 
+/// Sentinel value appended to args for FK-correlation placeholders emitted by
+/// `has_edge` / `not_has_edge` predicates. The actual parent PK is bound by the
+/// caller (the executor) before the query runs; this placeholder exists only so
+/// the SQL string contains a valid `?` and the args slice stays aligned. See
+/// `Predicate.has_edge` / `Predicate.not_has_edge` for details.
+const sql_pk_placeholder: Value = .null;
+
 pub const QueryResult = struct {
     sql: []const u8,
     args: []const Value,
@@ -208,9 +215,15 @@ pub const Predicate = union(enum) {
     has_neighbors_with: struct { step: Step, preds: []const Predicate },
     /// EntQL `has(edge)` — EXISTS subquery on the edge table.
     /// edge_name is the table name of the related entity.
-    has_edge: struct { edge_name: []const u8, pred: ?*const Predicate },
+    /// fk_col is the foreign-key column on the edge table that points back to
+    /// the parent row (e.g. `"user_id"`). The emit appends a parent-PK
+    /// placeholder so callers must bind it via `Builder.arg` before execution.
+    has_edge: struct { edge_name: []const u8, fk_col: []const u8, pred: ?*const Predicate },
     /// EntQL `not_has(edge)` — NOT EXISTS subquery on the edge table.
-    not_has_edge: []const u8,
+    /// fk_col is the foreign-key column on the edge table pointing to the
+    /// parent row (e.g. `"user_id"`). The emit appends a parent-PK
+    /// placeholder so callers must bind it via `Builder.arg` before execution.
+    not_has_edge: struct { edge_name: []const u8, fk_col: []const u8 },
     and_: struct { left: *const Predicate, right: *const Predicate },
     or_: struct { left: *const Predicate, right: *const Predicate },
     not_: *const Predicate,
@@ -366,15 +379,31 @@ pub const Predicate = union(enum) {
             .has_edge => |h| {
                 try b.writeString("EXISTS (SELECT 1 FROM ");
                 try b.ident(h.edge_name);
+                try b.writeString(" WHERE ");
+                try b.ident(h.edge_name);
+                try b.writeByte('.');
+                try b.ident(h.fk_col);
+                try b.writeString(" = ");
+                // Append a parent-PK placeholder; the real value is bound
+                // by the caller via `Builder.arg` once the parent row is known.
+                try b.arg(sql_pk_placeholder);
                 if (h.pred) |pred| {
-                    try b.writeString(" WHERE ");
+                    try b.writeString(" AND ");
                     try pred.appendTo(b);
                 }
                 try b.writeByte(')');
             },
-            .not_has_edge => |name| {
+            .not_has_edge => |h| {
                 try b.writeString("NOT EXISTS (SELECT 1 FROM ");
-                try b.ident(name);
+                try b.ident(h.edge_name);
+                try b.writeString(" WHERE ");
+                try b.ident(h.edge_name);
+                try b.writeByte('.');
+                try b.ident(h.fk_col);
+                try b.writeString(" = ");
+                // Append a parent-PK placeholder; the real value is bound
+                // by the caller via `Builder.arg` once the parent row is known.
+                try b.arg(sql_pk_placeholder);
                 try b.writeByte(')');
             },
             .and_ => |p| {
@@ -471,16 +500,20 @@ pub fn EQFold(column: []const u8, value: Value) Predicate {
     return .{ .eq_fold = .{ .column = column, .value = value } };
 }
 
-pub fn HasEdge(edge_name: []const u8) Predicate {
-    return .{ .has_edge = .{ .edge_name = edge_name, .pred = null } };
+/// Build a `has(edge)` predicate. `fk_col` is the FK column on the edge table
+/// that points back to the parent row. Pass a real column name (e.g. `"user_id"`)
+/// once the schema is known; the EntQL parser uses the literal string
+/// `"fk_col"` as a placeholder until schema is available.
+pub fn HasEdge(edge_name: []const u8, fk_col: []const u8) Predicate {
+    return .{ .has_edge = .{ .edge_name = edge_name, .fk_col = fk_col, .pred = null } };
 }
 
-pub fn HasEdgePred(edge_name: []const u8, pred: *const Predicate) Predicate {
-    return .{ .has_edge = .{ .edge_name = edge_name, .pred = pred } };
+pub fn HasEdgePred(edge_name: []const u8, fk_col: []const u8, pred: *const Predicate) Predicate {
+    return .{ .has_edge = .{ .edge_name = edge_name, .fk_col = fk_col, .pred = pred } };
 }
 
-pub fn NotHasEdge(edge_name: []const u8) Predicate {
-    return .{ .not_has_edge = edge_name };
+pub fn NotHasEdge(edge_name: []const u8, fk_col: []const u8) Predicate {
+    return .{ .not_has_edge = .{ .edge_name = edge_name, .fk_col = fk_col } };
 }
 
 // ------------------------------------------------------------------

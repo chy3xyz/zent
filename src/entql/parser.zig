@@ -376,14 +376,14 @@ fn parsePrimary(ctx: *ParserContext) ParseError!sql.Predicate {
                     switch (rparen) {
                         .rparen => {
                             _ = try ctx.next();
-                            return sql.HasEdgePred(edge_name, pred_ptr);
+                            return sql.HasEdgePred(edge_name, "fk_col", pred_ptr);
                         },
                         else => return ParseError.ExpectedRParen,
                     }
                 },
                 .rparen => {
                     _ = try ctx.next();
-                    return sql.HasEdge(edge_name);
+                    return sql.HasEdge(edge_name, "fk_col");
                 },
                 else => return ParseError.ExpectedRParen,
             }
@@ -402,7 +402,7 @@ fn parsePrimary(ctx: *ParserContext) ParseError!sql.Predicate {
             switch (rparen) {
                 .rparen => {
                     _ = try ctx.next();
-                    return sql.NotHasEdge(edge_name);
+                    return sql.NotHasEdge(edge_name, "fk_col");
                 },
                 else => return ParseError.ExpectedRParen,
             }
@@ -752,6 +752,7 @@ test "EntQL: has(edge)" {
     switch (p) {
         .has_edge => |h| {
             try std.testing.expectEqualStrings("pets", h.edge_name);
+            try std.testing.expectEqualStrings("fk_col", h.fk_col);
             try std.testing.expectEqual(@as(?*const sql.Predicate, null), h.pred);
         },
         else => @panic("expected has_edge predicate"),
@@ -765,6 +766,7 @@ test "EntQL: has(edge, expr)" {
     switch (p) {
         .has_edge => |h| {
             try std.testing.expectEqualStrings("pets", h.edge_name);
+            try std.testing.expectEqualStrings("fk_col", h.fk_col);
             try std.testing.expect(h.pred != null);
             try std.testing.expectEqualDeep(
                 sql.Predicate{ .eq = .{ .column = "name", .value = .{ .string = "fido" } } },
@@ -778,7 +780,7 @@ test "EntQL: has(edge, expr)" {
 test "EntQL: not_has(edge)" {
     const allocator = std.testing.allocator;
     const p = try parse(allocator, "not_has(pets)");
-    try std.testing.expectEqualDeep(sql.Predicate{ .not_has_edge = "pets" }, p);
+    try std.testing.expectEqualDeep(sql.Predicate{ .not_has_edge = .{ .edge_name = "pets", .fk_col = "fk_col" } }, p);
 }
 
 test "EntQL: has and not_has with SQL builder" {
@@ -794,7 +796,8 @@ test "EntQL: has and not_has with SQL builder" {
         defer deinitPred(allocator, &pred);
         try pred.appendTo(&b);
         const q = b.query();
-        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\")", q.sql);
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\" WHERE \"pets\".\"fk_col\" = ?)", q.sql);
+        try std.testing.expectEqual(@as(usize, 1), q.args.len);
     }
 
     // Test not_has(edge) → NOT EXISTS
@@ -806,7 +809,8 @@ test "EntQL: has and not_has with SQL builder" {
         defer deinitPred(allocator, &pred);
         try pred.appendTo(&b);
         const q = b.query();
-        try std.testing.expectEqualStrings("SELECT * FROM users WHERE NOT EXISTS (SELECT 1 FROM \"pets\")", q.sql);
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE NOT EXISTS (SELECT 1 FROM \"pets\" WHERE \"pets\".\"fk_col\" = ?)", q.sql);
+        try std.testing.expectEqual(@as(usize, 1), q.args.len);
     }
 
     // Test has(edge, expr) → EXISTS with predicate
@@ -818,9 +822,9 @@ test "EntQL: has and not_has with SQL builder" {
         defer deinitPred(allocator, &pred);
         try pred.appendTo(&b);
         const q = b.query();
-        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\" WHERE \"name\" = ?)", q.sql);
-        try std.testing.expectEqual(@as(usize, 1), q.args.len);
-        try std.testing.expectEqualStrings("fido", q.args[0].string);
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE EXISTS (SELECT 1 FROM \"pets\" WHERE \"pets\".\"fk_col\" = ? AND \"name\" = ?)", q.sql);
+        try std.testing.expectEqual(@as(usize, 2), q.args.len);
+        try std.testing.expectEqualStrings("fido", q.args[1].string);
     }
 
     // Test NOT IN
