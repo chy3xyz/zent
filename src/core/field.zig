@@ -182,7 +182,10 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
         .float => return "REAL",
         .string => return "TEXT",
         .text => return "TEXT",
-        .bytes => return "BLOB",
+        .bytes => {
+            if (std.mem.eql(u8, dialect.name, "postgres")) return "BYTEA";
+            return "BLOB";
+        },
         .time => {
             if (std.mem.eql(u8, dialect.name, "mysql")) return "DATETIME";
             if (std.mem.eql(u8, dialect.name, "postgres")) return "TIMESTAMPTZ";
@@ -233,4 +236,6 @@ test "SQL type mapping" {
     try std.testing.expectEqualStrings("TIMESTAMPTZ", sqlType(.time, .{ .name = "postgres" }));
     try std.testing.expectEqualStrings("JSONB", sqlType(.json, .{ .name = "postgres" }));
     try std.testing.expectEqualStrings("UUID", sqlType(.uuid, .{ .name = "postgres" }));
+    try std.testing.expectEqualStrings("BLOB", sqlType(.bytes, .{ .name = "sqlite3" }));
+    try std.testing.expectEqualStrings("BYTEA", sqlType(.bytes, .{ .name = "postgres" }));
 }

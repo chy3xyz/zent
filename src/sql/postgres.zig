@@ -3,6 +3,9 @@ const c = @import("pg_c");
 const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
+const cache_mod = @import("cache.zig");
+
+const PreparedCache = cache_mod.PreparedCache;
 
 const PG_ERRBUF_SIZE = 256;
 
@@ -20,6 +23,9 @@ fn toDriverError(err: anyerror) driver.Error {
 pub const PostgresDriver = struct {
     conn: *c.PGconn,
     allocator: std.mem.Allocator,
+    /// Optional prepared-statement cache. When set, exec() reuses named
+    /// prepared statements via PQprepare / PQexecPrepared.
+    cache: ?PreparedCache(16, *c.PGresult) = null,
 
     pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8) !PostgresDriver {
         // libpq expects a null-terminated string
@@ -47,6 +53,14 @@ pub const PostgresDriver = struct {
     }
 
     pub fn close(self: *PostgresDriver) void {
+        if (self.cache) |*cch| {
+            cch.evictAll(self, struct {
+                fn f(ctx: anytype, h: *c.PGresult) void {
+                    _ = ctx;
+                    c.PQclear(h);
+                }
+            }.f);
+        }
         c.PQfinish(self.conn);
     }
 
@@ -153,6 +167,101 @@ pub const PostgresDriver = struct {
 
         try bindParams(self.allocator, args, &paramValues, &paramLengths, &paramFormats, &owned_lens);
 
+        // DDL invalidates every cached prepared statement.
+        if (self.cache) |*cch| {
+            if (cache_mod.isDDL(sql)) {
+                cch.evictAll(self, struct {
+                    fn f(ctx: anytype, h: *c.PGresult) void {
+                        _ = ctx;
+                        c.PQclear(h);
+                    }
+                }.f);
+            }
+        }
+
+        // Use named prepared statements when cache is enabled and we have args.
+        if (self.cache != null and args.len > 0) {
+            const cch = &self.cache.?;
+            const hash = std.hash.Wyhash.hash(0, sql);
+            var name_buf: [20]u8 = std.mem.zeroes([20]u8);
+            const name_str = try std.fmt.bufPrint(&name_buf, "p_{x}", .{hash});
+            const name_z: [*:0]const u8 = @ptrCast(name_str.ptr);
+
+            const PrepareCtx = struct {
+                conn: *c.PGconn,
+                name: [*:0]const u8,
+                sql: [*:0]const u8,
+                nParams: c_int,
+            };
+            const pctx = PrepareCtx{
+                .conn = self.conn,
+                .name = name_z,
+                .sql = sql_z.ptr,
+                .nParams = @intCast(args.len),
+            };
+
+            _ = try cch.getOrPrepare(sql, pctx, struct {
+                fn f(ctx: PrepareCtx, s: []const u8) !*c.PGresult {
+                    _ = s;
+                    const res = c.PQprepare(ctx.conn, ctx.name, ctx.sql, ctx.nParams, null) orelse {
+                        logPgError(ctx.conn, "PQprepare");
+                        return error.PostgresExecFailed;
+                    };
+                    if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
+                        logPgError(ctx.conn, "PQprepare");
+                        return error.PostgresExecFailed;
+                    }
+                    return res;
+                }
+            }.f, self, struct {
+                fn f(ctx: anytype, h: *c.PGresult) void {
+                    _ = ctx;
+                    c.PQclear(h);
+                }
+            }.f);
+
+            const res = c.PQexecPrepared(
+                self.conn,
+                name_z,
+                @intCast(args.len),
+                paramValues.items.ptr,
+                paramLengths.items.ptr,
+                paramFormats.items.ptr,
+                0, // text results
+            );
+            if (res == null) {
+                logPgError(self.conn, "exec-prepared");
+                return error.PostgresExecFailed;
+            }
+            defer c.PQclear(res);
+
+            const status = c.PQresultStatus(res);
+            if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
+                logPgError(self.conn, "exec-prepared");
+                return error.PostgresExecFailed;
+            }
+
+            const affected = c.PQcmdTuples(res);
+            var rows_affected: usize = 0;
+            if (affected) |a| {
+                rows_affected = std.fmt.parseInt(usize, std.mem.span(a), 10) catch 0;
+            }
+
+            var last_insert_id: ?i64 = null;
+            if (c.PQntuples(res) > 0) {
+                const oid_value = c.PQgetvalue(res, 0, 0);
+                if (oid_value) |val| {
+                    last_insert_id = std.fmt.parseInt(i64, std.mem.span(val), 10) catch null;
+                }
+            }
+
+            return driver.Result{
+                .rows_affected = rows_affected,
+                .last_insert_id = last_insert_id,
+            };
+        }
+
+        // Fallback: PQexecParams (no cache, or no args).
         const res = c.PQexecParams(
             self.conn,
             sql_z.ptr,
@@ -477,4 +586,132 @@ test "Postgres quote ident" {
     var buf: [64]u8 = undefined;
     const q = try Dialect.postgres.quoteIdent(&buf, "my_table");
     try std.testing.expectEqualStrings("\"my_table\"", q);
+}
+
+test "PostgresDriver cache field is optional" {
+    // Verifies the cache field defaults to null and can be set.
+    var drv: PostgresDriver = undefined;
+    try std.testing.expect(drv.cache == null);
+
+    drv.cache = PreparedCache(16, *c.PGresult){};
+    try std.testing.expect(drv.cache != null);
+}
+
+test "PostgresDriver cache DDL eviction" {
+    // DDL SQL should be detected and trigger cache eviction.
+    var cch: PreparedCache(4, *c.PGresult) = .{};
+    try std.testing.expectEqual(@as(usize, 0), cch.len);
+
+    // Manually insert an entry (simulate a prepared statement).
+    // We use getOrPrepare with a no-op prepare that returns a dummy pointer.
+    const dummy: *c.PGresult = @ptrFromInt(0x1);
+    _ = cch.getOrPrepare(
+        "SELECT 1",
+        dummy,
+        struct {
+            fn f(ctx: *c.PGresult, sql: []const u8) !*c.PGresult {
+                _ = sql;
+                return ctx;
+            }
+        }.f,
+        dummy,
+        struct {
+            fn f(ctx: *c.PGresult, h: *c.PGresult) void {
+                _ = ctx;
+                _ = h;
+            }
+        }.f,
+    ) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), cch.len);
+
+    // Simulate DDL: evict all.
+    try std.testing.expect(cache_mod.isDDL("CREATE TABLE foo (id INT)"));
+    try std.testing.expect(cache_mod.isDDL("ALTER TABLE foo ADD x INT"));
+    try std.testing.expect(cache_mod.isDDL("DROP TABLE foo"));
+    try std.testing.expect(!cache_mod.isDDL("INSERT INTO foo VALUES (1)"));
+
+    cch.evictAll(dummy, struct {
+        fn f(ctx: *c.PGresult, h: *c.PGresult) void {
+            _ = ctx;
+            _ = h;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(usize, 0), cch.len);
+}
+
+test "PostgresDriver cache getOrPrepare hit" {
+    var cch: PreparedCache(4, *c.PGresult) = .{};
+    var prepare_count: usize = 0;
+
+    const Ctx = struct {
+        count: *usize,
+    };
+    var ctx = Ctx{ .count = &prepare_count };
+
+    const h1 = try cch.getOrPrepare("SELECT 1", &ctx, struct {
+        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+            _ = sql;
+            ctx_.count.* += 1;
+            return @ptrFromInt(ctx_.count.*);
+        }
+    }.f, &ctx, struct {
+        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+            _ = ctx_;
+            _ = h;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(usize, 1), prepare_count);
+
+    const h2 = try cch.getOrPrepare("SELECT 1", &ctx, struct {
+        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+            _ = sql;
+            ctx_.count.* += 1;
+            return @ptrFromInt(ctx_.count.*);
+        }
+    }.f, &ctx, struct {
+        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+            _ = ctx_;
+            _ = h;
+        }
+    }.f);
+    // Same SQL should hit cache, no new prepare.
+    try std.testing.expectEqual(h1, h2);
+    try std.testing.expectEqual(@as(usize, 1), prepare_count);
+}
+
+test "PostgresDriver cache different SQL different entries" {
+    var cch: PreparedCache(4, *c.PGresult) = .{};
+    var prepare_count: usize = 0;
+
+    const Ctx = struct {
+        count: *usize,
+    };
+    var ctx = Ctx{ .count = &prepare_count };
+
+    _ = try cch.getOrPrepare("SELECT 1", &ctx, struct {
+        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+            _ = sql;
+            ctx_.count.* += 1;
+            return @ptrFromInt(ctx_.count.*);
+        }
+    }.f, &ctx, struct {
+        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+            _ = ctx_;
+            _ = h;
+        }
+    }.f);
+    _ = try cch.getOrPrepare("SELECT 2", &ctx, struct {
+        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+            _ = sql;
+            ctx_.count.* += 1;
+            return @ptrFromInt(ctx_.count.*);
+        }
+    }.f, &ctx, struct {
+        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+            _ = ctx_;
+            _ = h;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(usize, 2), prepare_count);
+    try std.testing.expectEqual(@as(usize, 2), cch.len);
 }

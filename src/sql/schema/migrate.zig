@@ -1178,7 +1178,7 @@ pub fn migrateSchemaWithOptions(
                     const existing_col = getExistingColumnByName(existing_cols.items, col.name) orelse unreachable;
                     // Normalise both sides for comparison: the DB side is
                     // already lowercased by getExistingColumns.
-                    const schema_type_upper = col.sql_type;
+                    const schema_type_upper = columnSQLType(col, dialect);
                     // Build a lowercase copy of the schema type.
                     var buf: [128]u8 = undefined;
                     if (schema_type_upper.len <= buf.len) {

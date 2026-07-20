@@ -65,7 +65,14 @@ pub const TypeInfo = struct {
 };
 
 /// Build a TypeInfo from a schema type at comptime.
+/// Build a TypeInfo from a schema type at comptime with the default (SQLite) dialect.
 pub fn fromSchema(comptime S: type) TypeInfo {
+    return fromSchemaDialect(S, Dialect.sqlite);
+}
+
+/// Build a TypeInfo from a schema type at comptime, using the given dialect
+/// to produce dialect-correct `sql_type` values on FieldInfo entries.
+pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
     comptime {
         const schema_fields = S.fields;
         const schema_edges = S.edges;
@@ -87,7 +94,7 @@ pub fn fromSchema(comptime S: type) TypeInfo {
 
         var fields: []const FieldInfo = &.{};
         for (all_schema_fields) |f| {
-            fields = fields ++ &[_]FieldInfo{toFieldInfo(f)};
+            fields = fields ++ &[_]FieldInfo{toFieldInfoDialect(f, dialect)};
         }
 
         var edges: []const EdgeInfo = &.{};
@@ -123,13 +130,17 @@ fn hasFieldNamed(comptime fields: []const field_mod.Field, name: []const u8) boo
 }
 
 fn toFieldInfo(comptime f: field_mod.Field) FieldInfo {
+    return toFieldInfoDialect(f, Dialect.sqlite);
+}
+
+fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect) FieldInfo {
     comptime {
         const is_id = std.mem.eql(u8, f.name, "id");
         return FieldInfo{
             .name = f.name,
             .field_type = f.field_type,
             .zig_type = field_mod.zigType(f.field_type, f.zig_type),
-            .sql_type = field_mod.sqlType(f.field_type, Dialect.sqlite),
+            .sql_type = field_mod.sqlType(f.field_type, dialect),
             .optional = f.optional,
             .nillable = f.nillable,
             .unique = f.unique,
