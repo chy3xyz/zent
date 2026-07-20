@@ -150,27 +150,6 @@ pub fn build(b: *std.Build) void {
     pool_step.dependOn(&run_pool.step);
 
     // -------------------------------------------------------------
-    // Example: advanced (complex SQL: CTE, cursor, EntQL, privacy, bulk)
-    // -------------------------------------------------------------
-    const advanced_mod = b.createModule(.{
-        .root_source_file = b.path("examples/advanced/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    advanced_mod.addImport("zent", zent_mod);
-    advanced_mod.addImport("sqlite3_c", sqlite_c_mod);
-    advanced_mod.linkSystemLibrary("sqlite3", .{});
-    const advanced_exe = b.addExecutable(.{
-        .name = "advanced",
-        .root_module = advanced_mod,
-    });
-    b.installArtifact(advanced_exe);
-
-    const run_advanced = b.addRunArtifact(advanced_exe);
-    const advanced_step = b.step("run-advanced", "Run the advanced complex SQL example");
-    advanced_step.dependOn(&run_advanced.step);
-
-    // -------------------------------------------------------------
     // Benchmarks
     // -------------------------------------------------------------
     const bench_mod = b.createModule(.{

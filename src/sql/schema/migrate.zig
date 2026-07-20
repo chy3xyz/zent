@@ -39,11 +39,20 @@ fn unixTimestamp() i64 {
 fn computeMigrationVersion(comptime table: []const u8, comptime op: []const u8, comptime target: []const u8) i64 {
     @setEvalBranchQuota(5000);
     comptime var h: u64 = 14_695_981_039_346_656_037;
-    for (table) |b| { h ^= b; h *%= 1_099_511_628_211; }
+    for (table) |b| {
+        h ^= b;
+        h *%= 1_099_511_628_211;
+    }
     h ^= ':';
-    for (op) |b| { h ^= b; h *%= 1_099_511_628_211; }
+    for (op) |b| {
+        h ^= b;
+        h *%= 1_099_511_628_211;
+    }
     h ^= ':';
-    for (target) |b| { h ^= b; h *%= 1_099_511_628_211; }
+    for (target) |b| {
+        h ^= b;
+        h *%= 1_099_511_628_211;
+    }
     return @as(i64, @intCast(h & 0x7FFF_FFFF));
 }
 
