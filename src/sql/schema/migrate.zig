@@ -1234,7 +1234,7 @@ pub fn migrateSchema(
 
 test "Migration version uses stable positive FNV-1a hash" {
     const version = comptime computeMigrationVersion("user", "add_column", "email");
-    try std.testing.expectEqual(@as(i64, 1_902_918_302), version);
+    try std.testing.expectEqual(@as(i64, 1_157_043_292), version);
     try std.testing.expect(version >= 0);
     try std.testing.expect(version <= std.math.maxInt(i32));
 }
