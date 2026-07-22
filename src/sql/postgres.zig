@@ -99,14 +99,12 @@ pub const PostgresDriver = struct {
     }
 
     fn setStatementTimeout(self: *PostgresDriver, ctx: ?*const driver.ExecutionContext) driver.Error!void {
-        const ms = if (ctx) |cx| cx.remainingMs() else null;
-        const sql = if (ms) |m|
-            try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{m})
-        else
-            "SET statement_timeout = DEFAULT";
-        defer if (ms != null) self.allocator.free(sql);
-        const sql_z = if (ms != null) try self.allocator.dupeSentinel(u8, sql, 0) else sql;
-        defer if (ms != null) self.allocator.free(sql_z);
+        const ms = ctx.?.remainingMs();
+        if (ms == 0) return error.QueryTimeout;
+        const sql = try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{ms});
+        defer self.allocator.free(sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
+        defer self.allocator.free(sql_z);
 
         const res = c.PQexec(self.conn, sql_z.ptr);
         if (res == null) return error.ConnectionFailed;

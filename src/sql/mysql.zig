@@ -30,6 +30,7 @@ pub fn errnoToError(errno: c_uint) driver.Error {
         1205, 1213 => error.TxFailed, // Lock wait / deadlock
         1317, 1406 => error.ExecFailed, // Query interrupted / data too long
         2002, 2003, 2006, 2013 => error.ConnectionFailed, // Connection lost
+        3024 => error.QueryTimeout, // ER_QUERY_TIMEOUT
         else => error.DriverFailed,
     };
 }
@@ -140,7 +141,7 @@ pub const MySQLDriver = struct {
         write: c_uint,
     };
 
-    fn applySocketTimeout(self: *MySQLDriver, ctx: ?*const driver.ExecutionContext, saved: *SavedTimeouts) void {
+    fn applySocketTimeout(self: *MySQLDriver, ctx: ?*const driver.ExecutionContext, saved: *SavedTimeouts) driver.Error!void {
         saved.* = .{
             .read = self.default_read_timeout,
             .write = self.default_write_timeout,
@@ -152,6 +153,7 @@ pub const MySQLDriver = struct {
                 _ = c.mysql_options(self.conn, c.MYSQL_OPT_WRITE_TIMEOUT, &sec);
             }
         }
+        return {};
     }
 
     fn restoreSocketTimeout(self: *MySQLDriver, saved: SavedTimeouts) void {
@@ -223,7 +225,8 @@ pub const MySQLDriver = struct {
 
             if (c.mysql_real_query(self.conn, sql_z.ptr, @intCast(sql_z.len)) != 0) {
                 logMySQLError(self.conn, "exec");
-                if (c.mysql_errno(self.conn) == 3024) return error.QueryTimeout;
+                const err = errnoToError(c.mysql_errno(self.conn));
+                if (err == error.QueryTimeout) return err;
                 return error.MySQLExecFailed;
             }
 
@@ -292,7 +295,8 @@ pub const MySQLDriver = struct {
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             logMySQLError(self.conn, "stmt_execute");
-            if (c.mysql_errno(self.conn) == 3024) return error.QueryTimeout;
+            const err = errnoToError(c.mysql_errno(self.conn));
+            if (err == error.QueryTimeout) return err;
             return error.MySQLStmtFailed;
         }
 
@@ -361,7 +365,8 @@ pub const MySQLDriver = struct {
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             logMySQLError(self.conn, "stmt_execute");
-            if (c.mysql_errno(self.conn) == 3024) return error.QueryTimeout;
+            const err = errnoToError(c.mysql_errno(self.conn));
+            if (err == error.QueryTimeout) return err;
             return error.MySQLStmtFailed;
         }
 
@@ -448,7 +453,7 @@ pub const MySQLDriver = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
                 const self_ptr: *MySQLDriver = @ptrCast(@alignCast(ptr));
                 var saved: SavedTimeouts = undefined;
-                self_ptr.applySocketTimeout(ctx, &saved);
+                try self_ptr.applySocketTimeout(ctx, &saved);
                 defer self_ptr.restoreSocketTimeout(saved);
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
@@ -457,7 +462,7 @@ pub const MySQLDriver = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
                 const self_ptr: *MySQLDriver = @ptrCast(@alignCast(ptr));
                 var saved: SavedTimeouts = undefined;
-                self_ptr.applySocketTimeout(ctx, &saved);
+                try self_ptr.applySocketTimeout(ctx, &saved);
                 defer self_ptr.restoreSocketTimeout(saved);
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
