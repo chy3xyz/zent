@@ -176,6 +176,45 @@ fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
     return column.sql_type;
 }
 
+/// Normalize a SQL type name for dialect-agnostic comparison by:
+/// - Lowercasing
+/// - Stripping size/precision modifiers: `varchar(255)` → `varchar`
+/// - Canonicalizing aliases: `character varying` → `varchar`, `int` → `integer`
+/// - Trimming whitespace
+fn normalizeSqlType(sql_type: []const u8, buf: []u8) ![]u8 {
+    if (sql_type.len > buf.len) return error.NoSpaceLeft;
+
+    // Lowercase and copy to buf
+    for (sql_type, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+
+    // Strip parenthesized modifiers: e.g., "varchar(255)" → "varchar"
+    var end = sql_type.len;
+    if (std.mem.indexOfScalar(u8, buf[0..end], '(')) |paren_idx| {
+        end = paren_idx;
+        while (end > 0 and buf[end - 1] == ' ') end -= 1; // trim trailing space
+    }
+
+    const normalized = buf[0..end];
+
+    // Canonicalize aliases — copy canonical name into buffer and return
+    const canonical: ?[]const u8 = if (std.mem.eql(u8, normalized, "character varying")) "varchar"
+        else if (std.mem.eql(u8, normalized, "int") or std.mem.eql(u8, normalized, "int4")) "integer"
+        else if (std.mem.eql(u8, normalized, "double")) "double precision"
+        else if (std.mem.eql(u8, normalized, "bool")) "boolean"
+        else if (std.mem.eql(u8, normalized, "serial")) "integer"
+        else if (std.mem.eql(u8, normalized, "bigserial")) "bigint"
+        else if (std.mem.eql(u8, normalized, "timestamptz")) "timestamp with time zone"
+        else null;
+
+    if (canonical) |canon| {
+        if (canon.len > buf.len) return error.NoSpaceLeft;
+        @memcpy(buf[0..canon.len], canon);
+        return buf[0..canon.len];
+    }
+
+    return normalized;
+}
+
 /// Foreign key definition.
 pub const ForeignKeyDef = struct {
     columns: []const []const u8,
@@ -1173,29 +1212,23 @@ pub fn migrateSchemaWithOptions(
         // opts.allow_data_loss; SQLite is skipped (unsupported).
         if (opts.allow_data_loss) {
             inline for (table.columns) |col| {
-                // Only check columns that already exist in the DB.
                 if (columnExists(existing_cols.items, col.name)) {
                     const existing_col = getExistingColumnByName(existing_cols.items, col.name) orelse unreachable;
-                    // Normalise both sides for comparison: the DB side is
-                    // already lowercased by getExistingColumns.
                     const schema_type_upper = columnSQLType(col, dialect);
-                    // Build a lowercase copy of the schema type.
-                    var buf: [128]u8 = undefined;
-                    if (schema_type_upper.len <= buf.len) {
-                        @memcpy(buf[0..schema_type_upper.len], schema_type_upper);
-                        for (buf[0..schema_type_upper.len]) |*c| c.* = std.ascii.toLower(c.*);
-                        const schema_type_lower = buf[0..schema_type_upper.len];
+                    var schema_buf: [128]u8 = undefined;
+                    var db_buf: [128]u8 = undefined;
+                    const schema_norm = try normalizeSqlType(schema_type_upper, &schema_buf);
+                    const db_norm = try normalizeSqlType(existing_col.sql_type, &db_buf);
 
-                        if (!std.mem.eql(u8, existing_col.sql_type, schema_type_lower)) {
-                            // Skip ALTER TYPE on SQLite (unsupported natively).
-                            if (dialect.name[0] != 's') {
-                                const version = comptime computeMigrationVersion(info.table_name, "alter_type", col.name);
-                                if (!versionContains(applied, version)) {
-                                    const sql = try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect);
-                                    defer allocator.free(sql);
-                                    _ = try tx_drv.exec(sql, &.{});
-                                    try recordMigration(tx_drv, version, null);
-                                }
+                    if (!std.mem.eql(u8, db_norm, schema_norm)) {
+                        // Skip ALTER TYPE on SQLite (unsupported natively).
+                        if (dialect.name[0] != 's') {
+                            const version = comptime computeMigrationVersion(info.table_name, "alter_type", col.name);
+                            if (!versionContains(applied, version)) {
+                                const sql = try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect);
+                                defer allocator.free(sql);
+                                _ = try tx_drv.exec(sql, &.{});
+                                try recordMigration(tx_drv, version, null);
                             }
                         }
                     }

@@ -120,7 +120,8 @@ pub const MySQLDriver = struct {
 
     fn logMySQLError(conn: *c.MYSQL, context: []const u8) void {
         const msg = c.mysql_error(conn);
-        std.log.err("mysql error ({s}): {s}", .{ context, std.mem.span(msg) });
+        const errno = c.mysql_errno(conn);
+        std.log.err("mysql error ({s}) [errno={d}]: {s}", .{ context, errno, std.mem.span(msg) });
     }
 
     /// Bind `args` to `binds`/`str_bufs`/`int_bufs`/`float_bufs`/`bool_bufs`.
