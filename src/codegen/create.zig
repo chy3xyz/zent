@@ -231,21 +231,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var q = builder.takeQuery() catch |err| return mapBuildError(err);
                 defer q.deinit();
 
-                // Build the full SQL: q.sql + (mysql REPLACE prefix or PG UPSERT suffix) + RETURNING
-                const needs_replace_prefix = or_replace and std.mem.eql(u8, dialect.name, "mysql");
-                const replace_prefix: []const u8 = if (needs_replace_prefix) "REPLACE" else "";
+                // Build the full SQL: q.sql + PG/SQLite UPSERT suffix + RETURNING.
+                // MySQL never reaches this branch because it does not support RETURNING.
                 const ret_suffix = " RETURNING \"id\"";
 
-                const full_sql_len = replace_prefix.len + (if (needs_replace_prefix) @as(usize, 1) else 0) + q.sql.len + upsert_suffix.len + ret_suffix.len;
+                const full_sql_len = q.sql.len + upsert_suffix.len + ret_suffix.len;
                 const full_sql = try self.allocator.alloc(u8, full_sql_len);
                 defer self.allocator.free(full_sql);
                 var pos: usize = 0;
-                if (needs_replace_prefix) {
-                    @memcpy(full_sql[pos..][0..replace_prefix.len], replace_prefix);
-                    pos += replace_prefix.len;
-                    full_sql[pos] = ' ';
-                    pos += 1;
-                }
                 @memcpy(full_sql[pos..][0..q.sql.len], q.sql);
                 pos += q.sql.len;
                 @memcpy(full_sql[pos..][0..upsert_suffix.len], upsert_suffix);
@@ -279,11 +272,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     });
                 }
             } else {
-                // MySQL path: REPLACE INTO if or_replace. The Insert builder
-                // always emits "INSERT INTO ..."; replace the leading keyword.
-                const needs_replace_prefix = or_replace;
-                const insert_keyword = "INSERT";
-                const replace_keyword = "REPLACE";
+                // MySQL path: normal INSERT plus ON DUPLICATE KEY UPDATE suffix.
                 var builder = sql.Insert(self.allocator, dialect, info.table_name);
                 defer builder.deinit();
                 _ = try builder.columns(columns.items);
@@ -291,15 +280,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var q = builder.takeQuery() catch |err| return mapBuildError(err);
                 defer q.deinit();
 
-                const full_sql_len = q.sql.len + if (needs_replace_prefix) @as(usize, replace_keyword.len - insert_keyword.len) else 0;
+                const full_sql_len = q.sql.len + upsert_suffix.len;
                 const full_sql = try self.allocator.alloc(u8, full_sql_len);
                 defer self.allocator.free(full_sql);
-                if (needs_replace_prefix) {
-                    @memcpy(full_sql[0..replace_keyword.len], replace_keyword);
-                    @memcpy(full_sql[replace_keyword.len..], q.sql[insert_keyword.len..]);
-                } else {
-                    @memcpy(full_sql[0..q.sql.len], q.sql);
-                }
+                @memcpy(full_sql[0..q.sql.len], q.sql);
+                @memcpy(full_sql[q.sql.len..], upsert_suffix);
 
                 const start = nowUs();
                 const res = try self.driver.exec(full_sql, q.args);
