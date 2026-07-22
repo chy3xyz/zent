@@ -84,6 +84,15 @@ fn ensureMigrationsTable(drv: sql_driver.Driver) !void {
     _ = try drv.exec(migrationsTableSQL, &.{});
 }
 
+/// Returns true if `sql_type` is an integer type that supports AUTO_INCREMENT in MySQL.
+fn isMySqlAutoIncrementType(sql_type: []const u8) bool {
+    const types = &[_][]const u8{ "INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT", "MEDIUMINT" };
+    for (types) |t| {
+        if (std.ascii.eqlIgnoreCase(sql_type, t)) return true;
+    }
+    return false;
+}
+
 /// Build the dialect-appropriate INSERT statement for recording a migration.
 /// SQLite and MySQL use `?` placeholders; PostgreSQL uses `$1, $2, $3`.
 /// The statement tolerates duplicate versions so that re-running a migration
@@ -394,8 +403,7 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
             try buf.appendSlice(" PRIMARY KEY");
             if (col.auto_increment and
                 std.mem.eql(u8, dialect.name, "mysql") and
-                (std.ascii.eqlIgnoreCase(sql_type, "INTEGER") or
-                    std.ascii.eqlIgnoreCase(sql_type, "INT")))
+                isMySqlAutoIncrementType(sql_type))
             {
                 try buf.appendSlice(" AUTO_INCREMENT");
             }
