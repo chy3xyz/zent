@@ -14,6 +14,7 @@ fn toDriverError(err: anyerror) driver.Error {
         error.MySQLPingFailed => error.PingFailed,
         error.MySQLDataTruncated => error.ProtocolError,
         error.MySQLFetchFailed => error.ProtocolError,
+        error.QueryTimeout => error.QueryTimeout,
         else => error.DriverFailed,
     };
 }
@@ -36,6 +37,9 @@ pub fn errnoToError(errno: c_uint) driver.Error {
 pub const MySQLDriver = struct {
     conn: *c.MYSQL,
     allocator: std.mem.Allocator,
+    /// Default socket timeouts used when no ExecutionContext deadline is present.
+    default_read_timeout: c_uint = 30,
+    default_write_timeout: c_uint = 30,
     /// Tracks whether the connection currently has an active transaction.
     in_tx: bool = false,
     /// Optional prepared-statement cache. Set this field after `connect()` to
@@ -62,12 +66,14 @@ pub const MySQLDriver = struct {
         const conn = c.mysql_init(null);
         if (conn == null) return error.MySQLInitFailed;
 
-        // Set connect timeout (10s) and read timeout (30s).
+        // Set connect timeout (10s) and read/write timeouts (30s).
+        const default_read_timeout: c_uint = 30;
+        const default_write_timeout: c_uint = 30;
         {
             const connect_timeout: c_uint = 10;
             _ = c.mysql_options(conn, c.MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
-            const read_timeout: c_uint = 30;
-            _ = c.mysql_options(conn, c.MYSQL_OPT_READ_TIMEOUT, &read_timeout);
+            _ = c.mysql_options(conn, c.MYSQL_OPT_READ_TIMEOUT, &default_read_timeout);
+            _ = c.mysql_options(conn, c.MYSQL_OPT_WRITE_TIMEOUT, &default_write_timeout);
         }
 
         // Set SSL mode via mysql_ssl_set / MYSQL_OPT_SSL_ENFORCE
@@ -108,7 +114,12 @@ pub const MySQLDriver = struct {
         // Set UTF-8
         _ = c.mysql_set_character_set(conn, "utf8mb4");
 
-        return MySQLDriver{ .conn = conn, .allocator = allocator };
+        return MySQLDriver{
+            .conn = conn,
+            .allocator = allocator,
+            .default_read_timeout = default_read_timeout,
+            .default_write_timeout = default_write_timeout,
+        };
     }
 
     pub fn close(self: *MySQLDriver) void {
@@ -122,6 +133,30 @@ pub const MySQLDriver = struct {
         const msg = c.mysql_error(conn);
         const errno = c.mysql_errno(conn);
         std.log.err("mysql error ({s}) [errno={d}]: {s}", .{ context, errno, std.mem.span(msg) });
+    }
+
+    const SavedTimeouts = struct {
+        read: c_uint,
+        write: c_uint,
+    };
+
+    fn applySocketTimeout(self: *MySQLDriver, ctx: ?*const driver.ExecutionContext, saved: *SavedTimeouts) void {
+        saved.* = .{
+            .read = self.default_read_timeout,
+            .write = self.default_write_timeout,
+        };
+        if (ctx) |cx| {
+            if (cx.remainingMs()) |ms| {
+                const sec: c_uint = if (ms == 0) 1 else @intCast((ms + 999) / 1000);
+                _ = c.mysql_options(self.conn, c.MYSQL_OPT_READ_TIMEOUT, &sec);
+                _ = c.mysql_options(self.conn, c.MYSQL_OPT_WRITE_TIMEOUT, &sec);
+            }
+        }
+    }
+
+    fn restoreSocketTimeout(self: *MySQLDriver, saved: SavedTimeouts) void {
+        _ = c.mysql_options(self.conn, c.MYSQL_OPT_READ_TIMEOUT, &saved.read);
+        _ = c.mysql_options(self.conn, c.MYSQL_OPT_WRITE_TIMEOUT, &saved.write);
     }
 
     /// Bind `args` to `binds`/`str_bufs`/`int_bufs`/`float_bufs`/`bool_bufs`.
@@ -188,6 +223,7 @@ pub const MySQLDriver = struct {
 
             if (c.mysql_real_query(self.conn, sql_z.ptr, @intCast(sql_z.len)) != 0) {
                 logMySQLError(self.conn, "exec");
+                if (c.mysql_errno(self.conn) == 3024) return error.QueryTimeout;
                 return error.MySQLExecFailed;
             }
 
@@ -256,6 +292,7 @@ pub const MySQLDriver = struct {
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             logMySQLError(self.conn, "stmt_execute");
+            if (c.mysql_errno(self.conn) == 3024) return error.QueryTimeout;
             return error.MySQLStmtFailed;
         }
 
@@ -324,6 +361,7 @@ pub const MySQLDriver = struct {
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             logMySQLError(self.conn, "stmt_execute");
+            if (c.mysql_errno(self.conn) == 3024) return error.QueryTimeout;
             return error.MySQLStmtFailed;
         }
 
@@ -408,15 +446,19 @@ pub const MySQLDriver = struct {
     const vtable = driver.Driver.VTable{
         .exec = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
-                _ = ctx;
                 const self_ptr: *MySQLDriver = @ptrCast(@alignCast(ptr));
+                var saved: SavedTimeouts = undefined;
+                self_ptr.applySocketTimeout(ctx, &saved);
+                defer self_ptr.restoreSocketTimeout(saved);
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
-                _ = ctx;
                 const self_ptr: *MySQLDriver = @ptrCast(@alignCast(ptr));
+                var saved: SavedTimeouts = undefined;
+                self_ptr.applySocketTimeout(ctx, &saved);
+                defer self_ptr.restoreSocketTimeout(saved);
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,
