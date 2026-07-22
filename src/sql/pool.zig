@@ -169,6 +169,11 @@ pub fn ConnPool(comptime D: type) type {
         }
 
         /// Close every connection and free pool bookkeeping.
+        ///
+        /// The caller must ensure no other thread is currently in `borrow`,
+        /// `release`, or any `asDriver` operation before calling `deinit`, because
+        /// the owned `Io` instance is destroyed immediately after the pool mutex
+        /// is released.
         pub fn deinit(self: *Self) void {
             const io = self.io;
             self.mutex.lockUncancelable(io);
@@ -1119,4 +1124,32 @@ test "ConnPool supports concurrent borrow and release across threads" {
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try std.testing.expectEqual(@as(i64, 50 * thread_count), row.getInt(0).?);
+}
+
+test "ConnPool explicit io is not owned or destroyed by the pool" {
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+
+    var threaded_io = std.Io.Threaded.init(allocator, .{});
+    defer threaded_io.deinit();
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, ":memory:");
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .io = threaded_io.io(),
+    });
+    defer pool.deinit();
+
+    // The pool should not have created an owned Io.
+    try std.testing.expectEqual(@as(?*std.Io.Threaded, null), pool.owned_io);
+
+    // A borrow/release cycle should still work with the explicit Io.
+    const conn = try pool.borrow();
+    pool.release(conn);
 }
