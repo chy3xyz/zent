@@ -1202,3 +1202,64 @@ test "SQLite: stream iterator avoids loading all rows" {
         try testing.expectEqual(@as(usize, 50), count);
     }
 }
+
+test "SQLite: BulkInsert multi-row RETURNING" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const BulkEntity = schema("BulkEntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{BulkEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Insert 3 rows in a single round-trip.
+    var b = try client.bulk_entity.BulkInsert();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alpha");
+    _ = try b.setFieldValue("score", @as(i64, 100));
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "beta");
+    _ = try b.setFieldValue("score", @as(i64, 200));
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "gamma");
+    _ = try b.setFieldValue("score", @as(i64, 300));
+
+    const ids = try b.Save();
+    defer ids.deinit();
+
+    try testing.expectEqual(@as(usize, 3), ids.items.len);
+    // IDs should be sequential integers starting from 1.
+    try testing.expectEqual(@as(i64, 1), ids.items[0]);
+    try testing.expectEqual(@as(i64, 2), ids.items[1]);
+    try testing.expectEqual(@as(i64, 3), ids.items[2]);
+
+    // Verify rows actually exist in the DB.
+    var rows = try drv.query("SELECT id, name, score FROM bulk_entity ORDER BY id", &.{});
+    defer rows.deinit();
+
+    const r1 = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), r1.getInt(0).?);
+    try testing.expectEqualStrings("alpha", r1.getText(1).?);
+    try testing.expectEqual(@as(i64, 100), r1.getInt(2).?);
+
+    const r2 = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 2), r2.getInt(0).?);
+    try testing.expectEqualStrings("beta", r2.getText(1).?);
+    try testing.expectEqual(@as(i64, 200), r2.getInt(2).?);
+
+    const r3 = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 3), r3.getInt(0).?);
+    try testing.expectEqualStrings("gamma", r3.getText(1).?);
+    try testing.expectEqual(@as(i64, 300), r3.getInt(2).?);
+
+    try testing.expect(rows.next() == null);
+}

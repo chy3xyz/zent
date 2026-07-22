@@ -982,6 +982,25 @@ pub fn InsertOrReplace(allocator: std.mem.Allocator, dialect: Dialect, table: []
     return builder;
 }
 
+/// Build a multi-row INSERT in a single call.
+/// `values` is a flat slice: [row1col1, row1col2, ..., row2col1, row2col2, ...]
+/// Returns an OwnedQuery with SQL like:
+///   INSERT INTO "t" ("c1","c2") VALUES ($1,$2),($3,$4),...
+pub fn MultiInsert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8, columns: []const []const u8, row_count: usize, values: []const Value) !OwnedQuery {
+    std.debug.assert(columns.len > 0);
+    std.debug.assert(row_count > 0);
+    std.debug.assert(values.len == columns.len * row_count);
+    var ib = InsertBuilder.init(allocator, dialect, table);
+    defer ib.deinit();
+    _ = try ib.columns(columns);
+    const cols_per_row = columns.len;
+    for (0..row_count) |ri| {
+        const start = ri * cols_per_row;
+        _ = try ib.values(values[start..][0..cols_per_row]);
+    }
+    return ib.takeQuery();
+}
+
 // ------------------------------------------------------------------
 // UPDATE
 // ------------------------------------------------------------------
@@ -1452,6 +1471,45 @@ test "INSERT OR REPLACE" {
     const q = try i.query();
     try std.testing.expectEqualStrings("INSERT OR REPLACE INTO \"users\" (\"id\", \"name\") VALUES (?, ?)", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
+}
+
+test "MultiInsert single row" {
+    const allocator = std.testing.allocator;
+    const q = try MultiInsert(allocator, Dialect.sqlite, "users", &.{ "name", "age" }, 1, &.{
+        .{ .string = "alice" }, .{ .int = 30 },
+    });
+    defer q.deinit();
+    try std.testing.expectEqualStrings("INSERT INTO \"users\" (\"name\", \"age\") VALUES (?, ?)", q.sql);
+    try std.testing.expectEqual(@as(usize, 2), q.args.len);
+}
+
+test "MultiInsert three rows" {
+    const allocator = std.testing.allocator;
+    const q = try MultiInsert(allocator, Dialect.sqlite, "users", &.{ "name", "age" }, 3, &.{
+        .{ .string = "alice" }, .{ .int = 30 },
+        .{ .string = "bob" },   .{ .int = 25 },
+        .{ .string = "carol" }, .{ .int = 28 },
+    });
+    defer q.deinit();
+    try std.testing.expectEqualStrings(
+        "INSERT INTO \"users\" (\"name\", \"age\") VALUES (?, ?), (?, ?), (?, ?)",
+        q.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 6), q.args.len);
+}
+
+test "MultiInsert Postgres placeholders" {
+    const allocator = std.testing.allocator;
+    const q = try MultiInsert(allocator, Dialect.postgres, "users", &.{ "name", "age" }, 2, &.{
+        .{ .string = "alice" }, .{ .int = 30 },
+        .{ .string = "bob" },   .{ .int = 25 },
+    });
+    defer q.deinit();
+    try std.testing.expectEqualStrings(
+        "INSERT INTO \"users\" (\"name\", \"age\") VALUES ($1, $2), ($3, $4)",
+        q.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 4), q.args.len);
 }
 
 test "UPDATE" {

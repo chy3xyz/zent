@@ -8,6 +8,10 @@ pub const LogContext = struct {
     rows_affected: usize = 0,
     @"error": ?anyerror = null,
     table_name: []const u8 = "",
+    /// Caller-supplied trace identifier. The library never generates or mutates
+    /// this value — it only passes it through to logger callbacks so callers
+    /// can correlate queries with distributed traces.
+    trace_id: ?[]const u8 = null,
 };
 
 pub const Logger = struct {

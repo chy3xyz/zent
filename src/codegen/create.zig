@@ -166,7 +166,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 .op = .create,
                 .table_name = info.table_name,
                 .mutated = mutated,
-                .privacy = self.privacy_ctx orelse .{},
+                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
@@ -635,7 +635,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             var hook_ctx = HookContext{
                 .op = .create,
                 .table_name = info.table_name,
-                .privacy = self.privacy_ctx orelse .{},
+                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
@@ -680,30 +680,52 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 try columns.append(fv.name);
             }
 
-            var builder = sql.Insert(self.allocator, self.driver.dialect(), info.table_name);
-            defer builder.deinit();
-            _ = try builder.columns(columns.items);
-            for (self.rows.items) |row| {
-                var sql_values = std.array_list.Managed(sql.Value).init(self.allocator);
-                defer sql_values.deinit();
-                for (row.items) |fv| try sql_values.append(fv.value);
-                _ = try builder.values(sql_values.items);
+            // Collect all values into a flat array for MultiInsert.
+            const cols_per_row = columns.items.len;
+            const total_vals = cols_per_row * self.rows.items.len;
+            var flat_values = try self.allocator.alloc(sql.Value, total_vals);
+            defer self.allocator.free(flat_values);
+            {
+                var vi: usize = 0;
+                for (self.rows.items) |row| {
+                    for (row.items) |fv| {
+                        flat_values[vi] = fv.value;
+                        vi += 1;
+                    }
+                }
             }
-            const base = builder.query() catch |err| return mapBuildError(err);
 
-            var sql_buf = std.array_list.Managed(u8).init(self.allocator);
-            defer sql_buf.deinit();
-            try sql_buf.appendSlice(base.sql);
-            try sql_buf.appendSlice(" RETURNING \"id\"");
-
-            var rows = try self.driver.query(sql_buf.items, base.args);
-            defer rows.deinit();
+            // Build multi-row INSERT SQL.
+            const dialect = self.driver.dialect();
+            const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
+            const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
+            defer query.deinit();
 
             var ids = std.array_list.Managed(i64).init(self.allocator);
             errdefer ids.deinit();
-            while (rows.next()) |row| {
-                const id = row.getInt(0) orelse return error.TypeMismatch;
-                try ids.append(id);
+
+            if (supports_returning) {
+                // SQLite / PostgreSQL: append RETURNING clause and query.
+                const ret_suffix = " RETURNING \"id\"";
+                const full_sql = try self.allocator.alloc(u8, query.sql.len + ret_suffix.len);
+                defer self.allocator.free(full_sql);
+                @memcpy(full_sql[0..query.sql.len], query.sql);
+                @memcpy(full_sql[query.sql.len..], ret_suffix);
+
+                var rows = try self.driver.query(full_sql, query.args);
+                defer rows.deinit();
+                while (rows.next()) |row| {
+                    const id = row.getInt(0) orelse return error.TypeMismatch;
+                    try ids.append(id);
+                }
+            } else {
+                // MySQL: no RETURNING. Execute then compute IDs from
+                // last_insert_id and rows_affected.
+                const res = try self.driver.exec(query.sql, query.args);
+                const base_id = res.last_insert_id orelse 0;
+                for (0..self.rows.items.len) |i| {
+                    try ids.append(base_id + @as(i64, @intCast(i)));
+                }
             }
 
             // After hooks on success.

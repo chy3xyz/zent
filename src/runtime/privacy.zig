@@ -3,6 +3,9 @@ const std = @import("std");
 /// Maximum number of filter predicates retained inline by a DecisionSet.
 const max_filters = 8;
 
+/// Operation type for privacy evaluation. Mirrors hook.Op.
+pub const Op = enum { create, update, delete, query };
+
 /// Carries caller identity through the query/mutation pipeline.
 /// Value-type, copy-passed; immutable after construction.
 pub const PrivacyContext = struct {
@@ -10,6 +13,9 @@ pub const PrivacyContext = struct {
     role: ?[]const u8 = null,
     tenant_id: ?i64 = null,
     extra: ?*anyopaque = null,
+    /// Current operation being checked. Set by codegen at call time.
+    /// Allows policies to differentiate between create/update/delete/query.
+    op: Op = .query,
 };
 
 /// Decision returned by privacy rule evaluation.

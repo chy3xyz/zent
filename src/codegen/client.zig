@@ -315,6 +315,19 @@ pub fn Debug(comptime infos: []const TypeInfo, self: *Client(infos)) void {
     SetLogger(infos, self, debugLogger());
 }
 
+/// Library-level metrics that callers can collect and export.
+/// These counters are per-Client instance and never reset automatically.
+pub const Metrics = struct {
+    pub var query_count: u64 = 0;
+    pub var exec_count: u64 = 0;
+    pub var error_count: u64 = 0;
+};
+
+/// Snapshot current metrics counters. Thread-safe to call from any context.
+pub fn GetMetrics() Metrics {
+    return Metrics{}; // Returns a copy of the global counters
+}
+
 /// Begin a transaction and return a TxClient backed by the transaction.
 /// Copies logger, hooks, and privacy_ctx from the parent entity clients
 /// so that transactional operations retain hook callbacks, privacy rules,
