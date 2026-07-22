@@ -212,9 +212,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
             // Build the upsert suffix per dialect. For SQLite we use the
             // built-in InsertOrReplace builder. For PG we append ON CONFLICT
-            // (id) DO UPDATE SET col=excluded.col ... For MySQL we use
-            // REPLACE INTO. For plain Save (or_replace=false) the suffix is empty.
-            const upsert_suffix: []const u8 = try self.buildUpsertSuffix(or_replace, is_postgres, is_sqlite, columns.items);
+            // (id) DO UPDATE SET col=excluded.col ... For MySQL we generate
+            // ON DUPLICATE KEY UPDATE (the REPLACE prefix is removed in Task 2).
+            // For plain Save (or_replace=false) the suffix is empty.
+            const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
+            const upsert_suffix: []const u8 = try self.buildUpsertSuffix(or_replace, is_postgres, is_sqlite, is_mysql, columns.items);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             var entity: Entity = std.mem.zeroes(Entity);
@@ -401,8 +403,22 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return entity;
         }
 
-        fn buildUpsertSuffix(self: *Self, or_replace: bool, is_postgres: bool, is_sqlite: bool, columns: []const []const u8) ![]const u8 {
-            if (!or_replace or is_sqlite or !is_postgres) return "";
+        fn buildUpsertSuffix(self: *Self, or_replace: bool, is_postgres: bool, is_sqlite: bool, is_mysql: bool, columns: []const []const u8) ![]const u8 {
+            _ = is_postgres;
+            if (!or_replace or is_sqlite) return "";
+            if (is_mysql) {
+                var buf = std.array_list.Managed(u8).init(self.allocator);
+                errdefer buf.deinit();
+                try buf.appendSlice(" ON DUPLICATE KEY UPDATE ");
+                var first = true;
+                for (columns) |col| {
+                    if (std.mem.eql(u8, col, "id")) continue;
+                    if (!first) try buf.appendSlice(", ");
+                    first = false;
+                    try buf.print("`{s}`=VALUES(`{s}`)", .{ col, col });
+                }
+                return try buf.toOwnedSlice();
+            }
             var buf = std.array_list.Managed(u8).init(self.allocator);
             errdefer buf.deinit();
             try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
