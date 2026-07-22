@@ -76,10 +76,10 @@ pub fn ConnPool(comptime D: type) type {
             health_check_on_borrow: bool = true,
             /// Factory that opens a new connection.
             connect: ConnectFn,
-            /// I/O abstraction used for blocking synchronization. When omitted,
-            /// the global single-threaded `Io` instance is used. Applications
-            /// that need cross-thread blocking waits must provide an explicit
-            /// `std.Io` (e.g. `std.Io.Threaded.init(...).io()`).
+            /// I/O abstraction used for blocking synchronization. When omitted, the pool
+            /// creates and owns a thread-safe `std.Io.Threaded` instance. Applications that
+            /// want to share an `Io` across multiple pools or use a custom implementation
+            /// can provide an explicit `std.Io` here.
             io: ?std.Io = null,
             /// Maximum time in milliseconds to wait for a connection when the
             /// DEPRECATED: replaced by `max_retries` + `retry_backoff_ms`.
@@ -122,21 +122,36 @@ pub fn ConnPool(comptime D: type) type {
         all: std.ArrayListUnmanaged(PooledEntry) = .empty,
         available: std.ArrayListUnmanaged(*PooledEntry) = .empty,
         closed: bool = false,
+        owned_io: ?*std.Io.Threaded = null,
+
+        /// Create a thread-safe Io instance owned by the pool.
+        fn createOwnedIo(allocator: std.mem.Allocator) !*std.Io.Threaded {
+            const threaded = try allocator.create(std.Io.Threaded);
+            errdefer allocator.destroy(threaded);
+            threaded.* = std.Io.Threaded.init(allocator, .{});
+            return threaded;
+        }
 
         /// Open a pool and warm up `min_connections`.
         pub fn init(allocator: std.mem.Allocator, options: Options) !Self {
             assert(options.min_connections > 0);
             assert(options.min_connections <= options.max_connections);
 
-            const io = options.io orelse std.Io.Threaded.global_single_threaded.io();
-
             var self = Self{
                 .allocator = allocator,
                 .connect = options.connect,
                 .options = options,
                 .dialect = Dialect.sqlite, // overwritten after first conn
-                .io = io,
+                .io = undefined,
             };
+
+            if (options.io) |io| {
+                self.io = io;
+            } else {
+                const threaded = try createOwnedIo(allocator);
+                self.owned_io = threaded;
+                self.io = threaded.io();
+            }
             errdefer self.deinit();
 
             try self.all.ensureTotalCapacity(allocator, options.max_connections);
@@ -166,6 +181,10 @@ pub fn ConnPool(comptime D: type) type {
             self.all.deinit(self.allocator);
             self.available.deinit(self.allocator);
             self.mutex.unlock(io);
+            if (self.owned_io) |t| {
+                t.deinit();
+                self.allocator.destroy(t);
+            }
             self.* = undefined;
         }
 
@@ -738,10 +757,11 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
     MockDriver.opens = 0;
     MockDriver.closes = 0;
 
-    // fail_index = 2: init performs two capacity allocations (all, available),
-    // then the next allocation inside addConnection's all.addOne must fail.
+    // fail_index = 3: init performs one Io allocation plus two capacity
+    // allocations (all, available), then the next allocation inside
+    // addConnection's all.addOne must fail.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 2,
+        .fail_index = 3,
     });
     const allocator = failing.allocator();
 
