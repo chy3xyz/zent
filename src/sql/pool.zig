@@ -230,6 +230,17 @@ pub fn ConnPool(comptime D: type) type {
                             .created_at = unixTimestamp(),
                             .idle_since = null,
                         };
+                        // Newly created connections must also pass the health
+                        // check before being handed out. If they fail, close the
+                        // entry and let the caller's retry loop decide whether to
+                        // attempt again; otherwise we could spin forever creating
+                        // and discarding dead connections.
+                        if (self.options.health_check_on_borrow) {
+                            ptr.conn.asDriver().ping() catch {
+                                self.closeConnection(ptr);
+                                return null;
+                            };
+                        }
                         return ptr;
                     }
                     return null;
@@ -875,4 +886,162 @@ test "pool retries on exhaustion with backoff" {
 
     // Second borrow should retry twice and then fail with PoolExhausted.
     try std.testing.expectError(error.PoolExhausted, pool.borrow());
+}
+
+test "ConnPool evicts connection on failed health check during borrow" {
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+        pub var pings: usize = 0;
+        pub var ping_should_fail: bool = false;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {
+            pings += 1;
+            if (ping_should_fail) return error.ConnectionFailed;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            unreachable;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+        };
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+    MockDriver.pings = 0;
+    MockDriver.ping_should_fail = true;
+
+    const allocator = std.testing.allocator;
+    var pool = try ConnPool(MockDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 2,
+        .health_check_on_borrow = true,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    // The only available connection fails the health check, so it is closed
+    // and the borrow returns PoolExhausted (no retries and no new connection).
+    try std.testing.expectError(error.PoolExhausted, pool.borrow());
+    // One ping for the initial idle connection and one for the newly created
+    // connection that also failed the health check.
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.pings);
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.closes);
+}
+
+test "ConnPool evicts connection exceeding max lifetime on release" {
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {}
+        fn mockInTransaction(_: *anyopaque) bool {
+            return false;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+        };
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+
+    const allocator = std.testing.allocator;
+    var pool = try ConnPool(MockDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_lifetime_secs = 1,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.borrow();
+    // Wait long enough for the connection to exceed its 1-second lifetime.
+    pool.io.sleep(std.Io.Duration.fromMilliseconds(2100), .awake) catch {};
+    pool.release(c1);
+
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
+    try std.testing.expectEqual(@as(usize, 0), pool.available.items.len);
 }
