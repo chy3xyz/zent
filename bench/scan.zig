@@ -14,6 +14,7 @@ const MockRow = struct {
         .getFloat = getFloat,
         .getText = getText,
         .getBlob = getBlob,
+        .getBool = getBool,
         .isNull = isNull,
     };
 
@@ -40,6 +41,9 @@ const MockRow = struct {
         return null;
     }
     fn getBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+    fn getBool(_: *anyopaque, _: usize) ?bool {
         return null;
     }
     fn isNull(_: *anyopaque, _: usize) bool {
@@ -108,6 +112,7 @@ const MockRowLite = struct {
         .getFloat = getFloat,
         .getText = getText,
         .getBlob = getBlob,
+        .getBool = getBool,
         .isNull = isNull,
     };
 
@@ -133,6 +138,9 @@ const MockRowLite = struct {
         return null;
     }
     fn getBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+    fn getBool(_: *anyopaque, _: usize) ?bool {
         return null;
     }
     fn isNull(_: *anyopaque, _: usize) bool {

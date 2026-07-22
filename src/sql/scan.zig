@@ -238,6 +238,7 @@ const MockRowData = struct {
     ints: []const ?i64,
     floats: []const ?f64,
     texts: []const ?[]const u8,
+    bools: []const ?bool,
     nulls: []const bool,
 
     fn columnCountFn(ptr: *anyopaque) usize {
@@ -261,6 +262,11 @@ const MockRowData = struct {
         return self.floats[index];
     }
 
+    fn getBoolFn(ptr: *anyopaque, index: usize) ?bool {
+        const self: *const MockRowData = @ptrCast(@alignCast(ptr));
+        return self.bools[index];
+    }
+
     fn getTextFn(ptr: *anyopaque, index: usize) ?[]const u8 {
         const self: *const MockRowData = @ptrCast(@alignCast(ptr));
         return self.texts[index];
@@ -279,6 +285,7 @@ const MockRowData = struct {
 const mock_vtable = Row.VTable{
     .columnCount = MockRowData.columnCountFn,
     .columnName = MockRowData.columnNameFn,
+    .getBool = MockRowData.getBoolFn,
     .getInt = MockRowData.getIntFn,
     .getFloat = MockRowData.getFloatFn,
     .getText = MockRowData.getTextFn,
@@ -291,6 +298,7 @@ test "scan primitive" {
         .ints = &.{42},
         .floats = &.{null},
         .texts = &.{null},
+        .bools = &.{null},
         .nulls = &.{false},
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
@@ -308,6 +316,7 @@ test "scan struct" {
         .ints = &.{ 1, null, 30 },
         .floats = &.{ null, null, null },
         .texts = &.{ null, "alice", null },
+        .bools = &.{ null, null, null },
         .nulls = &.{ false, false, false },
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
@@ -323,6 +332,7 @@ test "scan optional null" {
         .ints = &.{null},
         .floats = &.{null},
         .texts = &.{null},
+        .bools = &.{null},
         .nulls = &.{true},
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };

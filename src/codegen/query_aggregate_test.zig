@@ -22,6 +22,7 @@ const MockRows = struct {
     const row_vtable = sql_driver.Row.VTable{
         .columnCount = columnCount,
         .columnName = columnName,
+        .getBool = getBool,
         .getInt = getInt,
         .getFloat = getFloat,
         .getText = getText,
@@ -47,6 +48,11 @@ const MockRows = struct {
 
     fn columnName(_: *anyopaque, _: usize) []const u8 {
         return "agg";
+    }
+
+    fn getBool(ptr: *anyopaque, _: usize) ?bool {
+        const self: *MockRows = @ptrCast(@alignCast(ptr));
+        return if (self.value == .bool) self.value.bool else null;
     }
 
     fn getInt(ptr: *anyopaque, _: usize) ?i64 {

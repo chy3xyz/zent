@@ -18,6 +18,21 @@ fn toDriverError(err: anyerror) driver.Error {
     };
 }
 
+/// Map a MySQL errno to a driver.Error variant.
+pub fn errnoToError(errno: c_uint) driver.Error {
+    return switch (errno) {
+        1040, 1043, 1129, 1130 => error.ConnectionFailed, // Too many connections / host blocked
+        1045, 1044 => error.ConnectionFailed, // Access denied
+        1062, 1586 => error.ExecFailed, // Duplicate entry
+        1064, 1146, 1054, 1060 => error.QueryFailed, // Syntax / no such table / bad column
+        1142, 1143 => error.ExecFailed, // Permission denied
+        1205, 1213 => error.TxFailed, // Lock wait / deadlock
+        1317, 1406 => error.ExecFailed, // Query interrupted / data too long
+        2002, 2003, 2006, 2013 => error.ConnectionFailed, // Connection lost
+        else => error.DriverFailed,
+    };
+}
+
 pub const MySQLDriver = struct {
     conn: *c.MYSQL,
     allocator: std.mem.Allocator,
@@ -27,9 +42,55 @@ pub const MySQLDriver = struct {
     /// enable caching; null (the default) disables it.
     cache: ?cache.PreparedCache(16, *c.MYSQL_STMT) = null,
 
+    /// MySQL SSL mode.
+    pub const SslMode = enum(u32) {
+        disabled = 1,
+        preferred = 2,
+        required = 3,
+        verify_ca = 4,
+    };
+
     pub fn connect(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8) !MySQLDriver {
+        return connectOpts(allocator, host, port, user, passwd, dbname, .preferred);
+    }
+
+    pub fn connectOpts(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, ssl_mode: SslMode) !MySQLDriver {
         const conn = c.mysql_init(null);
         if (conn == null) return error.MySQLInitFailed;
+
+        // Set connect timeout (10s) and read timeout (30s).
+        {
+            const connect_timeout: c_uint = 10;
+            _ = c.mysql_options(conn, c.MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
+            const read_timeout: c_uint = 30;
+            _ = c.mysql_options(conn, c.MYSQL_OPT_READ_TIMEOUT, &read_timeout);
+        }
+
+        // Set SSL mode via mysql_ssl_set / MYSQL_OPT_SSL_ENFORCE
+        // (MYSQL_OPT_SSL_MODE is only available in newer libmariadb).
+        switch (ssl_mode) {
+            .required => {
+                // Enable SSL with no specific cert requirements; fail if
+                // the server doesn't support SSL.
+                _ = c.mysql_ssl_set(conn, null, null, null, null, null);
+                const enforce: c_uint = 1;
+                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce);
+            },
+            .preferred => {
+                // Try SSL, fall back to non-SSL (MySQL/MariaDB default).
+                _ = c.mysql_ssl_set(conn, null, null, null, null, null);
+            },
+            .disabled => {
+                // No SSL at all.
+            },
+            .verify_ca => {
+                _ = c.mysql_ssl_set(conn, null, null, null, null, null);
+                const enforce: c_uint = 1;
+                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce);
+                const verify: c_uint = 1;
+                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify);
+            },
+        }
 
         const ret = c.mysql_real_connect(conn, host.ptr, user.ptr, passwd.ptr, dbname.ptr, @intCast(port), null, 0);
         if (ret == null) {
@@ -607,6 +668,7 @@ pub const MySQLRows = struct {
     const row_vtable = driver.Row.VTable{
         .columnCount = columnCount,
         .columnName = columnName,
+        .getBool = getBool,
         .getInt = getInt,
         .getFloat = getFloat,
         .getText = getText,
@@ -622,6 +684,16 @@ pub const MySQLRows = struct {
     fn columnName(ptr: *anyopaque, index: usize) []const u8 {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
         return std.mem.span(self.fields[@intCast(index)].name);
+    }
+
+    fn getBool(ptr: *anyopaque, index: usize) ?bool {
+        const self: *MySQLRows = @ptrCast(@alignCast(ptr));
+        const binds = self.row_bind orelse return null;
+        if (binds[index].is_null.* != 0) return null;
+        const sb = self.string_buffers.?;
+        const len = self.lengths.?;
+        const text = sb.items[index][0..len.items[index]];
+        return !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
     }
 
     fn getInt(ptr: *anyopaque, index: usize) ?i64 {

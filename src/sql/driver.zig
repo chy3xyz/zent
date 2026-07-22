@@ -36,6 +36,7 @@ pub const Row = struct {
     pub const VTable = struct {
         columnCount: *const fn (ptr: *anyopaque) usize,
         columnName: *const fn (ptr: *anyopaque, index: usize) []const u8,
+        getBool: *const fn (ptr: *anyopaque, index: usize) ?bool,
         getInt: *const fn (ptr: *anyopaque, index: usize) ?i64,
         getFloat: *const fn (ptr: *anyopaque, index: usize) ?f64,
         getText: *const fn (ptr: *anyopaque, index: usize) ?[]const u8,
@@ -49,6 +50,10 @@ pub const Row = struct {
 
     pub fn columnName(self: Row, index: usize) []const u8 {
         return self.vtable.columnName(self.ptr, index);
+    }
+
+    pub fn getBool(self: Row, index: usize) ?bool {
+        return self.vtable.getBool(self.ptr, index);
     }
 
     pub fn getInt(self: Row, index: usize) ?i64 {

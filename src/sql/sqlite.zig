@@ -289,6 +289,7 @@ const SQLiteRows = struct {
     const row_vtable = driver.Row.VTable{
         .columnCount = columnCount,
         .columnName = columnName,
+        .getBool = getBool,
         .getInt = getInt,
         .getFloat = getFloat,
         .getText = getText,
@@ -305,6 +306,12 @@ const SQLiteRows = struct {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
         const name = c.sqlite3_column_name(self.stmt, @intCast(index));
         return std.mem.span(name);
+    }
+
+    fn getBool(ptr: *anyopaque, index: usize) ?bool {
+        const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
+        if (c.sqlite3_column_type(self.stmt, @intCast(index)) == c.SQLITE_NULL) return null;
+        return c.sqlite3_column_int(self.stmt, @intCast(index)) != 0;
     }
 
     fn getInt(ptr: *anyopaque, index: usize) ?i64 {

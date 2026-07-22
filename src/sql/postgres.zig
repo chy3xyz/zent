@@ -26,6 +26,10 @@ pub const PostgresDriver = struct {
     /// Optional prepared-statement cache. When set, exec() reuses named
     /// prepared statements via PQprepare / PQexecPrepared.
     cache: ?PreparedCache(16, *c.PGresult) = null,
+    /// SSL/TLS mode for connections.
+    ssl_mode: SslMode = .prefer,
+
+    pub const SslMode = enum { disable, require, prefer, verify_full };
 
     pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8) !PostgresDriver {
         // libpq expects a null-terminated string
@@ -45,7 +49,7 @@ pub const PostgresDriver = struct {
     pub fn connectDb(allocator: std.mem.Allocator, host: []const u8, port: u16, dbname: []const u8, user: []const u8, password: []const u8) !PostgresDriver {
         const conninfo = try std.fmt.allocPrint(
             allocator,
-            "host={s} port={d} dbname={s} user={s} password={s}",
+            "host={s} port={d} dbname={s} user={s} password={s} sslmode=prefer connect_timeout=10",
             .{ host, port, dbname, user, password },
         );
         defer allocator.free(conninfo);
@@ -150,7 +154,34 @@ pub const PostgresDriver = struct {
         }
     }
 
-    pub fn exec(self: *PostgresDriver, sql: []const u8, args: []const Value) !driver.Result {
+    /// Map a SQLSTATE error code to driver.Error for precise diagnostics.
+    fn sqlstateToError(result: *c.PGresult) driver.Error {
+        const field = c.PQresultErrorField(result, c.PG_DIAG_SQLSTATE) orelse return error.DriverFailed;
+        const sqlstate: []const u8 = std.mem.span(field);
+        if (sqlstate.len < 2) return error.DriverFailed;
+        return switch (sqlstate[0]) {
+            '0' => if (sqlstate[1] == '8') error.ConnectionFailed else error.DriverFailed,
+            '2' => switch (sqlstate[1]) {
+                '2', '3', '8' => error.ExecFailed,
+                '5', 'D' => error.TxFailed,
+                else => error.DriverFailed,
+            },
+            '3' => if (sqlstate[1] == 'D') error.ExecFailed else error.DriverFailed,
+            '4' => switch (sqlstate[1]) {
+                '0' => error.TxFailed,
+                '2' => error.ExecFailed,
+                else => error.DriverFailed,
+            },
+            '5' => switch (sqlstate[1]) {
+                '3' => error.ConnectionFailed,
+                '7', '8' => error.ExecFailed,
+                else => error.DriverFailed,
+            },
+            else => error.DriverFailed,
+        };
+    }
+
+    pub fn exec(self: *PostgresDriver, sql: []const u8, args: []const Value) driver.Error!driver.Result {
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
@@ -205,11 +236,11 @@ pub const PostgresDriver = struct {
                     _ = s;
                     const res = c.PQprepare(ctx.conn, ctx.name, ctx.sql, ctx.nParams, null) orelse {
                         logPgError(ctx.conn, "PQprepare");
-                        return error.PostgresExecFailed;
+                        return error.DriverFailed;
                     };
                     if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
                         logPgError(ctx.conn, "PQprepare");
-                        return error.PostgresExecFailed;
+                        return sqlstateToError(res);
                     }
                     return res;
                 }
@@ -231,14 +262,14 @@ pub const PostgresDriver = struct {
             );
             if (res == null) {
                 logPgError(self.conn, "exec-prepared");
-                return error.PostgresExecFailed;
+                return error.DriverFailed;
             }
             defer c.PQclear(res);
 
             const status = c.PQresultStatus(res);
             if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
                 logPgError(self.conn, "exec-prepared");
-                return error.PostgresExecFailed;
+                return sqlstateToError(res);
             }
 
             const affected = c.PQcmdTuples(res);
@@ -274,14 +305,14 @@ pub const PostgresDriver = struct {
         );
         if (res == null) {
             logPgError(self.conn, "exec");
-            return error.PostgresExecFailed;
+            return error.DriverFailed;
         }
         defer c.PQclear(res);
 
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
             logPgError(self.conn, "exec");
-            return error.PostgresExecFailed;
+            return sqlstateToError(res);
         }
 
         const affected = c.PQcmdTuples(res);
@@ -334,14 +365,14 @@ pub const PostgresDriver = struct {
         );
         if (res == null) {
             logPgError(self.conn, "query");
-            return error.PostgresQueryFailed;
+            return error.DriverFailed;
         }
         errdefer c.PQclear(res);
 
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_TUPLES_OK) {
             logPgError(self.conn, "query");
-            return error.PostgresQueryFailed;
+            return sqlstateToError(res);
         }
 
         const rows_ptr = try self.allocator.create(PostgresRows);
