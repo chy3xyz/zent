@@ -1065,3 +1065,58 @@ test "ConnPool evicts connection exceeding max lifetime on release" {
     try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
     try std.testing.expectEqual(@as(usize, 0), pool.available.items.len);
 }
+
+test "ConnPool supports concurrent borrow and release across threads" {
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                var drv = try SQLiteDriver.open(a, "file::memory:?cache=shared");
+                _ = try drv.exec("CREATE TABLE IF NOT EXISTS t (id INTEGER)", &.{});
+                return drv;
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 4,
+        .health_check_on_borrow = false,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const Ctx = struct {
+        pool: *ConnPool(SQLiteDriver),
+        done: std.atomic.Value(usize),
+
+        fn run(ctx: *@This()) void {
+            for (0..50) |_| {
+                const conn = ctx.pool.borrow() catch unreachable;
+                _ = conn.asDriver().exec("INSERT INTO t (id) VALUES (?)", &.{.{ .int = 1 }}) catch unreachable;
+                ctx.pool.release(conn);
+            }
+            _ = ctx.done.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var ctx = Ctx{
+        .pool = &pool,
+        .done = std.atomic.Value(usize).init(0),
+    };
+
+    const thread_count = 4;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = std.Thread.spawn(.{}, Ctx.run, .{&ctx}) catch unreachable;
+    }
+    for (&threads) |*t| {
+        t.join();
+    }
+
+    try std.testing.expectEqual(@as(usize, thread_count), ctx.done.load(.monotonic));
+
+    var rows = try pool.asDriver().query("SELECT COUNT(*) FROM t", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try std.testing.expectEqual(@as(i64, 50 * thread_count), row.getInt(0).?);
+}
