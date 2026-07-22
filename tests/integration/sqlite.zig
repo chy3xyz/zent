@@ -1469,8 +1469,68 @@ test "SQLite: optimistic lock delete conflict" {
 
     var db = client.locked_user.Delete();
     defer db.deinit();
-    _ = try db.setVersion(999);
+    _ = db.setVersion(999);
     _ = try db.Where(.{client.locked_user.predicates.idEQ(.{ .int = created.id })});
     const result = db.ExecOne();
     try testing.expectError(error.OptimisticLockConflict, result);
+}
+
+test "SQLite: optimistic lock soft delete conflict and success" {
+    const allocator = testing.allocator;
+    const SoftLockedUser = schema("SoftLockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    const graph = comptime buildGraph(&.{SoftLockedUser});
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.soft_locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    // Stale version should fail with optimistic lock conflict.
+    {
+        var db = client.soft_locked_user.Delete();
+        defer db.deinit();
+        _ = db.setVersion(999);
+        _ = try db.Where(.{client.soft_locked_user.predicates.idEQ(.{ .int = created.id })});
+        const result = db.ExecOne();
+        try testing.expectError(error.OptimisticLockConflict, result);
+    }
+
+    // Correct version should soft-delete the row and bump the version.
+    {
+        var db = client.soft_locked_user.Delete();
+        defer db.deinit();
+        _ = db.setVersion(created.version);
+        _ = try db.Where(.{client.soft_locked_user.predicates.idEQ(.{ .int = created.id })});
+        const affected = try db.Exec();
+        try testing.expectEqual(@as(usize, 1), affected);
+    }
+
+    // Verify the row is still present but marked deleted and version incremented.
+    var rows = try drv.query("SELECT deleted_at, version FROM soft_locked_user WHERE id = ?", &.{
+        .{ .int = created.id },
+    });
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expect(row.getInt(0) != null);
+    try testing.expect(row.getInt(0).? > 0);
+    try testing.expectEqual(@as(i64, 1), row.getInt(1).?);
 }

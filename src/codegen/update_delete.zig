@@ -356,11 +356,18 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.version_value) |v| {
+                switch (v) {
+                    .string => |s| self.allocator.free(s),
+                    .bytes => |b| self.allocator.free(b),
+                    else => {},
+                }
+            }
             self.predicates.deinit();
         }
 
         /// Set the expected optimistic-lock version for the row to delete.
-        pub fn setVersion(self: *Self, value: i64) !*Self {
+        pub fn setVersion(self: *Self, value: i64) *Self {
             self.version_value = .{ .int = value };
             return self;
         }
@@ -453,11 +460,33 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
 
+            const version_field: ?FieldInfo = comptime blk: {
+                for (info.fields) |f| {
+                    if (f.is_version) break :blk f;
+                }
+                break :blk null;
+            };
+            const version_locked = version_field != null and self.version_value != null;
+
             // Get current timestamp (seconds since epoch)
             const now: i64 = @intCast(time(null));
             var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .{ .int = now });
+
+            if (version_field) |vf| {
+                if (version_locked) {
+                    const expr = try self.allocator.alloc(u8, vf.name.len + 4);
+                    defer self.allocator.free(expr);
+                    @memcpy(expr[0..vf.name.len], vf.name);
+                    @memcpy(expr[vf.name.len..], " + 1");
+                    _ = try builder.setExpr(vf.name, expr);
+                }
+
+                if (self.version_value) |v| {
+                    _ = try builder.where(sql.EQ(vf.name, v));
+                }
+            }
 
             for (self.predicates.items) |pred| {
                 _ = try builder.where(pred);
@@ -486,6 +515,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 });
             }
 
+            if (version_locked and res.rows_affected == 0) return error.OptimisticLockConflict;
             return res.rows_affected;
         }
 
