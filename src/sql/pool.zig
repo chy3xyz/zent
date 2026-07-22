@@ -99,6 +99,10 @@ pub fn ConnPool(comptime D: type) type {
             max_lifetime_secs: u32 = 3600,
             /// Optional metrics callbacks.
             metrics: Metrics = .{},
+            /// Optional per-query timeout in milliseconds. When set and a builder
+            /// does not provide its own deadline, the pool computes an absolute
+            /// deadline before invoking the underlying driver.
+            query_timeout_ms: ?u32 = null,
         };
 
         /// A pooled connection entry wrapping the driver with bookkeeping metadata.
@@ -418,31 +422,26 @@ pub fn ConnPool(comptime D: type) type {
             wrapper.pool.allocator.destroy(wrapper);
         }
 
-        fn driverExec(ptr: *anyopaque, query_sql: []const u8, args: []const Value) driver.Error!driver.Result {
-            const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrowForDriver();
-            defer pool.release(conn);
-            if (pool.options.slow_query_threshold_ms > 0) {
-                const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
-                const result = conn.asDriver().exec(query_sql, args);
-                const elapsed_ms: u64 = @intCast(start.untilNow(pool.io).raw.toMilliseconds());
-                if (elapsed_ms >= pool.options.slow_query_threshold_ms) {
-                    if (pool.options.metrics.onSlowQuery) |cb| {
-                        cb(pool.options.metrics.context, query_sql, elapsed_ms);
-                    }
+        fn mergeExecutionContext(pool: *Self, ctx: ?*const driver.ExecutionContext) driver.ExecutionContext {
+            var merged: driver.ExecutionContext = .{};
+            if (ctx) |cx| merged.deadline_ns = cx.deadline_ns;
+            if (merged.deadline_ns == null) {
+                if (pool.options.query_timeout_ms) |ms| {
+                    merged.deadline_ns = driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
                 }
-                return result;
             }
-            return conn.asDriver().exec(query_sql, args);
+            return merged;
         }
 
-        fn driverQuery(ptr: *anyopaque, query_sql: []const u8, args: []const Value) driver.Error!driver.Rows {
+        fn driverExec(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const Value) driver.Error!driver.Result {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             const conn = try pool.borrowForDriver();
             defer pool.release(conn);
+            var merged = pool.mergeExecutionContext(ctx);
+            const ctx_ptr: ?*const driver.ExecutionContext = if (merged.deadline_ns != null) &merged else null;
             if (pool.options.slow_query_threshold_ms > 0) {
                 const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
-                const result = conn.asDriver().query(query_sql, args);
+                const result = conn.asDriver().execCtx(ctx_ptr, query_sql, args);
                 const elapsed_ms: u64 = @intCast(start.untilNow(pool.io).raw.toMilliseconds());
                 if (elapsed_ms >= pool.options.slow_query_threshold_ms) {
                     if (pool.options.metrics.onSlowQuery) |cb| {
@@ -451,7 +450,27 @@ pub fn ConnPool(comptime D: type) type {
                 }
                 return result;
             }
-            return conn.asDriver().query(query_sql, args);
+            return conn.asDriver().execCtx(ctx_ptr, query_sql, args);
+        }
+
+        fn driverQuery(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const Value) driver.Error!driver.Rows {
+            const pool: *Self = @ptrCast(@alignCast(ptr));
+            const conn = try pool.borrowForDriver();
+            defer pool.release(conn);
+            var merged = pool.mergeExecutionContext(ctx);
+            const ctx_ptr: ?*const driver.ExecutionContext = if (merged.deadline_ns != null) &merged else null;
+            if (pool.options.slow_query_threshold_ms > 0) {
+                const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
+                const result = conn.asDriver().queryCtx(ctx_ptr, query_sql, args);
+                const elapsed_ms: u64 = @intCast(start.untilNow(pool.io).raw.toMilliseconds());
+                if (elapsed_ms >= pool.options.slow_query_threshold_ms) {
+                    if (pool.options.metrics.onSlowQuery) |cb| {
+                        cb(pool.options.metrics.context, query_sql, elapsed_ms);
+                    }
+                }
+                return result;
+            }
+            return conn.asDriver().queryCtx(ctx_ptr, query_sql, args);
         }
 
         fn driverBeginTx(ptr: *anyopaque) driver.Error!driver.Tx {
@@ -726,10 +745,10 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
             closes += 1;
         }
 
-        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
             unreachable;
         }
-        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
             unreachable;
         }
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
@@ -817,10 +836,10 @@ test "ConnPool closes connection once when available.append fails" {
             closes += 1;
         }
 
-        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
             unreachable;
         }
-        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
             unreachable;
         }
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
@@ -931,10 +950,10 @@ test "ConnPool evicts connection on failed health check during borrow" {
             closes += 1;
         }
 
-        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
             unreachable;
         }
-        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
             unreachable;
         }
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
@@ -1011,10 +1030,10 @@ test "ConnPool evicts connection exceeding max lifetime on release" {
             closes += 1;
         }
 
-        fn mockExec(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Result {
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
             unreachable;
         }
-        fn mockQuery(_: *anyopaque, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
             unreachable;
         }
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
