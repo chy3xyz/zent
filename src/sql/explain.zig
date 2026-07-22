@@ -13,11 +13,17 @@ pub const ExplainResult = struct {
 };
 
 pub fn explainSql(allocator: std.mem.Allocator, dialect: Dialect, raw_sql: []const u8, format: Format) !ExplainResult {
-    const prefix: []const u8 = switch (dialect.name[0]) {
-        's' => "EXPLAIN QUERY PLAN ",
-        'p' => if (format == .json) "EXPLAIN (FORMAT JSON) " else "EXPLAIN ",
-        'm' => "EXPLAIN ",
-        else => return error.UnsupportedDialect,
+    const prefix: []const u8 = blk: {
+        if (std.mem.eql(u8, dialect.name, "sqlite3")) {
+            break :blk "EXPLAIN QUERY PLAN ";
+        }
+        if (std.mem.eql(u8, dialect.name, "postgres")) {
+            break :blk if (format == .json) "EXPLAIN (FORMAT JSON) " else "EXPLAIN ";
+        }
+        if (std.mem.eql(u8, dialect.name, "mysql")) {
+            break :blk if (format == .json) "EXPLAIN FORMAT=JSON " else "EXPLAIN ";
+        }
+        return error.UnsupportedDialect;
     };
     const sql = try allocator.alloc(u8, prefix.len + raw_sql.len);
     @memcpy(sql[0..prefix.len], prefix);
@@ -49,7 +55,12 @@ test "PostgreSQL EXPLAIN SQL prefix" {
 test "MySQL EXPLAIN SQL prefix" {
     const allocator = std.testing.allocator;
     const raw = "SELECT 1";
-    var plan = try explainSql(allocator, Dialect.mysql, raw, .text);
-    defer plan.deinit(allocator);
-    try std.testing.expectEqualStrings("EXPLAIN SELECT 1", plan.sql);
+
+    var text_plan = try explainSql(allocator, Dialect.mysql, raw, .text);
+    defer text_plan.deinit(allocator);
+    try std.testing.expectEqualStrings("EXPLAIN SELECT 1", text_plan.sql);
+
+    var json_plan = try explainSql(allocator, Dialect.mysql, raw, .json);
+    defer json_plan.deinit(allocator);
+    try std.testing.expectEqualStrings("EXPLAIN FORMAT=JSON SELECT 1", json_plan.sql);
 }

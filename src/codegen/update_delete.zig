@@ -227,11 +227,14 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
+            var after_hooks_fired = false;
             errdefer {
-                rthook.globalAfter(&hook_ctx);
-                for (self.hooks) |h| {
-                    if (h.op == .update) {
-                        if (h.after) |f| f(&hook_ctx) catch {};
+                if (!after_hooks_fired) {
+                    rthook.globalAfter(&hook_ctx);
+                    for (self.hooks) |h| {
+                        if (h.op == .update) {
+                            if (h.after) |f| f(&hook_ctx) catch {};
+                        }
                     }
                 }
             }
@@ -300,6 +303,13 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             const res = try self.driver.exec(q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
+            // Optimistic-lock conflict: no row was updated, so after-hooks must
+            // not run. Mark them fired so the errdefer above is skipped.
+            if (version_locked and res.rows_affected == 0) {
+                after_hooks_fired = true;
+                return error.OptimisticLockConflict;
+            }
+
             // After hooks on success.
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
@@ -307,6 +317,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                     if (h.after) |f| f(&hook_ctx) catch {};
                 }
             }
+            after_hooks_fired = true;
 
             if (self.logger.onExec) |log| {
                 log(.{
@@ -318,7 +329,6 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 });
             }
 
-            if (version_locked and res.rows_affected == 0) return error.OptimisticLockConflict;
             return res.rows_affected;
         }
 
@@ -367,7 +377,18 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         /// Set the expected optimistic-lock version for the row to delete.
+        /// Compile error if the entity has no `is_version` field.
         pub fn setVersion(self: *Self, value: i64) *Self {
+            comptime {
+                var has_version = false;
+                for (info.fields) |f| {
+                    if (f.is_version) {
+                        has_version = true;
+                        break;
+                    }
+                }
+                if (!has_version) @compileError("Entity has no version field for optimistic locking");
+            }
             self.version_value = .{ .int = value };
             return self;
         }
@@ -451,11 +472,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
+            var after_hooks_fired = false;
             errdefer {
-                rthook.globalAfter(&hook_ctx);
-                for (self.hooks) |h| {
-                    if (h.op == .delete) {
-                        if (h.after) |f| f(&hook_ctx) catch {};
+                if (!after_hooks_fired) {
+                    rthook.globalAfter(&hook_ctx);
+                    for (self.hooks) |h| {
+                        if (h.op == .delete) {
+                            if (h.after) |f| f(&hook_ctx) catch {};
+                        }
                     }
                 }
             }
@@ -497,6 +521,11 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const res = try self.driver.exec(q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
+            if (version_locked and res.rows_affected == 0) {
+                after_hooks_fired = true;
+                return error.OptimisticLockConflict;
+            }
+
             // After hooks on success.
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
@@ -504,6 +533,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     if (h.after) |f| f(&hook_ctx) catch {};
                 }
             }
+            after_hooks_fired = true;
 
             if (self.logger.onExec) |log| {
                 log(.{
@@ -515,7 +545,6 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 });
             }
 
-            if (version_locked and res.rows_affected == 0) return error.OptimisticLockConflict;
             return res.rows_affected;
         }
 
@@ -545,11 +574,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
+            var after_hooks_fired = false;
             errdefer {
-                rthook.globalAfter(&hook_ctx);
-                for (self.hooks) |h| {
-                    if (h.op == .delete) {
-                        if (h.after) |f| f(&hook_ctx) catch {};
+                if (!after_hooks_fired) {
+                    rthook.globalAfter(&hook_ctx);
+                    for (self.hooks) |h| {
+                        if (h.op == .delete) {
+                            if (h.after) |f| f(&hook_ctx) catch {};
+                        }
                     }
                 }
             }
@@ -580,6 +612,11 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const res = try self.driver.exec(q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
+            if (version_locked and res.rows_affected == 0) {
+                after_hooks_fired = true;
+                return error.OptimisticLockConflict;
+            }
+
             // After hooks on success.
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
@@ -587,6 +624,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     if (h.after) |f| f(&hook_ctx) catch {};
                 }
             }
+            after_hooks_fired = true;
 
             if (self.logger.onExec) |log| {
                 log(.{
@@ -598,7 +636,6 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 });
             }
 
-            if (version_locked and res.rows_affected == 0) return error.OptimisticLockConflict;
             return res.rows_affected;
         }
     };
