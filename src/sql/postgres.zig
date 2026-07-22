@@ -99,9 +99,13 @@ pub const PostgresDriver = struct {
     }
 
     fn setStatementTimeout(self: *PostgresDriver, ctx: ?*const driver.ExecutionContext) driver.Error!void {
-        const ms = ctx.?.remainingMs();
-        if (ms == 0) return error.QueryTimeout;
-        const sql = try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{ms});
+        const ms_opt = if (ctx) |exec_ctx| exec_ctx.remainingMs() else null;
+        const sql = if (ms_opt) |ms| blk: {
+            if (ms == 0) return error.QueryTimeout;
+            break :blk try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{ms});
+        } else blk: {
+            break :blk try self.allocator.dupe(u8, "SET statement_timeout = DEFAULT");
+        };
         defer self.allocator.free(sql);
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
