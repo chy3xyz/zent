@@ -41,6 +41,7 @@ pub const Field = struct {
     nillable: bool = false,
     unique: bool = false,
     immutable: bool = false,
+    is_version: bool = false,
     default: DefaultValue = .none,
     validators: []const Validator = &.{},
     enum_values: []const []const u8 = &.{},
@@ -167,6 +168,13 @@ pub fn Enum(name: []const u8, comptime values: []const []const u8) Field {
 
 pub fn UUID(name: []const u8) Field {
     return .{ .name = name, .field_type = .uuid };
+}
+
+pub fn Version(name: []const u8) Field {
+    var f = Int(name);
+    f.is_version = true;
+    f.default = .{ .int = 0 };
+    return f;
 }
 
 // ------------------------------------------------------------------
