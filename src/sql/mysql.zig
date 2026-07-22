@@ -353,6 +353,9 @@ pub const MySQLDriver = struct {
             .allocator = self.allocator,
             .done = false,
             .last_error = null,
+            .cache = if (self.cache) |*cch| cch else null,
+            .cache_sql_hash = std.hash.Wyhash.hash(0, query_sql),
+            .cache_sql_len = query_sql.len,
         };
 
         return driver.Rows{
@@ -484,6 +487,9 @@ pub const MySQLRows = struct {
     allocator: std.mem.Allocator,
     done: bool,
     last_error: ?anyerror = null,
+    cache: ?*cache.PreparedCache(16, *c.MYSQL_STMT) = null,
+    cache_sql_hash: u64 = 0,
+    cache_sql_len: usize = 0,
 
     // Per-row buffer
     row_bind: ?[]c.MYSQL_BIND = null,
@@ -633,7 +639,17 @@ pub const MySQLRows = struct {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
         c.mysql_free_result(self.metadata);
         _ = c.mysql_stmt_free_result(self.stmt);
-        _ = c.mysql_stmt_close(self.stmt);
+
+        if (self.cache) |cch| {
+            _ = c.mysql_stmt_reset(self.stmt);
+            cch.returnStmtByHash(self.cache_sql_hash, self.cache_sql_len, self.stmt, {}, struct {
+                fn f(_: anytype, s: *c.MYSQL_STMT) void {
+                    _ = c.mysql_stmt_close(s);
+                }
+            }.f);
+        } else {
+            _ = c.mysql_stmt_close(self.stmt);
+        }
 
         if (self.row_bind) |binds| {
             self.allocator.free(binds);

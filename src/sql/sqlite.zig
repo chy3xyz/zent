@@ -122,6 +122,9 @@ pub const SQLiteDriver = struct {
             .stmt = stmt,
             .allocator = self.allocator,
             .done = false,
+            .cache = if (self.cache) |*cch| cch else null,
+            .cache_sql_hash = std.hash.Wyhash.hash(0, query_sql),
+            .cache_sql_len = query_sql.len,
         };
 
         return driver.Rows{
@@ -254,6 +257,9 @@ const SQLiteRows = struct {
     stmt: *c.sqlite3_stmt,
     allocator: std.mem.Allocator,
     done: bool,
+    cache: ?*cache.PreparedCache(16, *c.sqlite3_stmt) = null,
+    cache_sql_hash: u64 = 0,
+    cache_sql_len: usize = 0,
 
     const vtable = driver.Rows.VTable{
         .next = next,
@@ -281,7 +287,17 @@ const SQLiteRows = struct {
 
     fn deinit(ptr: *anyopaque) void {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
-        _ = c.sqlite3_finalize(self.stmt);
+        if (self.cache) |cch| {
+            _ = c.sqlite3_reset(self.stmt);
+            _ = c.sqlite3_clear_bindings(self.stmt);
+            cch.returnStmtByHash(self.cache_sql_hash, self.cache_sql_len, self.stmt, {}, struct {
+                fn f(_: anytype, s: *c.sqlite3_stmt) void {
+                    _ = c.sqlite3_finalize(s);
+                }
+            }.f);
+        } else {
+            _ = c.sqlite3_finalize(self.stmt);
+        }
         const alloc = self.allocator;
         alloc.destroy(self);
     }

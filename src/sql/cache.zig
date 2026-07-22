@@ -114,6 +114,20 @@ pub fn PreparedCache(comptime capacity: usize, comptime Handle: type) type {
             }
         }
 
+        /// Return a statement to the cache by pre-computed hash, avoiding re-hashing.
+        pub fn returnStmtByHash(self: *Self, sql_hash: u64, sql_len: usize, stmt: Handle, deinitCtx: anytype, deinitFn: anytype) void {
+            if (self.len < capacity) {
+                self.entries[self.len] = .{ .sql_hash = sql_hash, .sql_len = sql_len, .stmt = stmt };
+                self.order[self.len] = self.len;
+                self.len += 1;
+            } else {
+                // Evict LRU and replace.
+                const evict_idx = self.order[self.len - 1];
+                deinitFn(deinitCtx, self.entries[evict_idx].stmt);
+                self.entries[evict_idx] = .{ .sql_hash = sql_hash, .sql_len = sql_len, .stmt = stmt };
+            }
+        }
+
         /// Remove the entry at `entry_idx` from the cache.
         fn removeEntry(self: *Self, entry_idx: usize) void {
             // Compact the entries slice.
