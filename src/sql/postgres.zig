@@ -16,6 +16,7 @@ fn toDriverError(err: anyerror) driver.Error {
         error.PostgresExecFailed => error.ExecFailed,
         error.PostgresQueryFailed => error.QueryFailed,
         error.PostgresPingFailed => error.PingFailed,
+        error.QueryTimeout => error.QueryTimeout,
         else => error.DriverFailed,
     };
 }
@@ -95,6 +96,28 @@ pub const PostgresDriver = struct {
             }
         }
         logPgError(conn, context);
+    }
+
+    fn setStatementTimeout(self: *PostgresDriver, ctx: ?*const driver.ExecutionContext) driver.Error!void {
+        const ms = if (ctx) |cx| cx.remainingMs() else null;
+        const sql = if (ms) |m|
+            try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{m})
+        else
+            "SET statement_timeout = DEFAULT";
+        defer if (ms != null) self.allocator.free(sql);
+        const sql_z = if (ms != null) try self.allocator.dupeSentinel(u8, sql, 0) else sql;
+        defer if (ms != null) self.allocator.free(sql_z);
+
+        const res = c.PQexec(self.conn, sql_z.ptr);
+        if (res == null) return error.ConnectionFailed;
+        defer c.PQclear(res);
+        const status = c.PQresultStatus(res);
+        if (status != c.PGRES_COMMAND_OK) return sqlstateToError(res.?);
+    }
+
+    fn resetStatementTimeout(self: *PostgresDriver) void {
+        const res = c.PQexec(self.conn, "SET statement_timeout = DEFAULT");
+        if (res) |r| c.PQclear(r);
     }
 
     /// Free all parameters that were allocated (int, float, string, bytes).
@@ -183,6 +206,7 @@ pub const PostgresDriver = struct {
         const field = c.PQresultErrorField(result, c.PG_DIAG_SQLSTATE) orelse return error.DriverFailed;
         const sqlstate: []const u8 = std.mem.span(field);
         if (sqlstate.len < 2) return error.DriverFailed;
+        if (sqlstate.len >= 5 and std.mem.eql(u8, sqlstate[0..5], "57014")) return error.QueryTimeout;
         return switch (sqlstate[0]) {
             '0' => if (sqlstate[1] == '8') error.ConnectionFailed else error.DriverFailed,
             '2' => switch (sqlstate[1]) {
@@ -464,15 +488,21 @@ pub const PostgresDriver = struct {
     const vtable = driver.Driver.VTable{
         .exec = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
-                _ = ctx;
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
+                if (ctx != null) {
+                    try self_ptr.setStatementTimeout(ctx);
+                    defer self_ptr.resetStatementTimeout();
+                }
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
-                _ = ctx;
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
+                if (ctx != null) {
+                    try self_ptr.setStatementTimeout(ctx);
+                    defer self_ptr.resetStatementTimeout();
+                }
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,
