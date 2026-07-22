@@ -55,6 +55,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         logger: Logger = .{},
+        timeout_ms: ?u32 = null,
+        execution_context: sql_driver.ExecutionContext = .{},
 
         const EdgeValue = struct {
             edge: []const u8,
@@ -78,6 +80,19 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             self.json_strings.deinit();
             self.values.deinit();
             self.edge_values.deinit();
+        }
+
+        /// Set a per-query timeout in milliseconds. The deadline is computed
+        /// immediately before execution and passed to the driver.
+        pub fn withTimeout(self: *Self, ms: u32) *Self {
+            self.timeout_ms = ms;
+            return self;
+        }
+
+        fn ensureDeadline(self: *Self) void {
+            if (self.timeout_ms) |ms| {
+                self.execution_context.deadline_ns = sql_driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
+            }
         }
 
         // Set field value helper (dynamic, no compile-time checking).
@@ -245,8 +260,9 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 pos += upsert_suffix.len;
                 @memcpy(full_sql[pos..][0..ret_suffix.len], ret_suffix);
 
+                self.ensureDeadline();
                 const start = nowUs();
-                var rows = try self.driver.query(full_sql, q.args);
+                var rows = try self.driver.queryCtx(&self.execution_context, full_sql, q.args);
                 defer rows.deinit();
                 const row = rows.next() orelse return error.NotFound;
                 entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
@@ -286,8 +302,9 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 @memcpy(full_sql[0..q.sql.len], q.sql);
                 @memcpy(full_sql[q.sql.len..], upsert_suffix);
 
+                self.ensureDeadline();
                 const start = nowUs();
-                const res = try self.driver.exec(full_sql, q.args);
+                const res = try self.driver.execCtx(&self.execution_context, full_sql, q.args);
                 const duration_us: u64 = nowUs() - start;
                 entity.id = @intCast(res.last_insert_id orelse 0);
 
@@ -370,7 +387,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                             });
                             var iq = ib.takeQuery() catch |err| return mapBuildError(err);
                             defer iq.deinit();
-                            _ = try self.driver.exec(iq.sql, iq.args);
+                            self.ensureDeadline();
+                            _ = try self.driver.execCtx(&self.execution_context, iq.sql, iq.args);
                         }
                     }
                 }
@@ -559,6 +577,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        timeout_ms: ?u32 = null,
+        execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) !Self {
             var self = Self{
@@ -578,6 +598,19 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             self.json_strings.deinit();
             for (self.rows.items) |*row| row.deinit();
             self.rows.deinit();
+        }
+
+        /// Set a per-query timeout in milliseconds. The deadline is computed
+        /// immediately before execution and passed to the driver.
+        pub fn withTimeout(self: *Self, ms: u32) *Self {
+            self.timeout_ms = ms;
+            return self;
+        }
+
+        fn ensureDeadline(self: *Self) void {
+            if (self.timeout_ms) |ms| {
+                self.execution_context.deadline_ns = sql_driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
+            }
         }
 
         /// Start a new row in the bulk insert batch.
@@ -724,7 +757,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 @memcpy(full_sql[0..query.sql.len], query.sql);
                 @memcpy(full_sql[query.sql.len..], ret_suffix);
 
-                var rows = try self.driver.query(full_sql, query.args);
+                self.ensureDeadline();
+                var rows = try self.driver.queryCtx(&self.execution_context, full_sql, query.args);
                 defer rows.deinit();
                 while (rows.next()) |row| {
                     const id = row.getInt(0) orelse return error.TypeMismatch;
@@ -733,7 +767,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             } else {
                 // MySQL: no RETURNING. Execute then compute IDs from
                 // last_insert_id and rows_affected.
-                const res = try self.driver.exec(query.sql, query.args);
+                self.ensureDeadline();
+                const res = try self.driver.execCtx(&self.execution_context, query.sql, query.args);
                 const base_id = res.last_insert_id orelse 0;
                 for (0..self.rows.items.len) |i| {
                     try ids.append(base_id + @as(i64, @intCast(i)));

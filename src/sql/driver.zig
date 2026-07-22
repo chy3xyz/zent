@@ -109,7 +109,7 @@ pub const Rows = struct {
     }
 };
 
-fn monotonicNs() i64 {
+pub fn monotonicNs() i64 {
     var ts: std.c.timespec = undefined;
     const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
     if (rc != 0) unreachable;

@@ -100,6 +100,8 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         logger: Logger = .{},
+        timeout_ms: ?u32 = null,
+        execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
@@ -118,6 +120,19 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             self.json_strings.deinit();
             self.values.deinit();
             self.predicates.deinit();
+        }
+
+        /// Set a per-query timeout in milliseconds. The deadline is computed
+        /// immediately before execution and passed to the driver.
+        pub fn withTimeout(self: *Self, ms: u32) *Self {
+            self.timeout_ms = ms;
+            return self;
+        }
+
+        fn ensureDeadline(self: *Self) void {
+            if (self.timeout_ms) |ms| {
+                self.execution_context.deadline_ns = sql_driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
+            }
         }
 
         /// Set a field value dynamically (no compile-time checking).
@@ -299,8 +314,9 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             }
 
             const q = builder.query() catch |err| return mapBuildError(err);
+            self.ensureDeadline();
             const start = nowUs();
-            const res = try self.driver.exec(q.sql, q.args);
+            const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
             // Optimistic-lock conflict: no row was updated, so after-hooks must
@@ -353,6 +369,8 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         logger: Logger = .{},
+        timeout_ms: ?u32 = null,
+        execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
@@ -374,6 +392,19 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
             self.predicates.deinit();
+        }
+
+        /// Set a per-query timeout in milliseconds. The deadline is computed
+        /// immediately before execution and passed to the driver.
+        pub fn withTimeout(self: *Self, ms: u32) *Self {
+            self.timeout_ms = ms;
+            return self;
+        }
+
+        fn ensureDeadline(self: *Self) void {
+            if (self.timeout_ms) |ms| {
+                self.execution_context.deadline_ns = sql_driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
+            }
         }
 
         /// Set the expected optimistic-lock version for the row to delete.
@@ -517,8 +548,9 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             }
 
             const q = builder.query() catch |err| return mapBuildError(err);
+            self.ensureDeadline();
             const start = nowUs();
-            const res = try self.driver.exec(q.sql, q.args);
+            const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
             if (version_locked and res.rows_affected == 0) {
@@ -608,8 +640,9 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             }
 
             const q = builder.query() catch |err| return mapBuildError(err);
+            self.ensureDeadline();
             const start = nowUs();
-            const res = try self.driver.exec(q.sql, q.args);
+            const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
             if (version_locked and res.rows_affected == 0) {
@@ -653,6 +686,8 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        timeout_ms: ?u32 = null,
+        execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
@@ -669,6 +704,19 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             for (self.json_strings.items) |s| self.allocator.free(s);
             self.json_strings.deinit();
             self.b.deinit();
+        }
+
+        /// Set a per-query timeout in milliseconds. The deadline is computed
+        /// immediately before execution and passed to the driver.
+        pub fn withTimeout(self: *Self, ms: u32) *Self {
+            self.timeout_ms = ms;
+            return self;
+        }
+
+        fn ensureDeadline(self: *Self) void {
+            if (self.timeout_ms) |ms| {
+                self.execution_context.deadline_ns = sql_driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
+            }
         }
 
         /// Start a new row with the given id.
@@ -777,7 +825,8 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             }
 
             const q = self.b.query() catch |err| return mapBuildError(err);
-            const res = try self.driver.exec(q.sql, q.args);
+            self.ensureDeadline();
+            const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
 
             // After hooks on success.
             rthook.globalAfter(&hook_ctx);
@@ -802,6 +851,8 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         b: sql.BulkDeleteBuilder,
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        timeout_ms: ?u32 = null,
+        execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) !Self {
             return .{
@@ -815,6 +866,19 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
 
         pub fn deinit(self: *Self) void {
             self.b.deinit();
+        }
+
+        /// Set a per-query timeout in milliseconds. The deadline is computed
+        /// immediately before execution and passed to the driver.
+        pub fn withTimeout(self: *Self, ms: u32) *Self {
+            self.timeout_ms = ms;
+            return self;
+        }
+
+        fn ensureDeadline(self: *Self) void {
+            if (self.timeout_ms) |ms| {
+                self.execution_context.deadline_ns = sql_driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
+            }
         }
 
         /// Start a new predicate group for the next row to delete.
@@ -896,7 +960,8 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             if (self.b.groups.items.len == 0) return 0;
 
             const q = self.b.query() catch |err| return mapBuildError(err);
-            const res = try self.driver.exec(q.sql, q.args);
+            self.ensureDeadline();
+            const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
 
             // After hooks on success.
             rthook.globalAfter(&hook_ctx);

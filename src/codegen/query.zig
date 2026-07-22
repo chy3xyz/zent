@@ -55,6 +55,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         for_share: bool,
         privacy_ctx: ?privacy.PrivacyContext = null,
         logger: Logger = .{},
+        timeout_ms: ?u32 = null,
+        execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, privacy_ctx: ?privacy.PrivacyContext) Self {
             return .{
@@ -80,6 +82,19 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             self.order_terms.deinit();
             self.with_edges.deinit(self.allocator);
             self.group_cols.deinit(self.allocator);
+        }
+
+        /// Set a per-query timeout in milliseconds. The deadline is computed
+        /// immediately before the query is executed and passed to the driver.
+        pub fn withTimeout(self: *Self, ms: u32) *Self {
+            self.timeout_ms = ms;
+            return self;
+        }
+
+        fn ensureDeadline(self: *Self) void {
+            if (self.timeout_ms) |ms| {
+                self.execution_context.deadline_ns = sql_driver.monotonicNs() + @as(i64, ms) * std.time.ns_per_ms;
+            }
         }
 
         pub fn Where(self: *Self, predicates: anytype) !*Self {
@@ -328,8 +343,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
+            self.ensureDeadline();
             const start = nowUs();
-            var rows = try self.driver.query(q.sql, q.args);
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
 
             var result = std.array_list.Managed(Entity).init(self.allocator);
@@ -373,8 +389,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
+            self.ensureDeadline();
             const start = nowUs();
-            const rows = try self.driver.query(q.sql, q.args);
+            const rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
 
             const duration_us: u64 = nowUs() - start;
             if (self.logger.onQuery) |log| {
@@ -399,8 +416,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             self.limit_val = 1;
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
+            self.ensureDeadline();
             const start = nowUs();
-            var rows = try self.driver.query(q.sql, q.args);
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
 
             const row = rows.next() orelse {
@@ -433,8 +451,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
+            self.ensureDeadline();
             const start = nowUs();
-            var rows = try self.driver.query(q.sql, q.args);
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
 
             const row = rows.next() orelse {
@@ -469,7 +488,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildQuery(1); // only id column
             defer q.deinit();
-            var rows = try self.driver.query(q.sql, q.args);
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
 
             var result = std.array_list.Managed(i64).init(self.allocator);
@@ -488,7 +508,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildCountQuery();
             defer q.deinit();
-            var rows = try self.driver.query(q.sql, q.args);
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
 
             const row = rows.next() orelse {
@@ -504,7 +525,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             self.limit_val = 1;
             var q = try self.buildQuery(1);
             defer q.deinit();
-            var rows = try self.driver.query(q.sql, q.args);
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
             const maybe_row = rows.next();
             if (maybe_row == null) {
@@ -519,7 +541,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
             defer q.deinit();
-            var rows = try self.driver.query(q.sql, q.args);
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
             const row = rows.next() orelse {
                 if (rows.nextError()) |e| return e;
@@ -533,7 +556,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
             defer q.deinit();
-            var rows = try self.driver.query(q.sql, q.args);
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
             const row = rows.next() orelse {
                 if (rows.nextError()) |e| return e;
@@ -547,7 +571,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
             defer q.deinit();
-            var rows = try self.driver.query(q.sql, q.args);
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
             const row = rows.next() orelse {
                 if (rows.nextError()) |e| return e;
@@ -570,7 +595,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
             defer q.deinit();
-            var rows = try self.driver.query(q.sql, q.args);
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
             const row = rows.next() orelse {
                 if (rows.nextError()) |e| return e;
@@ -607,8 +633,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     defer b.deinit();
                     graph_neighbors.appendSetNeighbors(&b, step, parent_id_values) catch |err| return mapBuildError(err);
                     const qr = b.query();
+                    self.ensureDeadline();
 
-                    var rows = try self.driver.query(qr.sql, qr.args);
+                    var rows = try self.driver.queryCtx(&self.execution_context, qr.sql, qr.args);
                     defer rows.deinit();
 
                     var map = std.AutoHashMap(i64, std.ArrayListUnmanaged(TargetEntity)).init(self.allocator);
@@ -986,10 +1013,10 @@ test "Query builder Explain prefixes SQL" {
             return .{ .ptr = self, .vtable = &vtable };
         }
 
-        fn mockExec(_: *anyopaque, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        fn mockExec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
             unreachable;
         }
-        fn mockQuery(_: *anyopaque, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        fn mockQuery(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
             unreachable;
         }
         fn mockBeginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
