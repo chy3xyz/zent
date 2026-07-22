@@ -245,11 +245,50 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 }
             }
 
+            const version_field: ?FieldInfo = comptime blk: {
+                for (info.fields) |f| {
+                    if (f.is_version) break :blk f;
+                }
+                break :blk null;
+            };
+
+            // If the entity has a version field and the caller supplied its
+            // current value, use it for optimistic locking.
+            var version_old_value: ?sql.Value = null;
+            if (version_field) |vf| {
+                for (self.values.items) |fv| {
+                    if (std.mem.eql(u8, fv.name, vf.name)) {
+                        version_old_value = fv.value;
+                        break;
+                    }
+                }
+            }
+            const version_locked = version_field != null and version_old_value != null;
+
             var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
 
-            for (self.values.items) |fv| {
-                _ = try builder.set(fv.name, fv.value);
+            if (version_field) |vf| {
+                if (version_locked) {
+                    const expr = try self.allocator.alloc(u8, vf.name.len + 4);
+                    defer self.allocator.free(expr);
+                    @memcpy(expr[0..vf.name.len], vf.name);
+                    @memcpy(expr[vf.name.len..], " + 1");
+                    _ = try builder.setExpr(vf.name, expr);
+                }
+
+                for (self.values.items) |fv| {
+                    if (version_locked and std.mem.eql(u8, fv.name, vf.name)) continue;
+                    _ = try builder.set(fv.name, fv.value);
+                }
+
+                if (version_old_value) |v| {
+                    _ = try builder.where(sql.EQ(vf.name, v));
+                }
+            } else {
+                for (self.values.items) |fv| {
+                    _ = try builder.set(fv.name, fv.value);
+                }
             }
 
             for (self.predicates.items) |pred| {
@@ -279,6 +318,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 });
             }
 
+            if (version_locked and res.rows_affected == 0) return error.OptimisticLockConflict;
             return res.rows_affected;
         }
 
@@ -299,6 +339,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
         predicates: std.array_list.Managed(sql.Predicate),
+        version_value: ?sql.Value,
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         logger: Logger = .{},
@@ -310,11 +351,18 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 .hooks = hooks,
                 .privacy_ctx = privacy_ctx,
                 .predicates = std.array_list.Managed(sql.Predicate).init(allocator),
+                .version_value = null,
             };
         }
 
         pub fn deinit(self: *Self) void {
             self.predicates.deinit();
+        }
+
+        /// Set the expected optimistic-lock version for the row to delete.
+        pub fn setVersion(self: *Self, value: i64) !*Self {
+            self.version_value = .{ .int = value };
+            return self;
         }
 
         /// Add predicates for WHERE clause.
@@ -476,8 +524,22 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
 
+            const version_field: ?FieldInfo = comptime blk: {
+                for (info.fields) |f| {
+                    if (f.is_version) break :blk f;
+                }
+                break :blk null;
+            };
+            const version_locked = version_field != null and self.version_value != null;
+
             var builder = sql.Delete(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
+
+            if (version_field) |vf| {
+                if (self.version_value) |v| {
+                    _ = try builder.where(sql.EQ(vf.name, v));
+                }
+            }
 
             for (self.predicates.items) |pred| {
                 _ = try builder.where(pred);
@@ -506,6 +568,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 });
             }
 
+            if (version_locked and res.rows_affected == 0) return error.OptimisticLockConflict;
             return res.rows_affected;
         }
     };

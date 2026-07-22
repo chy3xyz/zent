@@ -1005,9 +1005,14 @@ pub fn MultiInsert(allocator: std.mem.Allocator, dialect: Dialect, table: []cons
 // UPDATE
 // ------------------------------------------------------------------
 
+pub const UpdateSetValue = union(enum) {
+    value: Value,
+    expr: []const u8,
+};
+
 pub const UpdateSet = struct {
     column: []const u8,
-    value: Value,
+    set_value: UpdateSetValue,
 };
 
 pub const UpdateBuilder = struct {
@@ -1026,13 +1031,26 @@ pub const UpdateBuilder = struct {
     }
 
     pub fn deinit(u: *UpdateBuilder) void {
+        for (u.sets.items) |s| {
+            switch (s.set_value) {
+                .expr => |e| u.b.allocator.free(e),
+                .value => {},
+            }
+        }
         u.b.deinit();
         u.sets.deinit();
         u.wheres.deinit();
     }
 
     pub fn set(u: *UpdateBuilder, column: []const u8, value: Value) !*UpdateBuilder {
-        try u.sets.append(.{ .column = column, .value = value });
+        try u.sets.append(.{ .column = column, .set_value = .{ .value = value } });
+        return u;
+    }
+
+    pub fn setExpr(u: *UpdateBuilder, column: []const u8, expr: []const u8) !*UpdateBuilder {
+        const copy = try u.b.allocator.dupe(u8, expr);
+        errdefer u.b.allocator.free(copy);
+        try u.sets.append(.{ .column = column, .set_value = .{ .expr = copy } });
         return u;
     }
 
@@ -1049,7 +1067,10 @@ pub const UpdateBuilder = struct {
             if (i > 0) try u.b.writeString(", ");
             try u.b.ident(s.column);
             try u.b.writeString(" = ");
-            try u.b.arg(s.value);
+            switch (s.set_value) {
+                .value => |v| try u.b.arg(v),
+                .expr => |e| try u.b.writeString(e),
+            }
         }
         if (u.wheres.items.len > 0) {
             try u.b.writeString(" WHERE ");
@@ -1069,7 +1090,10 @@ pub const UpdateBuilder = struct {
             if (i > 0) try u.b.writeString(", ");
             try u.b.ident(s.column);
             try u.b.writeString(" = ");
-            try u.b.arg(s.value);
+            switch (s.set_value) {
+                .value => |v| try u.b.arg(v),
+                .expr => |e| try u.b.writeString(e),
+            }
         }
         if (u.wheres.items.len > 0) {
             try u.b.writeString(" WHERE ");
@@ -1520,6 +1544,18 @@ test "UPDATE" {
     _ = try u.where(EQ("id", .{ .int = 1 }));
     const q = try u.query();
     try std.testing.expectEqualStrings("UPDATE \"users\" SET \"name\" = ? WHERE \"id\" = ?", q.sql);
+    try std.testing.expectEqual(@as(usize, 2), q.args.len);
+}
+
+test "UPDATE with expression" {
+    const allocator = std.testing.allocator;
+    var u = Update(allocator, Dialect.sqlite, "users");
+    defer u.deinit();
+    _ = try u.set("name", .{ .string = "bob" });
+    _ = try u.setExpr("version", "version + 1");
+    _ = try u.where(EQ("id", .{ .int = 1 }));
+    const q = try u.query();
+    try std.testing.expectEqualStrings("UPDATE \"users\" SET \"name\" = ?, \"version\" = version + 1 WHERE \"id\" = ?", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
 }
 

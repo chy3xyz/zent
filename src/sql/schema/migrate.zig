@@ -558,6 +558,7 @@ pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const Ty
                 error.ProtocolError => return error.ProtocolError,
                 error.DriverFailed => return error.DriverFailed,
                 error.QueryTimeout => return error.QueryTimeout,
+                error.OptimisticLockConflict => return error.OptimisticLockConflict,
             };
         }
         defer if (existing_mysql_indexes) |*indexes| {

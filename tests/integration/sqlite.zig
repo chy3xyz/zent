@@ -1350,3 +1350,44 @@ test "SQLite: database-level cascade delete" {
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
 }
+
+test "SQLite: optimistic lock conflict" {
+    const allocator = testing.allocator;
+    const User = schema("LockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    // Simulate stale update: the row exists but the version value is wrong.
+    var stale = created;
+    stale.name = "bob";
+    stale.version = 999;
+
+    var ub = client.locked_user.Update();
+    defer ub.deinit();
+    _ = try ub.set("name", .{ .string = "bob" });
+    _ = try ub.setFieldValue("version", stale.version);
+    _ = try ub.Where(.{zent.sql.EQ("id", .{ .int = stale.id })});
+    const result = ub.SaveOne();
+    try testing.expectError(error.OptimisticLockConflict, result);
+}

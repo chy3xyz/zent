@@ -26,6 +26,9 @@ pub const Error = error{
     /// Retained for source compatibility; pooled operations no longer synthesize
     /// timeout errors after a driver operation has already completed.
     QueryTimeout,
+    /// An UPDATE or DELETE affected zero rows because the optimistic-lock
+    /// version value did not match the current row.
+    OptimisticLockConflict,
 };
 
 /// A single database row exposed for scanning.
