@@ -215,7 +215,10 @@ pub const PostgresDriver = struct {
             const cch = &self.cache.?;
             const hash = std.hash.Wyhash.hash(0, sql);
             var name_buf: [20]u8 = std.mem.zeroes([20]u8);
-            const name_str = try std.fmt.bufPrint(&name_buf, "p_{x}", .{hash});
+            const name_str = std.fmt.bufPrint(&name_buf, "p_{x}", .{hash}) catch {
+                std.log.err("postgres: bufPrint for prepared name failed", .{});
+                return error.DriverFailed;
+            };
             const name_z: [*:0]const u8 = @ptrCast(name_str.ptr);
 
             const PrepareCtx = struct {
@@ -269,7 +272,7 @@ pub const PostgresDriver = struct {
             const status = c.PQresultStatus(res);
             if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
                 logPgError(self.conn, "exec-prepared");
-                return sqlstateToError(res);
+                return sqlstateToError(res.?);
             }
 
             const affected = c.PQcmdTuples(res);
@@ -312,7 +315,7 @@ pub const PostgresDriver = struct {
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
             logPgError(self.conn, "exec");
-            return sqlstateToError(res);
+            return sqlstateToError(res.?);
         }
 
         const affected = c.PQcmdTuples(res);
@@ -372,7 +375,7 @@ pub const PostgresDriver = struct {
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_TUPLES_OK) {
             logPgError(self.conn, "query");
-            return sqlstateToError(res);
+            return sqlstateToError(res.?);
         }
 
         const rows_ptr = try self.allocator.create(PostgresRows);
@@ -544,6 +547,7 @@ const PostgresRows = struct {
         .getFloat = getFloat,
         .getText = getText,
         .getBlob = getBlob,
+        .getBool = getBool,
         .isNull = isNull,
     };
 
@@ -595,6 +599,14 @@ const PostgresRows = struct {
         // For binary format, PQgetlength gives the byte length
         length = c.PQgetlength(self.result, self.currentRow(), @intCast(index));
         return val[0..@intCast(length)];
+    }
+
+    fn getBool(ptr: *anyopaque, index: usize) ?bool {
+        const self: *PostgresRows = @ptrCast(@alignCast(ptr));
+        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
+        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
+        if (val == null) return null;
+        return val[0] == 't';
     }
 
     fn isNull(ptr: *anyopaque, index: usize) bool {
