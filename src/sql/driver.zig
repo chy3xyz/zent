@@ -109,6 +109,22 @@ pub const Rows = struct {
     }
 };
 
+/// Execution context carried by driver operations.
+///
+/// Currently holds an absolute monotonic deadline; drivers may use it to
+/// bound waiting for locks, network I/O, or query execution time.
+pub const ExecutionContext = struct {
+    deadline_ns: ?i64 = null,
+
+    pub fn remainingMs(self: ExecutionContext) ?u32 {
+        const d = self.deadline_ns orelse return null;
+        const now = std.time.nanoTimestamp();
+        if (now >= d) return 0;
+        const remaining = @as(u64, @intCast(d - now)) / std.time.ns_per_ms;
+        return if (remaining > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(remaining);
+    }
+};
+
 /// Transaction handle.
 ///
 /// The caller MUST call `deinit` exactly once, regardless of whether
@@ -147,8 +163,8 @@ pub const Driver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        exec: *const fn (ptr: *anyopaque, query: []const u8, args: []const Value) Error!Result,
-        query: *const fn (ptr: *anyopaque, query: []const u8, args: []const Value) Error!Rows,
+        exec: *const fn (ptr: *anyopaque, ctx: ?*const ExecutionContext, query: []const u8, args: []const Value) Error!Result,
+        query: *const fn (ptr: *anyopaque, ctx: ?*const ExecutionContext, query: []const u8, args: []const Value) Error!Rows,
         beginTx: *const fn (ptr: *anyopaque) Error!Tx,
         close: *const fn (ptr: *anyopaque) void,
         dialect: *const fn (ptr: *anyopaque) Dialect,
@@ -158,11 +174,19 @@ pub const Driver = struct {
     };
 
     pub fn exec(self: Driver, query_sql: []const u8, args: []const Value) !Result {
-        return self.vtable.exec(self.ptr, query_sql, args);
+        return self.vtable.exec(self.ptr, null, query_sql, args);
     }
 
     pub fn query(self: Driver, query_sql: []const u8, args: []const Value) !Rows {
-        return self.vtable.query(self.ptr, query_sql, args);
+        return self.vtable.query(self.ptr, null, query_sql, args);
+    }
+
+    pub fn execCtx(self: Driver, ctx: ?*const ExecutionContext, query_sql: []const u8, args: []const Value) !Result {
+        return self.vtable.exec(self.ptr, ctx, query_sql, args);
+    }
+
+    pub fn queryCtx(self: Driver, ctx: ?*const ExecutionContext, query_sql: []const u8, args: []const Value) !Rows {
+        return self.vtable.query(self.ptr, ctx, query_sql, args);
     }
 
     pub fn beginTx(self: Driver) !Tx {

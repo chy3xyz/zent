@@ -463,13 +463,15 @@ pub const PostgresDriver = struct {
 
     const vtable = driver.Driver.VTable{
         .exec = struct {
-            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) driver.Error!driver.Result {
+            fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
+                _ = ctx;
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
-            fn f(ptr: *anyopaque, q: []const u8, a: []const Value) driver.Error!driver.Rows {
+            fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
+                _ = ctx;
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
