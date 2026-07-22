@@ -155,6 +155,14 @@ pub const Tx = struct {
     pub fn query(self: Tx, sql: []const u8, args: []const Value) !Rows {
         return self.inner.query(sql, args);
     }
+
+    pub fn execCtx(self: Tx, ctx: ?*const ExecutionContext, sql: []const u8, args: []const Value) !Result {
+        return self.inner.execCtx(ctx, sql, args);
+    }
+
+    pub fn queryCtx(self: Tx, ctx: ?*const ExecutionContext, sql: []const u8, args: []const Value) !Rows {
+        return self.inner.queryCtx(ctx, sql, args);
+    }
 };
 
 /// Database driver abstraction.
