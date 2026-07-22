@@ -8,6 +8,8 @@ const cache = @import("cache.zig");
 pub const SQLiteDriver = struct {
     db: *c.sqlite3,
     allocator: std.mem.Allocator,
+    /// Default busy timeout used when no ExecutionContext deadline is present.
+    default_busy_timeout: c_int = 5000,
     /// Optional prepared-statement cache. Set this field after `open()` to
     /// enable caching; null (the default) disables it.
     cache: ?cache.PreparedCache(16, *c.sqlite3_stmt) = null,
@@ -26,8 +28,9 @@ pub const SQLiteDriver = struct {
             }
             return error.SqliteOpenFailed;
         }
-        _ = c.sqlite3_busy_timeout(db.?, 5000);
-        return SQLiteDriver{ .db = db.?, .allocator = allocator };
+        const default_busy_timeout: c_int = 5000;
+        _ = c.sqlite3_busy_timeout(db.?, default_busy_timeout);
+        return SQLiteDriver{ .db = db.?, .allocator = allocator, .default_busy_timeout = default_busy_timeout };
     }
 
     pub fn close(self: *SQLiteDriver) void {
@@ -48,9 +51,32 @@ pub const SQLiteDriver = struct {
             error.SqliteOpenFailed => error.ConnectionFailed,
             error.SqlitePrepareFailed => error.PrepareFailed,
             error.SqliteExecFailed => error.ExecFailed,
+            error.SqliteInterrupt => error.QueryTimeout,
             error.TxNotActive => error.TxFailed,
+            error.QueryTimeout => error.QueryTimeout,
             else => error.DriverFailed,
         };
+    }
+
+    fn applyDeadline(self: *SQLiteDriver, ctx: ?*const driver.ExecutionContext, saved_timeout: *c_int) void {
+        saved_timeout.* = self.default_busy_timeout;
+        if (ctx) |cx| {
+            if (cx.remainingMs()) |ms| {
+                _ = c.sqlite3_busy_timeout(self.db, @intCast(ms));
+            }
+        }
+    }
+
+    fn restoreDeadline(self: *SQLiteDriver, saved_timeout: c_int) void {
+        _ = c.sqlite3_busy_timeout(self.db, saved_timeout);
+    }
+
+    fn progressCallback(ctx: ?*anyopaque) callconv(.c) c_int {
+        const ec: *const driver.ExecutionContext = @ptrCast(@alignCast(ctx.?));
+        if (ec.remainingMs()) |ms| {
+            if (ms == 0) return 1; // interrupt
+        }
+        return 0;
     }
 
     pub fn exec(self: *SQLiteDriver, sql: []const u8, args: []const Value) !driver.Result {
@@ -83,6 +109,7 @@ pub const SQLiteDriver = struct {
         const step_rc = c.sqlite3_step(stmt);
         if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
             logSqliteError(self.db, "exec");
+            if (step_rc == c.SQLITE_INTERRUPT) return error.SqliteInterrupt;
             return error.SqliteExecFailed;
         }
         return driver.Result{
@@ -185,15 +212,35 @@ pub const SQLiteDriver = struct {
     const vtable = driver.Driver.VTable{
         .exec = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
-                _ = ctx;
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                var saved_busy: c_int = undefined;
+                self_ptr.applyDeadline(ctx, &saved_busy);
+                if (ctx) |cx| {
+                    c.sqlite3_progress_handler(self_ptr.db, 100, progressCallback, @ptrCast(@constCast(cx)));
+                }
+                defer {
+                    if (ctx != null) {
+                        c.sqlite3_progress_handler(self_ptr.db, 0, null, null);
+                    }
+                    self_ptr.restoreDeadline(saved_busy);
+                }
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
-                _ = ctx;
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                var saved_busy: c_int = undefined;
+                self_ptr.applyDeadline(ctx, &saved_busy);
+                if (ctx) |cx| {
+                    c.sqlite3_progress_handler(self_ptr.db, 100, progressCallback, @ptrCast(@constCast(cx)));
+                }
+                defer {
+                    if (ctx != null) {
+                        c.sqlite3_progress_handler(self_ptr.db, 0, null, null);
+                    }
+                    self_ptr.restoreDeadline(saved_busy);
+                }
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,

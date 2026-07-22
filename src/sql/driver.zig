@@ -109,6 +109,13 @@ pub const Rows = struct {
     }
 };
 
+fn monotonicNs() i64 {
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    if (rc != 0) unreachable;
+    return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
+}
+
 /// Execution context carried by driver operations.
 ///
 /// Currently holds an absolute monotonic deadline; drivers may use it to
@@ -118,7 +125,7 @@ pub const ExecutionContext = struct {
 
     pub fn remainingMs(self: ExecutionContext) ?u32 {
         const d = self.deadline_ns orelse return null;
-        const now = std.time.nanoTimestamp();
+        const now = monotonicNs();
         if (now >= d) return 0;
         const remaining = @as(u64, @intCast(d - now)) / std.time.ns_per_ms;
         return if (remaining > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(remaining);
