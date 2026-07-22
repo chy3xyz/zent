@@ -395,11 +395,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var buf = std.array_list.Managed(u8).init(self.allocator);
                 errdefer buf.deinit();
                 try buf.appendSlice(" ON DUPLICATE KEY UPDATE ");
-                var first = true;
+                // Preserve the row id through LAST_INSERT_ID so callers receive the
+                // existing auto-increment value on UPDATE as well as on INSERT.
+                try buf.appendSlice("`id`=LAST_INSERT_ID(`id`)");
                 for (columns) |col| {
                     if (std.mem.eql(u8, col, "id")) continue;
-                    if (!first) try buf.appendSlice(", ");
-                    first = false;
+                    try buf.appendSlice(", ");
                     try buf.print("`{s}`=VALUES(`{s}`)", .{ col, col });
                 }
                 return try buf.toOwnedSlice();

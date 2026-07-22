@@ -392,6 +392,13 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
             }
         } else if (col.primary_key) {
             try buf.appendSlice(" PRIMARY KEY");
+            if (col.auto_increment and
+                std.mem.eql(u8, dialect.name, "mysql") and
+                (std.ascii.eqlIgnoreCase(sql_type, "INTEGER") or
+                    std.ascii.eqlIgnoreCase(sql_type, "INT")))
+            {
+                try buf.appendSlice(" AUTO_INCREMENT");
+            }
         }
 
         if (col.not_null and !col.primary_key) {

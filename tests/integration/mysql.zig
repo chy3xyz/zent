@@ -12,6 +12,7 @@ const buildGraph = zent.codegen.graph.buildGraph;
 const Client = zent.codegen.client;
 const field = zent.core.field;
 const index = zent.core.index;
+const edge = zent.core.edge;
 const migrate = zent.sql_schema;
 const schema = zent.core.schema.Schema;
 const testing = std.testing;
@@ -523,4 +524,73 @@ test "MySQL: MySQL-specific types (VARCHAR length, TEXT, BOOL round-trip)" {
     try testing.expectEqualStrings("hello_types", entity.short_text);
     try testing.expectEqualStrings(long_str, entity.long_text);
     try testing.expectEqual(true, entity.active);
+}
+
+test "MySQL: SaveOrUpdate preserves auto-increment id and child rows" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyUpsertParent = schema("MyUpsertParent", .{
+        .fields = &.{
+            field.String("name"),
+        },
+    });
+    const MyUpsertChild = schema("MyUpsertChild", .{
+        .fields = &.{
+            field.String("label"),
+        },
+        .edges = &.{
+            edge.From("parent", MyUpsertParent).Required(),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{ MyUpsertParent, MyUpsertChild });
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_upsert_parent", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_upsert_child", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // First SaveOrUpdate: creates the parent row.
+    var b1 = try client.my_upsert_parent.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("id", @as(i64, 1));
+    _ = try b1.setFieldValue("name", "alice");
+    var parent1 = try b1.SaveOrUpdate();
+    defer zent.codegen.deinitEntity(infos, infos[0], &parent1, allocator);
+    const original_id = parent1.id;
+    try testing.expect(original_id != 0);
+
+    // Insert a child referencing the parent.
+    var cb = try client.my_upsert_child.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("parent_id", original_id);
+    _ = try cb.setFieldValue("label", "child-of-alice");
+    var child = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[1], &child, allocator);
+
+    // Second SaveOrUpdate with the same unique key: should UPDATE in place.
+    var b2 = try client.my_upsert_parent.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("id", @as(i64, 1));
+    _ = try b2.setFieldValue("name", "alice-updated");
+    var parent2 = try b2.SaveOrUpdate();
+    defer zent.codegen.deinitEntity(infos, infos[0], &parent2, allocator);
+
+    // The id must be preserved (REPLACE INTO would delete and re-insert).
+    try testing.expectEqual(original_id, parent2.id);
+
+    // The child row must still exist.
+    var rows = try drv.query("SELECT COUNT(*) FROM my_upsert_child WHERE parent_id = ?", &.{.{ .int = original_id }});
+    defer rows.deinit();
+    const r = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), r.getInt(0).?);
+
+    // The parent name must reflect the update.
+    var parent_rows = try drv.query("SELECT name FROM my_upsert_parent WHERE id = ?", &.{.{ .int = original_id }});
+    defer parent_rows.deinit();
+    const pr = parent_rows.next() orelse return error.NoRow;
+    try testing.expectEqualStrings("alice-updated", pr.getText(0).?);
 }
