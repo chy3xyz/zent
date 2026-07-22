@@ -10,6 +10,7 @@ pub const sql_postgres = @import("sql/postgres.zig");
 pub const sql_mysql = @import("sql/mysql.zig");
 pub const sql_schema = @import("sql/schema/migrate.zig");
 pub const sql_pool = @import("sql/pool.zig");
+pub const sql_explain = @import("sql/explain.zig");
 pub const sql_logger = @import("sql/logger.zig");
 
 pub const core = struct {

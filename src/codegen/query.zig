@@ -16,6 +16,7 @@ const EntityGen = @import("entity.zig").Entity;
 const LightEntityGen = @import("entity.zig").LightEntity;
 const graph_step = @import("../graph/step.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
+const explain = @import("../sql/explain.zig");
 
 fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {
     for (infos) |ti| {
@@ -245,6 +246,15 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
+        const ExplainError = error{ OutOfMemory, BuildFailed, InvalidCursor, UnsupportedDialect };
+
+        /// Return the dialect-prefixed EXPLAIN SQL for the current query.
+        /// The caller owns the returned `ExplainResult` and must call `deinit`.
+        pub fn Explain(self: *Self, allocator: std.mem.Allocator, format: explain.Format) ExplainError!explain.ExplainResult {
+            var q = try self.buildQuery(info.fields.len);
+            defer q.deinit();
+            return explain.explainSql(allocator, self.driver.dialect(), q.sql, format);
+        }
 
         /// Streaming row iterator. Wraps driver.Rows and advances one entity
         /// at a time. Each call to `next()` frees the previous entity, so only
@@ -963,4 +973,65 @@ test "query contract tests" {
         if (@typeInfo(@typeInfo(@TypeOf(QB.Count)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.Count error set");
         if (@typeInfo(@typeInfo(@TypeOf(QB.Exist)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.Exist error set");
     }
+}
+
+test "Query builder Explain prefixes SQL" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const MockDriver = struct {
+        pub fn asDriver(self: *@This()) sql_driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn mockExec(_: *anyopaque, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) sql_driver.Error!void {
+            unreachable;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            unreachable;
+        }
+
+        const vtable = sql_driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+        };
+    };
+
+    var mock = MockDriver{};
+
+    const User = schema("User", .{ .fields = &.{ field.String("name"), field.Int("age") } });
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGenerator(infos, info);
+    const UserQuery = QueryBuilder(infos, info, UserEntity);
+
+    var q = UserQuery.init(std.testing.allocator, mock.asDriver(), null);
+    defer q.deinit();
+
+    var plan = try q.Explain(std.testing.allocator, .text);
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("EXPLAIN QUERY PLAN SELECT \"user\".\"id\", \"user\".\"name\", \"user\".\"age\" FROM \"user\"", plan.sql);
 }
