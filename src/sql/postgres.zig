@@ -43,6 +43,11 @@ pub const PostgresDriver = struct {
             std.log.err("postgres connect failed: {s}", .{std.mem.span(msg)});
             return error.PostgresConnectFailed;
         }
+        // Set client encoding to UTF8 for consistent text handling.
+        {
+            const set_res = c.PQexec(conn, "SET client_encoding = 'UTF8'");
+            defer c.PQclear(set_res);
+        }
         return PostgresDriver{ .conn = conn, .allocator = allocator };
     }
 
