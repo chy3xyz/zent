@@ -1391,3 +1391,86 @@ test "SQLite: optimistic lock conflict" {
     const result = ub.SaveOne();
     try testing.expectError(error.OptimisticLockConflict, result);
 }
+
+test "SQLite: optimistic lock update increments version" {
+    const allocator = testing.allocator;
+    const User = schema("LockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    var update = client.locked_user.Update();
+    defer update.deinit();
+    _ = try update.set("name", .{ .string = "bob" });
+    _ = try update.setFieldValue("version", created.version);
+    _ = try update.Where(.{client.locked_user.predicates.idEQ(.{ .int = created.id })});
+    const affected = try update.Save();
+    try testing.expectEqual(@as(usize, 1), affected);
+
+    var q = client.locked_user.Query();
+    defer q.deinit();
+    _ = try q.Where(.{client.locked_user.predicates.idEQ(.{ .int = created.id })});
+    const results = try q.All();
+    defer {
+        for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        results.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), results.items.len);
+    try testing.expectEqualStrings("bob", results.items[0].name);
+    try testing.expectEqual(@as(i64, 1), results.items[0].version);
+}
+
+test "SQLite: optimistic lock delete conflict" {
+    const allocator = testing.allocator;
+    const User = schema("LockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    var db = client.locked_user.Delete();
+    defer db.deinit();
+    _ = try db.setVersion(999);
+    _ = try db.Where(.{client.locked_user.predicates.idEQ(.{ .int = created.id })});
+    const result = db.ExecOne();
+    try testing.expectError(error.OptimisticLockConflict, result);
+}
