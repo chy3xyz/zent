@@ -1152,3 +1152,53 @@ test "SQLite: beginTx propagates hooks and privacy_ctx to transaction entity cli
 
     try tx.commit();
 }
+
+test "SQLite: stream iterator avoids loading all rows" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const StreamEntity = schema("StreamEntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("idx"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{StreamEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Create 50 entities.
+    for (0..50) |i| {
+        var b = try client.stream_entity.Create();
+        defer b.deinit();
+        const name = try std.fmt.allocPrint(allocator, "entity_{d}", .{i});
+        defer allocator.free(name);
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("idx", @as(i64, @intCast(i)));
+        var entity = try b.Save();
+        zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+    }
+
+    // Stream all rows via iterator.
+    {
+        var q = client.stream_entity.Query();
+        defer q.deinit();
+        _ = try q.OrderBy(&.{zent.sql.OrderAsc("idx")});
+        var iter = try q.Iterate();
+        defer iter.deinit();
+
+        var count: usize = 0;
+        while (try iter.next()) |entity| {
+            const expected_name = try std.fmt.allocPrint(allocator, "entity_{d}", .{count});
+            defer allocator.free(expected_name);
+            try testing.expectEqualStrings(expected_name, entity.name);
+            try testing.expectEqual(@as(i64, @intCast(count)), entity.idx);
+            count += 1;
+        }
+        try testing.expectEqual(@as(usize, 50), count);
+    }
+}

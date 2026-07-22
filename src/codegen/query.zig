@@ -246,6 +246,47 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
 
+        /// Streaming row iterator. Wraps driver.Rows and advances one entity
+        /// at a time. Each call to `next()` frees the previous entity, so only
+        /// one entity is held in memory at a time — safe for large result sets.
+        pub const QueryIterator = struct {
+            rows: sql_driver.Rows,
+            allocator: std.mem.Allocator,
+            current: ?Entity = null,
+
+            const IterSelf = @This();
+
+            /// Advance to the next row. Frees the previous entity automatically.
+            /// Returns null when exhausted. After null, call deinit() to release
+            /// driver resources.
+            pub fn next(self: *IterSelf) QueryError!?Entity {
+                if (self.current) |*e| {
+                    deinitEntity(infos, info, e, self.allocator);
+                }
+                self.current = null;
+
+                const row = self.rows.next() orelse {
+                    if (self.rows.nextError()) |e| return e;
+                    return null;
+                };
+                const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+                self.current = entity;
+                return entity;
+            }
+
+            /// Release all resources. Safe to call even if partially consumed.
+            /// Frees the current entity (if any), drains remaining rows, and
+            /// calls rows.deinit().
+            pub fn deinit(self: *IterSelf) void {
+                if (self.current) |*e| {
+                    deinitEntity(infos, info, e, self.allocator);
+                    self.current = null;
+                }
+                while (self.rows.next()) |_| {}
+                self.rows.deinit();
+            }
+        };
+
         fn mapBuildError(err: anyerror) BuildError {
             return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -309,6 +350,37 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 try self.loadEdges(edge_name, result.items);
             }
             return result;
+        }
+
+        /// Execute the query and return a streaming iterator that yields entities
+        /// one row at a time. Unlike All(), this does not load the full result set
+        /// into memory — safe for large tables.
+        ///
+        /// The returned QueryIterator MUST be deinited. Does NOT support
+        /// eager edge loading (WithEdge); use All() for that.
+        pub fn Iterate(self: *Self) QueryError!QueryIterator {
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
+            var q = try self.buildQuery(info.fields.len);
+            defer q.deinit();
+            const start = nowUs();
+            const rows = try self.driver.query(q.sql, q.args);
+
+            const duration_us: u64 = nowUs() - start;
+            if (self.logger.onQuery) |log| {
+                log(.{
+                    .sql = q.sql,
+                    .args = q.args,
+                    .duration_us = duration_us,
+                    .rows_affected = 0,
+                    .table_name = info.table_name,
+                });
+            }
+
+            return QueryIterator{
+                .rows = rows,
+                .allocator = self.allocator,
+            };
         }
 
         pub fn First(self: *Self) QueryError!?Entity {
@@ -810,7 +882,7 @@ test "Query builder execution methods expose explicit driver error union" {
     const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed };
 
     comptime {
-        const method_names = .{ "All", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
+        const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
         for (method_names) |method_name| {
             const return_type = @typeInfo(@TypeOf(@field(UserQuery, method_name))).@"fn".return_type.?;
             if (@typeInfo(return_type).error_union.error_set != QueryError) {
@@ -866,4 +938,29 @@ test "Query builder CursorAfter sets id" {
     _ = q.CursorAfter(entity).Limit(5);
     try std.testing.expectEqualStrings("id", q.cursor_col.?);
     try std.testing.expectEqual(@as(i64, 99), q.cursor_val.?.int);
+}
+
+test "query contract tests" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const User = schema("User", .{ .fields = &.{ field.String("name"), field.Int("age") } });
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGenerator(infos, info);
+    const QB = QueryBuilder(infos, info, UserEntity);
+    const QE = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed, InvalidCursor };
+
+    comptime {
+        // Verify all public query method error sets are explicit
+        if (@typeInfo(@typeInfo(@TypeOf(QB.All)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.All error set");
+        if (@typeInfo(@typeInfo(@TypeOf(QB.Iterate)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.Iterate error set");
+        if (@typeInfo(@typeInfo(@TypeOf(QB.First)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.First error set");
+        if (@typeInfo(@typeInfo(@TypeOf(QB.Only)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.Only error set");
+        if (@typeInfo(@typeInfo(@TypeOf(QB.IDs)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.IDs error set");
+        if (@typeInfo(@typeInfo(@TypeOf(QB.Count)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.Count error set");
+        if (@typeInfo(@typeInfo(@TypeOf(QB.Exist)).@"fn".return_type.?).error_union.error_set != QE) @compileError("Query.Exist error set");
+    }
 }
