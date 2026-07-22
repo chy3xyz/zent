@@ -1633,6 +1633,30 @@ test "Create table SQL" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"age\" INTEGER") != null);
 }
 
+test "CREATE TABLE SQL includes ON DELETE/UPDATE cascade" {
+    const table = TableDef{
+        .name = "order",
+        .columns = &.{
+            ColumnDef{ .name = "id", .sql_type = "INTEGER", .primary_key = true },
+            ColumnDef{ .name = "user_id", .sql_type = "INTEGER" },
+        },
+        .primary_keys = &.{"id"},
+        .foreign_keys = &.{
+            ForeignKeyDef{
+                .columns = &.{"user_id"},
+                .ref_table = "user",
+                .ref_columns = &.{"id"},
+                .on_delete = "CASCADE",
+                .on_update = "CASCADE",
+            },
+        },
+    };
+    const sql = try createTableSQL(table, Dialect.sqlite);
+    defer std.heap.page_allocator.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ON DELETE CASCADE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ON UPDATE CASCADE") != null);
+}
+
 test "PostgreSQL migration SQL resolves logical field types" {
     const field = @import("../../core/field.zig");
     const schema = @import("../../core/schema.zig").Schema;

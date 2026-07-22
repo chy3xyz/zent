@@ -11,6 +11,7 @@ const Client = zent.codegen.client;
 const migrate = zent.sql_schema;
 const field = zent.core.field;
 const index = zent.core.index;
+const edge = zent.core.edge;
 const schema = zent.core.schema.Schema;
 const testing = std.testing;
 
@@ -1308,4 +1309,44 @@ test "SQLite: file-based migrations" {
     defer rows2.deinit();
     const row2 = rows2.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 0), row2.getInt(0).?);
+}
+
+test "SQLite: database-level cascade delete" {
+    const allocator = testing.allocator;
+
+    const User = schema("User", .{
+        .fields = &.{ field.Int("id"), field.String("name") },
+    });
+    const Order = schema("Order", .{
+        .fields = &.{
+            field.Int("id"),
+        },
+        .edges = &.{
+            // O2M From edge: order.user -> user
+            edge.From("user", User).Required(),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{ User, Order });
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // SQLite parses FK constraints by default but enforces them only when
+    // foreign_keys is enabled per connection.
+    _ = try drv.exec("PRAGMA foreign_keys = ON", &.{});
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    _ = try drv.exec("INSERT INTO user (id, name) VALUES (1, 'alice')", &.{});
+    _ = try drv.exec("INSERT INTO \"order\" (id, user_id) VALUES (10, 1)", &.{});
+    _ = try drv.exec("INSERT INTO \"order\" (id, user_id) VALUES (11, 1)", &.{});
+
+    _ = try drv.exec("DELETE FROM user WHERE id = 1", &.{});
+
+    var rows = try drv.query("SELECT COUNT(*) FROM \"order\"", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
 }
