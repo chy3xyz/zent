@@ -166,7 +166,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 .op = .create,
                 .table_name = info.table_name,
                 .mutated = mutated,
-                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
+                .privacy = blk: {
+                    var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
+                    pc.op = .create;
+                    break :blk pc;
+                },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
@@ -635,7 +639,11 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             var hook_ctx = HookContext{
                 .op = .create,
                 .table_name = info.table_name,
-                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
+                .privacy = blk: {
+                    var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
+                    pc.op = .create;
+                    break :blk pc;
+                },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {

@@ -150,6 +150,38 @@ pub fn build(b: *std.Build) void {
     pool_step.dependOn(&run_pool.step);
 
     // -------------------------------------------------------------
+    // Example: migrate (file-based migrations)
+    // -------------------------------------------------------------
+    const migrate_mod = b.createModule(.{
+        .root_source_file = b.path("examples/migrate/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    migrate_mod.addImport("zent", zent_mod);
+    migrate_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (pg_c_mod) |m| migrate_mod.addImport("pg_c", m);
+    if (my_c_mod) |m| migrate_mod.addImport("mysql_c", m);
+    linkSqlite(migrate_mod);
+    if (pg_include_dir) |inc| linkPg(migrate_mod, inc, pg_lib_dir.?);
+    if (my_include_dir) |inc| linkMySQL(migrate_mod, inc, my_lib_dir.?);
+
+    const migrate_exe = b.addExecutable(.{
+        .name = "migrate",
+        .root_module = migrate_mod,
+    });
+    b.installArtifact(migrate_exe);
+
+    const run_migrate = b.addRunArtifact(migrate_exe);
+    const migrate_step = b.step("migrate", "Apply pending migrations from ZENT_MIGRATIONS_DIR (default: migrations)");
+    migrate_step.dependOn(&run_migrate.step);
+
+    const run_rollback = b.addRunArtifact(migrate_exe);
+    run_rollback.setEnvironmentVariable("ZENT_MIGRATE_CMD", "down");
+    const rollback_step = b.step("migrate-rollback", "Roll back the most recent migration");
+    rollback_step.dependOn(&run_rollback.step);
+
+    // -------------------------------------------------------------
     // Benchmarks
     // -------------------------------------------------------------
     const bench_mod = b.createModule(.{

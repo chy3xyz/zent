@@ -215,7 +215,11 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 .op = .update,
                 .table_name = info.table_name,
                 .mutated = mutated,
-                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
+                .privacy = blk: {
+                    var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
+                    pc.op = .create;
+                    break :blk pc;
+                },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
@@ -380,7 +384,11 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             var hook_ctx = HookContext{
                 .op = .delete,
                 .table_name = info.table_name,
-                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
+                .privacy = blk: {
+                    var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
+                    pc.op = .create;
+                    break :blk pc;
+                },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
@@ -447,7 +455,11 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             var hook_ctx = HookContext{
                 .op = .delete,
                 .table_name = info.table_name,
-                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
+                .privacy = blk: {
+                    var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
+                    pc.op = .create;
+                    break :blk pc;
+                },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
@@ -600,7 +612,11 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             var hook_ctx = HookContext{
                 .op = .update,
                 .table_name = info.table_name,
-                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
+                .privacy = blk: {
+                    var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
+                    pc.op = .create;
+                    break :blk pc;
+                },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
@@ -726,7 +742,11 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             var hook_ctx = HookContext{
                 .op = .delete,
                 .table_name = info.table_name,
-                .privacy = blk: { var pc = self.privacy_ctx orelse privacy.PrivacyContext{}; pc.op = .create; break :blk pc; },
+                .privacy = blk: {
+                    var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
+                    pc.op = .create;
+                    break :blk pc;
+                },
             };
             try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {

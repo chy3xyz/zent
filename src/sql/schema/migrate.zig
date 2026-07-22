@@ -1264,6 +1264,322 @@ pub fn migrateSchema(
 }
 
 // ------------------------------------------------------------------
+// File-based migrations
+// ------------------------------------------------------------------
+
+pub const FileMigrationOptions = struct {
+    /// If true, don't execute any SQL — only print what would be done.
+    dry_run: bool = false,
+    /// If true, rollback skips migrations that have no .down.sql file.
+    /// If false, missing down files produce error.MissingDownMigration.
+    allow_missing_down: bool = true,
+};
+
+const MigrationFile = struct {
+    version: i64,
+    name: []const u8,
+    up_sql: []const u8,
+    down_sql: ?[]const u8,
+    checksum: []const u8,
+};
+
+pub const MigrateFilesError = sql_driver.Error || std.Io.Dir.OpenError || std.Io.Dir.ReadFileAllocError || std.Io.Dir.AccessError || std.Io.Dir.Iterator.Error || error{
+    NoSpaceLeft,
+    InvalidMigrationFilename,
+    DuplicateMigrationVersion,
+    MissingDownMigration,
+};
+
+/// Parse a migration filename and return the numeric version if it matches the
+/// requested direction (e.g. `.up.sql`). Filenames must begin with a positive
+/// integer version, optionally followed by an underscore and a description.
+fn parseMigrationFilename(name: []const u8, direction: []const u8) !?i64 {
+    const suffix = try std.fmt.allocPrint(std.heap.page_allocator, ".{s}.sql", .{direction});
+    defer std.heap.page_allocator.free(suffix);
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+
+    const stem = name[0 .. name.len - suffix.len];
+    const underscore_idx = std.mem.indexOfScalar(u8, stem, '_') orelse stem.len;
+    const version_str = stem[0..underscore_idx];
+
+    if (version_str.len == 0) return error.InvalidMigrationFilename;
+    return std.fmt.parseInt(i64, version_str, 10) catch error.InvalidMigrationFilename;
+}
+
+fn fileChecksum(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+    defer allocator.free(data);
+    const crc = std.hash.crc.@"CRC-32/ISO-HDLC".hash(data);
+    return try std.fmt.allocPrint(allocator, "{x:0>8}", .{crc});
+}
+
+/// Split a SQL script into individual statements on unquoted `;` terminators.
+/// This is intentionally simple: it does not parse PL/pgSQL bodies or trigger
+/// definitions that contain nested semicolons. Complex procedural objects should
+/// be placed in separate migration files or use a tool that understands statement
+/// boundaries.
+fn splitSqlStatements(allocator: std.mem.Allocator, sql: []const u8) ![]const []const u8 {
+    var statements = std.array_list.Managed([]const u8).init(allocator);
+    errdefer {
+        for (statements.items) |s| allocator.free(s);
+        statements.deinit();
+    }
+
+    var start: usize = 0;
+    var in_string = false;
+    var string_char: u8 = 0;
+    var i: usize = 0;
+    while (i < sql.len) : (i += 1) {
+        const c = sql[i];
+        if (in_string) {
+            if (c == string_char) {
+                if (i + 1 < sql.len and sql[i + 1] == string_char) {
+                    i += 1;
+                } else {
+                    in_string = false;
+                }
+            }
+        } else if (c == '\'' or c == '"') {
+            in_string = true;
+            string_char = c;
+        } else if (c == ';') {
+            const stmt = std.mem.trim(u8, sql[start..i], " \t\r\n");
+            if (stmt.len > 0) {
+                try statements.append(try allocator.dupe(u8, stmt));
+            }
+            start = i + 1;
+        }
+    }
+    const last = std.mem.trim(u8, sql[start..], " \t\r\n");
+    if (last.len > 0) {
+        try statements.append(try allocator.dupe(u8, last));
+    }
+    return statements.toOwnedSlice();
+}
+
+fn executeMigrationSql(allocator: std.mem.Allocator, drv: sql_driver.Driver, sql: []const u8) !void {
+    const statements = try splitSqlStatements(allocator, sql);
+    defer {
+        for (statements) |s| allocator.free(s);
+        allocator.free(statements);
+    }
+    for (statements) |stmt| {
+        _ = try drv.exec(stmt, &.{});
+    }
+}
+
+fn freeMigrationFile(allocator: std.mem.Allocator, mf: *MigrationFile) void {
+    allocator.free(mf.name);
+    allocator.free(mf.up_sql);
+    if (mf.down_sql) |d| allocator.free(d);
+    allocator.free(mf.checksum);
+    mf.* = undefined;
+}
+
+fn readSingleMigrationFile(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8) !MigrationFile {
+    const up_version = try parseMigrationFilename(name, "up") orelse return error.InvalidMigrationFilename;
+
+    const up_path = try std.fs.path.join(allocator, &.{ dir_path, name });
+    defer allocator.free(up_path);
+
+    const up_sql = try std.Io.Dir.cwd().readFileAlloc(io, up_path, allocator, .limited(1024 * 1024));
+    errdefer allocator.free(up_sql);
+
+    const checksum = try fileChecksum(io, allocator, up_path);
+    errdefer allocator.free(checksum);
+
+    const stem = name[0 .. name.len - ".up.sql".len];
+    const down_name = try std.fmt.allocPrint(allocator, "{s}.down.sql", .{stem});
+    defer allocator.free(down_name);
+    const down_path = try std.fs.path.join(allocator, &.{ dir_path, down_name });
+    defer allocator.free(down_path);
+
+    var down_sql: ?[]const u8 = null;
+    errdefer if (down_sql) |d| allocator.free(d);
+    down_sql = std.Io.Dir.cwd().readFileAlloc(io, down_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => |e| return e,
+    };
+
+    const name_copy = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_copy);
+
+    return MigrationFile{
+        .version = up_version,
+        .name = name_copy,
+        .up_sql = up_sql,
+        .down_sql = down_sql,
+        .checksum = checksum,
+    };
+}
+
+fn insertionSortMigrationFiles(files: []MigrationFile) void {
+    if (files.len < 2) return;
+    var i: usize = 1;
+    while (i < files.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and files[j - 1].version > files[j].version) : (j -= 1) {
+            const tmp = files[j - 1];
+            files[j - 1] = files[j];
+            files[j] = tmp;
+        }
+    }
+}
+
+fn readMigrationDir(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) ![]MigrationFile {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var files = std.array_list.Managed(MigrationFile).init(allocator);
+    errdefer {
+        for (files.items) |*f| freeMigrationFile(allocator, f);
+        files.deinit();
+    }
+
+    var seen = std.AutoHashMap(i64, void).init(allocator);
+    defer seen.deinit();
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const up_version = parseMigrationFilename(entry.name, "up") catch |err| switch (err) {
+            error.InvalidMigrationFilename => continue,
+            else => |e| return e,
+        } orelse continue;
+
+        if (seen.contains(up_version)) return error.DuplicateMigrationVersion;
+        try seen.put(up_version, {});
+
+        var mf = try readSingleMigrationFile(io, allocator, dir_path, entry.name);
+        errdefer freeMigrationFile(allocator, &mf);
+        try files.append(mf);
+    }
+
+    const slice = try files.toOwnedSlice();
+    insertionSortMigrationFiles(slice);
+    return slice;
+}
+
+fn freeMigrationFiles(allocator: std.mem.Allocator, files: []MigrationFile) void {
+    for (files) |*f| freeMigrationFile(allocator, f);
+    allocator.free(files);
+}
+
+fn deleteMigrationRecord(drv: sql_driver.Driver, version: i64) !void {
+    const dialect = drv.dialect();
+    var buf: [384]u8 = undefined;
+    const p1 = try dialect.placeholder(&buf, 1);
+    const sql = try std.fmt.bufPrint(buf[p1.len..], "DELETE FROM zent_schema_migrations WHERE version = {s}", .{p1});
+    _ = try drv.exec(sql, &.{.{ .int = version }});
+}
+
+/// Apply pending `.up.sql` migration files from `dir_path` in version order.
+/// Already-applied versions (tracked in `zent_schema_migrations`) are skipped.
+/// The whole run is wrapped in a transaction on backends that support
+/// transactional DDL (SQLite, PostgreSQL). MySQL applies DDL immediately.
+pub fn migrateFromFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    dir_path: []const u8,
+) MigrateFilesError!void {
+    return migrateFromFilesWithOptions(io, allocator, driver, dir_path, .{});
+}
+
+/// Options-aware version of `migrateFromFiles`.
+pub fn migrateFromFilesWithOptions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    dir_path: []const u8,
+    opts: FileMigrationOptions,
+) MigrateFilesError!void {
+    if (opts.dry_run) {
+        const files = try readMigrationDir(io, allocator, dir_path);
+        defer freeMigrationFiles(allocator, files);
+        std.debug.print("-- Dry-run: would apply {d} migration(s) from {s}\n", .{ files.len, dir_path });
+        for (files) |f| {
+            std.debug.print("-- {s} (version {d}, checksum {s})\n", .{ f.name, f.version, f.checksum });
+        }
+        return;
+    }
+
+    try ensureMigrationsTable(driver);
+    const applied = try appliedVersions(allocator, driver);
+    defer allocator.free(applied);
+
+    const files = try readMigrationDir(io, allocator, dir_path);
+    defer freeMigrationFiles(allocator, files);
+
+    var tx = try driver.beginTx();
+    errdefer tx.deinit();
+    const tx_drv = tx.inner;
+
+    for (files) |f| {
+        if (versionContains(applied, f.version)) continue;
+        try executeMigrationSql(allocator, tx_drv, f.up_sql);
+        try recordMigration(tx_drv, f.version, f.checksum);
+    }
+
+    try tx.commit();
+    tx.deinit();
+}
+
+/// Roll back the last `steps` applied file migrations, using `.down.sql` files
+/// from `dir_path`. Migrations are rolled back in reverse application order.
+pub fn rollbackFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    dir_path: []const u8,
+    steps: usize,
+) MigrateFilesError!void {
+    return rollbackFilesWithOptions(io, allocator, driver, dir_path, steps, .{});
+}
+
+pub fn rollbackFilesWithOptions(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    dir_path: []const u8,
+    steps: usize,
+    opts: FileMigrationOptions,
+) MigrateFilesError!void {
+    try ensureMigrationsTable(driver);
+    const applied = try appliedVersions(allocator, driver);
+    defer allocator.free(applied);
+    if (applied.len == 0) return;
+
+    const files = try readMigrationDir(io, allocator, dir_path);
+    defer freeMigrationFiles(allocator, files);
+
+    var tx = try driver.beginTx();
+    errdefer tx.deinit();
+    const tx_drv = tx.inner;
+
+    var rolled: usize = 0;
+    var i: usize = applied.len;
+    while (i > 0 and rolled < steps) {
+        i -= 1;
+        const version = applied[i];
+        const mf = for (files) |f| {
+            if (f.version == version) break f;
+        } else continue;
+
+        if (mf.down_sql) |down| {
+            try executeMigrationSql(allocator, tx_drv, down);
+            try deleteMigrationRecord(tx_drv, version);
+            rolled += 1;
+        } else if (!opts.allow_missing_down) {
+            return error.MissingDownMigration;
+        }
+    }
+
+    try tx.commit();
+    tx.deinit();
+}
+
+// ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
 

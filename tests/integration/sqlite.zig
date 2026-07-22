@@ -1263,3 +1263,49 @@ test "SQLite: BulkInsert multi-row RETURNING" {
 
     try testing.expect(rows.next() == null);
 }
+
+test "SQLite: file-based migrations" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    const dir_name = "test_migrations_file";
+    try std.Io.Dir.cwd().createDirPath(io, dir_name);
+    defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{
+            .sub_path = "001_create_items.up.sql",
+            .data =
+            \\CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+            \\INSERT INTO items (id, name) VALUES (1, 'first');
+            ,
+        });
+        try dir.writeFile(io, .{
+            .sub_path = "001_create_items.down.sql",
+            .data = "DELETE FROM items;",
+        });
+        try dir.writeFile(io, .{
+            .sub_path = "002_add_second_item.up.sql",
+            .data = "INSERT INTO items (id, name) VALUES (2, 'second');",
+        });
+    }
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    try migrate.migrateFromFiles(io, allocator, drv.asDriver(), dir_name);
+
+    var rows = try drv.query("SELECT COUNT(*) FROM items", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 2), row.getInt(0).?);
+
+    try migrate.rollbackFiles(io, allocator, drv.asDriver(), dir_name, 1);
+
+    var rows2 = try drv.query("SELECT COUNT(*) FROM items", &.{});
+    defer rows2.deinit();
+    const row2 = rows2.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row2.getInt(0).?);
+}
