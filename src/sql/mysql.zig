@@ -55,6 +55,10 @@ pub const MySQLDriver = struct {
     }
 
     pub fn connectOpts(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, ssl_mode: SslMode) !MySQLDriver {
+        return connectOptsSocket(allocator, host, port, user, passwd, dbname, ssl_mode, null);
+    }
+
+    pub fn connectOptsSocket(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, ssl_mode: SslMode, unix_socket: ?[:0]const u8) !MySQLDriver {
         const conn = c.mysql_init(null);
         if (conn == null) return error.MySQLInitFailed;
 
@@ -92,7 +96,8 @@ pub const MySQLDriver = struct {
             },
         }
 
-        const ret = c.mysql_real_connect(conn, host.ptr, user.ptr, passwd.ptr, dbname.ptr, @intCast(port), null, 0);
+        const sock_ptr: ?[*:0]const u8 = if (unix_socket) |s| s.ptr else null;
+        const ret = c.mysql_real_connect(conn, host.ptr, user.ptr, passwd.ptr, dbname.ptr, @intCast(port), sock_ptr, 0);
         if (ret == null) {
             defer c.mysql_close(conn);
             const msg = c.mysql_error(conn);

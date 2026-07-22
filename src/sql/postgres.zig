@@ -73,6 +73,25 @@ pub const PostgresDriver = struct {
         std.log.err("postgres error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
+    /// Extract diagnostic detail from a PGresult for richer error logging.
+    fn logPgResultError(conn: *c.PGconn, result: ?*c.PGresult, context: []const u8) void {
+        const table = if (result) |r| c.PQresultErrorField(r, c.PG_DIAG_TABLE_NAME) else null;
+        const column = if (result) |r| c.PQresultErrorField(r, c.PG_DIAG_COLUMN_NAME) else null;
+        const detail = if (result) |r| c.PQresultErrorField(r, c.PG_DIAG_MESSAGE_DETAIL) else null;
+        if (table != null or column != null) {
+            if (detail) |d| {
+                std.log.err("postgres ({s}) table={s} col={s}: {s}", .{
+                    context,
+                    if (table) |t| std.mem.span(t) else "?",
+                    if (column) |col| std.mem.span(col) else "?",
+                    std.mem.span(d),
+                });
+                return;
+            }
+        }
+        logPgError(conn, context);
+    }
+
     /// Free all parameters that were allocated (int, float, string, bytes).
     /// Bool params point to static "t"/"f" strings and are not freed.
     /// Uses the saved allocation length (NOT std.mem.span) so that values
@@ -271,7 +290,7 @@ pub const PostgresDriver = struct {
 
             const status = c.PQresultStatus(res);
             if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
-                logPgError(self.conn, "exec-prepared");
+                logPgResultError(self.conn, res, "exec-prepared");
                 return sqlstateToError(res.?);
             }
 
@@ -314,7 +333,7 @@ pub const PostgresDriver = struct {
 
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
-            logPgError(self.conn, "exec");
+            logPgResultError(self.conn, res, "exec");
             return sqlstateToError(res.?);
         }
 
@@ -374,7 +393,7 @@ pub const PostgresDriver = struct {
 
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_TUPLES_OK) {
-            logPgError(self.conn, "query");
+            logPgResultError(self.conn, res, "query");
             return sqlstateToError(res.?);
         }
 
