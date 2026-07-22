@@ -9,6 +9,7 @@ const Hook = @import("../runtime/hook.zig").Hook;
 const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
+const rthook = @import("../runtime/hook.zig");
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
@@ -167,12 +168,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 .mutated = mutated,
                 .privacy = self.privacy_ctx orelse .{},
             };
+            try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
             errdefer {
+                rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .create) {
                         if (h.after) |f| f(&hook_ctx) catch {};
@@ -384,6 +387,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
             // After hooks on success: entity is fully populated.
             hook_ctx.entity = &entity;
+            rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.after) |f| f(&hook_ctx) catch {};
@@ -633,12 +637,14 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 .table_name = info.table_name,
                 .privacy = self.privacy_ctx orelse .{},
             };
+            try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
             errdefer {
+                rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .create) {
                         if (h.after) |f| f(&hook_ctx) catch {};
@@ -701,6 +707,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             }
 
             // After hooks on success.
+            rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.after) |f| f(&hook_ctx) catch {};

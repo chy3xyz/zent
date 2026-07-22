@@ -8,6 +8,7 @@ const Hook = @import("../runtime/hook.zig").Hook;
 const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
+const rthook = @import("../runtime/hook.zig");
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
@@ -216,12 +217,14 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 .mutated = mutated,
                 .privacy = self.privacy_ctx orelse .{},
             };
+            try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
             errdefer {
+                rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .update) {
                         if (h.after) |f| f(&hook_ctx) catch {};
@@ -255,6 +258,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             const duration_us: u64 = nowUs() - start;
 
             // After hooks on success.
+            rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.after) |f| f(&hook_ctx) catch {};
@@ -378,12 +382,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = self.privacy_ctx orelse .{},
             };
+            try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
             errdefer {
+                rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
                         if (h.after) |f| f(&hook_ctx) catch {};
@@ -407,6 +413,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const duration_us: u64 = nowUs() - start;
 
             // After hooks on success.
+            rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch {};
@@ -442,12 +449,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = self.privacy_ctx orelse .{},
             };
+            try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
             errdefer {
+                rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
                         if (h.after) |f| f(&hook_ctx) catch {};
@@ -468,6 +477,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const duration_us: u64 = nowUs() - start;
 
             // After hooks on success.
+            rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch {};
@@ -592,12 +602,14 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = self.privacy_ctx orelse .{},
             };
+            try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
             errdefer {
+                rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .update) {
                         if (h.after) |f| f(&hook_ctx) catch {};
@@ -622,6 +634,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             const res = try self.driver.exec(q.sql, q.args);
 
             // After hooks on success.
+            rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.after) |f| f(&hook_ctx) catch {};
@@ -715,12 +728,14 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = self.privacy_ctx orelse .{},
             };
+            try rthook.globalBefore(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.before) |f| try f(&hook_ctx);
                 }
             }
             errdefer {
+                rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
                         if (h.after) |f| f(&hook_ctx) catch {};
@@ -734,6 +749,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             const res = try self.driver.exec(q.sql, q.args);
 
             // After hooks on success.
+            rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch {};

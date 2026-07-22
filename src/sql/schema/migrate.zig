@@ -197,14 +197,7 @@ fn normalizeSqlType(sql_type: []const u8, buf: []u8) ![]u8 {
     const normalized = buf[0..end];
 
     // Canonicalize aliases — copy canonical name into buffer and return
-    const canonical: ?[]const u8 = if (std.mem.eql(u8, normalized, "character varying")) "varchar"
-        else if (std.mem.eql(u8, normalized, "int") or std.mem.eql(u8, normalized, "int4")) "integer"
-        else if (std.mem.eql(u8, normalized, "double")) "double precision"
-        else if (std.mem.eql(u8, normalized, "bool")) "boolean"
-        else if (std.mem.eql(u8, normalized, "serial")) "integer"
-        else if (std.mem.eql(u8, normalized, "bigserial")) "bigint"
-        else if (std.mem.eql(u8, normalized, "timestamptz")) "timestamp with time zone"
-        else null;
+    const canonical: ?[]const u8 = if (std.mem.eql(u8, normalized, "character varying")) "varchar" else if (std.mem.eql(u8, normalized, "int") or std.mem.eql(u8, normalized, "int4")) "integer" else if (std.mem.eql(u8, normalized, "double")) "double precision" else if (std.mem.eql(u8, normalized, "bool")) "boolean" else if (std.mem.eql(u8, normalized, "serial")) "integer" else if (std.mem.eql(u8, normalized, "bigserial")) "bigint" else if (std.mem.eql(u8, normalized, "timestamptz")) "timestamp with time zone" else null;
 
     if (canonical) |canon| {
         if (canon.len > buf.len) return error.NoSpaceLeft;

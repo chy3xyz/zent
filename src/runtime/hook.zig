@@ -93,8 +93,10 @@ pub const HookChain = struct {
     /// Execute all before-hooks for the given context. Propagates the first error.
     pub fn executeBefore(self: *const HookChain, ctx: *HookContext) HookError!void {
         for (self.hooks.items) |hook| {
-            if (hook.op == ctx.op and hook.before) |before| {
-                try before(ctx);
+            if (hook.op == ctx.op) {
+                if (hook.before) |before| {
+                    try before(ctx);
+                }
             }
         }
     }
@@ -102,13 +104,15 @@ pub const HookChain = struct {
     /// Execute all after-hooks for the given context. Errors are logged but not propagated.
     pub fn executeAfter(self: *const HookChain, ctx: *HookContext) void {
         for (self.hooks.items) |hook| {
-            if (hook.op == ctx.op and hook.after) |after| {
-                after(ctx) catch |err| {
-                    std.log.err(
-                        "after-hook failed on table '{s}' ({s}): {s}",
-                        .{ ctx.table_name, @tagName(ctx.op), @errorName(err) },
-                    );
-                };
+            if (hook.op == ctx.op) {
+                if (hook.after) |after| {
+                    after(ctx) catch |err| {
+                        std.log.err(
+                            "after-hook failed on table '{s}' ({s}): {s}",
+                            .{ ctx.table_name, @tagName(ctx.op), @errorName(err) },
+                        );
+                    };
+                }
             }
         }
     }
@@ -119,33 +123,22 @@ pub const HookChain = struct {
 // ------------------------------------------------------------------
 
 var global_registry: ?*HookChain = null;
-var global_mutex: std.Thread.Mutex = .{};
 
 /// Register a global hook chain that fires for every table/operation.
 pub fn registerGlobal(chain: *HookChain) void {
-    global_mutex.lock();
-    defer global_mutex.unlock();
     global_registry = chain;
 }
 
 /// Execute all global before-hooks. Called by codegen before per-table hooks.
 pub fn globalBefore(ctx: *HookContext) HookError!void {
-    global_mutex.lock();
-    const chain = global_registry;
-    global_mutex.unlock();
-
-    if (chain) |c| {
+    if (global_registry) |c| {
         try c.executeBefore(ctx);
     }
 }
 
 /// Execute all global after-hooks. Called by codegen after per-table hooks.
 pub fn globalAfter(ctx: *HookContext) void {
-    global_mutex.lock();
-    const chain = global_registry;
-    global_mutex.unlock();
-
-    if (chain) |c| {
+    if (global_registry) |c| {
         c.executeAfter(ctx);
     }
 }
