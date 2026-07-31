@@ -249,7 +249,7 @@ fn discoverPg(b: *std.Build) ?PgInfo {
     if (execOutput(b, &.{ "pg_config", "--includedir" })) |inc| {
         if (execOutput(b, &.{ "pg_config", "--libdir" })) |lib| {
             const header = std.fs.path.join(allocator, &.{ inc, "libpq-fe.h" }) catch return null;
-            if (pathExists(header)) {
+            if (pathExists(b, header)) {
                 return .{ .include_dir = inc, .lib_dir = lib };
             }
         }
@@ -259,7 +259,7 @@ fn discoverPg(b: *std.Build) ?PgInfo {
     if (firstIncludeDirFromCflags(execOutput(b, &.{ "pkg-config", "--cflags-only-I", "libpq" }))) |inc| {
         if (firstLibDirFromLibs(execOutput(b, &.{ "pkg-config", "--libs-only-L", "libpq" }))) |lib| {
             const header = std.fs.path.join(allocator, &.{ inc, "libpq-fe.h" }) catch return null;
-            if (pathExists(header)) {
+            if (pathExists(b, header)) {
                 return .{ .include_dir = inc, .lib_dir = lib };
             }
         }
@@ -276,7 +276,7 @@ fn discoverPgHomebrew(b: *std.Build) ?PgInfo {
         for (versions) |pkg| {
             const versioned = b.fmt("{s}/{s}/include/{s}/libpq-fe.h", .{ home, pkg, pkg });
             const plain = b.fmt("{s}/{s}/include/libpq-fe.h", .{ home, pkg });
-            const header = if (pathExists(versioned)) versioned else if (pathExists(plain)) plain else continue;
+            const header = if (pathExists(b, versioned)) versioned else if (pathExists(b, plain)) plain else continue;
             const include_dir = std.fs.path.dirname(header).?;
             const lib_home = if (std.mem.eql(u8, home, "/opt/homebrew/opt")) "/opt/homebrew/lib" else "/usr/local/lib";
             const lib_dir = b.fmt("{s}/{s}", .{ lib_home, pkg });
@@ -298,7 +298,7 @@ fn discoverMySQL(b: *std.Build) ?MySQLInfo {
     if (execOutput(b, &.{ "mariadb_config", "--variable=pkgincludedir" })) |inc| {
         if (execOutput(b, &.{ "mariadb_config", "--variable=pkglibdir" })) |lib| {
             const header = std.fs.path.join(allocator, &.{ inc, "mysql.h" }) catch return null;
-            if (pathExists(header)) {
+            if (pathExists(b, header)) {
                 // <mariadb/mysql.h> resolves against the parent of pkgincludedir.
                 const include_dir = std.fs.path.dirname(inc) orelse inc;
                 return .{ .include_dir = include_dir, .lib_dir = lib };
@@ -310,7 +310,7 @@ fn discoverMySQL(b: *std.Build) ?MySQLInfo {
     if (firstIncludeDirFromCflags(execOutput(b, &.{ "pkg-config", "--cflags-only-I", "libmariadb" }))) |inc| {
         if (firstLibDirFromLibs(execOutput(b, &.{ "pkg-config", "--libs-only-L", "libmariadb" }))) |lib| {
             const header = std.fs.path.join(allocator, &.{ inc, "mariadb", "mysql.h" }) catch return null;
-            if (pathExists(header)) {
+            if (pathExists(b, header)) {
                 return .{ .include_dir = inc, .lib_dir = lib };
             }
         }
@@ -324,7 +324,7 @@ fn discoverMySQLHomebrew(b: *std.Build) ?MySQLInfo {
     const homes = [_][]const u8{ "/opt/homebrew/opt", "/usr/local/opt" };
     for (homes) |home| {
         const header = b.fmt("{s}/mariadb-connector-c/include/mariadb/mysql.h", .{home});
-        if (pathExists(header)) {
+        if (pathExists(b, header)) {
             const include_dir = b.fmt("{s}/mariadb-connector-c/include", .{home});
             const lib_dir = b.fmt("{s}/mariadb-connector-c/lib", .{home});
             return .{ .include_dir = include_dir, .lib_dir = lib_dir };
@@ -385,14 +385,9 @@ fn firstLibDirFromLibs(libs: ?[]const u8) ?[]const u8 {
     return null;
 }
 
-extern "c" fn stat(path: [*:0]const u8, buf: *anyopaque) c_int;
-
 /// Returns true if `path` points to an existing file system object.
-/// Limited to short paths (Homebrew locations are well under the buffer).
-fn pathExists(path: []const u8) bool {
-    var zbuf: [512:0]u8 = std.mem.zeroes([512:0]u8);
-    if (path.len >= zbuf.len) return false;
-    @memcpy(zbuf[0..path.len], path);
-    var st: [144]u8 = undefined;
-    return stat(@ptrCast(&zbuf), @ptrCast(&st)) == 0;
+/// Uses Zig Io (no `extern "c"`) so the build runner need not link libc.
+fn pathExists(b: *std.Build, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return false;
+    return true;
 }
