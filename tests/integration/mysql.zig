@@ -594,3 +594,38 @@ test "MySQL: SaveOrUpdate preserves auto-increment id and child rows" {
     const pr = parent_rows.next() orelse return error.NoRow;
     try testing.expectEqualStrings("alice-updated", pr.getText(0).?);
 }
+
+test "MySQL: slow query times out" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const User = schema("User", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var q = client.user.Query();
+    defer q.deinit();
+    _ = q.withTimeout(100);
+    _ = try q.Where(&.{zent.sql.Raw("SLEEP(2) = 0")});
+    const result = q.All();
+    try testing.expectError(error.QueryTimeout, result);
+
+    // Driver should still be usable after the timeout.
+    try drv.ping();
+
+    var rows = try drv.query("SELECT 1 AS one", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+}

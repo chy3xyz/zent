@@ -132,6 +132,20 @@ pub const ExecutionContext = struct {
     }
 };
 
+test "ExecutionContext.remainingMs around deadline" {
+    const past = monotonicNs() - 1_000_000;
+    const ctx_past = ExecutionContext{ .deadline_ns = past };
+    try std.testing.expectEqual(@as(?u32, 0), ctx_past.remainingMs());
+
+    const future = monotonicNs() + 10 * std.time.ns_per_ms;
+    const ctx_future = ExecutionContext{ .deadline_ns = future };
+    const remaining = ctx_future.remainingMs().?;
+    try std.testing.expect(remaining <= 10);
+
+    const ctx_null = ExecutionContext{ .deadline_ns = null };
+    try std.testing.expectEqual(@as(?u32, null), ctx_null.remainingMs());
+}
+
 /// Transaction handle.
 ///
 /// The caller MUST call `deinit` exactly once, regardless of whether

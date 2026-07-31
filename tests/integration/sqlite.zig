@@ -1534,3 +1534,32 @@ test "SQLite: optimistic lock soft delete conflict and success" {
     try testing.expect(row.getInt(0).? > 0);
     try testing.expectEqual(@as(i64, 1), row.getInt(1).?);
 }
+
+test "SQLite: query with timeout succeeds" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const User = schema("User", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var q = client.user.Query();
+    defer q.deinit();
+    _ = q.withTimeout(1_000);
+    const users = try q.All();
+    defer {
+        for (users.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        users.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), users.items.len);
+}
