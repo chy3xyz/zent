@@ -519,6 +519,81 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return row.getInt(0) orelse return error.TypeMismatch;
         }
 
+        /// Owned paged result: one `count` query + one `limit/offset` fetch.
+        /// Callers release entities with `deinit`.
+        pub const PagedResult = struct {
+            items: std.array_list.Managed(Entity),
+            total: i64,
+
+            pub fn deinit(self: *PagedResult) void {
+                const allocator = self.items.allocator;
+                for (self.items.items) |*e| deinitEntity(infos, info, e, allocator);
+                self.items.deinit();
+                self.* = undefined;
+            }
+        };
+
+        /// One-call pagination: total via Count, page slice via All with
+        /// limit/offset. Reuses the same predicates/order — no duplicate
+        /// count+fetch loops or per-module free helpers.
+        pub fn paged(self: *Self, page: usize, page_size: usize) (QueryError || error{InvalidPageSize})!PagedResult {
+            if (page_size == 0) return error.InvalidPageSize;
+            const total = try self.Count();
+            if (total == 0) {
+                return .{ .items = std.array_list.Managed(Entity).init(self.allocator), .total = 0 };
+            }
+            self.limit_val = page_size;
+            self.offset_val = (page -| 1) * page_size;
+            const items = try self.All();
+            return .{ .items = items, .total = total };
+        }
+
+        /// One GROUP BY query: `SELECT <col>, COUNT(*) FROM … WHERE … GROUP BY <col>`.
+        /// Replaces N separate Count() calls with a single round trip.
+        pub const GroupCount = struct { key: i64, count: i64 };
+
+        pub fn CountBy(self: *Self, comptime field_name: []const u8) QueryError!std.array_list.Managed(GroupCount) {
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
+            var q = try self.buildGroupedCountQuery(field_name);
+            defer q.deinit();
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
+            defer rows.deinit();
+
+            var result = std.array_list.Managed(GroupCount).init(self.allocator);
+            errdefer result.deinit();
+            while (rows.next()) |row| {
+                try result.append(.{
+                    .key = row.getInt(0) orelse return error.TypeMismatch,
+                    .count = row.getInt(1) orelse return error.TypeMismatch,
+                });
+            }
+            if (rows.nextError()) |e| return e;
+            return result;
+        }
+
+        fn buildGroupedCountQuery(self: *Self, comptime field_name: []const u8) !sql.OwnedQuery {
+            const t = sql.Table(info.table_name);
+            const key_col = sql.ColumnRef{ .table = null, .name = field_name, .raw = false };
+            const cnt_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
+            var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{ key_col, cnt_col });
+            _ = selector.from(t);
+            if (self.predicates.items.len > 0) {
+                for (self.predicates.items) |pred| {
+                    _ = try selector.where(pred);
+                }
+            }
+            if (info.soft_delete and !self.with_trashed) {
+                _ = try selector.where(sql.IsNull("deleted_at"));
+            }
+            _ = try selector.groupBy(&.{field_name});
+            if (self.having_pred) |pred| {
+                _ = selector.having(pred);
+            }
+            return selector.takeQuery() catch |err| return mapBuildError(err);
+        }
+
         pub fn Exist(self: *Self) QueryError!bool {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);

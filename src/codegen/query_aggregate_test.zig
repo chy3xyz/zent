@@ -82,6 +82,10 @@ const MockRows = struct {
 
 const MockDriver = struct {
     value: sql.Value,
+    no_rows: bool = false,
+    capture_sql: bool = false,
+    last_sql: ?[]const u8 = null,
+    last_sql_owned: ?[]u8 = null,
 
     const vtable = sql_driver.Driver.VTable{
         .exec = exec,
@@ -101,10 +105,14 @@ const MockDriver = struct {
         return .{ .rows_affected = 0, .last_insert_id = null };
     }
 
-    fn query(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+    fn query(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, sql_text: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
         const self: *MockDriver = @ptrCast(@alignCast(ptr));
+        if (self.capture_sql) {
+            self.last_sql_owned = std.testing.allocator.dupe(u8, sql_text) catch null;
+            self.last_sql = self.last_sql_owned;
+        }
         const rows = try std.testing.allocator.create(MockRows);
-        rows.* = .{ .value = self.value, .returned = false };
+        rows.* = .{ .value = self.value, .returned = self.no_rows };
         return sql_driver.Rows{ .ptr = rows, .vtable = &MockRows.vtable };
     }
 
@@ -182,4 +190,63 @@ test "Max and Min do not leak Rows on null/int/float/text paths" {
         defer if (min == .string) allocator.free(min.string);
         try expectValueEqual(value, min);
     }
+}
+
+test "CountBy issues one grouped query with predicates" {
+    const allocator = std.testing.allocator;
+
+    const Order = schema("Order", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.String("status"),
+            field.Int("amount"),
+        },
+    });
+    const info = comptime fromSchema(Order);
+    const infos = &[_]TypeInfo{info};
+    const OrderEntity = comptime EntityGen(infos, info);
+    const OrderQuery = QueryBuilder(infos, info, OrderEntity);
+
+    var mock = MockDriver{ .value = .null, .no_rows = true, .capture_sql = true };
+    var q = OrderQuery.init(allocator, mock.asDriver(), null);
+    defer q.deinit();
+    _ = try q.Where(&.{sql.EQ("tenant_id", .{ .int = 1 })});
+    var counts = try q.CountBy("status");
+    defer counts.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counts.items.len);
+
+    const s = mock.last_sql orelse return error.NoSqlCaptured;
+    defer if (mock.last_sql_owned) |o| allocator.free(o);
+    try std.testing.expect(std.mem.indexOf(u8, s, "COUNT(*)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "GROUP BY \"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "tenant_id") != null);
+}
+
+test "paged rejects zero page size and short-circuits empty tables" {
+    const allocator = std.testing.allocator;
+
+    const User = schema("User", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+        },
+    });
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const UserQuery = QueryBuilder(infos, info, UserEntity);
+
+    var mock_invalid = MockDriver{ .value = .null, .no_rows = true };
+    var q_invalid = UserQuery.init(allocator, mock_invalid.asDriver(), null);
+    defer q_invalid.deinit();
+    try std.testing.expectError(error.InvalidPageSize, q_invalid.paged(1, 0));
+
+    // Count returns 0 → paged returns an empty result without fetching items.
+    var mock_empty = MockDriver{ .value = .{ .int = 0 } };
+    var q_empty = UserQuery.init(allocator, mock_empty.asDriver(), null);
+    defer q_empty.deinit();
+    var page = try q_empty.paged(1, 20);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(i64, 0), page.total);
+    try std.testing.expectEqual(@as(usize, 0), page.items.items.len);
 }

@@ -213,12 +213,18 @@ pub const Predicate = union(enum) {
     /// tables, foreign-key columns, and correlation semantics.
     has_edge: struct { edge_name: []const u8, fk_col: []const u8, pred: ?*const Predicate },
     not_has_edge: struct { edge_name: []const u8, fk_col: []const u8 },
+    like_escaped: LikeEscapedOp,
     and_: struct { left: *const Predicate, right: *const Predicate },
     or_: struct { left: *const Predicate, right: *const Predicate },
     not_: *const Predicate,
 
     pub const BinOp = struct { column: []const u8, value: Value };
     pub const InOp = struct { column: []const u8, values: []const Value };
+    pub const LikeEscapedOp = struct {
+        column: []const u8,
+        needle: []const u8,
+        escape: u8 = '\\',
+    };
 
     pub fn appendTo(self: Predicate, b: *Builder) !void {
         switch (self) {
@@ -256,6 +262,20 @@ pub const Predicate = union(enum) {
                 try b.ident(p.column);
                 try b.writeString(" LIKE ");
                 try b.arg(p.value);
+            },
+            .like_escaped => |p| {
+                // Inline literal with full escaping of the escape char,
+                // LIKE wildcards and quotes — no injection surface, no
+                // pre-escaped allocation needed.
+                try b.ident(p.column);
+                try b.writeString(" LIKE '");
+                try b.writeByte('%');
+                try writeLikeEscaped(b, p.needle, p.escape);
+                try b.writeByte('%');
+                try b.writeByte('\'');
+                try b.writeString(" ESCAPE '");
+                try b.writeByte(p.escape);
+                try b.writeByte('\'');
             },
             .in => |p| {
                 try b.ident(p.column);
@@ -414,6 +434,38 @@ pub fn LTE(column: []const u8, value: Value) Predicate {
 
 pub fn Like(column: []const u8, value: Value) Predicate {
     return .{ .like = .{ .column = column, .value = value } };
+}
+
+/// Contains with `%`/`_`/escape/quote escaped at render time — user input
+/// stays literal. Backward compatible: `Like`/`Contains` are unchanged.
+pub fn ContainsEscaped(column: []const u8, needle: []const u8) Predicate {
+    return .{ .like_escaped = .{ .column = column, .needle = needle } };
+}
+
+fn writeLikeEscaped(b: *Builder, needle: []const u8, escape: u8) !void {
+    for (needle) |c| {
+        if (c == '\'') {
+            // SQL string literals escape quotes by doubling, not backslash.
+            try b.writeByte('\'');
+            try b.writeByte('\'');
+        } else if (c == escape or c == '%' or c == '_') {
+            try b.writeByte(escape);
+            try b.writeByte(c);
+        } else {
+            try b.writeByte(c);
+        }
+    }
+}
+
+test "ContainsEscaped renders LIKE with escaped wildcards and quotes" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("users"));
+    _ = try s.where(ContainsEscaped("name", "a%b_c\\d'e"));
+    const q = try s.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE \"name\" LIKE '%a\\%b\\_c\\\\d''e%' ESCAPE '\\'", q.sql);
+    try std.testing.expectEqual(@as(usize, 0), q.args.len);
 }
 
 pub fn In(column: []const u8, values: []const Value) Predicate {

@@ -39,7 +39,7 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
         for (info.fields) |f| {
             total_fields += 6; // EQ, NE, GT, GTE, LT, LTE
             if (f.field_type == .string or f.field_type == .text) {
-                total_fields += 1; // Contains
+                total_fields += 2; // Contains + ContainsEscaped
             }
         }
 
@@ -74,6 +74,11 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
             if (f.field_type == .string or f.field_type == .text) {
                 const contains_name = fieldName(f.name, "Contains");
                 field_names[idx] = contains_name;
+                field_types[idx] = StringPredFn;
+                field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(StringPredFn) };
+                idx += 1;
+                const contains_esc_name = fieldName(f.name, "ContainsEscaped");
+                field_names[idx] = contains_esc_name;
                 field_types[idx] = StringPredFn;
                 field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(StringPredFn) };
                 idx += 1;
@@ -145,6 +150,11 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
                         return sql.Like(col, .{ .string = v });
                     }
                 }.containsFn;
+                @field(result, col ++ "ContainsEscaped") = struct {
+                    fn containsEscapedFn(v: []const u8) sql.Predicate {
+                        return sql.ContainsEscaped(col, v);
+                    }
+                }.containsEscapedFn;
             }
         }
 
