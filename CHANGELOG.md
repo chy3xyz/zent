@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Nested transactions via savepoints: `Driver.beginSavepoint` (SQLite /
+  Postgres / MySQL, pool-forwarded) and `codegen.beginTx` degrading to
+  `SAVEPOINT` when already inside a transaction — re-entrant service
+  orchestration with inner rollback/commit semantics.
+- After-commit hook: `TxClient.afterCommit(ctx, fn)` fires once after a
+  successful commit (cache invalidation, indexing, notifications).
+- Distributed ids: `core.id.uuidv4() / uuidv7(now_ms) / format()` with a
+  statically-held CSPRNG; uuid primary keys support Create/Save, query by
+  id, CursorAfter, and eager edge loading (compile-time map selection).
+- Sensitive-field JSON masking: `codegen.entity.toMaskedJson` emits
+  sensitive fields as `"***"` (APIs must use it instead of serializing raw
+  entities — @Struct has no decls slot for jsonStringify).
+- Transaction-scoped event collection: `TxClient.enqueueEvent` /
+  `takePendingEvents` (typically from the after-commit hook) for
+  outbox/audit/notifications.
+- Update-path sensitive log masking (create already masked; update/query
+  were leaking secrets into exec logs).
+- Chunked `IN` clauses: `sql.InChunked`, `QueryBuilder.WhereIn`, and
+  chunked eager-load parent ids (SQLite ~999 parameter cap).
+- `CrudService.insertMany` / `upsertMany` batch writes.
+
 ## [0.23.0] - 2026-08-03
 
 ### Added
