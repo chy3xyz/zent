@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-03
+
 ### Added
 - `helpers` module — official environment assemblers lifted from the ZigModu
   example into the framework: `StoreEnv` (single store + `driver()` accessor),
