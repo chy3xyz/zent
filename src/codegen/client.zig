@@ -238,6 +238,10 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
         tx: sql_driver.Tx,
         after_commit: ?*const fn (ctx: ?*anyopaque) void = null,
         after_commit_ctx: ?*anyopaque = null,
+        /// Transaction-scoped event payloads collected via `enqueueEvent`;
+        /// ownership transfers to the caller via `takePendingEvents`
+        /// (typically from the after-commit callback). Frees on deinit.
+        events: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn commit(self: *@This()) sql_driver.Error!void {
             try self.tx.commit();
@@ -249,6 +253,9 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
         }
 
         pub fn deinit(self: *@This()) void {
+            const alloc = self.client.allocator;
+            for (self.events.items) |p| alloc.free(p);
+            self.events.deinit(alloc);
             return self.tx.deinit();
         }
 
@@ -258,6 +265,25 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
         pub fn afterCommit(self: *@This(), ctx: ?*anyopaque, f: *const fn (ctx: ?*anyopaque) void) void {
             self.after_commit = f;
             self.after_commit_ctx = ctx;
+        }
+
+        /// Collect a transaction-scoped event payload (outbox, audit log,
+        /// notification). The payload is duped; transfer it out after commit
+        /// with `takePendingEvents`. TxClient is a value: keep one instance
+        /// for the transaction's lifetime.
+        pub fn enqueueEvent(self: *@This(), payload: []const u8) !void {
+            const alloc = self.client.allocator;
+            try self.events.append(alloc, try alloc.dupe(u8, payload));
+        }
+
+        /// Transfer ownership of the collected event payloads to the caller
+        /// (caller frees each entry and the slice). Valid after commit.
+        pub fn takePendingEvents(self: *@This()) [][]u8 {
+            const alloc = self.client.allocator;
+            const out = alloc.dupe([]u8, self.events.items) catch return &.{};
+            self.events.deinit(alloc);
+            self.events = .empty;
+            return out;
         }
     };
 }
@@ -777,4 +803,46 @@ test "TxClient afterCommit fires on commit, not on rollback" {
     }.f);
     try tx2.rollback();
     try std.testing.expectEqual(@as(usize, 1), Ctx.committed);
+}
+
+test "TxClient enqueueEvent collects transaction-scoped events" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Item = Schema("Item4", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = makeClient(infos, allocator, driver.asDriver());
+
+    const TxT = TxClient(infos);
+    const Ctx = struct {
+        var handled: [][]u8 = &.{};
+        fn onCommit(ctx: ?*anyopaque) void {
+            const tx: *TxT = @ptrCast(@alignCast(ctx.?));
+            handled = tx.takePendingEvents();
+        }
+    };
+
+    var tx = try beginTx(infos, root);
+    defer tx.deinit();
+    tx.afterCommit(&tx, Ctx.onCommit);
+    try tx.enqueueEvent("{\"type\":\"order.created\"}");
+    try tx.enqueueEvent("{\"type\":\"stock.updated\"}");
+    try tx.commit();
+
+    try std.testing.expectEqual(@as(usize, 2), Ctx.handled.len);
+    try std.testing.expectEqualStrings("{\"type\":\"order.created\"}", Ctx.handled[0]);
+    try std.testing.expectEqualStrings("{\"type\":\"stock.updated\"}", Ctx.handled[1]);
+    for (Ctx.handled) |p| allocator.free(p);
+    allocator.free(Ctx.handled);
+    Ctx.handled = &.{};
 }

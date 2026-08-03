@@ -325,9 +325,66 @@ fn isOwningField(comptime T: type) bool {
     }
 }
 
+/// Serialize an entity to JSON with `sensitive` fields masked as "***".
+/// The generated entity struct cannot carry a `jsonStringify` method (the
+/// @Struct builtin has no decls slot), so APIs must use this helper instead
+/// of serializing the raw entity (std.json would leak sensitive fields).
+/// Non-sensitive values are emitted through std.json (safe escaping).
+pub fn toMaskedJson(
+    allocator: std.mem.Allocator,
+    comptime infos: []const TypeInfo,
+    comptime info: TypeInfo,
+    entity: anytype,
+) ![]u8 {
+    _ = infos;
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '{');
+    inline for (info.fields, 0..) |f, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",");
+        try buf.appendSlice(allocator, "\"");
+        try buf.appendSlice(allocator, f.name);
+        try buf.appendSlice(allocator, "\":");
+        if (f.sensitive) {
+            try buf.appendSlice(allocator, "\"***\"");
+        } else {
+            const value = @field(entity, f.name);
+            const piece = try std.json.Stringify.valueAlloc(allocator, value, .{});
+            defer allocator.free(piece);
+            try buf.appendSlice(allocator, piece);
+        }
+    }
+    try buf.append(allocator, '}');
+    return buf.toOwnedSlice(allocator);
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
+
+test "toMaskedJson masks sensitive fields" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Account = Schema("Account2", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("api_key").Sensitive(),
+        },
+    });
+    const info = comptime fromSchema(Account);
+    const infos = &[_]TypeInfo{info};
+    const AccountEntity = Entity(infos, info);
+
+    const a = AccountEntity{ .id = 1, .name = "alice", .api_key = "sk-secret-123" };
+    const json = try toMaskedJson(allocator, infos, info, a);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"api_key\":\"***\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "sk-secret-123") == null);
+}
 
 test "Entity struct generation" {
     const field = @import("../core/field.zig");
