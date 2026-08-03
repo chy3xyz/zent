@@ -48,6 +48,16 @@ pub const ShardRouter = struct {
         const hash: u64 = @intCast(tenant_id);
         return @intCast(hash % self.shard_count);
     }
+
+    /// Idempotently move a tenant to `new_index` (rebalance). No-op when the
+    /// tenant is already routed there — whether via an explicit mapping or
+    /// the hash fallback — so re-running a rebalance plan is safe.
+    pub fn moveTenant(self: *ShardRouter, tenant_id: i64, new_index: usize) !bool {
+        if (new_index >= self.shard_count) return error.InvalidShardIndex;
+        if (self.route(tenant_id) == new_index) return false;
+        try self.tenant_map.put(tenant_id, new_index);
+        return true;
+    }
 };
 
 /// A set of per-shard root Clients plus the router that selects among them.
@@ -89,6 +99,12 @@ pub fn ShardSet(comptime infos: []const TypeInfo) type {
         pub fn clientAt(self: *Self, index: usize) *RootClient {
             return &self.clients[index];
         }
+
+        /// Idempotent rebalance: move a tenant to another shard. Returns true
+        /// when the routing actually changed.
+        pub fn rebalance(self: *Self, tenant_id: i64, to_shard: usize) !bool {
+            return self.router.moveTenant(tenant_id, to_shard);
+        }
     };
 }
 
@@ -109,6 +125,26 @@ test "ShardRouter explicit map + hash fallback" {
     try testing.expectEqual(router.route(7), router.route(7));
     try testing.expect(router.route(7) < 3);
     try testing.expectError(error.InvalidShardIndex, router.assignTenant(1, 9));
+}
+
+test "ShardRouter moveTenant is idempotent" {
+    var router = ShardRouter.init(testing.allocator, 3);
+    defer router.deinit();
+    try router.assignTenant(10, 1);
+    // Already explicit -> no-op.
+    try testing.expect(!try router.moveTenant(10, 1));
+    // Real move.
+    try testing.expect(try router.moveTenant(10, 2));
+    try testing.expectEqual(@as(usize, 2), router.route(10));
+    // Move back -> real change again.
+    try testing.expect(try router.moveTenant(10, 1));
+    // Hash-routed tenant (route(7) != 0): pinning to a different shard is a
+    // real change; repeating the same move is a no-op.
+    const hash_shard = router.route(7);
+    const other = if (hash_shard == 0) @as(usize, 1) else @as(usize, 0);
+    try testing.expect(try router.moveTenant(7, other));
+    try testing.expect(!try router.moveTenant(7, other));
+    try testing.expectError(error.InvalidShardIndex, router.moveTenant(7, 9));
 }
 
 test "ShardSet routes writes to the tenant's shard" {
