@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Composite keyset pagination: `CursorKeyset(col, value, id, desc)` generates
+  `WHERE (col > ?) OR (col = ? AND id > ?) ORDER BY col, id` — ties on the
+  cursor column (e.g. duplicate feed timestamps) no longer drop rows between
+  pages.
+- Eager-loaded edge filtering: `Edge.WhereRaw(fragment, args)` filters which
+  neighbors load (e.g. only visible comments); filters apply before
+  order/limit so limits rank filtered rows.
+
+### Changed
+- `sql.Value` moved to `src/sql/value.zig` (re-exported by the builder) so
+  `core/edge` and `graph/step` can reference it without a builder↔step import
+  cycle.
+
 ## [0.22.0] - 2026-08-03
 
 ### Added
