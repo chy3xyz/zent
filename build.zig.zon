@@ -1,6 +1,6 @@
 .{
     .name = .zent,
-    .version = "0.12.1",
+    .version = "0.18.0",
     .fingerprint = 0xc7cc6523fbab2ba2,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

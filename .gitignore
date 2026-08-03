@@ -4,6 +4,7 @@ red.md
 
 # Zig build artifacts
 .zig-cache/
+.zig-global-cache/
 zig-out/
 
 # Temporary files
