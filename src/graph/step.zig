@@ -1,4 +1,5 @@
 const std = @import("std");
+const value = @import("../sql/value.zig");
 
 /// Relation cardinality for graph edges.
 /// Mirrors ent's sqlgraph.Rel.
@@ -55,6 +56,7 @@ pub const Step = struct {
     order_by: ?[]const u8 = null,
     desc: bool = false,
     limit: ?usize = null,
+    filter: ?value.Filter = null,
 
     /// Inverse indicates if traversal goes in the inverse direction
     /// (i.e. following a `from` edge rather than a `to` edge).

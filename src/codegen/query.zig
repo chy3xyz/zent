@@ -138,6 +138,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         offset_val: ?usize,
         cursor_col: ?[]const u8 = null,
         cursor_val: ?sql.Value = null,
+        cursor_id: ?i64 = null,
         cursor_desc: bool = false,
         distinct: bool,
         with_trashed: bool,
@@ -278,7 +279,21 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Cursor(self: *Self, column: []const u8, value: sql.Value) *Self {
             self.cursor_col = column;
             self.cursor_val = value;
+            self.cursor_id = null;
             self.cursor_desc = false;
+            self.offset_val = null;
+            return self;
+        }
+
+        /// Composite keyset pagination on `(column, id)`: the generated
+        /// query appends `WHERE (col > ?) OR (col = ? AND id > ?)
+        /// ORDER BY col ASC, id ASC` (desc variants with `<`). Ties on the
+        /// cursor column no longer drop rows between pages.
+        pub fn CursorKeyset(self: *Self, column: []const u8, value: sql.Value, id_value: i64, desc: bool) *Self {
+            self.cursor_col = column;
+            self.cursor_val = value;
+            self.cursor_id = id_value;
+            self.cursor_desc = desc;
             self.offset_val = null;
             return self;
         }
@@ -288,6 +303,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn CursorDesc(self: *Self, column: []const u8, value: sql.Value) *Self {
             self.cursor_col = column;
             self.cursor_val = value;
+            self.cursor_id = null;
             self.cursor_desc = true;
             self.offset_val = null;
             return self;
@@ -297,6 +313,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn CursorAfter(self: *Self, entity: Entity) *Self {
             self.cursor_col = "id";
             self.cursor_val = .{ .int = entity.id };
+            self.cursor_id = null;
             self.cursor_desc = false;
             self.offset_val = null;
             return self;
@@ -818,10 +835,23 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                         }
                     }
                     if (!col_valid) return error.InvalidCursor;
-                    if (self.cursor_desc) {
-                        _ = try selector.where(sql.LT(col, val));
+                    if (self.cursor_id) |id_val| {
+                        // Composite keyset: (col > ?) OR (col = ? AND id > ?)
+                        // — ties on the cursor column never drop rows.
+                        const col_cmp = if (self.cursor_desc) sql.LT(col, val) else sql.GT(col, val);
+                        const col_eq = sql.EQ(col, val);
+                        const id_cmp = if (self.cursor_desc)
+                            sql.LT("id", .{ .int = id_val })
+                        else
+                            sql.GT("id", .{ .int = id_val });
+                        _ = try selector.where(sql.Or(&col_cmp, &sql.And(&col_eq, &id_cmp)));
                     } else {
-                        _ = try selector.where(sql.GT(col, val));
+                        // Single-column cursor (backward compatible).
+                        if (self.cursor_desc) {
+                            _ = try selector.where(sql.LT(col, val));
+                        } else {
+                            _ = try selector.where(sql.GT(col, val));
+                        }
                     }
                 }
             }
@@ -1363,4 +1393,136 @@ test "Query builder Explain prefixes SQL" {
     defer plan.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("EXPLAIN QUERY PLAN SELECT \"user\".\"id\", \"user\".\"name\", \"user\".\"age\" FROM \"user\"", plan.sql);
+}
+
+test "CursorKeyset composite pagination does not drop rows on ties" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const FeedItem = schema("FeedItem", .{
+        .fields = &.{
+            field.Time("created_at"),
+            field.String("body"),
+        },
+    });
+    const graph = comptime buildGraph(&.{FeedItem});
+    const infos = graph.types;
+    const info = comptime fromSchema(FeedItem);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    // Seed 6 rows with duplicate timestamps (ties the naive cursor drops).
+    const times = [_]i64{ 100, 100, 100, 200, 200, 300 };
+    for (times) |t| {
+        var b = try root.feed_item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("created_at", t);
+        _ = try b.setFieldValue("body", "x");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+
+    var seen = std.AutoHashMap(i64, void).init(allocator);
+    defer seen.deinit();
+    var collected: usize = 0;
+    var cursor_col: []const u8 = "created_at";
+    var cursor_val: i64 = 0;
+    var cursor_id: i64 = 0;
+
+    while (true) {
+        var q = root.feed_item.Query();
+        defer q.deinit();
+        _ = q.CursorKeyset(cursor_col, .{ .int = cursor_val }, cursor_id, false);
+        _ = q.Limit(2);
+        const rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        if (rows.items.len == 0) break;
+        for (rows.items) |*e| {
+            try std.testing.expect(!seen.contains(e.id));
+            try seen.put(e.id, {});
+            collected += 1;
+            cursor_col = "created_at";
+            cursor_val = e.created_at;
+            cursor_id = e.id;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 6), collected);
+}
+
+test "WithEdge applies edge filter (only visible comments)" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const FComment = schema("FComment", .{
+        .fields = &.{
+            field.Int("post_id"),
+            field.String("body"),
+            field.String("status"),
+        },
+    });
+    const FPost = schema("FPost", .{
+        .fields = &.{field.String("title")},
+        .edges = &.{edge.To("comments", FComment)
+            .Field("post_id")
+            .WhereRaw("\"status\" = ?", &.{.{ .string = "visible" }})},
+    });
+    const graph = comptime buildGraph(&.{ FPost, FComment });
+    const infos = graph.types;
+    const post_info = comptime fromSchema(FPost);
+    const comment_info = comptime fromSchema(FComment);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    const pid = id: {
+        var b = try root.f_post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("title", "t");
+        var row = try b.Save();
+        defer deinitEntity(infos, post_info, &row, allocator);
+        break :id row.id;
+    };
+    inline for (.{ .{ "v1", "visible" }, .{ "v2", "visible" }, .{ "h1", "hidden" } }) |seed| {
+        var b = try root.f_comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", pid);
+        _ = try b.setFieldValue("body", seed[0]);
+        _ = try b.setFieldValue("status", seed[1]);
+        var row = try b.Save();
+        defer deinitEntity(infos, comment_info, &row, allocator);
+    }
+
+    var q = root.f_post.Query();
+    defer q.deinit();
+    _ = try q.WithEdge("comments");
+    const posts = try q.All();
+    defer {
+        for (posts.items) |*p| deinitEntity(infos, post_info, p, allocator);
+        posts.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), posts.items.len);
+    const comments = posts.items[0].edges.comments.?;
+    try std.testing.expectEqual(@as(usize, 2), comments.len);
+    for (comments) |c| try std.testing.expectEqualStrings("visible", c.status);
 }

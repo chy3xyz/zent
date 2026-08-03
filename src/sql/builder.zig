@@ -1,16 +1,7 @@
 const std = @import("std");
 const Dialect = @import("dialect.zig").Dialect;
 const Step = @import("../graph/step.zig").Step;
-
-/// A value that can be passed as a SQL argument.
-pub const Value = union(enum) {
-    null,
-    bool: bool,
-    int: i64,
-    float: f64,
-    string: []const u8,
-    bytes: []const u8,
-};
+pub const Value = @import("value.zig").Value;
 
 pub const QueryResult = struct {
     sql: []const u8,
@@ -1207,7 +1198,7 @@ pub const UpdateBuilder = struct {
 /// Render an expression with `?` placeholders, replacing each `?` with the
 /// dialect placeholder and binding the matching arg (SET args come before
 /// WHERE args, matching SQL order).
-fn appendExprWithArgs(b: *Builder, expr: []const u8, args: []const Value) !void {
+pub fn appendExprWithArgs(b: *Builder, expr: []const u8, args: []const Value) !void {
     var arg_idx: usize = 0;
     var start: usize = 0;
     for (expr, 0..) |c, i| {

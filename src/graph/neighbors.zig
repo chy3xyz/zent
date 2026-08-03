@@ -125,6 +125,12 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
         },
     }
 
+    if (step.filter) |*pred| {
+        // Inner WHERE (before any window/order), so limits rank filtered rows.
+        try b.writeString(" AND ");
+        try sql.appendExprWithArgs(b, pred.sql, pred.args);
+    }
+
     if (use_window) {
         var num_buf: [32]u8 = undefined;
         const n = try std.fmt.bufPrint(&num_buf, "{d}", .{step.limit.?});
@@ -415,6 +421,27 @@ test "appendSetNeighbors rejects limit on m2m" {
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
     defer b.deinit();
     try testing.expectError(error.UnsupportedEdgeLimit, appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }}));
+}
+
+test "appendSetNeighbors applies filter fragment with args" {
+    const step = Step{
+        .from_table = "post",
+        .from_column = "id",
+        .to_table = "comment",
+        .to_column = "id",
+        .edge_rel = .o2m,
+        .edge_table = "comment",
+        .edge_columns = &[_][]const u8{"post_id"},
+        .inverse = false,
+        .filter = .{ .sql = "\"status\" = ?", .args = &.{.{ .string = "visible" }} },
+    };
+    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+    try appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }});
+    const result = b.query();
+    try testing.expect(std.mem.indexOf(u8, result.sql, "AND \"status\" = ?") != null);
+    try testing.expectEqual(@as(usize, 2), result.args.len);
+    try testing.expectEqualStrings("visible", result.args[1].string);
 }
 
 test "appendHasNeighbors O2M" {

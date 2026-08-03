@@ -6,6 +6,7 @@ const Dialect = @import("../sql/dialect.zig").Dialect;
 const Policy = @import("../privacy/policy.zig").Policy;
 const Annotation = @import("../core/schema.zig").Annotation;
 const graph_step = @import("../graph/step.zig");
+const value = @import("../sql/value.zig");
 
 pub const FieldInfo = struct {
     name: []const u8,
@@ -47,6 +48,7 @@ pub const EdgeInfo = struct {
     order_by: ?[]const u8 = null,
     desc: bool = false,
     limit: ?usize = null,
+    filter: ?value.Filter = null,
 };
 
 pub const IndexInfo = struct {
@@ -208,6 +210,7 @@ fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
             .order_by = e.order_by,
             .desc = e.desc,
             .limit = e.limit,
+            .filter = e.filter,
         };
     }
 }
@@ -501,6 +504,7 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
             .order_by = edge.order_by,
             .desc = edge.desc,
             .limit = edge.limit,
+            .filter = edge.filter,
         };
     } else {
         const fk_col = getEdgeFKColumn(edge, source_info, target_info);
@@ -517,6 +521,7 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
             .order_by = edge.order_by,
             .desc = edge.desc,
             .limit = edge.limit,
+            .filter = edge.filter,
         };
     }
 }

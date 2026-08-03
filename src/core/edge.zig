@@ -1,4 +1,5 @@
 const std = @import("std");
+const value = @import("../sql/value.zig");
 
 /// Edge kind.
 pub const EdgeKind = enum {
@@ -30,6 +31,9 @@ pub const Edge = struct {
     desc: bool = false,
     /// Cap on eager-loaded neighbors per parent (with order_by).
     limit: ?usize = null,
+    /// Static filter applied to eager-loaded neighbors (e.g. only visible
+    /// comments). Values may be parameters (bound in SQL order).
+    filter: ?value.Filter = null,
 
     pub fn Unique(self: Edge) Edge {
         var e = self;
@@ -86,6 +90,14 @@ pub const Edge = struct {
     pub fn Limit(self: Edge, n: usize) Edge {
         var e = self;
         e.limit = n;
+        return e;
+    }
+
+    /// Filter which neighbors are eager-loaded with a raw WHERE fragment,
+    /// e.g. `WhereRaw("\"status\" = ?", &.{.{ .string = "visible" }})`.
+    pub fn WhereRaw(self: Edge, fragment: []const u8, args: []const value.Value) Edge {
+        var e = self;
+        e.filter = .{ .sql = fragment, .args = args };
         return e;
     }
 };
