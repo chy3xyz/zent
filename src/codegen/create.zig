@@ -533,8 +533,8 @@ fn toSqlValue(v: anytype) sql.Value {
 /// Dialect-aware upsert suffix shared by single-row `SaveOrUpdate` and the
 /// bulk `SaveOrUpdate`. The single-row SQLite path deliberately returns ""
 /// (it uses INSERT OR REPLACE instead); the bulk path passes
-/// `is_sqlite=false` and emits ON CONFLICT, which SQLite supports for
-/// multi-row INSERTs. Returns "" when `or_replace` is false.
+/// `is_sqlite=false` and falls into the ON CONFLICT branch — SQLite supports
+/// ON CONFLICT for multi-row INSERTs. Returns "" when `or_replace` is false.
 fn buildUpsertSuffix(
     allocator: std.mem.Allocator,
     or_replace: bool,
@@ -558,20 +558,20 @@ fn buildUpsertSuffix(
         }
         return try buf.toOwnedSlice();
     }
-    if (is_postgres) {
-        var buf = std.array_list.Managed(u8).init(allocator);
-        errdefer buf.deinit();
-        try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
-        var first = true;
-        for (columns) |col| {
-            if (std.mem.eql(u8, col, "id")) continue;
-            if (!first) try buf.appendSlice(", ");
-            first = false;
-            try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
-        }
-        return try buf.toOwnedSlice();
+    // PostgreSQL AND SQLite (bulk path): ON CONFLICT ("id") DO UPDATE SET …
+    // (is_postgres is unused beyond this branch — keep for signature clarity).
+    _ = is_postgres;
+    var buf = std.array_list.Managed(u8).init(allocator);
+    errdefer buf.deinit();
+    try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
+    var first = true;
+    for (columns) |col| {
+        if (std.mem.eql(u8, col, "id")) continue;
+        if (!first) try buf.appendSlice(", ");
+        first = false;
+        try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
     }
-    return "";
+    return try buf.toOwnedSlice();
 }
 
 /// Generate a Bulk Insert builder for an entity.

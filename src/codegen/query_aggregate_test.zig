@@ -190,6 +190,19 @@ test "Bulk upsert emits ON CONFLICT on postgres/sqlite and ON DUPLICATE on mysql
     try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"name\"=EXCLUDED.\"name\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"age\"=EXCLUDED.\"age\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pg_sql, "RETURNING \"id\"") != null);
+    // SQLite bulk upsert must ALSO emit ON CONFLICT (single-row SaveOrUpdate
+    // uses INSERT OR REPLACE, but the bulk path uses ON CONFLICT).
+    var mock_sq = MockDriver{ .value = .{ .int = 1 }, .capture_sql = true, .dialect_override = .sqlite };
+    var b_sq = try BulkBuilder.init(allocator, mock_sq.asDriver(), &.{}, null);
+    defer b_sq.deinit();
+    _ = try b_sq.setFieldValue("name", "alice");
+    _ = try b_sq.setFieldValue("age", 30);
+    var ids_sq = try b_sq.SaveOrUpdate();
+    defer ids_sq.deinit();
+    const sq_sql = mock_sq.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(sq_sql);
+    try std.testing.expect(std.mem.indexOf(u8, sq_sql, "ON CONFLICT (\"id\") DO UPDATE SET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sq_sql, "RETURNING \"id\"") != null);
     // Plain Save must NOT emit a conflict clause.
     var mock_plain = MockDriver{ .value = .{ .int = 1 }, .capture_sql = true, .dialect_override = .postgres };
     var b_plain = try BulkBuilder.init(allocator, mock_plain.asDriver(), &.{}, null);
