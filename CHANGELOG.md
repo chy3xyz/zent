@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-08-04
+
 ### Added
 - Public root export of `codegen.toMaskedJson` — the sensitive-field JSON
   masking helper is now reachable as `zent.codegen.toMaskedJson(...)` so
