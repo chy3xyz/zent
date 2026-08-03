@@ -186,6 +186,29 @@ zent/
 | SQLite | ✅ | ✅ |
 | PostgreSQL/MySQL | ✅ | ✅ (占位符) |
 
+## 消费者接线
+
+把 zent 作为依赖加入，并自行链接你要用的驱动——库本身不会强制消费者链接 C：
+
+```zig
+// build.zig.zon
+.zent = .{
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.18.0.tar.gz",
+    .hash = "…", // 用 `zig fetch --save <url>` 自动填充
+},
+
+// build.zig
+const zent = b.dependency("zent", .{ .target = target, .optimize = optimize });
+mod.addImport("zent", zent.module("zent"));
+mod.linkSystemLibrary("sqlite3", .{}); // 或 libpq / mariadb-connector-c
+```
+
+每次 zent 发版后需要刷新锁定 hash：
+
+```bash
+zig fetch --save https://github.com/chy3xyz/zent/archive/refs/tags/vX.Y.Z.tar.gz
+```
+
 ## 贡献
 
 欢迎贡献！请参阅 [CONTRIBUTING.md](CONTRIBUTING.md) 了解详细信息。

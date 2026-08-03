@@ -48,6 +48,12 @@ jobs:
       - name: Unit tests
         run: zig build test --summary all
 
+      - name: Benchmark smoke (ReleaseFast)
+        run: zig build benchmark -Doptimize=ReleaseFast --summary all
+
+      - name: Example smoke (start)
+        run: zig build run-start --summary all
+
       - name: Version consistency
         run: bash scripts/check-version.sh
 
@@ -115,3 +121,24 @@ jobs:
 
       - name: Integration tests with real databases
         run: zig build test-integration --summary all
+
+  deadcode:
+    name: Dead-code baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (zigmodu toolchain)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1422+e863bf3be
+
+      - name: Build zmodu CLI from zigmodu (pinned v0.15.5)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+          git clone --depth 1 --branch v0.15.5 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
+          cd /tmp/zigmodu && zig build -Ddb=sqlite
+
+      - name: Check dead-code baseline
+        run: ZMODU=/tmp/zigmodu/zig-out/bin/zmodu bash scripts/check-deadcode.sh

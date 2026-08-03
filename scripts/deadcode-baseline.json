@@ -1,0 +1,172 @@
+{
+  "items": [
+    {
+      "file": "src/codegen/client.zig",
+      "line": 24,
+      "kind": "constant",
+      "name": "graph_step",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/client.zig",
+      "line": 27,
+      "kind": "function",
+      "name": "capitalize",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/create.zig",
+      "line": 7,
+      "kind": "constant",
+      "name": "Dialect",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/create.zig",
+      "line": 11,
+      "kind": "constant",
+      "name": "Op",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/create.zig",
+      "line": 15,
+      "kind": "constant",
+      "name": "LogContext",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/entity.zig",
+      "line": 3,
+      "kind": "constant",
+      "name": "EdgeInfo",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/entity.zig",
+      "line": 12,
+      "kind": "function",
+      "name": "toSnakeCase",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/entity.zig",
+      "line": 76,
+      "kind": "function",
+      "name": "EntityFields",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/graph.zig",
+      "line": 133,
+      "kind": "function",
+      "name": "toFieldInfo",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/predicate.zig",
+      "line": 3,
+      "kind": "constant",
+      "name": "FieldInfo",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/query.zig",
+      "line": 3,
+      "kind": "constant",
+      "name": "FieldInfo",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/query.zig",
+      "line": 12,
+      "kind": "constant",
+      "name": "LogContext",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/query.zig",
+      "line": 15,
+      "kind": "constant",
+      "name": "EntityGen",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/query.zig",
+      "line": 17,
+      "kind": "constant",
+      "name": "graph_step",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/update_delete.zig",
+      "line": 6,
+      "kind": "constant",
+      "name": "Dialect",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/update_delete.zig",
+      "line": 10,
+      "kind": "constant",
+      "name": "Op",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/update_delete.zig",
+      "line": 14,
+      "kind": "constant",
+      "name": "LogContext",
+      "parent": null
+    },
+    {
+      "file": "src/entql/parser.zig",
+      "line": 76,
+      "kind": "function",
+      "name": "advance",
+      "parent": "Lexer"
+    },
+    {
+      "file": "src/entql/parser.zig",
+      "line": 208,
+      "kind": "error",
+      "name": "UnexpectedToken",
+      "parent": "ParseError"
+    },
+    {
+      "file": "src/entql/parser.zig",
+      "line": 220,
+      "kind": "error",
+      "name": "InvalidCharacter",
+      "parent": "ParseError"
+    },
+    {
+      "file": "src/entql/parser.zig",
+      "line": 221,
+      "kind": "error",
+      "name": "Overflow",
+      "parent": "ParseError"
+    },
+    {
+      "file": "src/graph/neighbors.zig",
+      "line": 270,
+      "kind": "function",
+      "name": "runSQL",
+      "parent": null
+    },
+    {
+      "file": "src/sql/postgres.zig",
+      "line": 10,
+      "kind": "constant",
+      "name": "PG_ERRBUF_SIZE",
+      "parent": null
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 8,
+      "kind": "constant",
+      "name": "Value",
+      "parent": null
+    }
+  ]
+}

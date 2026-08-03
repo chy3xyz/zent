@@ -190,6 +190,30 @@ zent/
 | SQLite | ✅ | ✅ |
 | PostgreSQL/MySQL | ✅ | ✅ (basic; some mutation paths SQLite-only) |
 
+## Consumer wiring
+
+Add zent as a dependency and link the driver **you** use — the library never
+forces C linkage on consumers:
+
+```zig
+// build.zig.zon
+.zent = .{
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.18.0.tar.gz",
+    .hash = "…", // run `zig fetch --save <url>` to fill this in
+},
+
+// build.zig
+const zent = b.dependency("zent", .{ .target = target, .optimize = optimize });
+mod.addImport("zent", zent.module("zent"));
+mod.linkSystemLibrary("sqlite3", .{}); // or libpq / mariadb-connector-c
+```
+
+After every zent release the pinned hash must be refreshed:
+
+```bash
+zig fetch --save https://github.com/chy3xyz/zent/archive/refs/tags/vX.Y.Z.tar.gz
+```
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
