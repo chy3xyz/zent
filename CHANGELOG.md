@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-03
+
 ### Added
 - Composite keyset pagination: `CursorKeyset(col, value, id, desc)` generates
   `WHERE (col > ?) OR (col = ? AND id > ?) ORDER BY col, id` — ties on the
