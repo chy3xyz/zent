@@ -30,6 +30,10 @@ pub const Validator = union(enum) {
     range: struct { min: i64, max: i64 },
     match: []const u8,
     custom: []const u8,
+    not_empty,
+    length: struct { min: usize, max: usize },
+    email,
+    phone,
 };
 
 /// Field descriptor used at comptime.
@@ -124,6 +128,35 @@ pub const Field = struct {
         var f = self;
         const v = Validator{ .match = pattern };
         f.validators = f.validators ++ &[_]Validator{v};
+        return f;
+    }
+
+    /// Reject empty strings.
+    pub fn NotEmpty(self: Field) Field {
+        var f = self;
+        f.validators = f.validators ++ &[_]Validator{.not_empty};
+        return f;
+    }
+
+    /// Constrain string length (inclusive).
+    pub fn Length(self: Field, comptime min: usize, comptime max: usize) Field {
+        var f = self;
+        const v: Validator = .{ .length = .{ .min = min, .max = max } };
+        f.validators = f.validators ++ &[_]Validator{v};
+        return f;
+    }
+
+    /// Lightweight email format check.
+    pub fn Email(self: Field) Field {
+        var f = self;
+        f.validators = f.validators ++ &[_]Validator{.email};
+        return f;
+    }
+
+    /// Lightweight phone check: optional leading +, digits only, 7-15 chars.
+    pub fn Phone(self: Field) Field {
+        var f = self;
+        f.validators = f.validators ++ &[_]Validator{.phone};
         return f;
     }
 };

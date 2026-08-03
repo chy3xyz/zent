@@ -26,6 +26,7 @@ const FieldValue = @import("create.zig").FieldValue;
 // C time() — libc is linked via build.zig
 extern "c" fn time(tloc: ?*anyopaque) c_long;
 const validateSqlValue = @import("create.zig").validateSqlValue;
+const fillAuditUser = @import("create.zig").fillAuditUser;
 
 fn isStringLike(comptime T: type) bool {
     return comptime switch (@typeInfo(T)) {
@@ -339,6 +340,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                     }
                 }
             }
+            fillAuditUser(info, self.privacy_ctx, &self.values, true);
 
             const version_field: ?FieldInfo = comptime blk: {
                 for (info.fields) |f| {
@@ -587,6 +589,26 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const affected = try self.ForceExec();
             if (affected == 0) return error.NotFound;
             if (affected > 1) return error.NotSingular;
+        }
+
+        /// Restore a soft-deleted row (clears `deleted_at`). Compile error
+        /// unless the entity has soft_delete enabled. Returns true when a
+        /// row was restored.
+        pub fn Restore(self: *Self, id: i64) !bool {
+            if (!info.soft_delete) @compileError("Restore requires soft_delete on the entity");
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
+            var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
+            defer builder.deinit();
+            _ = try builder.set("deleted_at", .null);
+            _ = try builder.where(sql.EQ("id", .{ .int = id }));
+            const q = try builder.query();
+            self.ensureDeadline();
+            const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
+            return res.rows_affected > 0;
         }
 
         fn execSoftDelete(self: *Self) ExecError!usize {
@@ -1353,6 +1375,146 @@ test "maskSensitiveArgs masks sensitive field values in logs" {
     try std.testing.expectEqualStrings("***", masked[0].string);
     try std.testing.expectEqualStrings("alice", masked[1].string);
     try std.testing.expectEqual(@as(i64, 7), masked[2].int);
+}
+
+test "AuditMixin auto-fills created_by/updated_by from privacy context" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+    const AuditMixin = @import("../core/mixin.zig").AuditMixin;
+
+    const Note = Schema("NoteAudit", .{
+        .fields = &.{field.String("body")},
+        .mixins = &.{AuditMixin},
+    });
+    const info = comptime fromSchema(Note);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const base = client_mod.EntityClient(infos, info).init(allocator, driver.asDriver());
+    const preds = base.predicates;
+
+    const note_id = id: {
+        const client = base.withContext(.{ .user_id = 7 });
+        var b = try client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("body", "hello");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+        try std.testing.expectEqual(@as(?i64, 7), row.created_by);
+        try std.testing.expectEqual(@as(?i64, 7), row.updated_by);
+        break :id row.id;
+    };
+
+    const client9 = base.withContext(.{ .user_id = 9 });
+    {
+        var u = client9.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("body", "hello2");
+        _ = try u.Where(.{preds.idEQ(.{ .int = note_id })});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    var q = base.Query();
+    defer q.deinit();
+    _ = try q.Where(.{preds.idEQ(.{ .int = note_id })});
+    var rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expectEqual(@as(?i64, 7), rows.items[0].created_by);
+    try std.testing.expectEqual(@as(?i64, 9), rows.items[0].updated_by);
+}
+
+test "soft-delete restore brings the row back" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Post = Schema("PostSoft", .{
+        .fields = &.{field.String("title")},
+        .mixins = &.{@import("../core/mixin.zig").SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const info = comptime fromSchema(Post);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const client = client_mod.EntityClient(infos, info).init(allocator, driver.asDriver());
+    const preds = client.predicates;
+
+    const post_id = id: {
+        var b = try client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("title", "hello");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+        break :id row.id;
+    };
+
+    // Soft delete.
+    {
+        var d = client.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{preds.idEQ(.{ .int = post_id })});
+        try std.testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+    // Hidden from normal queries.
+    {
+        var q = client.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    }
+    // Visible with WithTrashed.
+    {
+        var q = client.Query();
+        defer q.deinit();
+        _ = q.WithTrashed();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    }
+    // Restore brings it back.
+    {
+        var d = client.Delete();
+        defer d.deinit();
+        try std.testing.expect(try d.Restore(post_id));
+    }
+    {
+        var q = client.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+        try std.testing.expectEqualStrings("hello", rows.items[0].title);
+    }
 }
 
 test "updated_at auto-maintained by UpdateBuilder (TimeMixin)" {

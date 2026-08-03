@@ -8,6 +8,15 @@ pub const TimeMixin = struct {
     };
 };
 
+/// Audit-user fields (created_by / updated_by) auto-filled from
+/// PrivacyContext.user_id on Create/Update unless set explicitly.
+pub const AuditMixin = struct {
+    pub const fields = &[_]field.Field{
+        field.Int("created_by").Optional(),
+        field.Int("updated_by").Optional(),
+    };
+};
+
 /// A mixin that adds a deleted_at timestamp field for soft-delete support.
 pub const SoftDeleteMixin = struct {
     pub const fields = &[_]field.Field{

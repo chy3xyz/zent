@@ -171,6 +171,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            fillAuditUser(info, self.privacy_ctx, &self.values, false);
             // Build mutated slice from field values for hook context.
             const mutated = try self.allocator.alloc(sql.Value, self.values.items.len);
             defer self.allocator.free(mutated);
@@ -489,8 +490,105 @@ pub fn validateSqlValue(comptime field: FieldInfo, value: sql.Value) !void {
                 };
                 if (std.mem.indexOf(u8, str_val, pattern) == null) return error.ValidationFailed;
             },
+            .not_empty => {
+                const str_val = switch (value) {
+                    .string => |s| s,
+                    else => return error.ValidationFailed,
+                };
+                if (str_val.len == 0) return error.ValidationFailed;
+            },
+            .length => |l| {
+                const str_val = switch (value) {
+                    .string => |s| s,
+                    else => return error.ValidationFailed,
+                };
+                if (str_val.len < l.min or str_val.len > l.max) return error.ValidationFailed;
+            },
+            .email => {
+                const str_val = switch (value) {
+                    .string => |s| s,
+                    else => return error.ValidationFailed,
+                };
+                if (!isEmail(str_val)) return error.ValidationFailed;
+            },
+            .phone => {
+                const str_val = switch (value) {
+                    .string => |s| s,
+                    else => return error.ValidationFailed,
+                };
+                if (!isPhone(str_val)) return error.ValidationFailed;
+            },
             .custom => return error.ValidationFailed,
         }
+    }
+}
+
+fn isEmail(s: []const u8) bool {
+    if (s.len < 3 or s.len > 254) return false;
+    var has_at = false;
+    var at_pos: usize = 0;
+    for (s, 0..) |c, i| {
+        if (c == ' ' or c == '\n' or c == '\r' or c == '\t') return false;
+        if (c == '@') {
+            if (has_at) return false;
+            has_at = true;
+            at_pos = i;
+        }
+    }
+    if (!has_at or at_pos == 0 or at_pos == s.len - 1) return false;
+    // Domain must contain a dot after the @.
+    return std.mem.indexOfScalarPos(u8, s, at_pos + 1, '.') != null;
+}
+
+fn isPhone(s: []const u8) bool {
+    if (s.len < 7 or s.len > 15) return false;
+    var start: usize = 0;
+    if (s[0] == '+') start = 1;
+    if (start >= s.len) return false;
+    for (s[start..]) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+/// Auto-fill `created_by` / `updated_by` (AuditMixin) from the privacy
+/// context's user id, unless the caller set them explicitly.
+pub fn fillAuditUser(
+    comptime info: TypeInfo,
+    privacy_ctx: ?privacy.PrivacyContext,
+    values: *std.array_list.Managed(FieldValue),
+    is_update: bool,
+) void {
+    const user = if (privacy_ctx) |ctx| ctx.user_id else null;
+    if (user == null) return;
+    const has_created_by = comptime blk: {
+        for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, "created_by")) break :blk true;
+        }
+        break :blk false;
+    };
+    const has_updated_by = comptime blk: {
+        for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, "updated_by")) break :blk true;
+        }
+        break :blk false;
+    };
+    if (!has_created_by and !has_updated_by) return;
+
+    const set = struct {
+        fn fieldSet(vals: []const FieldValue, name: []const u8) bool {
+            for (vals) |fv| {
+                if (std.mem.eql(u8, fv.name, name)) return true;
+            }
+            return false;
+        }
+    }.fieldSet;
+
+    if (!is_update and has_created_by and !set(values.items, "created_by")) {
+        values.append(.{ .name = "created_by", .value = .{ .int = user.? } }) catch {};
+    }
+    if (has_updated_by and !set(values.items, "updated_by")) {
+        values.append(.{ .name = "updated_by", .value = .{ .int = user.? } }) catch {};
     }
 }
 
@@ -1022,6 +1120,34 @@ test "Create builders expose explicit driver error unions" {
         if (@typeInfo(bulk_save_return).error_union.error_set != BulkSaveError) @compileError("BulkInsert.Save error set is not explicit");
         if (@typeInfo(bulk_save_or_update_return).error_union.error_set != BulkSaveError) @compileError("BulkInsert.SaveOrUpdate error set is not explicit");
     }
+}
+
+test "validators: not_empty / length / email / phone" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Profile = Schema("ProfileV", .{
+        .fields = &.{
+            field.String("username").NotEmpty().Length(3, 20),
+            field.String("email").Email(),
+            field.String("phone").Phone(),
+        },
+    });
+    const info = comptime fromSchema(Profile);
+
+    try validateSqlValue(info.fields[1], .{ .string = "abc" });
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[1], .{ .string = "" }));
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[1], .{ .string = "ab" }));
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[1], .{ .string = "abcdefghijklmnopqrstu" }));
+
+    try validateSqlValue(info.fields[2], .{ .string = "a@b.com" });
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[2], .{ .string = "a@" }));
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[2], .{ .string = "a b@c.com" }));
+
+    try validateSqlValue(info.fields[3], .{ .string = "+8613800138000" });
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[3], .{ .string = "123" }));
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[3], .{ .string = "12ab89012" }));
 }
 
 test "create with edges schema setFieldValue compiles" {
