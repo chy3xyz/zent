@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Public root export of `codegen.toMaskedJson` — the sensitive-field JSON
+  masking helper is now reachable as `zent.codegen.toMaskedJson(...)` so
+  consumers no longer need to reach into internal file paths.
+
+### Fixed
+- Optional fields (`field.*.Optional()`) now work across create / get /
+  update / bulk paths: `setFieldValue` accepts bare values for optional
+  fields, SQL binding handles null, validators skip null, and `ownedCopy`
+  duplicates `?[]const u8` correctly (no dangling strings on read).
+
 ## [0.26.0] - 2026-08-04
 
 ### Added
