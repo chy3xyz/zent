@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Atomic expression parameters: `sql.UpdateBuilder.setExprArgs` and the
+  generated `UpdateBuilder.setExprArgs(field, expr, args)` — `?` placeholders
+  in SET expressions are rewritten dialect-aware and bound in SQL order
+  (SET args precede WHERE args). Enables oversell-safe stock decrement:
+  `SET stock = stock - ? WHERE id = ? AND stock >= ?`, with
+  `rows_affected == 0` meaning insufficient stock.
+- Two-level nested eager loading: `QueryBuilder.WithEdge("posts.comments")`
+  preloads two levels (one IN neighbor query per level). `LightEntity` now
+  carries one shallow edges level (terminal targets are plain fields; deeper
+  paths are compile errors), and `deinitEntity` recursively frees nested edge
+  slices.
+
+### Fixed
+- Global-hook registry test left a dangling chain pointer that crashed later
+  Create/Save tests.
+
 ## [0.20.0] - 2026-08-03
 
 ### Added
