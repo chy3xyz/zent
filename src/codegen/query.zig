@@ -1113,6 +1113,74 @@ test "WithEdge nested two-level preload" {
     try std.testing.expectEqual(@as(i64, p2), posts[1].id);
 }
 
+test "WithEdge honors edge order_by + limit" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const Comment = schema("FeedComment", .{
+        .fields = &.{
+            field.Int("post_id"),
+            field.String("body"),
+        },
+    });
+    const Post = schema("FeedPost", .{
+        .fields = &.{
+            field.Int("author_id"),
+            field.String("title"),
+        },
+        .edges = &.{edge.To("comments", Comment).OrderBy("id").Desc().Limit(1).Field("post_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ Post, Comment });
+    const infos = graph.types;
+    const post_info = comptime fromSchema(Post);
+    const comment_info = comptime fromSchema(Comment);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    const pid = id: {
+        var b = try root.feed_post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("author_id", @as(i64, 1));
+        _ = try b.setFieldValue("title", "t");
+        var row = try b.Save();
+        defer deinitEntity(infos, post_info, &row, allocator);
+        break :id row.id;
+    };
+    inline for (.{ "c1", "c2", "c3" }) |body| {
+        var b = try root.feed_comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", pid);
+        _ = try b.setFieldValue("body", body);
+        var row = try b.Save();
+        defer deinitEntity(infos, comment_info, &row, allocator);
+    }
+
+    var q = root.feed_post.Query();
+    defer q.deinit();
+    _ = try q.WithEdge("comments");
+    const posts = try q.All();
+    defer {
+        for (posts.items) |*p| deinitEntity(infos, post_info, p, allocator);
+        posts.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), posts.items.len);
+    const comments = posts.items[0].edges.comments.?;
+    // Limit(1) + Desc: only the newest comment per post.
+    try std.testing.expectEqual(@as(usize, 1), comments.len);
+    try std.testing.expectEqualStrings("c3", comments[0].body);
+}
+
 test "Query builder GroupBy and Having" {
     const field = @import("../core/field.zig");
     const schema = @import("../core/schema.zig").Schema;

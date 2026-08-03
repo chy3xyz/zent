@@ -185,6 +185,20 @@ fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
     return column.sql_type;
 }
 
+/// Dialect-aware epoch default for the conventional audit timestamp columns
+/// (`created_at` / `updated_at` of logical type `.time`), matching zent's
+/// i64-epoch representation (CURRENT_TIMESTAMP would store text and break
+/// integer scanning). Returns null when the column has an explicit default
+/// or is not an audit column.
+fn auditTimestampDefault(column: ColumnDef, dialect: Dialect) ?[]const u8 {
+    if (column.default_value != null) return null;
+    if (column.logical_type == null or column.logical_type.? != .time) return null;
+    if (!std.mem.eql(u8, column.name, "created_at") and !std.mem.eql(u8, column.name, "updated_at")) return null;
+    if (std.mem.eql(u8, dialect.name, "postgres")) return "(EXTRACT(EPOCH FROM now())::bigint)";
+    if (std.mem.eql(u8, dialect.name, "mysql")) return "(UNIX_TIMESTAMP())";
+    return "(unixepoch())";
+}
+
 /// Normalize a SQL type name for dialect-agnostic comparison by:
 /// - Lowercasing
 /// - Stripping size/precision modifiers: `varchar(255)` → `varchar`
@@ -420,6 +434,9 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
         if (col.default_value) |dv| {
             try buf.appendSlice(" DEFAULT ");
             try buf.appendSlice(dv);
+        } else if (auditTimestampDefault(col, dialect)) |dv2| {
+            try buf.appendSlice(" DEFAULT ");
+            try buf.appendSlice(dv2);
         }
     }
 
@@ -680,7 +697,7 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
 
                     if (e.relation == .o2m) {
                         // O2M: "one User has many Cars" → Car table gets FK column
-                        const fk_col_name = toSnakeCase(other_info.name) ++ "_id";
+                        const fk_col_name = e.field_name orelse toSnakeCase(other_info.name) ++ "_id";
                         // Check if this column already exists
                         var exists = false;
                         for (columns) |c| {
@@ -936,6 +953,8 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
     // For ALTER ADD COLUMN, avoid NOT NULL without a default to keep SQLite happy.
     if (col.default_value) |dv| {
         try buf.print(" DEFAULT {s}", .{dv});
+    } else if (auditTimestampDefault(col, dialect)) |dv2| {
+        try buf.print(" DEFAULT {s}", .{dv2});
     }
 
     // UNIQUE is intentionally NOT appended: SQLite's ALTER TABLE ADD
@@ -943,6 +962,44 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
     // output already carries the UNIQUE constraint on this column.
 
     return buf.toOwnedSlice();
+}
+
+test "createTableSQL adds epoch default to audit timestamp columns" {
+    const table = TableDef{
+        .name = "audit_demo",
+        .columns = &.{
+            .{ .name = "id", .sql_type = "INTEGER", .logical_type = .int, .primary_key = true },
+            .{ .name = "created_at", .sql_type = "INTEGER", .logical_type = .time },
+            .{ .name = "updated_at", .sql_type = "INTEGER", .logical_type = .time },
+        },
+        .primary_keys = &.{"id"},
+    };
+
+    const sqlite_sql = try createTableSQL(table, Dialect.sqlite);
+    defer std.heap.page_allocator.free(sqlite_sql);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "created_at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "DEFAULT (unixepoch())") != null);
+
+    const pg_sql = try createTableSQL(table, Dialect.postgres);
+    defer std.heap.page_allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "DEFAULT (EXTRACT(EPOCH FROM now())::bigint)") != null);
+
+    const mysql_sql = try createTableSQL(table, Dialect.mysql);
+    defer std.heap.page_allocator.free(mysql_sql);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "DEFAULT (UNIX_TIMESTAMP())") != null);
+
+    // A plain Time column keeps no default.
+    const plain = TableDef{
+        .name = "t",
+        .columns = &.{
+            .{ .name = "id", .sql_type = "INTEGER", .logical_type = .int, .primary_key = true },
+            .{ .name = "seen_at", .sql_type = "INTEGER", .logical_type = .time },
+        },
+        .primary_keys = &.{"id"},
+    };
+    const plain_sql = try createTableSQL(plain, Dialect.sqlite);
+    defer std.heap.page_allocator.free(plain_sql);
+    try std.testing.expect(std.mem.indexOf(u8, plain_sql, "DEFAULT") == null);
 }
 
 /// Generate DROP COLUMN SQL for a table column in a dialect-specific format.

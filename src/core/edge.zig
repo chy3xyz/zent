@@ -25,6 +25,11 @@ pub const Edge = struct {
     ref: ?[]const u8 = null,
     field_name: ?[]const u8 = null, // explicit FK field binding
     through: ?type = null, // edge schema for M2M junction table
+    /// Eager-loaded neighbors are ordered by this target column.
+    order_by: ?[]const u8 = null,
+    desc: bool = false,
+    /// Cap on eager-loaded neighbors per parent (with order_by).
+    limit: ?usize = null,
 
     pub fn Unique(self: Edge) Edge {
         var e = self;
@@ -59,6 +64,28 @@ pub const Edge = struct {
     pub fn Through(self: Edge, comptime schema: type) Edge {
         var e = self;
         e.through = schema;
+        return e;
+    }
+
+    /// Order eager-loaded neighbors by a target column (ascending by
+    /// default; combine with `Desc` for newest-first lists).
+    pub fn OrderBy(self: Edge, comptime column: []const u8) Edge {
+        var e = self;
+        e.order_by = column;
+        return e;
+    }
+
+    /// Descending order for eager-loaded neighbors.
+    pub fn Desc(self: Edge) Edge {
+        var e = self;
+        e.desc = true;
+        return e;
+    }
+
+    /// Cap the number of eager-loaded neighbors per parent.
+    pub fn Limit(self: Edge, n: usize) Edge {
+        var e = self;
+        e.limit = n;
         return e;
     }
 };

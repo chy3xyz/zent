@@ -51,6 +51,11 @@ pub const Step = struct {
     /// - For M2M: [pk_target, pk_source]  (2 columns)
     edge_columns: []const []const u8,
 
+    /// Optional ordering / cap for eager-loaded neighbor lists.
+    order_by: ?[]const u8 = null,
+    desc: bool = false,
+    limit: ?usize = null,
+
     /// Inverse indicates if traversal goes in the inverse direction
     /// (i.e. following a `from` edge rather than a `to` edge).
     inverse: bool,

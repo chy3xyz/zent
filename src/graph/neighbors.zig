@@ -15,10 +15,10 @@ fn writeInClause(b: *sql.Builder, parent_ids: []const sql.Value) !void {
     try b.writeByte(')');
 }
 
-fn writeEagerLoadColumns(b: *sql.Builder, step: Step) !void {
+fn writeEagerLoadColumns(b: *sql.Builder, step: Step, include_select: bool) !void {
     // The result set includes target.* plus a computed __fk column that
     // identifies which parent row each result belongs to.
-    try b.writeString("SELECT ");
+    if (include_select) try b.writeString("SELECT ");
     try b.ident(step.to_table);
     try b.writeString(".*, ");
 
@@ -54,7 +54,27 @@ fn writeEagerLoadColumns(b: *sql.Builder, step: Step) !void {
 /// The caller owns `b` and is responsible for calling `b.query()` and
 /// `b.deinit()`.
 pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.Value) !void {
-    try writeEagerLoadColumns(b, step);
+    const use_window = step.limit != null;
+    if (use_window and step.edge_rel != .o2m and step.edge_rel != .o2o) {
+        return error.UnsupportedEdgeLimit;
+    }
+
+    if (use_window) {
+        try b.writeString("SELECT * FROM (SELECT ");
+    }
+    try writeEagerLoadColumns(b, step, !use_window);
+    if (use_window) {
+        // Per-parent row number: PARTITION BY the FK, ordered by the edge's
+        // declared order column (required when a limit is set).
+        try b.writeString(", ROW_NUMBER() OVER (PARTITION BY ");
+        try b.ident(step.edge_columns[0]);
+        try b.writeString(" ORDER BY ");
+        try b.ident(step.to_table);
+        try b.writeByte('.');
+        try b.ident(step.order_by orelse return error.MissingEdgeOrder);
+        if (step.desc) try b.writeString(" DESC");
+        try b.writeString(") AS __rn");
+    }
     try b.writeString(" FROM ");
     try b.ident(step.to_table);
 
@@ -103,6 +123,19 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
             try b.writeString(" IN ");
             try writeInClause(b, parent_ids);
         },
+    }
+
+    if (use_window) {
+        var num_buf: [32]u8 = undefined;
+        const n = try std.fmt.bufPrint(&num_buf, "{d}", .{step.limit.?});
+        try b.writeString(") WHERE __rn <= ");
+        try b.writeString(n);
+    } else if (step.order_by) |col| {
+        try b.writeString(" ORDER BY ");
+        try b.ident(step.to_table);
+        try b.writeByte('.');
+        try b.ident(col);
+        if (step.desc) try b.writeString(" DESC");
     }
 }
 
@@ -342,6 +375,46 @@ test "appendSetNeighbors M2O" {
 
     try testing.expect(std.mem.indexOf(u8, result.sql, "INNER JOIN \"car\" s ON \"user\".\"id\" = s.\"owner_id\"") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, "WHERE s.\"owner_id\" IN (?)") != null);
+}
+
+test "appendSetNeighbors order + per-parent limit uses window function" {
+    const step = Step{
+        .from_table = "user",
+        .from_column = "id",
+        .to_table = "post",
+        .to_column = "id",
+        .edge_rel = .o2m,
+        .edge_table = "post",
+        .edge_columns = &[_][]const u8{"author_id"},
+        .inverse = false,
+        .order_by = "created_at",
+        .desc = true,
+        .limit = 2,
+    };
+    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+    try appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }});
+    const result = b.query();
+    try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT * FROM (SELECT") != null);
+    try testing.expect(std.mem.indexOf(u8, result.sql, "ROW_NUMBER() OVER (PARTITION BY \"author_id\" ORDER BY \"post\".\"created_at\" DESC) AS __rn") != null);
+    try testing.expect(std.mem.indexOf(u8, result.sql, ") WHERE __rn <= 2") != null);
+}
+
+test "appendSetNeighbors rejects limit on m2m" {
+    const step = Step{
+        .from_table = "user",
+        .from_column = "id",
+        .to_table = "group",
+        .to_column = "id",
+        .edge_rel = .m2m,
+        .edge_table = "user_group",
+        .edge_columns = &[_][]const u8{ "group_id", "user_id" },
+        .inverse = false,
+        .limit = 2,
+    };
+    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+    try testing.expectError(error.UnsupportedEdgeLimit, appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }}));
 }
 
 test "appendHasNeighbors O2M" {

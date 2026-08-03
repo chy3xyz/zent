@@ -44,6 +44,9 @@ pub const EdgeInfo = struct {
     inverse_name: ?[]const u8,
     through: ?type,
     through_name: ?[]const u8,
+    order_by: ?[]const u8 = null,
+    desc: bool = false,
+    limit: ?usize = null,
 };
 
 pub const IndexInfo = struct {
@@ -202,6 +205,9 @@ fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
             .inverse_name = inverse_name,
             .through = e.through,
             .through_name = through_name,
+            .order_by = e.order_by,
+            .desc = e.desc,
+            .limit = e.limit,
         };
     }
 }
@@ -392,7 +398,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) 
                     if (has_from_inverse) continue;
 
                     if (e.relation == .o2m) {
-                        const fk_col_name = toSnakeCase(other_info.name) ++ "_id";
+                        const fk_col_name = e.field_name orelse toSnakeCase(other_info.name) ++ "_id";
                         var exists = false;
                         for (fields) |f| {
                             if (std.mem.eql(u8, f.name, fk_col_name)) {
@@ -450,6 +456,7 @@ fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
 
 /// Resolve the foreign-key column name for a non-M2M edge.
 fn getEdgeFKColumn(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) []const u8 {
+    if (edge.field_name) |fn_| return fn_;
     if (edge.kind == .to) {
         for (target_info.edges) |target_edge| {
             if (target_edge.kind == .from) {
@@ -491,6 +498,9 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
             .edge_table = junction,
             .edge_columns = &[_][]const u8{ target_col, source_col },
             .inverse = edge.kind == .from,
+            .order_by = edge.order_by,
+            .desc = edge.desc,
+            .limit = edge.limit,
         };
     } else {
         const fk_col = getEdgeFKColumn(edge, source_info, target_info);
@@ -504,6 +514,9 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
             .edge_table = if (is_to) target_table else source_table,
             .edge_columns = &[_][]const u8{fk_col},
             .inverse = !is_to,
+            .order_by = edge.order_by,
+            .desc = edge.desc,
+            .limit = edge.limit,
         };
     }
 }

@@ -44,6 +44,15 @@ fn isStringLike(comptime T: type) bool {
     };
 }
 
+/// Dialect SQL expression producing the current Unix epoch (seconds) as an
+/// integer, matching zent's i64 Time representation.
+fn epochExpr(dialect: anytype) []const u8 {
+    const name: []const u8 = dialect.name;
+    if (std.mem.eql(u8, name, "postgres")) return "EXTRACT(EPOCH FROM now())::bigint";
+    if (std.mem.eql(u8, name, "mysql")) return "UNIX_TIMESTAMP()";
+    return "(unixepoch())";
+}
+
 fn canSetField(comptime Expected: type, Actual: type) bool {
     const Unwrapped = if (@typeInfo(Expected) == .optional)
         @typeInfo(Expected).optional.child
@@ -344,6 +353,28 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             } else {
                 for (self.values.items) |fv| {
                     _ = try builder.set(fv.name, fv.value);
+                }
+            }
+
+            // Auto-maintain updated_at (TimeMixin convention) unless the
+            // caller set it explicitly. Uses a dialect epoch expression so
+            // the stored value stays an integer (i64) like zent's Time type.
+            const has_updated_at = comptime blk: {
+                for (info.fields) |f| {
+                    if (std.mem.eql(u8, f.name, "updated_at") and f.field_type == .time) break :blk true;
+                }
+                break :blk false;
+            };
+            if (comptime has_updated_at) {
+                var explicit_updated_at = false;
+                for (self.values.items) |fv| {
+                    if (std.mem.eql(u8, fv.name, "updated_at")) {
+                        explicit_updated_at = true;
+                        break;
+                    }
+                }
+                if (!explicit_updated_at) {
+                    _ = try builder.setExpr("updated_at", epochExpr(self.driver.dialect()));
                 }
             }
 
@@ -1254,4 +1285,79 @@ test "setExprArgs atomic stock decrement prevents oversell" {
         found.deinit();
     }
     try std.testing.expectEqual(@as(i64, 2), found.items[0].stock);
+}
+
+test "updated_at auto-maintained by UpdateBuilder (TimeMixin)" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+    const TimeMixin = @import("../core/mixin.zig").TimeMixin;
+
+    const Note = Schema("Note", .{
+        .fields = &.{
+            field.String("body"),
+        },
+        .mixins = &.{TimeMixin},
+    });
+    const info = comptime fromSchema(Note);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const EntityClient = client_mod.EntityClient(infos, info);
+    const client = EntityClient.init(allocator, driver.asDriver());
+    const preds = client.predicates;
+
+    // Create without timestamps: DB default fills created_at/updated_at.
+    const note_id = id: {
+        var b = try client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("body", "hello");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+        break :id row.id;
+    };
+    var q1 = client.Query();
+    defer q1.deinit();
+    var after_create = (try q1.First()) orelse return error.NoRow;
+    defer deinitEntity(infos, info, &after_create, allocator);
+    try std.testing.expect(after_create.created_at != null);
+    const created_ms = after_create.created_at.?;
+
+    // Update without touching updated_at: auto-refresh.
+    {
+        var u = client.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("body", "hello2");
+        _ = try u.Where(.{preds.idEQ(.{ .int = note_id })});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    var q2 = client.Query();
+    defer q2.deinit();
+    var after_update = (try q2.First()) orelse return error.NoRow;
+    defer deinitEntity(infos, info, &after_update, allocator);
+    try std.testing.expect(after_update.updated_at != null);
+    try std.testing.expect(after_update.updated_at.? >= created_ms);
+
+    // Explicit updated_at wins over the auto-maintenance.
+    {
+        var u = client.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("body", "hello3");
+        _ = try u.setFieldValue("updated_at", @as(i64, 42));
+        _ = try u.Where(.{preds.idEQ(.{ .int = note_id })});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    var q3 = client.Query();
+    defer q3.deinit();
+    var after_explicit = (try q3.First()) orelse return error.NoRow;
+    defer deinitEntity(infos, info, &after_explicit, allocator);
+    try std.testing.expectEqual(@as(?i64, 42), after_explicit.updated_at);
 }
