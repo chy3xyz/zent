@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Column projection: `QueryBuilder.Select(cols)` restricts the query to a
+  column subset (skips large text/blob fields); rows scan by name
+  (`scanRowNamed`) and unselected fields keep zero values (read-only).
+- Bulk soft delete: `BulkDelete` on `soft_delete` entities updates
+  `deleted_at` per WHERE group (OR semantics) instead of compile-erroring.
+- `field.Custom(pattern)` validator lands as wildcard matching (`*` any
+  sequence, `?` one char).
+
+### Fixed
+- Dangling-pointer bug in pointer-based `And`/`Or` predicate trees
+  (`WhereIn` stored pointers to expired stack locals). New value-semantics
+  `or_in` predicate (`col IN (…) OR col IN (…)`) with chunks owned by the
+  query builder.
+
 ## [0.25.0] - 2026-08-04
 
 ### Added
