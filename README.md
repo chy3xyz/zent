@@ -4,7 +4,7 @@ A Zig language implementation of an Entity Framework, inspired by [ent](https://
 
 [中文版本](README_CN.md)
 
-Current release: **v0.20.0** (package version synced to tags; see `scripts/release.sh`).
+Current release: **v0.21.0** (package version synced to tags; see `scripts/release.sh`).
 
 ## Features
 
@@ -198,7 +198,7 @@ forces C linkage on consumers:
 ```zig
 // build.zig.zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.20.0.tar.gz",
+    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.21.0.tar.gz",
     .hash = "…", // run `zig fetch --save <url>` to fill this in
 },
 

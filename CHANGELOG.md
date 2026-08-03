@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-03
+
 ### Added
 - Atomic expression parameters: `sql.UpdateBuilder.setExprArgs` and the
   generated `UpdateBuilder.setExprArgs(field, expr, args)` — `?` placeholders
