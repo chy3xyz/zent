@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `helpers` module — official environment assemblers lifted from the ZigModu
+  example into the framework: `StoreEnv` (single store + `driver()` accessor),
+  `PooledEnv` (thread-safe `sql_pool`-backed client), `ShardedEnv`
+  (per-shard driver/client + `ShardSet` routing), `TestEnv` (isolated
+  in-memory store with `reset()`).
+- `sql_pool.ConnPool`: `connect` is now optional and a `connectCtx` factory
+  pair was added, so pools can open connections with runtime configuration
+  (e.g. a file path) without globals.
+- `shard.ShardRouter.moveTenant` / `ShardSet.rebalance` — idempotent tenant
+  rebalance (no-op when already routed to the target shard).
+
 ## [0.19.0] - 2026-08-03
 
 ### Added
