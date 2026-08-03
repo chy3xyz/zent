@@ -47,6 +47,7 @@ pub const graph = struct {
 };
 
 pub const privacy = @import("privacy/policy.zig");
+pub const data_scope = @import("privacy/data_scope.zig");
 
 pub const entql = @import("entql/parser.zig");
 
