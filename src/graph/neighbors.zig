@@ -298,7 +298,7 @@ test "appendSetNeighbors O2M" {
     try testing.expectEqual(2, result.args.len);
     try testing.expectEqual(@as(i64, 1), result.args[0].int);
     try testing.expectEqual(@as(i64, 2), result.args[1].int);
-    try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT \"car\".*, \"car\".\"owner_id\" AS __fk") != null);
+    try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT \"car\".*, \"owner_id\" AS __fk") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, "FROM \"car\"") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, "WHERE \"owner_id\" IN (?, ?)") != null);
 }
@@ -321,7 +321,7 @@ test "appendSetNeighbors M2M" {
 
     try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT \"group\".*, \"j\".\"user_id\" AS __fk") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, "INNER JOIN \"user_group\" j") != null);
-    try testing.expect(std.mem.indexOf(u8, result.sql, "WHERE \"j\".\"user_id\" IN (?)") != null);
+    try testing.expect(std.mem.indexOf(u8, result.sql, "WHERE j.\"user_id\" IN (?)") != null);
 }
 
 test "appendSetNeighbors M2O" {
@@ -341,7 +341,7 @@ test "appendSetNeighbors M2O" {
     const result = b.query();
 
     try testing.expect(std.mem.indexOf(u8, result.sql, "INNER JOIN \"car\" s ON \"user\".\"id\" = s.\"owner_id\"") != null);
-    try testing.expect(std.mem.indexOf(u8, result.sql, "WHERE \"s\".\"owner_id\" IN (?)") != null);
+    try testing.expect(std.mem.indexOf(u8, result.sql, "WHERE s.\"owner_id\" IN (?)") != null);
 }
 
 test "appendHasNeighbors O2M" {

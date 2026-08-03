@@ -99,6 +99,20 @@ pub const Builder = struct {
         b.buffer.appendAssumeCapacity(quote);
     }
 
+    /// Render an identifier, honoring the `qualifier.name` dotted form as
+    /// `"qualifier"."name"` (single-part names stay `"name"`). Predicates
+    /// commonly reference joined columns like `group.name`, which must not be
+    /// quoted as one literal identifier.
+    pub fn qualifiedIdent(b: *Builder, name: []const u8) !void {
+        if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+            try b.ident(name[0..dot]);
+            try b.writeByte('.');
+            try b.ident(name[dot + 1 ..]);
+        } else {
+            try b.ident(name);
+        }
+    }
+
     pub fn arg(b: *Builder, value: Value) !void {
         try b.args.append(value);
         const idx = b.args.items.len;
@@ -229,37 +243,37 @@ pub const Predicate = union(enum) {
     pub fn appendTo(self: Predicate, b: *Builder) !void {
         switch (self) {
             .eq => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" = ");
                 try b.arg(p.value);
             },
             .ne => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" <> ");
                 try b.arg(p.value);
             },
             .gt => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" > ");
                 try b.arg(p.value);
             },
             .lt => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" < ");
                 try b.arg(p.value);
             },
             .gte => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" >= ");
                 try b.arg(p.value);
             },
             .lte => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" <= ");
                 try b.arg(p.value);
             },
             .like => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" LIKE ");
                 try b.arg(p.value);
             },
@@ -267,7 +281,7 @@ pub const Predicate = union(enum) {
                 // Inline literal with full escaping of the escape char,
                 // LIKE wildcards and quotes — no injection surface, no
                 // pre-escaped allocation needed.
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" LIKE '");
                 try b.writeByte('%');
                 try writeLikeEscaped(b, p.needle, p.escape);
@@ -278,7 +292,7 @@ pub const Predicate = union(enum) {
                 try b.writeByte('\'');
             },
             .in => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" IN ");
                 try b.writeByte('(');
                 for (p.values, 0..) |v, i| {
@@ -288,7 +302,7 @@ pub const Predicate = union(enum) {
                 try b.writeByte(')');
             },
             .not_in => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" NOT IN ");
                 try b.writeByte('(');
                 for (p.values, 0..) |v, i| {
@@ -299,24 +313,24 @@ pub const Predicate = union(enum) {
             },
             .eq_fold => |p| {
                 try b.writeString("LOWER(");
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(") = LOWER(");
                 try b.arg(p.value);
                 try b.writeByte(')');
             },
             .is_null => |col| {
-                try b.ident(col);
+                try b.qualifiedIdent(col);
                 try b.writeString(" IS NULL");
             },
             .is_not_null => |col| {
-                try b.ident(col);
+                try b.qualifiedIdent(col);
                 try b.writeString(" IS NOT NULL");
             },
             .raw => |sql_text| {
                 try b.writeString(sql_text);
             },
             .in_subquery => |p| {
-                try b.ident(p.column);
+                try b.qualifiedIdent(p.column);
                 try b.writeString(" IN (");
                 try b.writeString(p.sql);
                 try b.writeByte(')');

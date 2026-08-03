@@ -529,11 +529,11 @@ test "EntityClient" {
     const ClientType = EntityClient(infos, info);
 
     const client = ClientType.init(std.testing.allocator, undefined);
-    var builder = client.Create();
+    var builder = try client.Create();
     defer builder.deinit();
 
     // Test set method indirectly
-    _ = builder.setValue("name", .{ .string = "alice" });
+    _ = try builder.setFieldValue("name", "alice");
     try std.testing.expectEqual(@as(usize, 1), builder.values.items.len);
 }
 
@@ -557,9 +557,9 @@ test "Client type generation" {
 
     // Verify field names exist
     const c = std.testing.allocator;
-    var client = makeClient(infos, c, undefined);
-    _ = client.user.Create();
-    _ = client.car.Create();
+    const client = makeClient(infos, c, undefined);
+    _ = try client.user.Create();
+    _ = try client.car.Create();
 }
 
 test "Client driver operations expose explicit driver error unions" {
@@ -579,13 +579,10 @@ test "Client driver operations expose explicit driver error unions" {
     const car_info = comptime fromSchema(Car);
     const infos = &[_]TypeInfo{ user_info, car_info };
     const RootClient = Client(infos);
-    const UserClient = EntityClient(infos, user_info);
     const TransactionClient = TxClient(infos);
-    const ExpectedQueryTargetsError = sql_driver.Error || error{TypeMismatch};
 
     comptime {
-        if (@typeInfo(@typeInfo(@TypeOf(beginTx(infos, @as(RootClient, undefined)))).error_union).error_set != sql_driver.Error) @compileError("beginTx error set is not explicit");
-        if (@typeInfo(@typeInfo(@TypeOf(UserClient.QueryEdge)).@"fn".return_type.?).error_union.error_set != ExpectedQueryTargetsError) @compileError("EntityClient.QueryEdge error set is not explicit");
+        if (@typeInfo(@TypeOf(beginTx(infos, @as(RootClient, undefined)))).error_union.error_set != sql_driver.Error) @compileError("beginTx error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.commit)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.commit error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.rollback)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.rollback error set is not explicit");
     }

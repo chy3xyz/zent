@@ -28,7 +28,7 @@ extern "c" fn time(tloc: ?*anyopaque) c_long;
 const validateSqlValue = @import("create.zig").validateSqlValue;
 
 fn isStringLike(comptime T: type) bool {
-    return switch (@typeInfo(T)) {
+    return comptime switch (@typeInfo(T)) {
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) return true;
             if (ptr.size == .one) {
@@ -81,7 +81,7 @@ fn toSqlValue(v: anytype) sql.Value {
         .int => .{ .int = v },
         .float => .{ .float = v },
         else => {
-            if (isStringLike(T)) return .{ .string = v };
+            if (comptime isStringLike(T)) return .{ .string = v };
             @compileError("Unsupported value type: " ++ @typeName(T));
         },
     };
@@ -995,10 +995,11 @@ test "Update builder basic" {
     var u = Upd.init(std.testing.allocator, undefined, &.{}, null);
     defer u.deinit();
 
-    _ = u.set("name", .{ .string = "bob" });
+    const bob: []const u8 = "bob";
+    _ = try u.setFieldValue("name", bob);
     try std.testing.expectEqual(@as(usize, 1), u.values.items.len);
 
-    _ = u.Where(&.{sql.EQ("id", .{ .int = 1 })});
+    _ = try u.Where(.{sql.EQ("id", .{ .int = 1 })});
     try std.testing.expectEqual(@as(usize, 1), u.predicates.items.len);
 }
 
@@ -1017,7 +1018,7 @@ test "Delete builder basic" {
     var d = Del.init(std.testing.allocator, undefined, &.{}, null);
     defer d.deinit();
 
-    _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
+    _ = try d.Where(.{sql.EQ("id", .{ .int = 1 })});
     try std.testing.expectEqual(@as(usize, 1), d.predicates.items.len);
 }
 
@@ -1036,11 +1037,13 @@ test "Update builder SaveOne and Delete builder ExecOne compile" {
 
     var u = Upd.init(std.testing.allocator, undefined, &.{}, null);
     defer u.deinit();
-    _ = u.set("name", .{ .string = "bob" }).Where(&.{sql.EQ("id", .{ .int = 1 })});
+    const bob: []const u8 = "bob";
+    _ = try u.setFieldValue("name", bob);
+    _ = try u.Where(.{sql.EQ("id", .{ .int = 1 })});
 
     var d = Del.init(std.testing.allocator, undefined, &.{}, null);
     defer d.deinit();
-    _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
+    _ = try d.Where(.{sql.EQ("id", .{ .int = 1 })});
 
     // Compilation check only; actual execution requires a real driver.
     try std.testing.expectEqual(@as(usize, 1), u.values.items.len);
@@ -1059,11 +1062,18 @@ test "BulkUpdate builder basic" {
     const info = comptime fromSchema(User);
     const BulkUpd = BulkUpdateBuilder(info);
 
-    var u = BulkUpd.init(std.testing.allocator, undefined, &.{}, null);
+    var driver = try @import("../sql/sqlite.zig").SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer driver.close();
+    var u = BulkUpd.init(std.testing.allocator, driver.asDriver(), &.{}, null);
     defer u.deinit();
 
-    _ = u.Row(1).setFieldValue("name", "alice").setFieldValue("age", 31);
-    _ = u.Row(2).setFieldValue("name", "bob");
+    _ = try u.Row(1);
+    const alice: []const u8 = "alice";
+    const bob: []const u8 = "bob";
+    _ = try u.setFieldValue("name", alice);
+    _ = try u.setFieldValue("age", 31);
+    _ = try u.Row(2);
+    _ = try u.setFieldValue("name", bob);
 
     try std.testing.expectEqual(@as(usize, 2), u.b.rows.items.len);
     try std.testing.expectEqual(@as(i64, 1), u.b.rows.items[0].id);
@@ -1084,11 +1094,14 @@ test "BulkDelete builder basic" {
     const info = comptime fromSchema(User);
     const BulkDel = BulkDeleteBuilder(info);
 
-    var d = BulkDel.init(std.testing.allocator, undefined, &.{}, null);
+    var driver = try @import("../sql/sqlite.zig").SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer driver.close();
+    var d = try BulkDel.init(std.testing.allocator, driver.asDriver(), &.{}, null);
     defer d.deinit();
 
-    _ = d.Where(&.{sql.EQ("id", .{ .int = 1 })});
-    _ = d.Next().Where(&.{sql.EQ("id", .{ .int = 2 })});
+    _ = try d.Where(.{sql.EQ("id", .{ .int = 1 })});
+    _ = try d.Next();
+    _ = try d.Where(.{sql.EQ("id", .{ .int = 2 })});
 
     try std.testing.expectEqual(@as(usize, 2), d.b.groups.items.len);
     try std.testing.expectEqual(@as(usize, 1), d.b.groups.items[0].items.len);

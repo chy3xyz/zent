@@ -33,6 +33,8 @@ pub const codegen = struct {
     pub const client = @import("codegen/client.zig");
 };
 
+pub const crud = @import("crud.zig");
+
 pub const runtime = struct {
     pub const hook = @import("runtime/hook.zig");
     pub const err = @import("runtime/error.zig");
