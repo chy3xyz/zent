@@ -265,7 +265,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var rows = try self.driver.queryCtx(&self.execution_context, full_sql, q.args);
                 defer rows.deinit();
                 const row = rows.next() orelse return error.NotFound;
-                entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
+                if (comptime @TypeOf(entity.id) == i64) {
+                    entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
+                } else {
+                    // Textual primary key (uuid): RETURNING gives the value back.
+                    entity.id = try self.allocator.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
+                }
                 const duration_us: u64 = nowUs() - start;
 
                 if (self.logger.onExec) |log| {
@@ -306,7 +311,17 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const start = nowUs();
                 const res = try self.driver.execCtx(&self.execution_context, full_sql, q.args);
                 const duration_us: u64 = nowUs() - start;
-                entity.id = @intCast(res.last_insert_id orelse 0);
+                if (comptime @TypeOf(entity.id) == i64) {
+                    entity.id = @intCast(res.last_insert_id orelse 0);
+                } else {
+                    // Textual primary key (uuid) on MySQL: no RETURNING — keep
+                    // the caller-provided id from the values.
+                    for (self.values.items) |fv| {
+                        if (std.mem.eql(u8, fv.name, "id") and fv.value == .string) {
+                            entity.id = try self.allocator.dupe(u8, fv.value.string);
+                        }
+                    }
+                }
 
                 if (self.logger.onExec) |log| {
                     var log_args = try self.allocator.alloc(sql.Value, args.items.len);

@@ -156,6 +156,9 @@ pub const Tx = struct {
     rollbackFn: *const fn (ptr: *anyopaque) Error!void,
     deinitFn: *const fn (ptr: *anyopaque) void,
     ptr: *anyopaque,
+    savepointFn: ?*const fn (ptr: *anyopaque, name: []const u8) Error!void = null,
+    savepointRollbackFn: ?*const fn (ptr: *anyopaque, name: []const u8) Error!void = null,
+    savepointReleaseFn: ?*const fn (ptr: *anyopaque, name: []const u8) Error!void = null,
 
     pub fn commit(self: Tx) !void {
         return self.commitFn(self.ptr);
@@ -167,6 +170,21 @@ pub const Tx = struct {
 
     pub fn deinit(self: Tx) void {
         self.deinitFn(self.ptr);
+    }
+
+    pub fn savepoint(self: Tx, name: []const u8) !void {
+        if (self.savepointFn) |f| return f(self.ptr, name);
+        return error.SavepointUnsupported;
+    }
+
+    pub fn savepointRollback(self: Tx, name: []const u8) !void {
+        if (self.savepointRollbackFn) |f| return f(self.ptr, name);
+        return error.SavepointUnsupported;
+    }
+
+    pub fn savepointRelease(self: Tx, name: []const u8) !void {
+        if (self.savepointReleaseFn) |f| return f(self.ptr, name);
+        return error.SavepointUnsupported;
     }
 
     pub fn exec(self: Tx, sql: []const u8, args: []const Value) !Result {
@@ -200,6 +218,7 @@ pub const Driver = struct {
         ping: *const fn (ptr: *anyopaque) Error!void,
         /// Returns true if the connection currently has an active transaction.
         inTransaction: *const fn (ptr: *anyopaque) bool,
+        beginSavepoint: *const fn (ptr: *anyopaque, name: []const u8) Error!Tx,
     };
 
     pub fn exec(self: Driver, query_sql: []const u8, args: []const Value) !Result {
@@ -236,5 +255,9 @@ pub const Driver = struct {
 
     pub fn inTransaction(self: Driver) bool {
         return self.vtable.inTransaction(self.ptr);
+    }
+
+    pub fn beginSavepoint(self: Driver, name: []const u8) !Tx {
+        return self.vtable.beginSavepoint(self.ptr, name);
     }
 };

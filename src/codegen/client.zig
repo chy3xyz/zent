@@ -236,9 +236,12 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
     return struct {
         client: Client(infos),
         tx: sql_driver.Tx,
+        after_commit: ?*const fn (ctx: ?*anyopaque) void = null,
+        after_commit_ctx: ?*anyopaque = null,
 
         pub fn commit(self: *@This()) sql_driver.Error!void {
-            return self.tx.commit();
+            try self.tx.commit();
+            if (self.after_commit) |f| f(self.after_commit_ctx);
         }
 
         pub fn rollback(self: *@This()) sql_driver.Error!void {
@@ -247,6 +250,14 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
 
         pub fn deinit(self: *@This()) void {
             return self.tx.deinit();
+        }
+
+        /// Register a callback invoked once after a successful commit (cache
+        /// invalidation, search indexing, notifications). The TxClient is a
+        /// value: call `afterCommit` on the instance you commit.
+        pub fn afterCommit(self: *@This(), ctx: ?*anyopaque, f: *const fn (ctx: ?*anyopaque) void) void {
+            self.after_commit = f;
+            self.after_commit_ctx = ctx;
         }
     };
 }
@@ -333,7 +344,12 @@ pub fn GetMetrics() Metrics {
 /// so that transactional operations retain hook callbacks, privacy rules,
 /// and logging configuration.
 pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver.Error!TxClient(infos) {
-    const tx = try self.driver.beginTx();
+    // Re-entrant beginTx inside an active transaction degrades to a
+    // savepoint, so service orchestration can nest transactions safely.
+    const tx = if (self.driver.inTransaction())
+        try self.driver.beginSavepoint("zent_sp")
+    else
+        try self.driver.beginTx();
     var c = makeClient(infos, self.allocator, tx.inner);
     c.logger = self.logger;
     inline for (infos) |info| {
@@ -586,4 +602,179 @@ test "Client driver operations expose explicit driver error unions" {
         if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.commit)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.commit error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.rollback)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.rollback error set is not explicit");
     }
+}
+
+test "beginTx nested savepoint: inner rollback discards only inner writes" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Item = Schema("Item", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+    const info = comptime fromSchema(Item);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = makeClient(infos, allocator, driver.asDriver());
+
+    // Outer transaction.
+    var outer = try beginTx(infos, root);
+    defer outer.deinit();
+    {
+        var b = try outer.client.item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "outer-a");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+
+    // Nested beginTx degrades to a savepoint on the same connection.
+    try std.testing.expect(driver.inTransaction());
+    var inner = try beginTx(infos, root);
+    defer inner.deinit();
+    {
+        var b = try inner.client.item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "inner-b");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+    try inner.rollback(); // savepoint rollback -> inner-b discarded
+
+    {
+        var b = try outer.client.item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "outer-c");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+    try outer.commit();
+
+    var q = root.item.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+    var names = std.StringHashMap(void).init(allocator);
+    defer names.deinit();
+    for (rows.items) |*e| try names.put(e.name, {});
+    try std.testing.expect(names.contains("outer-a"));
+    try std.testing.expect(!names.contains("inner-b"));
+    try std.testing.expect(names.contains("outer-c"));
+}
+
+test "beginTx nested savepoint: inner commit releases to outer tx" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Item = Schema("Item2", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+    const info = comptime fromSchema(Item);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = makeClient(infos, allocator, driver.asDriver());
+
+    var outer = try beginTx(infos, root);
+    defer outer.deinit();
+    {
+        var b = try outer.client.item2.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "outer");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+
+    var inner = try beginTx(infos, root);
+    defer inner.deinit();
+    {
+        var b = try inner.client.item2.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "inner-committed");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+    try inner.commit(); // savepoint release
+
+    // Inner writes are visible inside the outer tx and survive its commit.
+    var q = outer.client.item2.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+    try outer.commit();
+
+    var q2 = root.item2.Query();
+    defer q2.deinit();
+    const final_rows = try q2.All();
+    defer {
+        for (final_rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        final_rows.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), final_rows.items.len);
+}
+
+test "TxClient afterCommit fires on commit, not on rollback" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Item = Schema("Item3", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = makeClient(infos, allocator, driver.asDriver());
+
+    const Ctx = struct {
+        var committed: usize = 0;
+    };
+    var tx = try beginTx(infos, root);
+    defer tx.deinit();
+    tx.afterCommit(null, struct {
+        fn f(_: ?*anyopaque) void {
+            Ctx.committed += 1;
+        }
+    }.f);
+    try tx.commit();
+    try std.testing.expectEqual(@as(usize, 1), Ctx.committed);
+
+    var tx2 = try beginTx(infos, root);
+    defer tx2.deinit();
+    tx2.afterCommit(null, struct {
+        fn f(_: ?*anyopaque) void {
+            Ctx.committed += 1;
+        }
+    }.f);
+    try tx2.rollback();
+    try std.testing.expectEqual(@as(usize, 1), Ctx.committed);
 }

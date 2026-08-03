@@ -38,6 +38,18 @@ fn splitEdgePath(path: []const u8) struct { head: []const u8, rest: []const u8 }
     return .{ .head = path, .rest = "" };
 }
 
+/// Convert an entity primary key to a SQL value, supporting numeric (i64)
+/// and textual (uuid) keys.
+fn idValue(id: anytype) sql.Value {
+    const T = @TypeOf(id);
+    return if (comptime T == i64)
+        .{ .int = id }
+    else if (comptime T == []const u8 or T == [:0]const u8)
+        .{ .string = id }
+    else
+        @compileError("Unsupported primary key type: " ++ @typeName(T));
+}
+
 /// Eager-load one or two levels of edges for a set of parent entities.
 /// A dot path (`"posts.comments"`) recurses once into the loaded targets;
 /// the terminal target type has no edges container, so deeper paths are a
@@ -55,74 +67,80 @@ fn loadEdgePath(
     if (entities.len == 0 or path.len == 0) return;
     const split = splitEdgePath(path);
 
-    inline for (ParentInfo.edges) |edge| {
-        if (std.mem.eql(u8, edge.name, split.head)) {
-            const target_info = comptime findTypeInfo(infos, edge.target_name);
-            // Target type mirrors the parent's edges field: LightEntity for
-            // the first level (so nesting can continue), PlainFields for the
-            // terminal level.
-            const EdgeFieldType = @TypeOf(@field(@as(ParentEntity, undefined).edges, edge.name));
-            const TargetEntity = @typeInfo(@typeInfo(EdgeFieldType).optional.child).pointer.child;
-            const step = comptime buildEdgeStep(edge, ParentInfo, target_info);
+    // Eager edge loading currently supports integer primary keys; textual
+    // (uuid) parents return a clear error instead of miscompiling.
+    const IdType = @TypeOf(@as(ParentEntity, undefined).id);
+    if (comptime IdType == i64) {
+        inline for (ParentInfo.edges) |edge| {
+            if (std.mem.eql(u8, edge.name, split.head)) {
+                const target_info = comptime findTypeInfo(infos, edge.target_name);
+                // Target type mirrors the parent's edges field: LightEntity for
+                // the first level (so nesting can continue), PlainFields for the
+                // terminal level.
+                const EdgeFieldType = @TypeOf(@field(@as(ParentEntity, undefined).edges, edge.name));
+                const TargetEntity = @typeInfo(@typeInfo(EdgeFieldType).optional.child).pointer.child;
+                const step = comptime buildEdgeStep(edge, ParentInfo, target_info);
 
-            var parent_id_values = try allocator.alloc(sql.Value, entities.len);
-            defer allocator.free(parent_id_values);
-            for (entities, 0..) |e, i| {
-                parent_id_values[i] = .{ .int = e.id };
-            }
-
-            var b = sql.Builder.init(allocator, driver.dialect());
-            defer b.deinit();
-            graph_neighbors.appendSetNeighbors(&b, step, parent_id_values) catch |err| {
-                return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
-            };
-            const qr = b.query();
-
-            var rows = try driver.queryCtx(&execution_context, qr.sql, qr.args);
-            defer rows.deinit();
-
-            var map = std.AutoHashMap(i64, std.ArrayListUnmanaged(TargetEntity)).init(allocator);
-            defer {
-                var it = map.iterator();
-                while (it.next()) |entry| {
-                    entry.value_ptr.deinit(allocator);
+                var parent_id_values = try allocator.alloc(sql.Value, entities.len);
+                defer allocator.free(parent_id_values);
+                for (entities, 0..) |e, i| {
+                    parent_id_values[i] = idValue(e.id);
                 }
-                map.deinit();
-            }
 
-            while (rows.next()) |row| {
-                const target = try sql_scan.scanRow(TargetEntity, allocator, row);
-                const fk_idx = sql_scan.findColumnIndex(row, "__fk") orelse return error.MissingColumn;
-                const parent_id = row.getInt(fk_idx) orelse return error.TypeMismatch;
+                var b = sql.Builder.init(allocator, driver.dialect());
+                defer b.deinit();
+                graph_neighbors.appendSetNeighbors(&b, step, parent_id_values) catch |err| {
+                    return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
+                };
+                const qr = b.query();
 
-                var gop = try map.getOrPut(parent_id);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = std.ArrayListUnmanaged(TargetEntity).empty;
+                var rows = try driver.queryCtx(&execution_context, qr.sql, qr.args);
+                defer rows.deinit();
+
+                var map = std.AutoHashMap(i64, std.ArrayListUnmanaged(TargetEntity)).init(allocator);
+                defer {
+                    var it = map.iterator();
+                    while (it.next()) |entry| {
+                        entry.value_ptr.deinit(allocator);
+                    }
+                    map.deinit();
                 }
-                try gop.value_ptr.append(allocator, target);
-            }
-            if (rows.nextError()) |e| return e;
 
-            for (entities) |*e| {
-                if (map.get(e.id)) |list| {
-                    const slice = try allocator.dupe(TargetEntity, list.items);
-                    @field(e.edges, edge.name) = slice;
+                while (rows.next()) |row| {
+                    const target = try sql_scan.scanRow(TargetEntity, allocator, row);
+                    const fk_idx = sql_scan.findColumnIndex(row, "__fk") orelse return error.MissingColumn;
+                    const parent_id = row.getInt(fk_idx) orelse return error.TypeMismatch;
+
+                    var gop = try map.getOrPut(parent_id);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = std.ArrayListUnmanaged(TargetEntity).empty;
+                    }
+                    try gop.value_ptr.append(allocator, target);
                 }
-            }
+                if (rows.nextError()) |e| return e;
 
-            // Recurse one level into the loaded targets.
-            if (split.rest.len > 0) {
                 for (entities) |*e| {
-                    const arr = @field(e.edges, edge.name);
-                    if (arr) |items| {
-                        try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest);
+                    if (map.get(e.id)) |list| {
+                        const slice = try allocator.dupe(TargetEntity, list.items);
+                        @field(e.edges, edge.name) = slice;
                     }
                 }
+
+                // Recurse one level into the loaded targets.
+                if (split.rest.len > 0) {
+                    for (entities) |*e| {
+                        const arr = @field(e.edges, edge.name);
+                        if (arr) |items| {
+                            try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest);
+                        }
+                    }
+                }
+                return;
             }
-            return;
         }
+        return error.InvalidEdge;
     }
-    return error.InvalidEdge;
+    return error.UuidEdgesUnsupported;
 }
 
 /// Generate a Query builder for an entity.
@@ -312,7 +330,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// Set a cursor to page after a given entity, using its `id` field.
         pub fn CursorAfter(self: *Self, entity: Entity) *Self {
             self.cursor_col = "id";
-            self.cursor_val = .{ .int = entity.id };
+            self.cursor_val = idValue(entity.id);
             self.cursor_id = null;
             self.cursor_desc = false;
             self.offset_val = null;
@@ -376,7 +394,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
-        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed };
+        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported };
         const BuildError = error{ OutOfMemory, BuildFailed };
         const ExplainError = error{ OutOfMemory, BuildFailed, InvalidCursor, UnsupportedDialect };
 
@@ -1248,7 +1266,7 @@ test "Query builder execution methods expose explicit driver error union" {
     const infos = &[_]TypeInfo{info};
     const UserEntity = comptime EntityGenerator(infos, info);
     const UserQuery = QueryBuilder(infos, info, UserEntity);
-    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed };
+    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported };
 
     comptime {
         const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
@@ -1320,7 +1338,7 @@ test "query contract tests" {
     const infos = &[_]TypeInfo{info};
     const UserEntity = comptime EntityGenerator(infos, info);
     const QB = QueryBuilder(infos, info, UserEntity);
-    const QE = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed, InvalidCursor };
+    const QE = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed, InvalidCursor, UuidEdgesUnsupported };
 
     comptime {
         // Verify all public query method error sets are explicit
@@ -1366,6 +1384,9 @@ test "Query builder Explain prefixes SQL" {
         fn mockInTransaction(_: *anyopaque) bool {
             unreachable;
         }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+            unreachable;
+        }
 
         const vtable = sql_driver.Driver.VTable{
             .exec = mockExec,
@@ -1375,6 +1396,7 @@ test "Query builder Explain prefixes SQL" {
             .dialect = mockDialect,
             .ping = mockPing,
             .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
         };
     };
 
@@ -1525,4 +1547,81 @@ test "WithEdge applies edge filter (only visible comments)" {
     const comments = posts.items[0].edges.comments.?;
     try std.testing.expectEqual(@as(usize, 2), comments.len);
     for (comments) |c| try std.testing.expectEqualStrings("visible", c.status);
+}
+
+test "uuid primary key works with create, query and CursorAfter" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const idgen = @import("../core/id.zig");
+
+    const UComment = schema("UComment", .{
+        .fields = &.{
+            field.String("post_id"),
+            field.String("body"),
+        },
+    });
+    const UPost = schema("UPost", .{
+        .fields = &.{
+            field.UUID("id"),
+            field.String("title"),
+        },
+        .edges = &.{edge.To("comments", UComment).Field("post_id")},
+    });
+    const graph = comptime buildGraph(&.{ UPost, UComment });
+    const infos = graph.types;
+    const post_info = comptime fromSchema(UPost);
+    const comment_info = comptime fromSchema(UComment);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    var uuid_buf: [36]u8 = undefined;
+    const pid_str = idgen.format(idgen.uuidv7(1000), &uuid_buf);
+    const pid = id: {
+        var b = try root.u_post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("id", pid_str);
+        _ = try b.setFieldValue("title", "u");
+        var row = try b.Save();
+        const id_copy = try allocator.dupe(u8, row.id);
+        defer deinitEntity(infos, post_info, &row, allocator);
+        break :id id_copy;
+    };
+    defer allocator.free(pid);
+    try std.testing.expectEqualStrings(pid_str, pid);
+
+    inline for (.{ "c1", "c2" }) |body| {
+        var b = try root.u_comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", pid_str);
+        _ = try b.setFieldValue("body", body);
+        var row = try b.Save();
+        defer deinitEntity(infos, comment_info, &row, allocator);
+    }
+
+    // Query by uuid id.
+    var q = root.u_post.Query();
+    defer q.deinit();
+    _ = try q.Where(.{root.u_post.predicates.idEQ(.{ .string = pid_str })});
+    var posts = try q.All();
+    defer {
+        for (posts.items) |*p| deinitEntity(infos, post_info, p, allocator);
+        posts.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), posts.items.len);
+
+    // CursorAfter uses the textual id value.
+    var q2 = root.u_post.Query();
+    defer q2.deinit();
+    _ = q2.CursorAfter(posts.items[0]).Limit(10);
+    try std.testing.expectEqualStrings(pid_str, q2.cursor_val.?.string);
 }

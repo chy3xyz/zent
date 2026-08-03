@@ -188,7 +188,59 @@ pub const SQLiteDriver = struct {
                     self_ptr.deinit();
                 }
             }.f,
+            .savepointFn = struct {
+                fn f(ptr: *anyopaque, name: []const u8) driver.Error!void {
+                    const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                    return execSavepointStmt(self_ptr, "SAVEPOINT", name) catch |err| return toDriverError(err);
+                }
+            }.f,
+            .savepointRollbackFn = struct {
+                fn f(ptr: *anyopaque, name: []const u8) driver.Error!void {
+                    const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                    return execSavepointStmt(self_ptr, "ROLLBACK TO", name) catch |err| return toDriverError(err);
+                }
+            }.f,
+            .savepointReleaseFn = struct {
+                fn f(ptr: *anyopaque, name: []const u8) driver.Error!void {
+                    const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                    return execSavepointStmt(self_ptr, "RELEASE", name) catch |err| return toDriverError(err);
+                }
+            }.f,
             .ptr = tx_ptr,
+        };
+    }
+
+    /// Open a nested savepoint on an already-active transaction.
+    pub fn beginSavepoint(self: *SQLiteDriver, name: []const u8) !driver.Tx {
+        try execSavepointStmt(self, "SAVEPOINT", name);
+        const sp = try self.allocator.create(SQLiteSavepoint);
+        errdefer self.allocator.destroy(sp);
+        sp.* = .{
+            .driver = self,
+            .name = try self.allocator.dupe(u8, name),
+            .active = true,
+        };
+        return driver.Tx{
+            .inner = self.asDriver(),
+            .commitFn = struct {
+                fn f(ptr: *anyopaque) driver.Error!void {
+                    const s: *SQLiteSavepoint = @ptrCast(@alignCast(ptr));
+                    return s.commit() catch |err| return toDriverError(err);
+                }
+            }.f,
+            .rollbackFn = struct {
+                fn f(ptr: *anyopaque) driver.Error!void {
+                    const s: *SQLiteSavepoint = @ptrCast(@alignCast(ptr));
+                    return s.rollback() catch |err| return toDriverError(err);
+                }
+            }.f,
+            .deinitFn = struct {
+                fn f(ptr: *anyopaque) void {
+                    const s: *SQLiteSavepoint = @ptrCast(@alignCast(ptr));
+                    s.deinit();
+                }
+            }.f,
+            .ptr = sp,
         };
     }
 
@@ -273,7 +325,43 @@ pub const SQLiteDriver = struct {
                 return self_ptr.inTransaction();
             }
         }.f,
+        .beginSavepoint = struct {
+            fn f(ptr: *anyopaque, name: []const u8) driver.Error!driver.Tx {
+                const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.beginSavepoint(name) catch |err| return toDriverError(err);
+            }
+        }.f,
     };
+};
+
+fn execSavepointStmt(d: *SQLiteDriver, stmt: []const u8, name: []const u8) !void {
+    const sql = try std.fmt.allocPrint(d.allocator, "{s} \"{s}\"", .{ stmt, name });
+    defer d.allocator.free(sql);
+    _ = try d.exec(sql, &.{});
+}
+
+const SQLiteSavepoint = struct {
+    driver: *SQLiteDriver,
+    name: []u8,
+    active: bool,
+
+    fn commit(self: *SQLiteSavepoint) !void {
+        if (!self.active) return;
+        try execSavepointStmt(self.driver, "RELEASE", self.name);
+        self.active = false;
+    }
+
+    fn rollback(self: *SQLiteSavepoint) !void {
+        if (!self.active) return;
+        try execSavepointStmt(self.driver, "ROLLBACK TO", self.name);
+        self.active = false;
+    }
+
+    fn deinit(self: *SQLiteSavepoint) void {
+        self.rollback() catch {};
+        self.driver.allocator.free(self.name);
+        self.driver.allocator.destroy(self);
+    }
 };
 
 const SQLiteTx = struct {

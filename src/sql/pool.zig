@@ -509,6 +509,31 @@ pub fn ConnPool(comptime D: type) type {
             };
         }
 
+        fn driverBeginSavepoint(ptr: *anyopaque, name: []const u8) driver.Error!driver.Tx {
+            const pool: *Self = @ptrCast(@alignCast(ptr));
+            const conn = try pool.borrowForDriver();
+            errdefer pool.release(conn);
+
+            const tx = try conn.asDriver().beginSavepoint(name);
+            errdefer tx.deinit();
+
+            const wrapper = try pool.allocator.create(PooledTx);
+            errdefer pool.allocator.destroy(wrapper);
+            wrapper.* = .{
+                .pool = pool,
+                .conn = conn,
+                .tx = tx,
+            };
+
+            return .{
+                .inner = tx.inner,
+                .commitFn = pooledCommit,
+                .rollbackFn = pooledRollback,
+                .deinitFn = pooledTxDeinit,
+                .ptr = wrapper,
+            };
+        }
+
         fn driverClose(ptr: *anyopaque) void {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             pool.deinit();
@@ -538,6 +563,7 @@ pub fn ConnPool(comptime D: type) type {
             .exec = driverExec,
             .query = driverQuery,
             .beginTx = driverBeginTx,
+            .beginSavepoint = driverBeginSavepoint,
             .close = driverClose,
             .dialect = driverDialect,
             .ping = driverPing,
@@ -765,6 +791,9 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
             unreachable;
         }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
         fn mockClose(_: *anyopaque) void {
             unreachable;
         }
@@ -786,6 +815,7 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
             .dialect = mockDialect,
             .ping = mockPing,
             .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
         };
     };
 
@@ -856,6 +886,9 @@ test "ConnPool closes connection once when available.append fails" {
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
             unreachable;
         }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
         fn mockClose(_: *anyopaque) void {
             unreachable;
         }
@@ -877,6 +910,7 @@ test "ConnPool closes connection once when available.append fails" {
             .dialect = mockDialect,
             .ping = mockPing,
             .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
         };
     };
 
@@ -970,6 +1004,9 @@ test "ConnPool evicts connection on failed health check during borrow" {
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
             unreachable;
         }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
         fn mockClose(_: *anyopaque) void {
             unreachable;
         }
@@ -992,6 +1029,7 @@ test "ConnPool evicts connection on failed health check during borrow" {
             .dialect = mockDialect,
             .ping = mockPing,
             .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
         };
     };
 
@@ -1050,6 +1088,9 @@ test "ConnPool evicts connection exceeding max lifetime on release" {
         fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
             unreachable;
         }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
         fn mockClose(_: *anyopaque) void {
             unreachable;
         }
@@ -1069,6 +1110,7 @@ test "ConnPool evicts connection exceeding max lifetime on release" {
             .dialect = mockDialect,
             .ping = mockPing,
             .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
         };
     };
 

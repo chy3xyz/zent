@@ -19,6 +19,7 @@ pub const core = struct {
     pub const index = @import("core/index.zig");
     pub const schema = @import("core/schema.zig");
     pub const mixin = @import("core/mixin.zig");
+    pub const id = @import("core/id.zig");
 };
 
 pub const codegen = struct {

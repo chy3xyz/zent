@@ -97,6 +97,7 @@ const MockDriver = struct {
         .dialect = dialect,
         .ping = ping,
         .inTransaction = inTransaction,
+        .beginSavepoint = beginSavepoint,
     };
 
     fn asDriver(self: *MockDriver) sql_driver.Driver {
@@ -124,6 +125,10 @@ const MockDriver = struct {
     }
 
     fn beginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn beginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
         return error.TxFailed;
     }
 
