@@ -231,7 +231,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // ON DUPLICATE KEY UPDATE (the old REPLACE prefix has been removed).
             // For plain Save (or_replace=false) the suffix is empty.
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
-            const upsert_suffix: []const u8 = try self.buildUpsertSuffix(or_replace, is_postgres, is_sqlite, is_mysql, columns.items);
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             var entity: Entity = std.mem.zeroes(Entity);
@@ -406,38 +406,6 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return entity;
         }
 
-        fn buildUpsertSuffix(self: *Self, or_replace: bool, is_postgres: bool, is_sqlite: bool, is_mysql: bool, columns: []const []const u8) ![]const u8 {
-            if (!or_replace or is_sqlite) return "";
-            if (is_mysql) {
-                var buf = std.array_list.Managed(u8).init(self.allocator);
-                errdefer buf.deinit();
-                try buf.appendSlice(" ON DUPLICATE KEY UPDATE ");
-                // Preserve the row id through LAST_INSERT_ID so callers receive the
-                // existing auto-increment value on UPDATE as well as on INSERT.
-                try buf.appendSlice("`id`=LAST_INSERT_ID(`id`)");
-                for (columns) |col| {
-                    if (std.mem.eql(u8, col, "id")) continue;
-                    try buf.appendSlice(", ");
-                    try buf.print("`{s}`=VALUES(`{s}`)", .{ col, col });
-                }
-                return try buf.toOwnedSlice();
-            }
-            if (is_postgres) {
-                var buf = std.array_list.Managed(u8).init(self.allocator);
-                errdefer buf.deinit();
-                try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
-                var first = true;
-                for (columns) |col| {
-                    if (std.mem.eql(u8, col, "id")) continue;
-                    if (!first) try buf.appendSlice(", ");
-                    first = false;
-                    try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
-                }
-                return try buf.toOwnedSlice();
-            }
-            return "";
-        }
-
         fn setEntityField(entity: *Entity, name: []const u8, value: sql.Value, allocator: std.mem.Allocator) !void {
             inline for (info.fields) |f| {
                 if (std.mem.eql(u8, f.name, name)) {
@@ -562,6 +530,50 @@ fn toSqlValue(v: anytype) sql.Value {
     @compileError("Unsupported value type: " ++ @typeName(T));
 }
 
+/// Dialect-aware upsert suffix shared by single-row `SaveOrUpdate` and the
+/// bulk `SaveOrUpdate`. The single-row SQLite path deliberately returns ""
+/// (it uses INSERT OR REPLACE instead); the bulk path passes
+/// `is_sqlite=false` and emits ON CONFLICT, which SQLite supports for
+/// multi-row INSERTs. Returns "" when `or_replace` is false.
+fn buildUpsertSuffix(
+    allocator: std.mem.Allocator,
+    or_replace: bool,
+    is_postgres: bool,
+    is_sqlite: bool,
+    is_mysql: bool,
+    columns: []const []const u8,
+) ![]const u8 {
+    if (!or_replace or is_sqlite) return "";
+    if (is_mysql) {
+        var buf = std.array_list.Managed(u8).init(allocator);
+        errdefer buf.deinit();
+        try buf.appendSlice(" ON DUPLICATE KEY UPDATE ");
+        // Preserve the row id through LAST_INSERT_ID so callers receive the
+        // existing auto-increment value on UPDATE as well as on INSERT.
+        try buf.appendSlice("`id`=LAST_INSERT_ID(`id`)");
+        for (columns) |col| {
+            if (std.mem.eql(u8, col, "id")) continue;
+            try buf.appendSlice(", ");
+            try buf.print("`{s}`=VALUES(`{s}`)", .{ col, col });
+        }
+        return try buf.toOwnedSlice();
+    }
+    if (is_postgres) {
+        var buf = std.array_list.Managed(u8).init(allocator);
+        errdefer buf.deinit();
+        try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
+        var first = true;
+        for (columns) |col| {
+            if (std.mem.eql(u8, col, "id")) continue;
+            if (!first) try buf.appendSlice(", ");
+            first = false;
+            try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
+        }
+        return try buf.toOwnedSlice();
+    }
+    return "";
+}
+
 /// Generate a Bulk Insert builder for an entity.
 /// Supports INSERT ... VALUES (...), (...) RETURNING "id" for backends
 /// that support RETURNING (SQLite 3.35+, PostgreSQL, MySQL 8.0.19+).
@@ -668,6 +680,20 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
+            return self.saveInternal(false);
+        }
+
+        /// Bulk upsert: INSERT … ON CONFLICT ("id") DO UPDATE SET … for
+        /// SQLite/PostgreSQL (single-row SaveOrUpdate uses INSERT OR REPLACE
+        /// on SQLite; the bulk path prefers ON CONFLICT so unspecified
+        /// columns are preserved), ON DUPLICATE KEY UPDATE for MySQL. Returns
+        /// one id per row (RETURNING where supported; last_insert_id chain on
+        /// MySQL).
+        pub fn SaveOrUpdate(self: *Self) SaveError!std.array_list.Managed(i64) {
+            return self.saveInternal(true);
+        }
+
+        fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!std.array_list.Managed(i64) {
             if (info.policy) |p| {
                 const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 const result = p.eval(ctx);
@@ -743,6 +769,10 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             // Build multi-row INSERT SQL.
             const dialect = self.driver.dialect();
             const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
+            const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
+            const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items);
+            defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
             const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
             defer query.deinit();
 
@@ -752,10 +782,14 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             if (supports_returning) {
                 // SQLite / PostgreSQL: append RETURNING clause and query.
                 const ret_suffix = " RETURNING \"id\"";
-                const full_sql = try self.allocator.alloc(u8, query.sql.len + ret_suffix.len);
+                const full_sql = try self.allocator.alloc(u8, query.sql.len + upsert_suffix.len + ret_suffix.len);
                 defer self.allocator.free(full_sql);
-                @memcpy(full_sql[0..query.sql.len], query.sql);
-                @memcpy(full_sql[query.sql.len..], ret_suffix);
+                var pos: usize = 0;
+                @memcpy(full_sql[pos..][0..query.sql.len], query.sql);
+                pos += query.sql.len;
+                @memcpy(full_sql[pos..][0..upsert_suffix.len], upsert_suffix);
+                pos += upsert_suffix.len;
+                @memcpy(full_sql[pos..][0..ret_suffix.len], ret_suffix);
 
                 self.ensureDeadline();
                 var rows = try self.driver.queryCtx(&self.execution_context, full_sql, query.args);
@@ -767,8 +801,13 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             } else {
                 // MySQL: no RETURNING. Execute then compute IDs from
                 // last_insert_id and rows_affected.
+                const full_sql_len = query.sql.len + upsert_suffix.len;
+                const full_sql = try self.allocator.alloc(u8, full_sql_len);
+                defer self.allocator.free(full_sql);
+                @memcpy(full_sql[0..query.sql.len], query.sql);
+                @memcpy(full_sql[query.sql.len..], upsert_suffix);
                 self.ensureDeadline();
-                const res = try self.driver.execCtx(&self.execution_context, query.sql, query.args);
+                const res = try self.driver.execCtx(&self.execution_context, full_sql, query.args);
                 const base_id = res.last_insert_id orelse 0;
                 for (0..self.rows.items.len) |i| {
                     try ids.append(base_id + @as(i64, @intCast(i)));
@@ -811,7 +850,7 @@ test "Create builder basic" {
     defer b.deinit();
 
     // Test the internal setValue method
-    _ = b.setValue("name", .{ .string = "alice" });
+    _ = try b.setValue("name", .{ .string = "alice" });
     try std.testing.expectEqual(@as(usize, 1), b.values.items.len);
 }
 
@@ -830,12 +869,14 @@ test "BulkInsert builder basic" {
     const UserEntity = comptime EntityGen(infos, info);
     const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
 
-    var b = BulkBuilder.init(std.testing.allocator, undefined, &.{}, null);
+    var b = try BulkBuilder.init(std.testing.allocator, undefined, &.{}, null);
     defer b.deinit();
 
-    _ = b.setFieldValue("name", "alice").setFieldValue("age", 30);
-    b.Next();
-    _ = b.setFieldValue("name", "bob").setFieldValue("age", 25);
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", 30);
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "bob");
+    _ = try b.setFieldValue("age", 25);
 
     try std.testing.expectEqual(@as(usize, 2), b.rows.items.len);
     try std.testing.expectEqualStrings("alice", b.rows.items[0].items[0].value.string);
@@ -931,7 +972,8 @@ test "Create builder SaveOrUpdate compiles" {
     var b = Builder.init(std.testing.allocator, undefined, &.{}, null);
     defer b.deinit();
 
-    _ = b.setFieldValue("name", "alice").setFieldValue("age", 30);
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", 30);
     // We can't actually execute SaveOrUpdate without a real driver,
     // but we verify the method exists and compiles.
     try std.testing.expectEqual(@as(usize, 2), b.values.items.len);
@@ -959,8 +1001,10 @@ test "Create builders expose explicit driver error unions" {
         const save_return = @typeInfo(@TypeOf(Builder.Save)).@"fn".return_type.?;
         const save_or_update_return = @typeInfo(@TypeOf(Builder.SaveOrUpdate)).@"fn".return_type.?;
         const bulk_save_return = @typeInfo(@TypeOf(BulkBuilder.Save)).@"fn".return_type.?;
+        const bulk_save_or_update_return = @typeInfo(@TypeOf(BulkBuilder.SaveOrUpdate)).@"fn".return_type.?;
         if (@typeInfo(save_return).error_union.error_set != SaveError) @compileError("Create.Save error set is not explicit");
         if (@typeInfo(save_or_update_return).error_union.error_set != SaveError) @compileError("Create.SaveOrUpdate error set is not explicit");
         if (@typeInfo(bulk_save_return).error_union.error_set != BulkSaveError) @compileError("BulkInsert.Save error set is not explicit");
+        if (@typeInfo(bulk_save_or_update_return).error_union.error_set != BulkSaveError) @compileError("BulkInsert.SaveOrUpdate error set is not explicit");
     }
 }

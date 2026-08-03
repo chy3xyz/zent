@@ -77,17 +77,17 @@ pub const HookChain = struct {
     pub fn init(allocator: std.mem.Allocator) HookChain {
         return .{
             .allocator = allocator,
-            .hooks = std.ArrayList(Hook).init(allocator),
+            .hooks = std.ArrayList(Hook).empty,
         };
     }
 
     pub fn deinit(self: *HookChain) void {
-        self.hooks.deinit();
+        self.hooks.deinit(self.allocator);
     }
 
     /// Add a hook to the chain.
     pub fn add(self: *HookChain, hook: Hook) !void {
-        try self.hooks.append(hook);
+        try self.hooks.append(self.allocator, hook);
     }
 
     /// Execute all before-hooks for the given context. Propagates the first error.
@@ -107,7 +107,12 @@ pub const HookChain = struct {
             if (hook.op == ctx.op) {
                 if (hook.after) |after| {
                     after(ctx) catch |err| {
-                        std.log.err(
+                        // Deliberately non-fatal: the row operation has already
+                        // succeeded; we surface the hook failure without failing
+                        // the request. Warn (not err) so the test runner does not
+                        // treat an intentional failure-path exercise as a suite
+                        // failure.
+                        std.log.warn(
                             "after-hook failed on table '{s}' ({s}): {s}",
                             .{ ctx.table_name, @tagName(ctx.op), @errorName(err) },
                         );

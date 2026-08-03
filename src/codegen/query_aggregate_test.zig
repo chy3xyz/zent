@@ -6,6 +6,7 @@ const TypeInfo = @import("graph.zig").TypeInfo;
 const fromSchema = @import("graph.zig").fromSchema;
 const EntityGen = @import("entity.zig").Entity;
 const QueryBuilder = @import("query.zig").QueryBuilder;
+const BulkInsertBuilder = @import("create.zig").BulkInsertBuilder;
 const field = @import("../core/field.zig");
 const schema = @import("../core/schema.zig").Schema;
 
@@ -86,6 +87,7 @@ const MockDriver = struct {
     capture_sql: bool = false,
     last_sql: ?[]const u8 = null,
     last_sql_owned: ?[]u8 = null,
+    dialect_override: ?Dialect = null,
 
     const vtable = sql_driver.Driver.VTable{
         .exec = exec,
@@ -101,7 +103,12 @@ const MockDriver = struct {
         return sql_driver.Driver{ .ptr = self, .vtable = &vtable };
     }
 
-    fn exec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+    fn exec(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, sql_text: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        const self: *MockDriver = @ptrCast(@alignCast(ptr));
+        if (self.capture_sql) {
+            self.last_sql_owned = std.testing.allocator.dupe(u8, sql_text) catch null;
+            self.last_sql = self.last_sql_owned;
+        }
         return .{ .rows_affected = 0, .last_insert_id = null };
     }
 
@@ -122,8 +129,9 @@ const MockDriver = struct {
 
     fn close(_: *anyopaque) void {}
 
-    fn dialect(_: *anyopaque) Dialect {
-        return .sqlite;
+    fn dialect(ptr: *anyopaque) Dialect {
+        const self: *MockDriver = @ptrCast(@alignCast(ptr));
+        return self.dialect_override orelse .sqlite;
     }
 
     fn ping(_: *anyopaque) sql_driver.Error!void {}
@@ -150,6 +158,63 @@ fn expectValueEqual(expected: sql.Value, actual: sql.Value) !void {
         },
         else => unreachable,
     }
+}
+
+test "Bulk upsert emits ON CONFLICT on postgres/sqlite and ON DUPLICATE on mysql" {
+    const allocator = std.testing.allocator;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
+
+    // PostgreSQL: RETURNING path + ON CONFLICT DO UPDATE SET.
+    var mock_pg = MockDriver{ .value = .{ .int = 1 }, .capture_sql = true, .dialect_override = .postgres };
+    var b_pg = try BulkBuilder.init(allocator, mock_pg.asDriver(), &.{}, null);
+    defer b_pg.deinit();
+    _ = try b_pg.setFieldValue("name", "alice");
+    _ = try b_pg.setFieldValue("age", 30);
+    _ = try b_pg.Next();
+    _ = try b_pg.setFieldValue("name", "bob");
+    _ = try b_pg.setFieldValue("age", 25);
+    var ids_pg = try b_pg.SaveOrUpdate();
+    defer ids_pg.deinit();
+    const pg_sql = mock_pg.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "INSERT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "ON CONFLICT (\"id\") DO UPDATE SET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"name\"=EXCLUDED.\"name\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"age\"=EXCLUDED.\"age\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "RETURNING \"id\"") != null);
+    // Plain Save must NOT emit a conflict clause.
+    var mock_plain = MockDriver{ .value = .{ .int = 1 }, .capture_sql = true, .dialect_override = .postgres };
+    var b_plain = try BulkBuilder.init(allocator, mock_plain.asDriver(), &.{}, null);
+    defer b_plain.deinit();
+    _ = try b_plain.setFieldValue("name", "carol");
+    _ = try b_plain.setFieldValue("age", 40);
+    var ids_plain = try b_plain.Save();
+    defer ids_plain.deinit();
+    const plain_sql = mock_plain.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(plain_sql);
+    try std.testing.expect(std.mem.indexOf(u8, plain_sql, "ON CONFLICT") == null);
+
+    // MySQL: exec path + ON DUPLICATE KEY UPDATE.
+    var mock_my = MockDriver{ .value = .null, .capture_sql = true, .dialect_override = .mysql };
+    var b_my = try BulkBuilder.init(allocator, mock_my.asDriver(), &.{}, null);
+    defer b_my.deinit();
+    _ = try b_my.setFieldValue("name", "dave");
+    _ = try b_my.setFieldValue("age", 35);
+    var ids_my = try b_my.SaveOrUpdate();
+    defer ids_my.deinit();
+    const my_sql = mock_my.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(my_sql);
+    try std.testing.expect(std.mem.indexOf(u8, my_sql, "ON DUPLICATE KEY UPDATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my_sql, "`name`=VALUES(`name`)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my_sql, "RETURNING") == null);
 }
 
 test "Max and Min do not leak Rows on null/int/float/text paths" {
