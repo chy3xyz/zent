@@ -77,7 +77,10 @@ pub fn CrudService(
             var found = try q.All();
             defer {
                 for (found.items) |*e| {
-                    zent_deinit(infos, info, e, allocator);
+                    // Scan rows are allocated with the *client* allocator —
+                    // freeing them with the caller's allocator (e.g. a request
+                    // arena) is mismatched-free UB and corrupts arena state.
+                    zent_deinit(infos, info, e, self.allocator);
                 }
                 found.deinit();
             }
@@ -223,4 +226,38 @@ test "CrudService list/get/create/update/delete with events and tenant isolation
     try std.testing.expect(!try svc.delete(2, c_id)); // already gone
 
     _ = b_id;
+}
+
+test "CrudService get with mismatched allocator (arena copy)" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+
+    const Item = Schema("Item", .{ .fields = &.{
+        field.Int("tenant_id"),
+        field.String("name"),
+    } });
+    const info = comptime fromSchema(Item);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = codegen.EntityClient(infos, info);
+    const client = Client.init(allocator, driver.asDriver());
+    var svc = Service.init(allocator, client);
+    const id = try svc.create(.{ .id = 0, .tenant_id = 7, .name = "hello-world" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var got = (try svc.get(arena.allocator(), 7, id)).?;
+    defer deinitEntity(infos, info, &got, arena.allocator());
+    try std.testing.expectEqualStrings("hello-world", got.name);
 }
