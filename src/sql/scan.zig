@@ -65,6 +65,28 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
     }
 }
 
+/// Like scanRow but resolves columns by name (Row.findColumnIndex), so a
+/// partial projection (`QueryBuilder.Select`) scans only the selected
+/// columns; unselected fields keep their zero value and must not be freed
+/// (treat projected entities as read-only).
+pub fn scanRowNamed(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("scanRowNamed supports structs only");
+    var value: T = std.mem.zeroes(T);
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "edges")) {
+            @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+        } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
+            @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), null);
+        } else {
+            if (findColumnIndex(row, field_name)) |idx| {
+                @field(value, field_name) = try scanColumn(field_type, allocator, row, idx);
+            }
+        }
+    }
+    return value;
+}
+
 /// Like scanRow but uses the column `offset` to map struct fields to
 /// result-set columns. The struct's i-th non-edge field maps to row
 /// column `offset + i`. Used when the entity is part of a larger

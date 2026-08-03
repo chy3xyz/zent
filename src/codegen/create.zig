@@ -518,9 +518,41 @@ pub fn validateSqlValue(comptime field: FieldInfo, value: sql.Value) !void {
                 };
                 if (!isPhone(str_val)) return error.ValidationFailed;
             },
-            .custom => return error.ValidationFailed,
+            .custom => |pattern| {
+                const str_val = switch (value) {
+                    .string => |s| s,
+                    else => return error.ValidationFailed,
+                };
+                if (!wildcardMatch(pattern, str_val)) return error.ValidationFailed;
+            },
         }
     }
+}
+
+/// Simple wildcard matcher: `*` matches any sequence, `?` matches one char.
+fn wildcardMatch(pattern: []const u8, s: []const u8) bool {
+    var p: usize = 0;
+    var i: usize = 0;
+    var star: ?usize = null;
+    var mark: usize = 0;
+    while (i < s.len) {
+        if (p < pattern.len and (pattern[p] == '?' or pattern[p] == s[i])) {
+            p += 1;
+            i += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            p += 1;
+            mark = i;
+        } else if (star) |sp| {
+            p = sp + 1;
+            mark += 1;
+            i = mark;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
 }
 
 fn isEmail(s: []const u8) bool {
@@ -1148,6 +1180,27 @@ test "validators: not_empty / length / email / phone" {
     try validateSqlValue(info.fields[3], .{ .string = "+8613800138000" });
     try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[3], .{ .string = "123" }));
     try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[3], .{ .string = "12ab89012" }));
+}
+
+test "custom validator uses wildcard matching" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Order = Schema("OrderNo", .{
+        .fields = &.{
+            field.String("no").Custom("ORD-*"),
+            field.String("code").Custom("AB?X"),
+        },
+    });
+    const info = comptime fromSchema(Order);
+
+    try validateSqlValue(info.fields[1], .{ .string = "ORD-12345" });
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[1], .{ .string = "X-1" }));
+
+    try validateSqlValue(info.fields[2], .{ .string = "AB9X" });
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[2], .{ .string = "AB99X" }));
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[2], .{ .string = "A9X" }));
 }
 
 test "create with edges schema setFieldValue compiles" {

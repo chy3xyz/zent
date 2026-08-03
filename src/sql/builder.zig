@@ -199,6 +199,9 @@ pub const Predicate = union(enum) {
     like: BinOp,
     in: InOp,
     not_in: InOp,
+    /// Chunked `col IN (…) OR col IN (…)` — value semantics (no pointers),
+    /// safe to store beyond the constructing scope.
+    or_in: struct { column: []const u8, chunks: []const []const Value },
     eq_fold: BinOp,
     is_null: []const u8,
     is_not_null: []const u8,
@@ -301,6 +304,18 @@ pub const Predicate = union(enum) {
                     try b.arg(v);
                 }
                 try b.writeByte(')');
+            },
+            .or_in => |p| {
+                for (p.chunks, 0..) |chunk, ci| {
+                    if (ci > 0) try b.writeString(" OR ");
+                    try b.qualifiedIdent(p.column);
+                    try b.writeString(" IN (");
+                    for (chunk, 0..) |v, i| {
+                        if (i > 0) try b.writeString(", ");
+                        try b.arg(v);
+                    }
+                    try b.writeByte(')');
+                }
             },
             .eq_fold => |p| {
                 try b.writeString("LOWER(");
@@ -496,6 +511,13 @@ pub fn InChunked(
         i += 1;
     }
     return out;
+}
+
+/// Build a single value-semantics predicate for a large IN list split into
+/// chunks (`col IN (…) OR col IN (…)`). `chunks` is owned by the caller and
+/// must outlive the predicate (like `In` values).
+pub fn OrIn(column: []const u8, chunks: []const []const Value) Predicate {
+    return .{ .or_in = .{ .column = column, .chunks = chunks } };
 }
 
 pub fn IsNull(column: []const u8) Predicate {

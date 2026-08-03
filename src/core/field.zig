@@ -131,6 +131,14 @@ pub const Field = struct {
         return f;
     }
 
+    /// Wildcard validation (`*` any sequence, `?` one char).
+    pub fn Custom(self: Field, comptime pattern: []const u8) Field {
+        var f = self;
+        const v = Validator{ .custom = pattern };
+        f.validators = f.validators ++ &[_]Validator{v};
+        return f;
+    }
+
     /// Reject empty strings.
     pub fn NotEmpty(self: Field) Field {
         var f = self;

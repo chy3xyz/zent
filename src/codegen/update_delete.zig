@@ -1049,9 +1049,42 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         /// Execute the bulk DELETE and return rows affected.
         pub fn Exec(self: *Self) ExecError!usize {
             if (info.soft_delete) {
-                @compileError("BulkDelete does not support soft_delete entities; use Update or individual Delete");
+                return self.execSoftDelete();
             }
             return self.execHardDelete();
+        }
+
+        /// Bulk soft delete: UPDATE deleted_at for every WHERE group (ORed),
+        /// so soft_delete entities get the same batch semantics as hard
+        /// delete. No hooks fire (management operation).
+        fn execSoftDelete(self: *Self) ExecError!usize {
+            if (info.policy) |p| {
+                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                const result = p.eval(ctx);
+                if (result.decision == .deny) return error.PrivacyDenied;
+            }
+            if (self.b.groups.items.len == 0) return 0;
+
+            // Each WHERE group becomes its own UPDATE (OR semantics across
+            // groups); avoids pointer-based And/Or trees that would dangle.
+            var total: usize = 0;
+            for (self.b.groups.items) |g| {
+                if (g.items.len == 0) continue;
+                var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
+                defer builder.deinit();
+                _ = try builder.setExpr("deleted_at", epochExpr(self.driver.dialect()));
+                for (g.items) |p| {
+                    _ = try builder.where(p);
+                }
+                const q = builder.query() catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.ExecFailed,
+                };
+                self.ensureDeadline();
+                const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
+                total += res.rows_affected;
+            }
+            return total;
         }
 
         fn execHardDelete(self: *Self) ExecError!usize {
@@ -1514,6 +1547,72 @@ test "soft-delete restore brings the row back" {
         }
         try std.testing.expectEqual(@as(usize, 1), rows.items.len);
         try std.testing.expectEqualStrings("hello", rows.items[0].title);
+    }
+}
+
+test "BulkDelete soft_delete performs bulk soft delete" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Post = Schema("PostSoftBulk", .{
+        .fields = &.{field.String("title")},
+        .mixins = &.{@import("../core/mixin.zig").SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const info = comptime fromSchema(Post);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const client = client_mod.EntityClient(infos, info).init(allocator, driver.asDriver());
+    const preds = client.predicates;
+
+    var ids: [3]i64 = undefined;
+    for (&ids) |*out| {
+        var b = try client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("title", "t");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+        out.* = row.id;
+    }
+
+    var d = try BulkDeleteBuilder(info).init(allocator, driver.asDriver(), &.{}, null);
+    defer d.deinit();
+    for (ids) |id| {
+        _ = try d.Next();
+        _ = try d.Where(.{preds.idEQ(.{ .int = id })});
+    }
+    try std.testing.expectEqual(@as(usize, 3), try d.Exec());
+
+    // All rows hidden from normal queries, visible with trashed.
+    {
+        var q = client.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    }
+    {
+        var q = client.Query();
+        defer q.deinit();
+        _ = q.WithTrashed();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 3), rows.items.len);
     }
 }
 

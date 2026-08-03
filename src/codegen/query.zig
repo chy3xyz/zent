@@ -174,7 +174,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         with_trashed: bool,
         with_edges: std.ArrayListUnmanaged([]const u8),
         group_cols: std.ArrayListUnmanaged([]const u8),
+        or_in_chunks: std.ArrayListUnmanaged([]const []const sql.Value),
         having_pred: ?sql.Predicate,
+        /// Optional column projection (Select); rows are scanned by column
+        /// name and unselected fields keep zero values (read-only entities).
+        select_cols: ?[]const []const u8 = null,
         for_update: bool,
         for_share: bool,
         privacy_ctx: ?privacy.PrivacyContext = null,
@@ -194,6 +198,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 .with_trashed = false,
                 .with_edges = .empty,
                 .group_cols = .empty,
+                .or_in_chunks = .empty,
                 .having_pred = null,
                 .for_update = false,
                 .for_share = false,
@@ -202,6 +207,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn deinit(self: *Self) void {
+            for (self.or_in_chunks.items) |chunks| self.allocator.free(chunks);
+            self.or_in_chunks.deinit(self.allocator);
             self.predicates.deinit();
             self.order_terms.deinit();
             self.with_edges.deinit(self.allocator);
@@ -266,15 +273,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// Add `column IN (…)` with automatic chunking (drivers cap parameter
         /// counts), OR-joined across chunks.
         pub fn WhereIn(self: *Self, column: []const u8, values: []const sql.Value) !*Self {
-            const preds = try sql.InChunked(self.allocator, column, values, 500);
-            defer self.allocator.free(preds);
-            if (preds.len == 1) {
-                try self.predicates.append(self.allocator, preds[0]);
-            } else {
-                var acc = preds[0];
-                for (preds[1..]) |p| acc = sql.Or(&acc, &p);
-                try self.predicates.append(self.allocator, acc);
+            if (values.len == 0) return error.EmptyInValues;
+            const chunk_size: usize = 500;
+            const count = (values.len + chunk_size - 1) / chunk_size;
+            // Chunks outlive WhereIn: owned by the query builder (freed in
+            // deinit), so the value-semantics or_in predicate is safe.
+            const chunks = try self.allocator.alloc([]const sql.Value, count);
+            errdefer self.allocator.free(chunks);
+            var start: usize = 0;
+            var i: usize = 0;
+            while (start < values.len) : (start += chunk_size) {
+                const end = @min(start + chunk_size, values.len);
+                chunks[i] = values[start..end];
+                i += 1;
             }
+            try self.or_in_chunks.append(self.allocator, chunks);
+            try self.predicates.append(self.allocator, sql.OrIn(column, chunks));
             return self;
         }
 
@@ -369,6 +383,26 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return self;
         }
 
+        /// Restrict the query to a column subset (skips large text/blob
+        /// fields). Projected entities have zero values for unselected
+        /// fields — treat them as read-only (do not deinit string fields).
+        pub fn Select(self: *Self, comptime cols: []const []const u8) *Self {
+            comptime {
+                for (cols) |c| {
+                    var found = false;
+                    for (info.fields) |f| {
+                        if (std.mem.eql(u8, f.name, c)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) @compileError("Unknown column in Select: " ++ c);
+                }
+            }
+            self.select_cols = cols;
+            return self;
+        }
+
         pub fn WithTrashed(self: *Self) *Self {
             self.with_trashed = true;
             return self;
@@ -456,7 +490,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     if (self.rows.nextError()) |e| return e;
                     return null;
                 };
-                const entity = try sql_scan.scanRow(Entity, self.allocator, row);
+                const entity = if (self.select_cols != null)
+                    try sql_scan.scanRowNamed(Entity, self.allocator, row)
+                else
+                    try sql_scan.scanRow(Entity, self.allocator, row);
                 self.current = entity;
                 return entity;
             }
@@ -517,7 +554,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
 
             while (rows.next()) |row| {
-                var entity = try sql_scan.scanRow(Entity, self.allocator, row);
+                var entity = if (self.select_cols != null)
+                    try sql_scan.scanRowNamed(Entity, self.allocator, row)
+                else
+                    try sql_scan.scanRow(Entity, self.allocator, row);
                 errdefer deinitEntity(infos, info, &entity, self.allocator);
                 try result.append(entity);
             }
@@ -587,7 +627,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (rows.nextError()) |e| return e;
                 return null;
             };
-            var entity = try sql_scan.scanRow(Entity, self.allocator, row);
+            var entity = if (self.select_cols != null)
+                try sql_scan.scanRowNamed(Entity, self.allocator, row)
+            else
+                try sql_scan.scanRow(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
 
             const duration_us: u64 = nowUs() - start;
@@ -622,7 +665,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (rows.nextError()) |e| return e;
                 return error.NotFound;
             };
-            var entity = try sql_scan.scanRow(Entity, self.allocator, row);
+            var entity = if (self.select_cols != null)
+                try sql_scan.scanRowNamed(Entity, self.allocator, row)
+            else
+                try sql_scan.scanRow(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
             if (rows.next()) |_| return error.NotSingular;
             if (rows.nextError()) |e| return e;
@@ -855,11 +901,12 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {
             const t = sql.Table(info.table_name);
-            var columns: [column_count]sql.ColumnRef = undefined;
-            inline for (info.fields[0..column_count], 0..) |f, i| {
-                columns[i] = t.c(f.name);
-            }
-            var selector = try sql.Select(self.allocator, self.driver.dialect(), &columns);
+            var all_cols: [column_count][]const u8 = undefined;
+            inline for (info.fields[0..column_count], 0..) |f, i| all_cols[i] = f.name;
+            const cols: []const []const u8 = self.select_cols orelse all_cols[0..column_count];
+            var columns: [info.fields.len]sql.ColumnRef = undefined;
+            for (cols, 0..) |cname, i| columns[i] = t.c(cname);
+            var selector = try sql.Select(self.allocator, self.driver.dialect(), columns[0..cols.len]);
             _ = selector.from(t);
             _ = selector.setDistinct(self.distinct);
 
@@ -1664,4 +1711,52 @@ test "uuid primary key works with create, query and CursorAfter" {
     defer q2.deinit();
     _ = q2.CursorAfter(posts.items[0]).Limit(10);
     try std.testing.expectEqualStrings(pid_str, q2.cursor_val.?.string);
+}
+
+test "Select projects columns and leaves others zero" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const Doc = schema("DocProj", .{
+        .fields = &.{
+            field.String("title"),
+            field.String("body"),
+        },
+    });
+    const graph = comptime buildGraph(&.{Doc});
+    const infos = graph.types;
+    const info = comptime fromSchema(Doc);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    {
+        var b = try root.doc_proj.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("title", "t1");
+        _ = try b.setFieldValue("body", "long body text");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+
+    var q = root.doc_proj.Query();
+    defer q.deinit();
+    _ = q.Select(&.{ "id", "title" });
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expectEqualStrings("t1", rows.items[0].title);
+    // Unselected string field keeps its zero value (empty, read-only).
+    try std.testing.expectEqual(@as(usize, 0), rows.items[0].body.len);
 }
