@@ -1008,3 +1008,24 @@ test "Create builders expose explicit driver error unions" {
         if (@typeInfo(bulk_save_or_update_return).error_union.error_set != BulkSaveError) @compileError("BulkInsert.SaveOrUpdate error set is not explicit");
     }
 }
+
+test "create with edges schema setFieldValue compiles" {
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const Comment = schema("Comment2", .{ .fields = &.{field.String("body")} });
+    const Post = schema("Post2", .{
+        .fields = &.{ field.Int("author_id"), field.String("title") },
+        .edges = &.{edge.To("comments", Comment)},
+    });
+    const post_info = comptime fromSchema(Post);
+    const comment_info = comptime fromSchema(Comment);
+    const infos = &[_]TypeInfo{ post_info, comment_info };
+    const Builder = CreateBuilder(infos, post_info, EntityGen(infos, post_info));
+    var b = Builder.init(std.testing.allocator, undefined, &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("title", "hello");
+}
