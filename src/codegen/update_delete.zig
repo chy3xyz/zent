@@ -89,12 +89,19 @@ fn toSqlValue(v: anytype) sql.Value {
 
 /// Generate an Update builder for an entity.
 pub fn UpdateBuilder(comptime info: TypeInfo) type {
+    const FieldExpr = struct {
+        name: []const u8,
+        expr: []const u8,
+        args: []const sql.Value,
+    };
+
     return struct {
         const Self = @This();
 
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
         values: std.array_list.Managed(FieldValue),
+        expr_values: std.array_list.Managed(FieldExpr),
         predicates: std.array_list.Managed(sql.Predicate),
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
@@ -110,6 +117,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 .hooks = hooks,
                 .privacy_ctx = privacy_ctx,
                 .values = std.array_list.Managed(FieldValue).init(allocator),
+                .expr_values = std.array_list.Managed(FieldExpr).init(allocator),
                 .predicates = std.array_list.Managed(sql.Predicate).init(allocator),
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
             };
@@ -119,7 +127,37 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             for (self.json_strings.items) |s| self.allocator.free(s);
             self.json_strings.deinit();
             self.values.deinit();
+            for (self.expr_values.items) |fe| {
+                self.allocator.free(fe.expr);
+                self.allocator.free(fe.args);
+            }
+            self.expr_values.deinit();
             self.predicates.deinit();
+        }
+
+        /// Set a column to an expression with bound parameters, e.g. atomic
+        /// stock decrement: `setExprArgs("stock", "stock - ?", &.{ .{ .int = n } })`.
+        pub fn setExprArgs(self: *Self, comptime field_name: []const u8, expr: []const u8, args: []const sql.Value) !*Self {
+            comptime {
+                var found = false;
+                for (info.fields) |f| {
+                    if (std.mem.eql(u8, f.name, field_name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) @compileError("Unknown field: " ++ field_name);
+            }
+            const expr_copy = try self.allocator.dupe(u8, expr);
+            errdefer self.allocator.free(expr_copy);
+            const args_copy = try self.allocator.dupe(sql.Value, args);
+            errdefer self.allocator.free(args_copy);
+            try self.expr_values.append(.{
+                .name = field_name,
+                .expr = expr_copy,
+                .args = args_copy,
+            });
+            return self;
         }
 
         /// Set a per-query timeout in milliseconds. The deadline is computed
@@ -307,6 +345,10 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 for (self.values.items) |fv| {
                     _ = try builder.set(fv.name, fv.value);
                 }
+            }
+
+            for (self.expr_values.items) |fe| {
+                _ = try builder.setExprArgs(fe.name, fe.expr, fe.args);
             }
 
             for (self.predicates.items) |pred| {
@@ -1137,4 +1179,79 @@ test "Update and delete execution methods expose explicit driver error unions" {
         if (@typeInfo(@typeInfo(@TypeOf(BulkUpd.Save)).@"fn".return_type.?).error_union.error_set != SaveError) @compileError("BulkUpdate.Save error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(BulkDel.Exec)).@"fn".return_type.?).error_union.error_set != ExecError) @compileError("BulkDelete.Exec error set is not explicit");
     }
+}
+
+test "setExprArgs atomic stock decrement prevents oversell" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Sku = Schema("Sku", .{
+        .fields = &.{
+            field.Int("stock"),
+            field.Version("version"),
+        },
+    });
+    const info = comptime fromSchema(Sku);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const EntityClient = client_mod.EntityClient(infos, info);
+    const client = EntityClient.init(allocator, driver.asDriver());
+
+    // Seed stock = 10.
+    {
+        var b = try client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("stock", @as(i64, 10));
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+
+    const preds = client.predicates;
+
+    // Atomic decrement: SET stock = stock - ? WHERE id = ? AND stock >= ?.
+    {
+        var u = client.Update();
+        defer u.deinit();
+        _ = try u.setExprArgs("stock", "stock - ?", &.{.{ .int = 3 }});
+        _ = try u.Where(.{ preds.idEQ(.{ .int = 1 }), preds.stockGTE(.{ .int = 3 }) });
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    // Second decrement of 5 succeeds (7 >= 5).
+    {
+        var u = client.Update();
+        defer u.deinit();
+        _ = try u.setExprArgs("stock", "stock - ?", &.{.{ .int = 5 }});
+        _ = try u.Where(.{ preds.idEQ(.{ .int = 1 }), preds.stockGTE(.{ .int = 5 }) });
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    // Oversell attempt: stock 2 < 3 -> 0 rows affected, stock unchanged.
+    {
+        var u = client.Update();
+        defer u.deinit();
+        _ = try u.setExprArgs("stock", "stock - ?", &.{.{ .int = 3 }});
+        _ = try u.Where(.{ preds.idEQ(.{ .int = 1 }), preds.stockGTE(.{ .int = 3 }) });
+        try std.testing.expectEqual(@as(usize, 0), try u.Save());
+    }
+
+    var q = client.Query();
+    defer q.deinit();
+    _ = try q.Where(.{preds.idEQ(.{ .int = 1 })});
+    var found = try q.All();
+    defer {
+        for (found.items) |*e| deinitEntity(infos, info, e, allocator);
+        found.deinit();
+    }
+    try std.testing.expectEqual(@as(i64, 2), found.items[0].stock);
 }

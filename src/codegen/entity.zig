@@ -24,7 +24,8 @@ fn toSnakeCase(name: []const u8) []const u8 {
 
 /// Generate a light entity struct (fields only, no edges) from TypeInfo.
 /// This breaks comptime recursion when edges reference each other.
-pub fn LightEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
+/// Pure scalar fields (no edges) - the terminal node of nested eager loads.
+fn PlainFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     _ = infos;
     comptime {
         var field_names: [info.fields.len][:0]const u8 = undefined;
@@ -40,6 +41,69 @@ pub fn LightEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo) ty
                 .@"align" = @alignOf(FieldType),
             };
         }
+        return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+    }
+}
+
+/// One level of edges whose targets are plain fields (no further nesting).
+/// Used by LightEntity so `WithEdge("posts.comments")` can preload two
+/// levels; a third level is a compile error (no edges container on the
+/// terminal target).
+fn EdgesTypeShallow(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
+    comptime {
+        if (info.edges.len == 0) {
+            return struct {
+                pub fn deinit(_: @This(), _: std.mem.Allocator) void {}
+            };
+        }
+        var field_names: [info.edges.len][:0]const u8 = undefined;
+        var field_types: [info.edges.len]type = undefined;
+        var field_attrs: [info.edges.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+        for (info.edges, 0..) |e, i| {
+            const target_info = findTypeInfo(infos, e.target_name);
+            const TargetEntity = PlainFields(infos, target_info);
+            const FieldType = ?[]TargetEntity;
+            const default_val: FieldType = null;
+            field_names[i] = (e.name)[0..e.name.len :0];
+            field_types[i] = FieldType;
+            field_attrs[i] = .{
+                .default_value_ptr = &default_val,
+                .@"comptime" = false,
+                .@"align" = @alignOf(FieldType),
+            };
+        }
+        return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+    }
+}
+
+/// Light entity (fields + one shallow edges level) used as the eager-load
+/// target type, so nested `WithEdge("a.b")` works for two levels.
+pub fn LightEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
+    comptime {
+        const ET = EdgesTypeShallow(infos, info);
+        const edges_default: ET = .{};
+        const Plain = PlainFields(infos, info);
+        const fields_info = @typeInfo(Plain).@"struct";
+        var field_names: [fields_info.field_names.len + 1][:0]const u8 = undefined;
+        var field_types: [fields_info.field_names.len + 1]type = undefined;
+        var field_attrs: [fields_info.field_names.len + 1]std.builtin.Type.Struct.FieldAttributes = undefined;
+        for (fields_info.field_names, fields_info.field_types, 0..) |fname, ftype, i| {
+            field_names[i] = fname;
+            field_types[i] = ftype;
+            field_attrs[i] = .{
+                .default_value_ptr = null,
+                .@"comptime" = false,
+                .@"align" = @alignOf(ftype),
+            };
+        }
+        const i = fields_info.field_names.len;
+        field_names[i] = "edges";
+        field_types[i] = ET;
+        field_attrs[i] = .{
+            .default_value_ptr = &edges_default,
+            .@"comptime" = false,
+            .@"align" = @alignOf(ET),
+        };
         return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
     }
 }
@@ -196,21 +260,32 @@ pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, s
         const fp: *field_type = &@field(self, f.name);
         FreeField(field_type, fp, allocator);
     }
-    if (comptime info.edges.len > 0) {
-        inline for (info.edges) |e| {
-            const target_info = comptime findTypeInfo(infos, e.target_name);
-            const edges_ptr: *?[]LightEntity(infos, target_info) = &@field(self.edges, e.name);
-            if (edges_ptr.*) |arr| {
-                for (arr) |*item| {
-                    inline for (target_info.fields) |tf| {
-                        if (!comptime isOwningField(tf.zig_type)) continue;
-                        const item_field_type = if (tf.optional) ?tf.zig_type else tf.zig_type;
-                        const item_fp: *item_field_type = &@field(item, tf.name);
-                        FreeField(item_field_type, item_fp, allocator);
-                    }
+    deinitEntityEdges(infos, info, self, allocator);
+}
+
+/// Recursively free eager-loaded edges (one level of nesting supported).
+/// The edges field type is `?[]Target` where Target is LightEntity (with a
+/// shallow edges level) or PlainFields (terminal); Target is derived from the
+/// field type so both work.
+fn deinitEntityEdges(comptime infos: []const TypeInfo, comptime info: TypeInfo, self: anytype, allocator: std.mem.Allocator) void {
+    if (comptime info.edges.len == 0) return;
+    inline for (info.edges) |e| {
+        const target_info = comptime findTypeInfo(infos, e.target_name);
+        const EdgeFieldType = @TypeOf(@field(self.edges, e.name));
+        const EdgeArrType = @typeInfo(EdgeFieldType).optional.child;
+        const ItemType = @typeInfo(EdgeArrType).pointer.child;
+        const edges_ptr: *?[]ItemType = &@field(self.edges, e.name);
+        if (edges_ptr.*) |arr| {
+            for (arr) |*item| {
+                inline for (target_info.fields) |tf| {
+                    if (!comptime isOwningField(tf.zig_type)) continue;
+                    const item_field_type = if (tf.optional) ?tf.zig_type else tf.zig_type;
+                    const item_fp: *item_field_type = &@field(item, tf.name);
+                    FreeField(item_field_type, item_fp, allocator);
                 }
-                allocator.free(arr);
+                deinitEntityEdges(infos, target_info, item, allocator);
             }
+            allocator.free(arr);
         }
     }
 }

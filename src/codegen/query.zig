@@ -13,7 +13,6 @@ const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;
 const deinitEntity = @import("entity.zig").deinitEntity;
 const EntityGen = @import("entity.zig").Entity;
-const LightEntityGen = @import("entity.zig").LightEntity;
 const graph_step = @import("../graph/step.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
 const explain = @import("../sql/explain.zig");
@@ -30,6 +29,100 @@ fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
         if (std.mem.eql(u8, e.name, name)) return e;
     }
     @compileError("Edge not found: " ++ name ++ " on " ++ info.name);
+}
+
+fn splitEdgePath(path: []const u8) struct { head: []const u8, rest: []const u8 } {
+    if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
+        return .{ .head = path[0..dot], .rest = path[dot + 1 ..] };
+    }
+    return .{ .head = path, .rest = "" };
+}
+
+/// Eager-load one or two levels of edges for a set of parent entities.
+/// A dot path (`"posts.comments"`) recurses once into the loaded targets;
+/// the terminal target type has no edges container, so deeper paths are a
+/// compile error.
+fn loadEdgePath(
+    comptime infos: []const TypeInfo,
+    comptime ParentInfo: TypeInfo,
+    comptime ParentEntity: type,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    execution_context: sql_driver.ExecutionContext,
+    entities: []ParentEntity,
+    path: []const u8,
+) !void {
+    if (entities.len == 0 or path.len == 0) return;
+    const split = splitEdgePath(path);
+
+    inline for (ParentInfo.edges) |edge| {
+        if (std.mem.eql(u8, edge.name, split.head)) {
+            const target_info = comptime findTypeInfo(infos, edge.target_name);
+            // Target type mirrors the parent's edges field: LightEntity for
+            // the first level (so nesting can continue), PlainFields for the
+            // terminal level.
+            const EdgeFieldType = @TypeOf(@field(@as(ParentEntity, undefined).edges, edge.name));
+            const TargetEntity = @typeInfo(@typeInfo(EdgeFieldType).optional.child).pointer.child;
+            const step = comptime buildEdgeStep(edge, ParentInfo, target_info);
+
+            var parent_id_values = try allocator.alloc(sql.Value, entities.len);
+            defer allocator.free(parent_id_values);
+            for (entities, 0..) |e, i| {
+                parent_id_values[i] = .{ .int = e.id };
+            }
+
+            var b = sql.Builder.init(allocator, driver.dialect());
+            defer b.deinit();
+            graph_neighbors.appendSetNeighbors(&b, step, parent_id_values) catch |err| {
+                return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
+            };
+            const qr = b.query();
+
+            var rows = try driver.queryCtx(&execution_context, qr.sql, qr.args);
+            defer rows.deinit();
+
+            var map = std.AutoHashMap(i64, std.ArrayListUnmanaged(TargetEntity)).init(allocator);
+            defer {
+                var it = map.iterator();
+                while (it.next()) |entry| {
+                    entry.value_ptr.deinit(allocator);
+                }
+                map.deinit();
+            }
+
+            while (rows.next()) |row| {
+                const target = try sql_scan.scanRow(TargetEntity, allocator, row);
+                const fk_idx = sql_scan.findColumnIndex(row, "__fk") orelse return error.MissingColumn;
+                const parent_id = row.getInt(fk_idx) orelse return error.TypeMismatch;
+
+                var gop = try map.getOrPut(parent_id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = std.ArrayListUnmanaged(TargetEntity).empty;
+                }
+                try gop.value_ptr.append(allocator, target);
+            }
+            if (rows.nextError()) |e| return e;
+
+            for (entities) |*e| {
+                if (map.get(e.id)) |list| {
+                    const slice = try allocator.dupe(TargetEntity, list.items);
+                    @field(e.edges, edge.name) = slice;
+                }
+            }
+
+            // Recurse one level into the loaded targets.
+            if (split.rest.len > 0) {
+                for (entities) |*e| {
+                    const arr = @field(e.edges, edge.name);
+                    if (arr) |items| {
+                        try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    return error.InvalidEdge;
 }
 
 /// Generate a Query builder for an entity.
@@ -219,9 +312,16 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return self;
         }
 
-        pub fn WithEdge(self: *Self, comptime edge_name: []const u8) !*Self {
-            _ = comptime findEdgeInfo(info, edge_name);
-            try self.with_edges.append(self.allocator, edge_name);
+        /// Eager-load one or two levels of edges. Dot paths preload nested
+        /// relations, e.g. `WithEdge("posts.comments")` loads each row's
+        /// posts and each post's comments (two levels max).
+        pub fn WithEdge(self: *Self, comptime edge_path: []const u8) !*Self {
+            const head = comptime blk: {
+                if (std.mem.indexOfScalar(u8, edge_path, '.')) |dot| break :blk edge_path[0..dot];
+                break :blk edge_path;
+            };
+            _ = comptime findEdgeInfo(info, head);
+            try self.with_edges.append(self.allocator, edge_path);
             return self;
         }
 
@@ -687,64 +787,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return error.TypeMismatch;
         }
 
-        fn loadEdges(self: *Self, edge_name: []const u8, entities: []Entity) !void {
-            if (entities.len == 0) return;
-
-            inline for (info.edges) |edge| {
-                if (std.mem.eql(u8, edge_name, edge.name)) {
-                    const target_info = comptime findTypeInfo(infos, edge.target_name);
-                    const TargetEntity = comptime LightEntityGen(infos, target_info);
-                    const step = comptime buildEdgeStep(edge, info, target_info);
-
-                    // Build parent ID values
-                    var parent_id_values = try self.allocator.alloc(sql.Value, entities.len);
-                    defer self.allocator.free(parent_id_values);
-                    for (entities, 0..) |e, i| {
-                        parent_id_values[i] = .{ .int = e.id };
-                    }
-
-                    // Use the graph layer to build the neighbor query
-                    var b = sql.Builder.init(self.allocator, self.driver.dialect());
-                    defer b.deinit();
-                    graph_neighbors.appendSetNeighbors(&b, step, parent_id_values) catch |err| return mapBuildError(err);
-                    const qr = b.query();
-                    self.ensureDeadline();
-
-                    var rows = try self.driver.queryCtx(&self.execution_context, qr.sql, qr.args);
-                    defer rows.deinit();
-
-                    var map = std.AutoHashMap(i64, std.ArrayListUnmanaged(TargetEntity)).init(self.allocator);
-                    defer {
-                        var it = map.iterator();
-                        while (it.next()) |entry| {
-                            entry.value_ptr.deinit(self.allocator);
-                        }
-                        map.deinit();
-                    }
-
-                    while (rows.next()) |row| {
-                        const target = try sql_scan.scanRow(TargetEntity, self.allocator, row);
-                        const fk_idx = sql_scan.findColumnIndex(row, "__fk") orelse return error.MissingColumn;
-                        const parent_id = row.getInt(fk_idx) orelse return error.TypeMismatch;
-
-                        var gop = try map.getOrPut(parent_id);
-                        if (!gop.found_existing) {
-                            gop.value_ptr.* = std.ArrayListUnmanaged(TargetEntity).empty;
-                        }
-                        try gop.value_ptr.append(self.allocator, target);
-                    }
-                    if (rows.nextError()) |e| return e;
-
-                    for (entities) |*e| {
-                        if (map.get(e.id)) |list| {
-                            const slice = try self.allocator.dupe(TargetEntity, list.items);
-                            @field(e.edges, edge.name) = slice;
-                        }
-                    }
-                    return;
-                }
-            }
-            return error.InvalidEdge;
+        fn loadEdges(self: *Self, edge_path: []const u8, entities: []Entity) !void {
+            return loadEdgePath(infos, info, Entity, self.allocator, self.driver, self.execution_context, entities, edge_path);
         }
 
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {
@@ -952,6 +996,121 @@ test "Query builder WithEdge compiles" {
     _ = try q.WithEdge("cars");
     try std.testing.expectEqual(@as(usize, 1), q.with_edges.items.len);
     try std.testing.expectEqualStrings("cars", q.with_edges.items[0]);
+}
+
+test "WithEdge nested two-level preload" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const Comment = schema("Comment", .{
+        .fields = &.{
+            field.Int("post_id"),
+            field.String("body"),
+        },
+    });
+    const Post = schema("Post", .{
+        .fields = &.{
+            field.Int("user_id"),
+            field.String("title"),
+        },
+        .edges = &.{edge.To("comments", Comment)},
+    });
+    const User = schema("User", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("posts", Post)},
+    });
+
+    const graph = comptime buildGraph(&.{ User, Post, Comment });
+    const infos = graph.types;
+    const user_info = comptime fromSchema(User);
+    const post_info = comptime fromSchema(Post);
+    const comment_info = comptime fromSchema(Comment);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    // Seed: user 1 with two posts; post 1 has two comments, post 2 has one.
+    const alice_id = id: {
+        var b = try root.user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "alice");
+        var row = try b.Save();
+        defer deinitEntity(infos, user_info, &row, allocator);
+        break :id row.id;
+    };
+    const p1 = id: {
+        var b = try root.post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("user_id", alice_id);
+        _ = try b.setFieldValue("title", "hello");
+        var row = try b.Save();
+        defer deinitEntity(infos, post_info, &row, allocator);
+        break :id row.id;
+    };
+    const p2 = id: {
+        var b = try root.post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("user_id", alice_id);
+        _ = try b.setFieldValue("title", "world");
+        var row = try b.Save();
+        defer deinitEntity(infos, post_info, &row, allocator);
+        break :id row.id;
+    };
+    {
+        var b = try root.comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", p1);
+        _ = try b.setFieldValue("body", "first");
+        var row = try b.Save();
+        defer deinitEntity(infos, comment_info, &row, allocator);
+    }
+    {
+        var b = try root.comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", p1);
+        _ = try b.setFieldValue("body", "second");
+        var row = try b.Save();
+        defer deinitEntity(infos, comment_info, &row, allocator);
+    }
+    {
+        var b = try root.comment.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("post_id", p2);
+        _ = try b.setFieldValue("body", "only");
+        var row = try b.Save();
+        defer deinitEntity(infos, comment_info, &row, allocator);
+    }
+    // Two-level eager load: user.posts[].comments[] populated in 3 queries.
+    var q = root.user.Query();
+    defer q.deinit();
+    _ = try q.WithEdge("posts.comments");
+    const users = try q.All();
+    defer {
+        for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+        users.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), users.items.len);
+    const posts = users.items[0].edges.posts.?;
+    try std.testing.expectEqual(@as(usize, 2), posts.len);
+    // Post 1 -> two comments; post 2 -> one comment.
+    const c1 = posts[0].edges.comments.?;
+    const c2 = posts[1].edges.comments.?;
+    try std.testing.expectEqual(@as(usize, 2), c1.len);
+    try std.testing.expectEqual(@as(usize, 1), c2.len);
+    try std.testing.expectEqualStrings("second", c1[1].body);
+    try std.testing.expectEqualStrings("only", c2[0].body);
+    try std.testing.expectEqual(@as(i64, p1), posts[0].id);
+    try std.testing.expectEqual(@as(i64, p2), posts[1].id);
 }
 
 test "Query builder GroupBy and Having" {

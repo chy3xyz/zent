@@ -1071,9 +1071,15 @@ pub fn MultiInsert(allocator: std.mem.Allocator, dialect: Dialect, table: []cons
 // UPDATE
 // ------------------------------------------------------------------
 
+pub const UpdateSetExprArgs = struct {
+    expr: []u8,
+    args: []Value,
+};
+
 pub const UpdateSetValue = union(enum) {
     value: Value,
     expr: []const u8,
+    expr_args: UpdateSetExprArgs,
 };
 
 pub const UpdateSet = struct {
@@ -1100,6 +1106,10 @@ pub const UpdateBuilder = struct {
         for (u.sets.items) |s| {
             switch (s.set_value) {
                 .expr => |e| u.b.allocator.free(e),
+                .expr_args => |e| {
+                    u.b.allocator.free(e.expr);
+                    u.b.allocator.free(e.args);
+                },
                 .value => {},
             }
         }
@@ -1120,6 +1130,22 @@ pub const UpdateBuilder = struct {
         return u;
     }
 
+    /// Set a column to an expression with bound parameters, e.g. atomic
+    /// stock decrement: `setExprArgs("stock", "stock - ?", &.{.{ .int = n }})`.
+    /// Placeholders in `expr` are filled from `args` in order (SET args come
+    /// before WHERE args in the final query).
+    pub fn setExprArgs(u: *UpdateBuilder, column: []const u8, expr: []const u8, args: []const Value) !*UpdateBuilder {
+        const expr_copy = try u.b.allocator.dupe(u8, expr);
+        errdefer u.b.allocator.free(expr_copy);
+        const args_copy = try u.b.allocator.dupe(Value, args);
+        errdefer u.b.allocator.free(args_copy);
+        try u.sets.append(.{ .column = column, .set_value = .{ .expr_args = .{
+            .expr = expr_copy,
+            .args = args_copy,
+        } } });
+        return u;
+    }
+
     pub fn where(u: *UpdateBuilder, pred: Predicate) !*UpdateBuilder {
         try u.wheres.append(pred);
         return u;
@@ -1136,6 +1162,9 @@ pub const UpdateBuilder = struct {
             switch (s.set_value) {
                 .value => |v| try u.b.arg(v),
                 .expr => |e| try u.b.writeString(e),
+                .expr_args => |e| {
+                    try appendExprWithArgs(&u.b, e.expr, e.args);
+                },
             }
         }
         if (u.wheres.items.len > 0) {
@@ -1159,6 +1188,9 @@ pub const UpdateBuilder = struct {
             switch (s.set_value) {
                 .value => |v| try u.b.arg(v),
                 .expr => |e| try u.b.writeString(e),
+                .expr_args => |e| {
+                    try appendExprWithArgs(&u.b, e.expr, e.args);
+                },
             }
         }
         if (u.wheres.items.len > 0) {
@@ -1171,6 +1203,25 @@ pub const UpdateBuilder = struct {
         return u.b.takeQuery();
     }
 };
+
+/// Render an expression with `?` placeholders, replacing each `?` with the
+/// dialect placeholder and binding the matching arg (SET args come before
+/// WHERE args, matching SQL order).
+fn appendExprWithArgs(b: *Builder, expr: []const u8, args: []const Value) !void {
+    var arg_idx: usize = 0;
+    var start: usize = 0;
+    for (expr, 0..) |c, i| {
+        if (c == '?') {
+            try b.writeString(expr[start..i]);
+            if (arg_idx >= args.len) return error.ExprArgMismatch;
+            try b.arg(args[arg_idx]);
+            arg_idx += 1;
+            start = i + 1;
+        }
+    }
+    try b.writeString(expr[start..]);
+    if (arg_idx != args.len) return error.ExprArgMismatch;
+}
 
 pub fn Update(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) UpdateBuilder {
     return UpdateBuilder.init(allocator, dialect, table);
@@ -1623,6 +1674,24 @@ test "UPDATE with expression" {
     const q = try u.query();
     try std.testing.expectEqualStrings("UPDATE \"users\" SET \"name\" = ?, \"version\" = version + 1 WHERE \"id\" = ?", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
+}
+
+test "UPDATE with expression args keeps arg order (SET before WHERE)" {
+    const allocator = std.testing.allocator;
+    var u = Update(allocator, Dialect.sqlite, "inventory");
+    defer u.deinit();
+    _ = try u.setExprArgs("stock", "stock - ?", &.{.{ .int = 3 }});
+    _ = try u.where(EQ("id", .{ .int = 7 }));
+    _ = try u.where(GTE("stock", .{ .int = 3 }));
+    const q = try u.query();
+    try std.testing.expectEqualStrings(
+        "UPDATE \"inventory\" SET \"stock\" = stock - ? WHERE \"id\" = ? AND \"stock\" >= ?",
+        q.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 3), q.args.len);
+    try std.testing.expectEqual(@as(i64, 3), q.args[0].int);
+    try std.testing.expectEqual(@as(i64, 7), q.args[1].int);
+    try std.testing.expectEqual(@as(i64, 3), q.args[2].int);
 }
 
 test "DELETE" {

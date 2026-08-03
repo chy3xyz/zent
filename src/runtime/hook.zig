@@ -285,6 +285,7 @@ test "global hook registry" {
     try chain.add(hook);
 
     registerGlobal(&chain);
+    defer global_registry = null;
 
     var ctx = HookContext{ .op = .create, .table_name = "users" };
     try globalBefore(&ctx);
