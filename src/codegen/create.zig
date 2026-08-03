@@ -108,7 +108,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var found = false;
                 for (info.fields) |f| {
                     if (std.mem.eql(u8, f.name, field_name)) {
-                        const Expected = f.zig_type;
+                        const Expected = if (f.optional) ?f.zig_type else f.zig_type;
                         const Actual = @TypeOf(value);
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
@@ -425,6 +425,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         fn setEntityField(entity: *Entity, name: []const u8, value: sql.Value, allocator: std.mem.Allocator) !void {
             inline for (info.fields) |f| {
                 if (std.mem.eql(u8, f.name, name)) {
+                    if (value == .null) {
+                        if (f.optional) {
+                            @field(entity, f.name) = @as(?f.zig_type, null);
+                        } else {
+                            return error.TypeMismatch;
+                        }
+                        return;
+                    }
                     @field(entity, f.name) = try valueToType(f.zig_type, f.field_type, value, allocator, entity);
                     return;
                 }
@@ -467,6 +475,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 }
 
 pub fn validateSqlValue(comptime field: FieldInfo, value: sql.Value) !void {
+    if (value == .null) return; // null is valid for optional fields
     for (field.validators) |v| {
         switch (v) {
             .positive => {
@@ -631,6 +640,7 @@ fn canSetField(comptime Expected: type, Actual: type) bool {
         Expected;
 
     if (Expected == Actual) return true;
+    if (Unwrapped == Actual) return true; // optional field accepts bare value
     if (Unwrapped == i64 and Actual == comptime_int) return true;
     if (Unwrapped == f64 and Actual == comptime_float) return true;
     if (Unwrapped == []const u8) {
@@ -657,6 +667,10 @@ fn toSqlValue(v: anytype) sql.Value {
 
     const ti = @typeInfo(T);
     switch (ti) {
+        .optional => {
+            if (v) |payload| return toSqlValue(payload);
+            return .null;
+        },
         .bool => return .{ .bool = v },
         .int => return .{ .int = v },
         .float => return .{ .float = v },
@@ -788,7 +802,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 var found = false;
                 for (info.fields) |f| {
                     if (std.mem.eql(u8, f.name, field_name)) {
-                        const Expected = f.zig_type;
+                        const Expected = if (f.optional) ?f.zig_type else f.zig_type;
                         const Actual = @TypeOf(value);
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));

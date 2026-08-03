@@ -92,7 +92,9 @@ pub fn CrudService(
             var b = try self.client.Create();
             defer b.deinit();
             inline for (info.fields) |f| {
-                if (!f.is_id) {
+                // id is auto-generated; audit fields (created_by/updated_by)
+                // are owned by fillAuditUser from the privacy context.
+                if (!f.is_id and !std.mem.eql(u8, f.name, "created_by") and !std.mem.eql(u8, f.name, "updated_by")) {
                     _ = try b.setFieldValue(f.name, @field(entity, f.name));
                 }
             }
@@ -108,7 +110,7 @@ pub fn CrudService(
             var b = self.client.Update();
             defer b.deinit();
             inline for (info.fields) |f| {
-                if (!f.is_id and !std.mem.eql(u8, f.name, tenant_col)) {
+                if (!f.is_id and !std.mem.eql(u8, f.name, tenant_col) and !std.mem.eql(u8, f.name, "created_by") and !std.mem.eql(u8, f.name, "updated_by")) {
                     _ = try b.setFieldValue(f.name, @field(entity, f.name));
                 }
             }
@@ -182,6 +184,10 @@ fn ownedCopy(allocator: std.mem.Allocator, src: anytype) !@TypeOf(src) {
     inline for (fields, types) |fname, ftype| {
         if (ftype == []const u8) {
             @field(out, fname) = try allocator.dupe(u8, @field(src, fname));
+        } else if (ftype == ?[]const u8) {
+            if (@field(src, fname)) |s| {
+                @field(out, fname) = try allocator.dupe(u8, s);
+            }
         }
     }
     return out;
@@ -361,4 +367,43 @@ test "CrudService insertMany/upsertMany batch writes" {
     var page2 = try svc.list(1, 1, 10);
     defer page2.deinit();
     try std.testing.expectEqual(@as(i64, 4), page2.total);
+}
+
+test "CrudService handles optional string fields in create/get" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+
+    const Product = Schema("OptionalProduct", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.String("name"),
+            field.String("description").Optional(),
+        },
+    });
+    const info = comptime fromSchema(Product);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const client = codegen.EntityClient(infos, info).init(allocator, driver.asDriver());
+    var svc = Service.init(allocator, client);
+
+    const a_id = try svc.create(.{ .id = 0, .tenant_id = 1, .name = "a", .description = null });
+    const b_id = try svc.create(.{ .id = 0, .tenant_id = 1, .name = "b", .description = "desc" });
+
+    var got_a = (try svc.get(allocator, 1, a_id)).?;
+    defer deinitEntity(infos, info, &got_a, allocator);
+    try std.testing.expect(got_a.description == null);
+
+    var got_b = (try svc.get(allocator, 1, b_id)).?;
+    defer deinitEntity(infos, info, &got_b, allocator);
+    try std.testing.expectEqualStrings("desc", got_b.description.?);
 }

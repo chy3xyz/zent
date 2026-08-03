@@ -91,6 +91,7 @@ fn canSetField(comptime Expected: type, Actual: type) bool {
         Expected;
 
     if (Expected == Actual) return true;
+    if (Unwrapped == Actual) return true; // optional field accepts bare value
     if (Unwrapped == i64 and Actual == comptime_int) return true;
     if (Unwrapped == f64 and Actual == comptime_float) return true;
     if (Unwrapped == []const u8) {
@@ -117,6 +118,10 @@ fn toSqlValue(v: anytype) sql.Value {
     if (T == comptime_int) return .{ .int = v };
     if (T == comptime_float) return .{ .float = v };
     return switch (@typeInfo(T)) {
+        .optional => {
+            if (v) |payload| return toSqlValue(payload);
+            return .null;
+        },
         .bool => .{ .bool = v },
         .int => .{ .int = v },
         .float => .{ .float = v },
@@ -226,7 +231,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 var found = false;
                 for (info.fields) |f| {
                     if (std.mem.eql(u8, f.name, field_name)) {
-                        const Expected = f.zig_type;
+                        const Expected = if (f.optional) ?f.zig_type else f.zig_type;
                         const Actual = @TypeOf(value);
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
@@ -872,7 +877,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 var found = false;
                 for (info.fields) |f| {
                     if (std.mem.eql(u8, f.name, field_name)) {
-                        const Expected = f.zig_type;
+                        const Expected = if (f.optional) ?f.zig_type else f.zig_type;
                         const Actual = @TypeOf(value);
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
