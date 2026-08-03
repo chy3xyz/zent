@@ -36,6 +36,7 @@ pub const codegen = struct {
 pub const crud = @import("crud.zig");
 pub const outbox = @import("outbox.zig");
 pub const shard = @import("shard.zig");
+pub const helpers = @import("helpers.zig");
 
 pub const runtime = struct {
     pub const hook = @import("runtime/hook.zig");

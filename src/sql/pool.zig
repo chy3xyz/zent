@@ -74,8 +74,14 @@ pub fn ConnPool(comptime D: type) type {
             max_connections: usize = 8,
             /// Run `ping()` before handing out a connection.
             health_check_on_borrow: bool = true,
-            /// Factory that opens a new connection.
-            connect: ConnectFn,
+            /// Factory that opens a new connection. Omit when `connectCtx`
+            /// is provided (e.g. a factory closing over runtime config).
+            connect: ?ConnectFn = null,
+            /// Optional context + factory pair: lets the connect factory close
+            /// over runtime configuration (e.g. a file path) instead of
+            /// relying on globals. When set, `connectCtx` wins over `connect`.
+            connect_ctx: ?*anyopaque = null,
+            connectCtx: ?*const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!D = null,
             /// I/O abstraction used for blocking synchronization. When omitted, the pool
             /// creates and owns a thread-safe `std.Io.Threaded` instance. Applications that
             /// want to share an `Io` across multiple pools or use a custom implementation
@@ -117,7 +123,6 @@ pub fn ConnPool(comptime D: type) type {
         };
 
         allocator: std.mem.Allocator,
-        connect: ConnectFn,
         options: Options,
         dialect: Dialect,
         io: std.Io,
@@ -143,7 +148,6 @@ pub fn ConnPool(comptime D: type) type {
 
             var self = Self{
                 .allocator = allocator,
-                .connect = options.connect,
                 .options = options,
                 .dialect = Dialect.sqlite, // overwritten after first conn
                 .io = undefined,
@@ -198,7 +202,7 @@ pub fn ConnPool(comptime D: type) type {
         }
 
         fn addConnection(self: *Self) !void {
-            var conn = try self.connect(self.allocator);
+            var conn = try self.openConnection();
             const ptr = blk: {
                 errdefer conn.close(); // only runs if all.addOne fails
                 const p = try self.all.addOne(self.allocator);
@@ -214,6 +218,13 @@ pub fn ConnPool(comptime D: type) type {
                 conn.close();
             }
             try self.available.append(self.allocator, ptr);
+        }
+
+        /// Open a new connection honoring either factory (connectCtx wins).
+        fn openConnection(self: *Self) !D {
+            if (self.options.connectCtx) |f| return f(self.options.connect_ctx, self.allocator);
+            if (self.options.connect) |f| return f(self.allocator);
+            return error.MissingConnectFactory;
         }
 
         /// Close a connection and remove it from the pool.
@@ -244,7 +255,7 @@ pub fn ConnPool(comptime D: type) type {
                 const entry = self.available.pop() orelse {
                     if (self.all.items.len < self.options.max_connections) {
                         // Open a new connection.
-                        var new_conn = self.connect(self.allocator) catch return null;
+                        var new_conn = self.openConnection() catch return null;
                         const ptr = blk: {
                             errdefer new_conn.close();
                             const p = self.all.addOne(self.allocator) catch {
