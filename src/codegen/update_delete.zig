@@ -53,6 +53,36 @@ fn epochExpr(dialect: anytype) []const u8 {
     return "(unixepoch())";
 }
 
+/// Copy `args` and mask values that came from `sensitive` fields (matched by
+/// field name against `values`), so exec/query logs never leak secrets.
+/// `value_arg_count` is how many of the leading args belong to the SET values
+/// (predicate args follow).
+fn maskSensitiveArgs(
+    allocator: std.mem.Allocator,
+    comptime info: TypeInfo,
+    values: []const FieldValue,
+    args: []const sql.Value,
+    value_arg_count: usize,
+    skip_field: ?[]const u8,
+) ![]sql.Value {
+    const out = try allocator.dupe(sql.Value, args);
+    errdefer allocator.free(out);
+    var arg_idx: usize = 0;
+    for (values) |fv| {
+        if (arg_idx >= value_arg_count) break;
+        if (skip_field) |sf| {
+            if (std.mem.eql(u8, fv.name, sf)) continue;
+        }
+        inline for (info.fields) |f| {
+            if (std.mem.eql(u8, f.name, fv.name) and f.sensitive) {
+                out[arg_idx] = .{ .string = "***" };
+            }
+        }
+        arg_idx += 1;
+    }
+    return out;
+}
+
 fn canSetField(comptime Expected: type, Actual: type) bool {
     const Unwrapped = if (@typeInfo(Expected) == .optional)
         @typeInfo(Expected).optional.child
@@ -409,9 +439,18 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             after_hooks_fired = true;
 
             if (self.logger.onExec) |log| {
+                const log_args = try maskSensitiveArgs(
+                    self.allocator,
+                    info,
+                    self.values.items,
+                    q.args,
+                    self.values.items.len,
+                    if (version_locked and version_field != null) version_field.?.name else null,
+                );
+                defer self.allocator.free(log_args);
                 log(.{
                     .sql = q.sql,
-                    .args = q.args,
+                    .args = log_args,
                     .duration_us = duration_us,
                     .rows_affected = res.rows_affected,
                     .table_name = info.table_name,
@@ -1285,6 +1324,35 @@ test "setExprArgs atomic stock decrement prevents oversell" {
         found.deinit();
     }
     try std.testing.expectEqual(@as(i64, 2), found.items[0].stock);
+}
+
+test "maskSensitiveArgs masks sensitive field values in logs" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const User = Schema("User9", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("api_key").Sensitive(),
+        },
+    });
+    const info = comptime fromSchema(User);
+    const values = [_]FieldValue{
+        .{ .name = "api_key", .value = .{ .string = "sk-secret" } },
+        .{ .name = "name", .value = .{ .string = "alice" } },
+    };
+    const args = [_]sql.Value{
+        .{ .string = "sk-secret" },
+        .{ .string = "alice" },
+        .{ .int = 7 },
+    };
+    const masked = try maskSensitiveArgs(allocator, info, &values, &args, 2, null);
+    defer allocator.free(masked);
+    try std.testing.expectEqualStrings("***", masked[0].string);
+    try std.testing.expectEqualStrings("alice", masked[1].string);
+    try std.testing.expectEqual(@as(i64, 7), masked[2].int);
 }
 
 test "updated_at auto-maintained by UpdateBuilder (TimeMixin)" {

@@ -263,6 +263,21 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return self;
         }
 
+        /// Add `column IN (…)` with automatic chunking (drivers cap parameter
+        /// counts), OR-joined across chunks.
+        pub fn WhereIn(self: *Self, column: []const u8, values: []const sql.Value) !*Self {
+            const preds = try sql.InChunked(self.allocator, column, values, 500);
+            defer self.allocator.free(preds);
+            if (preds.len == 1) {
+                try self.predicates.append(self.allocator, preds[0]);
+            } else {
+                var acc = preds[0];
+                for (preds[1..]) |p| acc = sql.Or(&acc, &p);
+                try self.predicates.append(self.allocator, acc);
+            }
+            return self;
+        }
+
         pub fn OrderBy(self: *Self, terms: []const sql.Order) !*Self {
             for (terms) |t| {
                 try self.order_terms.append(t);

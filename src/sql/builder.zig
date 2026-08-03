@@ -477,6 +477,27 @@ pub fn In(column: []const u8, values: []const Value) Predicate {
     return .{ .in = .{ .column = column, .values = values } };
 }
 
+/// Split a large IN list into chunked `col IN (…)` predicates (drivers cap
+/// parameter counts, e.g. SQLite 999). Caller frees the returned slice.
+pub fn InChunked(
+    allocator: std.mem.Allocator,
+    column: []const u8,
+    values: []const Value,
+    chunk_size: usize,
+) ![]Predicate {
+    if (values.len == 0) return error.EmptyInValues;
+    const count = (values.len + chunk_size - 1) / chunk_size;
+    const out = try allocator.alloc(Predicate, count);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (start < values.len) : (start += chunk_size) {
+        const end = @min(start + chunk_size, values.len);
+        out[i] = In(column, values[start..end]);
+        i += 1;
+    }
+    return out;
+}
+
 pub fn IsNull(column: []const u8) Predicate {
     return .{ .is_null = column };
 }
@@ -1856,4 +1877,23 @@ test "CTE WITH clause" {
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
     try std.testing.expectEqual(@as(i64, 18), q.args[0].int);
     try std.testing.expectEqualStrings("alice", q.args[1].string);
+}
+
+test "InChunked splits large IN lists" {
+    const allocator = std.testing.allocator;
+    var values: [1200]Value = undefined;
+    for (&values, 0..) |*v, i| v.* = .{ .int = @intCast(i) };
+    const preds = try InChunked(allocator, "id", &values, 500);
+    defer allocator.free(preds);
+    try std.testing.expectEqual(@as(usize, 3), preds.len);
+
+    var b = Builder.init(allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+    for (preds, 0..) |p, i| {
+        if (i > 0) try b.writeString(" OR ");
+        try p.appendTo(&b);
+    }
+    const q = b.query();
+    try std.testing.expectEqual(@as(usize, 1200), q.args.len);
+    try std.testing.expect(std.mem.indexOf(u8, q.sql, "OR") != null);
 }

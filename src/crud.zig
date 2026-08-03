@@ -131,6 +131,42 @@ pub fn CrudService(
             }
             return affected > 0;
         }
+
+        /// Batch insert in one statement (id auto-generated). Caller deinits
+        /// the returned id list. Emits one CrudEvent.created per row.
+        pub fn insertMany(self: *Self, entities: []const Entity) !std.array_list.Managed(i64) {
+            var b = try self.client.BulkInsert();
+            defer b.deinit();
+            for (entities) |e| {
+                inline for (info.fields) |f| {
+                    if (f.is_id) continue;
+                    _ = try b.setFieldValue(f.name, @field(e, f.name));
+                }
+                _ = try b.Next();
+            }
+            const ids = try b.Save();
+            if (self.on_event) |cb| {
+                for (ids.items) |id| cb(.{ .created = id });
+            }
+            return ids;
+        }
+
+        /// Batch upsert in one statement (`INSERT … ON CONFLICT DO UPDATE` /
+        /// `ON DUPLICATE KEY UPDATE`). The conflict key (id) is written, so
+        /// rows with an existing id update and new ids insert. Caller deinits
+        /// the returned id list. No CrudEvent is emitted (insert-vs-update is
+        /// indistinguishable from the returned ids).
+        pub fn upsertMany(self: *Self, entities: []const Entity) !std.array_list.Managed(i64) {
+            var b = try self.client.BulkInsert();
+            defer b.deinit();
+            for (entities) |e| {
+                inline for (info.fields) |f| {
+                    _ = try b.setFieldValue(f.name, @field(e, f.name));
+                }
+                _ = try b.Next();
+            }
+            return b.SaveOrUpdate();
+        }
     };
 }
 
@@ -260,4 +296,69 @@ test "CrudService get with mismatched allocator (arena copy)" {
     var got = (try svc.get(arena.allocator(), 7, id)).?;
     defer deinitEntity(infos, info, &got, arena.allocator());
     try std.testing.expectEqualStrings("hello-world", got.name);
+}
+
+test "CrudService insertMany/upsertMany batch writes" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Product = Schema("BatchProduct", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.String("name"),
+            field.Int("price_cents"),
+        },
+    });
+    const info = comptime fromSchema(Product);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    const Recorder = struct {
+        var created: usize = 0;
+        fn on(e: CrudEvent(infos, info)) void {
+            switch (e) {
+                .created => created += 1,
+                else => {},
+            }
+        }
+    };
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = codegen.EntityClient(infos, info);
+    const client = Client.init(allocator, driver.asDriver());
+    var svc = Service.init(allocator, client);
+    svc.setEventListener(&Recorder.on);
+
+    const ids = try svc.insertMany(&.{
+        .{ .id = 0, .tenant_id = 1, .name = "a", .price_cents = 100 },
+        .{ .id = 0, .tenant_id = 1, .name = "b", .price_cents = 200 },
+        .{ .id = 0, .tenant_id = 1, .name = "c", .price_cents = 300 },
+    });
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(usize, 3), ids.items.len);
+    try std.testing.expectEqual(@as(usize, 3), Recorder.created);
+
+    var page = try svc.list(1, 1, 10);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(i64, 3), page.total);
+
+    // Upsert: update existing id + insert a new row (id 0 -> new).
+    const ups = try svc.upsertMany(&.{
+        .{ .id = ids.items[0], .tenant_id = 1, .name = "a2", .price_cents = 150 },
+        .{ .id = 0, .tenant_id = 1, .name = "d", .price_cents = 400 },
+    });
+    defer ups.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ups.items.len);
+
+    var page2 = try svc.list(1, 1, 10);
+    defer page2.deinit();
+    try std.testing.expectEqual(@as(i64, 4), page2.total);
 }

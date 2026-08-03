@@ -6,13 +6,24 @@ const Step = @import("step.zig").Step;
 // Internal helpers
 // ------------------------------------------------------------------
 
-fn writeInClause(b: *sql.Builder, parent_ids: []const sql.Value) !void {
-    try b.writeByte('(');
-    for (parent_ids, 0..) |id, i| {
-        if (i > 0) try b.writeString(", ");
-        try b.arg(id);
+/// Write `(?,?,…) [OR (?,?,…)]` — parent id lists are chunked so eager loads
+/// never exceed the driver parameter limit (e.g. SQLite 999).
+fn writeInClauseChunked(b: *sql.Builder, parent_ids: []const sql.Value) !void {
+    const chunk_size: usize = 500;
+    var start: usize = 0;
+    var first = true;
+    while (start < parent_ids.len) {
+        const end = @min(start + chunk_size, parent_ids.len);
+        if (!first) try b.writeString(" OR ");
+        try b.writeByte('(');
+        for (parent_ids[start..end], 0..) |id, i| {
+            if (i > 0) try b.writeString(", ");
+            try b.arg(id);
+        }
+        try b.writeByte(')');
+        start = end;
+        first = false;
     }
-    try b.writeByte(')');
 }
 
 fn writeEagerLoadColumns(b: *sql.Builder, step: Step, include_select: bool) !void {
@@ -85,7 +96,7 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
             try b.writeString(" WHERE ");
             try b.ident(step.edge_columns[0]);
             try b.writeString(" IN ");
-            try writeInClause(b, parent_ids);
+            try writeInClauseChunked(b, parent_ids);
         },
         .m2o => {
             // FromEdgeOwner: FK is in source table.
@@ -103,7 +114,7 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
             try b.writeString(" WHERE s.");
             try b.ident(step.from_column);
             try b.writeString(" IN ");
-            try writeInClause(b, parent_ids);
+            try writeInClauseChunked(b, parent_ids);
         },
         .m2m => {
             // ThroughEdgeTable: M2M via junction table.
@@ -121,7 +132,7 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
             try b.writeString(" WHERE j.");
             try b.ident(step.sourcePK());
             try b.writeString(" IN ");
-            try writeInClause(b, parent_ids);
+            try writeInClauseChunked(b, parent_ids);
         },
     }
 
