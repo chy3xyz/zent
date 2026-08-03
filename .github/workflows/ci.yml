@@ -48,6 +48,9 @@ jobs:
       - name: Unit tests
         run: zig build test --summary all
 
+      - name: Version consistency
+        run: bash scripts/check-version.sh
+
       - name: Integration tests (SQLite; Postgres/MySQL skipped when no server)
         run: zig build test-integration --summary all
 

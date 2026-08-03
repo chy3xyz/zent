@@ -4,6 +4,8 @@ A Zig language implementation of an Entity Framework, inspired by [ent](https://
 
 [中文版本](README_CN.md)
 
+Current release: **v0.18.0** (package version synced to tags; see `scripts/release.sh`).
+
 ## Features
 
 - **Schema as Code**: Define entities, fields, edges, and indexes directly in Zig code
