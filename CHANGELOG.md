@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-08-03
+
 ### Added
 - `crud.CrudService(infos, info, tenant_col)` — generic list/get/create/
   update/delete over the generated client with tenant scoping and a
