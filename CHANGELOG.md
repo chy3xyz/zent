@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-04
+
 ### Added
 - `AuditMixin` (`created_by` / `updated_by`): Create/Update auto-fill from
   `PrivacyContext.user_id` unless set explicitly — audit trail for who
