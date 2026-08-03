@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `AuditMixin` (`created_by` / `updated_by`): Create/Update auto-fill from
+  `PrivacyContext.user_id` unless set explicitly — audit trail for who
+  created/changed a row.
+- Built-in validators: `NotEmpty`, `Length(min, max)`, `Email`, `Phone`
+  (lightweight checks in `validateSqlValue`, run automatically on
+  Create/Update).
+- Soft-delete restore: `DeleteBuilder.Restore(id)` clears `deleted_at`
+  (compile error on non-soft-delete entities).
+
 ## [0.24.0] - 2026-08-04
 
 ### Added
