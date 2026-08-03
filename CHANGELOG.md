@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-04
+
 ### Added
 - Column projection: `QueryBuilder.Select(cols)` restricts the query to a
   column subset (skips large text/blob fields); rows scan by name
