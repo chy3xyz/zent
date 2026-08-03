@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Audit timestamps auto-maintained: `created_at` / `updated_at` (`.time`)
+  columns get a dialect-aware epoch `DEFAULT` (`(unixepoch())` /
+  `EXTRACT(EPOCH FROM now())::bigint` / `UNIX_TIMESTAMP()`) — matching zent's
+  i64 Time storage; `UpdateBuilder` auto-refreshes `updated_at` unless the
+  caller sets it explicitly.
+- Eager-loaded edge lists can be ordered and capped:
+  `edge.To(...).OrderBy("created_at").Desc().Limit(10)` — per-parent `LIMIT`
+  uses `ROW_NUMBER() OVER (PARTITION BY fk …)` for O2M/O2O (other relations
+  reject limits with `UnsupportedEdgeLimit`).
+
+### Fixed
+- `Edge.Field(fk)` was ignored for `To` edges — FK column names were
+  hardcoded to `source_table_id` in both `graph.addEdgeFields` and
+  `tableFromTypeInfoCrossRef`, so explicit FK bindings never took effect.
+
 ## [0.21.0] - 2026-08-03
 
 ### Added
