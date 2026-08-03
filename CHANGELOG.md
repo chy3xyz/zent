@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-04
+
 ### Added
 - Nested transactions via savepoints: `Driver.beginSavepoint` (SQLite /
   Postgres / MySQL, pool-forwarded) and `codegen.beginTx` degrading to
