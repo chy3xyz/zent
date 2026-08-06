@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- `applyServerTimeout`'s expected `max_execution_time` probe failure on
+  MariaDB (errno 1193) is no longer logged as an error — previously every
+  MariaDB integration test logged an error and `zig build test-integration`
+  exited non-zero even though all tests passed.
+
+### CI
+- Zig toolchain pinned to `0.17.0-dev.1567+f0354179a` (matches the local
+  dev toolchain).
+- Dead-code baseline builds zigmodu v0.15.10 (v0.15.5 failed to build on
+  the current zig); baseline re-generated (still 24 declarations).
+- Consumer dependency examples use `git+https` refs instead of tarballs.
+
 ## [0.29.0] - 2026-08-06
 
 ### Added
