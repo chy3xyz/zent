@@ -38,7 +38,7 @@ must refresh the dependency — otherwise Zig rejects the stale hash:
 
 ```bash
 # in the consumer project
-zig fetch --save https://github.com/chy3xyz/zent/archive/refs/tags/v0.18.0.tar.gz
+zig fetch --save git+https://github.com/chy3xyz/zent.git#v0.18.0
 ```
 
 or update the `.zent` URL/hash in `build.zig.zon` manually and run
