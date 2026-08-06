@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-08-06
+
 ### Fixed
 - `applyServerTimeout`'s expected `max_execution_time` probe failure on
   MariaDB (errno 1193) is no longer logged as an error — previously every
