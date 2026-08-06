@@ -358,7 +358,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 i += 1;
             }
             try self.or_in_chunks.append(self.allocator, chunks);
-            try self.predicates.append(self.allocator, sql.OrIn(column, chunks));
+            try self.predicates.append(sql.OrIn(column, chunks));
             return self;
         }
 
