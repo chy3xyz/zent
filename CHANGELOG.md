@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- `QueryBuilder.WhereIn` now compiles on Zig 0.17: it appended to
+  `std.array_list.Managed` with an explicit allocator argument, but 0.17's
+  `Managed.append` takes only the item (only `ArrayListUnmanaged.append`
+  takes an allocator). The function had no callers, so lazy compilation
+  hid the breakage; new integration coverage exercises single/multi/>500
+  chunk (OR-joined) and empty-value paths.
+- Boolean columns scan correctly on Postgres/MySQL: `scanColumn(.bool)`
+  decoded via `getInt` (base-10 parse), but Postgres `BOOLEAN` comes back
+  as `"t"`/`"f"` over the wire, so every query touching a bool column
+  failed with `error.TypeMismatch` (MySQL only worked because its TINYINT
+  renders as `"0"`/`"1"`). Scanning now routes through the drivers'
+  `getBool`; Postgres + MySQL integration tests cover real bool
+  round-trips.
+
+### Docs
+- `All()` / `paged()` doc comments spell out their different return
+  shapes and ownership (`std.array_list.Managed(Entity)` vs
+  `PagedResult` with nested `.items.items`).
+
 ## [0.29.2] - 2026-08-07
 
 ### Fixed
