@@ -37,7 +37,7 @@ fn unixTimestamp() i64 {
 /// linear congruential hash. The 31-bit mask keeps it positive and
 /// within MySQL's signed INTEGER range (32-bit).
 fn computeMigrationVersion(comptime table: []const u8, comptime op: []const u8, comptime target: []const u8) i64 {
-    @setEvalBranchQuota(5000);
+    @setEvalBranchQuota(50000);
     comptime var h: u64 = 14_695_981_039_346_656_037;
     for (table) |b| {
         h ^= b;
