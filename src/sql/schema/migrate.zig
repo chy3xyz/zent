@@ -769,6 +769,10 @@ fn isSQLiteDialect(dialect: Dialect) bool {
 }
 
 fn defaultValueStr(comptime f: FieldInfo) ?[]const u8 {
+    // comptimePrint 的泛型格式化在 `inline for (infos)` 下按表×字段展开,
+    // 15+ 表的应用 schema 就会击穿默认 5000 分支限额(如 zenaipa);在此
+    // 提升当前 comptime 子树的配额,避免 "exceeded backwards branches"。
+    @setEvalBranchQuota(50_000);
     return switch (f.default) {
         .none => null,
         .bool => |v| if (v) "TRUE" else "FALSE",
