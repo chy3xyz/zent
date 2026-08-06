@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- EntQL `has(edge)` / `not_has(edge)` / `has(edge, expr)` — the parser now
+  accepts them and `QueryBuilder.WhereEntQL()` lowers them to schema-aware
+  EXISTS subqueries (previously a compile error).
+- Privacy operation-level policies are real: `OnCreate` / `OnUpdate` /
+  `OnDelete` / `OnQuery` deny only their own operation (the codegen layer
+  sets `PrivacyContext.op` per operation).
+- Codegen scale regression protection: a 30-table x 8-field stress test
+  (edges/indexes/JSON) compiles and runs a CRUD smoke.
+- Benchmarks now assert result correctness (generated SQL, scanned values,
+  borrowed connection) and fail loudly instead of print-and-continue.
+
+### Changed
+- JSON field ownership unified across create and scan paths: query results
+  (including eager-loaded edges) parse JSON into a per-entity arena that
+  `deinitEntity` releases — no more caller-owned JSON on the scan path.
+- `@setEvalBranchQuota` raised for codegen generation (predicates,
+  migrations, graph lowering) so 20+ table schemas compile.
+
+### Fixed
+- `zig build` was red on both CI and current dev zig: eager-load recursion
+  into the terminal PlainFields type, `std.hash.crc` API drift, and
+  `QueryIterator` losing `select_cols` (column projection) are fixed.
+- PostgreSQL `withTimeout` actually interrupts queries — a `defer` scoped to
+  an `if` block reset `statement_timeout` before the query ran; PG
+  `createAllTables` also emits `SERIAL`/`BIGSERIAL` ids now.
+- MySQL preferred SSL mode falls back to plaintext instead of enforcing TLS;
+  server-side statement timeouts apply to SELECTs; 14 silent `catch {}`
+  error drops (after-hooks, audit fields, Tx/Savepoint rollback,
+  mysql_options) now log.
+- CI/test infra: PG/MySQL integration tests are optional (compile without
+  libpq/libmariadb headers), `SKIP_MYSQL` matches `SKIP_PG`, and
+  check-version scripts work on macOS (`git tag --sort=-v:refname`).
+- README (en/zh) example compiles and runs; AGENTS.md / ARCHITECTURE.md
+  synced with the actual API.
+
 ## [0.27.0] - 2026-08-04
 
 ### Added
