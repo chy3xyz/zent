@@ -763,6 +763,40 @@ test "SQLite: Deny policy blocks query and create" {
     }
 }
 
+test "SQLite: constraint violations map to specific errors (not NotFound)" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const U = schema("ErrUser", .{
+        .fields = &.{ field.String("email").Unique(), field.String("name") },
+    });
+    const graph = comptime buildGraph(&.{U});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b1 = try client.err_user.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("email", "a@x.com");
+    _ = try b1.setFieldValue("name", "one");
+    var user1 = try b1.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &user1, allocator);
+
+    // Duplicate UNIQUE email must surface as UniqueViolation, not NotFound.
+    {
+        var b2 = try client.err_user.Create();
+        defer b2.deinit();
+        _ = try b2.setFieldValue("email", "a@x.com");
+        _ = try b2.setFieldValue("name", "two");
+        if (b2.Save()) |_| {
+            return error.UnexpectedInsert;
+        } else |err| {
+            try testing.expectEqual(error.UniqueViolation, err);
+        }
+    }
+}
+
 test "SQLite: JSONValue untyped document field round-trips" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");

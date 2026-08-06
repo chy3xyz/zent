@@ -45,7 +45,11 @@ pub const ShardRouter = struct {
     /// Route a tenant: explicit mapping wins, otherwise a stable hash.
     pub fn route(self: *const ShardRouter, tenant_id: i64) usize {
         if (self.tenant_map.get(tenant_id)) |idx| return idx;
-        const hash: u64 = @intCast(tenant_id);
+        // @intCast panics (Debug/ReleaseSafe) or is UB (ReleaseFast) for
+        // negative ids; @bitCast gives a deterministic two's-complement
+        // modulo for any value. Negative tenant ids remain unsupported
+        // semantically, but routing must not crash on them.
+        const hash: u64 = @bitCast(tenant_id);
         return @intCast(hash % self.shard_count);
     }
 

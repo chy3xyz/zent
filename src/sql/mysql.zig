@@ -15,6 +15,9 @@ fn toDriverError(err: anyerror) driver.Error {
         error.MySQLDataTruncated => error.ProtocolError,
         error.MySQLFetchFailed => error.ProtocolError,
         error.QueryTimeout => error.QueryTimeout,
+        error.UniqueViolation => error.UniqueViolation,
+        error.NotNullViolation => error.NotNullViolation,
+        error.ForeignKeyViolation => error.ForeignKeyViolation,
         else => error.DriverFailed,
     };
 }
@@ -39,7 +42,9 @@ pub fn errnoToError(errno: c_uint) driver.Error {
     return switch (errno) {
         1040, 1043, 1129, 1130 => error.ConnectionFailed, // Too many connections / host blocked
         1045, 1044 => error.ConnectionFailed, // Access denied
-        1062, 1586 => error.ExecFailed, // Duplicate entry
+        1062, 1586 => error.UniqueViolation, // Duplicate entry
+        1048 => error.NotNullViolation, // Column cannot be null
+        1451, 1452 => error.ForeignKeyViolation, // FK constraint fails
         1064, 1146, 1054, 1060 => error.QueryFailed, // Syntax / no such table / bad column
         1142, 1143 => error.ExecFailed, // Permission denied
         1205, 1213 => error.TxFailed, // Lock wait / deadlock
@@ -279,7 +284,11 @@ pub const MySQLDriver = struct {
             if (c.mysql_real_query(self.conn, sql_z.ptr, @intCast(sql_z.len)) != 0) {
                 logMySQLError(self.conn, "exec");
                 const err = errnoToError(c.mysql_errno(self.conn));
-                if (err == error.QueryTimeout) return err;
+                // Timeouts and constraint violations are distinct outcomes
+                // (callers rely on e.g. UniqueViolation for upsert fallbacks);
+                // everything else collapses to the generic exec failure.
+                if (err == error.QueryTimeout or err == error.UniqueViolation or
+                    err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
                 return error.MySQLExecFailed;
             }
 
@@ -348,8 +357,10 @@ pub const MySQLDriver = struct {
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             const err = errnoToError(c.mysql_errno(self.conn));
-            // Statement timeouts are the intended outcome of withTimeout.
-            if (err == error.QueryTimeout) return err;
+            // Statement timeouts and constraint violations are distinct
+            // outcomes; the rest collapse to the generic stmt failure.
+            if (err == error.QueryTimeout or err == error.UniqueViolation or
+                err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
             logMySQLError(self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
@@ -419,8 +430,10 @@ pub const MySQLDriver = struct {
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             const err = errnoToError(c.mysql_errno(self.conn));
-            // Statement timeouts are the intended outcome of withTimeout.
-            if (err == error.QueryTimeout) return err;
+            // Statement timeouts and constraint violations are distinct
+            // outcomes; the rest collapse to the generic stmt failure.
+            if (err == error.QueryTimeout or err == error.UniqueViolation or
+                err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
             logMySQLError(self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }

@@ -599,6 +599,86 @@ test "MySQL: SaveOrUpdate preserves auto-increment id and child rows" {
     try testing.expectEqualStrings("alice-updated", pr.getText(0).?);
 }
 
+test "MySQL: JSONValue + WhereEntQL has(edge) work" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CarBase = schema("MyJCar", .{
+        .fields = &.{ field.String("model"), field.JSONValue("meta") },
+    });
+    const UserBase = schema("MyJUser", .{
+        .fields = &.{ field.String("name"), field.JSONValue("settings") },
+    });
+    const Car = struct {
+        pub const schema_name = CarBase.schema_name;
+        pub const fields = CarBase.fields;
+        pub const edges = CarBase.edges;
+        pub const indexes = CarBase.indexes;
+        pub const policy = CarBase.policy;
+        pub const is_view = CarBase.is_view;
+        pub const view_sql = CarBase.view_sql;
+        pub const soft_delete = CarBase.soft_delete;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{edge.To("cars", CarBase)};
+        pub const indexes = UserBase.indexes;
+        pub const policy = UserBase.policy;
+        pub const is_view = UserBase.is_view;
+        pub const view_sql = UserBase.view_sql;
+        pub const soft_delete = UserBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{ User, Car });
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_j_user", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_j_car", &.{}) catch {};
+
+    var c = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var ub = try c.my_j_user.Create();
+    defer ub.deinit();
+    _ = try ub.setFieldValue("name", "alice");
+    _ = try ub.setFieldValue("settings", std.json.Value{ .string = "s1" });
+    var u = try ub.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &u, allocator);
+
+    var cb = try c.my_j_car.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("model", "m");
+    _ = try cb.setFieldValue("meta", std.json.Value{ .integer = 7 });
+    _ = try cb.setFieldValue("my_j_user_id", u.id);
+    var car = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[1], &car, allocator);
+
+    {
+        var q = c.my_j_car.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[1], e, allocator);
+            rows.deinit();
+        }
+        try testing.expect(rows.items[0].meta == .integer);
+        try testing.expectEqual(@as(i64, 7), rows.items[0].meta.integer);
+    }
+
+    {
+        var q = c.my_j_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(cars)");
+        var users = try q.All();
+        defer {
+            for (users.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            users.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), users.items.len);
+        try testing.expectEqualStrings("alice", users.items[0].name);
+    }
+}
+
 test "MySQL: slow query times out" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

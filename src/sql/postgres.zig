@@ -17,6 +17,9 @@ fn toDriverError(err: anyerror) driver.Error {
         error.PostgresQueryFailed => error.QueryFailed,
         error.PostgresPingFailed => error.PingFailed,
         error.QueryTimeout => error.QueryTimeout,
+        error.UniqueViolation => error.UniqueViolation,
+        error.NotNullViolation => error.NotNullViolation,
+        error.ForeignKeyViolation => error.ForeignKeyViolation,
         else => error.DriverFailed,
     };
 }
@@ -212,7 +215,14 @@ pub const PostgresDriver = struct {
         return switch (sqlstate[0]) {
             '0' => if (sqlstate[1] == '8') error.ConnectionFailed else error.DriverFailed,
             '2' => switch (sqlstate[1]) {
-                '2', '3', '8' => error.ExecFailed,
+                // Integrity constraint violation: classify the common codes.
+                '3' => switch (sqlstate[2]) {
+                    '5' => error.UniqueViolation, // 23505 unique_violation
+                    '0' => error.NotNullViolation, // 23502 not_null_violation
+                    '3' => error.ForeignKeyViolation, // 23503 foreign_key_violation
+                    else => error.ExecFailed,
+                },
+                '2', '8' => error.ExecFailed,
                 '5', 'D' => error.TxFailed,
                 else => error.DriverFailed,
             },
@@ -427,7 +437,14 @@ pub const PostgresDriver = struct {
             const err = sqlstateToError(res.?);
             // A statement timeout is the intended outcome of withTimeout,
             // not a fault — don't log it as an error.
-            if (err != error.QueryTimeout) logPgResultError(self.conn, res, "query");
+            // Timeouts and constraint violations are intended outcomes
+            // (e.g. upsert probing for UniqueViolation) — don't log them
+            // as errors.
+            if (err != error.QueryTimeout and err != error.UniqueViolation and
+                err != error.NotNullViolation and err != error.ForeignKeyViolation)
+            {
+                logPgResultError(self.conn, res, "query");
+            }
             return err;
         }
 

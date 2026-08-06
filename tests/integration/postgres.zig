@@ -12,6 +12,7 @@ const PostgresDriver = zent.sql_postgres.PostgresDriver;
 const buildGraph = zent.codegen.graph.buildGraph;
 const Client = zent.codegen.client;
 const field = zent.core.field;
+const edge = zent.core.edge;
 const index = zent.core.index;
 const migrate = zent.sql_schema;
 const schema = zent.core.schema.Schema;
@@ -24,6 +25,9 @@ const sql = zent.sql;
 const testing = std.testing;
 
 fn connect(allocator: std.mem.Allocator) !PostgresDriver {
+    // SKIP_PG skips every PG integration test (checked once at the shared
+    // entry point, mirroring SKIP_MYSQL in mysql.zig).
+    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const dsn = std.process.Environ.getPosix(std.testing.environ, "PG_DSN") orelse {
         const user = std.process.Environ.getPosix(std.testing.environ, "USER") orelse "n0x";
         const conninfo = try std.fmt.allocPrint(allocator, "host=localhost dbname=zent_test user={s}", .{user});
@@ -222,7 +226,6 @@ test "Postgres: migrateSchema is idempotent with existing table" {
 }
 
 test "Postgres: PG-specific types (TIMESTAMPTZ, JSONB, UUID, BYTEA)" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -311,7 +314,6 @@ test "Postgres: PG-specific types (TIMESTAMPTZ, JSONB, UUID, BYTEA)" {
 }
 
 test "Postgres: prepared statement cache hit" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -348,7 +350,6 @@ test "Postgres: prepared statement cache hit" {
 }
 
 test "Postgres: connection pool basic operations" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
 
     const BorrowReleaseCounters = struct {
@@ -414,7 +415,6 @@ test "Postgres: connection pool basic operations" {
 }
 
 test "Postgres: privacy deny blocks query" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -447,7 +447,6 @@ test "Postgres: privacy deny blocks query" {
 }
 
 test "Postgres: hooks fire on create/update" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -528,7 +527,6 @@ test "Postgres: hooks fire on create/update" {
 }
 
 test "Postgres: bulk insert and count" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -576,7 +574,6 @@ test "Postgres: bulk insert and count" {
 }
 
 test "Postgres: ForUpdate / ForShare in transaction" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -624,6 +621,122 @@ test "Postgres: ForUpdate / ForShare in transaction" {
     }
 }
 
+test "Postgres: JSONValue + WhereEntQL has(edge) work" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CarBase = schema("PqJCar", .{
+        .fields = &.{ field.String("model"), field.JSONValue("meta") },
+    });
+    const UserBase = schema("PqJUser", .{
+        .fields = &.{ field.String("name"), field.JSONValue("settings") },
+    });
+    const Car = struct {
+        pub const schema_name = CarBase.schema_name;
+        pub const fields = CarBase.fields;
+        pub const edges = CarBase.edges;
+        pub const indexes = CarBase.indexes;
+        pub const policy = CarBase.policy;
+        pub const is_view = CarBase.is_view;
+        pub const view_sql = CarBase.view_sql;
+        pub const soft_delete = CarBase.soft_delete;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{edge.To("cars", CarBase)};
+        pub const indexes = UserBase.indexes;
+        pub const policy = UserBase.policy;
+        pub const is_view = UserBase.is_view;
+        pub const view_sql = UserBase.view_sql;
+        pub const soft_delete = UserBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{ User, Car });
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pq_j_user", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pq_j_car", &.{}) catch {};
+
+    var c = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // User with untyped JSON document.
+    var ub = try c.pq_j_user.Create();
+    defer ub.deinit();
+    _ = try ub.setFieldValue("name", "alice");
+    _ = try ub.setFieldValue("settings", std.json.Value{ .string = "s1" });
+    var u = try ub.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &u, allocator);
+
+    // Car with untyped JSON + FK to user.
+    var cb = try c.pq_j_car.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("model", "m");
+    _ = try cb.setFieldValue("meta", std.json.Value{ .integer = 7 });
+    _ = try cb.setFieldValue("pq_j_user_id", u.id);
+    var car = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[1], &car, allocator);
+
+    // JSONValue round-trip via query.
+    {
+        var q = c.pq_j_car.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[1], e, allocator);
+            rows.deinit();
+        }
+        try testing.expect(rows.items[0].meta == .integer);
+        try testing.expectEqual(@as(i64, 7), rows.items[0].meta.integer);
+    }
+
+    // WhereEntQL has(cars) returns the user with a car.
+    {
+        var q = c.pq_j_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(cars)");
+        var users = try q.All();
+        defer {
+            for (users.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            users.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), users.items.len);
+        try testing.expectEqualStrings("alice", users.items[0].name);
+    }
+}
+
+test "Postgres: UNIQUE violation surfaces as UniqueViolation" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const U = schema("PqErrUser", .{
+        .fields = &.{ field.String("email").Unique(), field.String("name") },
+    });
+    const graph = comptime buildGraph(&.{U});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pq_err_user", &.{}) catch {};
+
+    var c = Client.makeClient(infos, allocator, drv.asDriver());
+    var b1 = try c.pq_err_user.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("email", "a@x.com");
+    _ = try b1.setFieldValue("name", "one");
+    var user1 = try b1.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &user1, allocator);
+
+    var b2 = try c.pq_err_user.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("email", "a@x.com");
+    _ = try b2.setFieldValue("name", "two");
+    if (b2.Save()) |_| {
+        return error.UnexpectedInsert;
+    } else |err| {
+        try testing.expectEqual(error.UniqueViolation, err);
+    }
+}
+
 test "Postgres: TimeMixin audit columns build (epoch BIGINT)" {
     // .time columns must map to BIGINT: the audit default is
     // EXTRACT(EPOCH FROM now())::bigint, so TIMESTAMPTZ + bigint default
@@ -662,7 +775,6 @@ test "Postgres: TimeMixin audit columns build (epoch BIGINT)" {
 }
 
 test "Postgres: slow query times out" {
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();

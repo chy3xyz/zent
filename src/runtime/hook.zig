@@ -127,23 +127,25 @@ pub const HookChain = struct {
 // Global hook registry
 // ------------------------------------------------------------------
 
-var global_registry: ?*HookChain = null;
+var global_registry: std.atomic.Value(?*HookChain) = std.atomic.Value(?*HookChain).init(null);
 
 /// Register a global hook chain that fires for every table/operation.
+/// Safe to call at any time (atomic store); the typical pattern is a single
+/// registration during startup.
 pub fn registerGlobal(chain: *HookChain) void {
-    global_registry = chain;
+    global_registry.store(chain, .monotonic);
 }
 
 /// Execute all global before-hooks. Called by codegen before per-table hooks.
 pub fn globalBefore(ctx: *HookContext) HookError!void {
-    if (global_registry) |c| {
+    if (global_registry.load(.monotonic)) |c| {
         try c.executeBefore(ctx);
     }
 }
 
 /// Execute all global after-hooks. Called by codegen after per-table hooks.
 pub fn globalAfter(ctx: *HookContext) void {
-    if (global_registry) |c| {
+    if (global_registry.load(.monotonic)) |c| {
         c.executeAfter(ctx);
     }
 }
@@ -285,7 +287,7 @@ test "global hook registry" {
     try chain.add(hook);
 
     registerGlobal(&chain);
-    defer global_registry = null;
+    defer global_registry.store(null, .monotonic);
 
     var ctx = HookContext{ .op = .create, .table_name = "users" };
     try globalBefore(&ctx);

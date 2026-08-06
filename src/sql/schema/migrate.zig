@@ -596,6 +596,7 @@ pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const Ty
                 error.ProtocolError => return error.ProtocolError,
                 error.DriverFailed => return error.DriverFailed,
                 error.QueryTimeout => return error.QueryTimeout,
+                error.UniqueViolation, error.NotNullViolation, error.ForeignKeyViolation => return error.ExecFailed,
                 error.OptimisticLockConflict => return error.OptimisticLockConflict,
             };
         }

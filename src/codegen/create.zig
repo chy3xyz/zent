@@ -273,7 +273,13 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const start = nowUs();
                 var rows = try self.driver.queryCtx(&self.execution_context, full_sql, q.args);
                 defer rows.deinit();
-                const row = rows.next() orelse return error.NotFound;
+                const row = rows.next() orelse {
+                    // Distinguish a driver error (e.g. a UNIQUE/NOT NULL
+                    // constraint on INSERT ... RETURNING) from a genuinely
+                    // missing RETURNING row.
+                    if (rows.nextError()) |e| return e;
+                    return error.NotFound;
+                };
                 if (comptime @TypeOf(entity.id) == i64) {
                     entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
                 } else {

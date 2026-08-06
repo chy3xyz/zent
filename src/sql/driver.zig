@@ -29,6 +29,12 @@ pub const Error = error{
     /// An UPDATE or DELETE affected zero rows because the optimistic-lock
     /// version value did not match the current row.
     OptimisticLockConflict,
+    /// A UNIQUE index/constraint was violated (duplicate key).
+    UniqueViolation,
+    /// A NOT NULL constraint was violated.
+    NotNullViolation,
+    /// A foreign key constraint was violated.
+    ForeignKeyViolation,
 };
 
 /// A single database row exposed for scanning.

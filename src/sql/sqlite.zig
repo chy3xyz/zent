@@ -54,6 +54,9 @@ pub const SQLiteDriver = struct {
             error.SqliteInterrupt => error.QueryTimeout,
             error.TxNotActive => error.TxFailed,
             error.QueryTimeout => error.QueryTimeout,
+            error.UniqueViolation => error.UniqueViolation,
+            error.NotNullViolation => error.NotNullViolation,
+            error.ForeignKeyViolation => error.ForeignKeyViolation,
             else => error.DriverFailed,
         };
     }
@@ -110,6 +113,7 @@ pub const SQLiteDriver = struct {
         if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
             logSqliteError(self.db, "exec");
             if (step_rc == c.SQLITE_INTERRUPT) return error.SqliteInterrupt;
+            if (step_rc == c.SQLITE_CONSTRAINT) return toDriverError(sqliteErrnoToDriver(self.db, error.ExecFailed));
             return error.SqliteExecFailed;
         }
         return driver.Result{
@@ -334,6 +338,18 @@ pub const SQLiteDriver = struct {
     };
 };
 
+/// Map a sqlite3_step error to a driver.Error, classifying the extended
+/// constraint codes (sqlite3_step returns the primary code; the extended
+/// code — SQLITE_CONSTRAINT_UNIQUE etc — comes from extended_errcode).
+fn sqliteErrnoToDriver(db: *c.sqlite3, fallback: driver.Error) driver.Error {
+    return switch (c.sqlite3_extended_errcode(db)) {
+        2067 => error.UniqueViolation, // SQLITE_CONSTRAINT_UNIQUE
+        1299 => error.NotNullViolation, // SQLITE_CONSTRAINT_NOTNULL
+        787 => error.ForeignKeyViolation, // SQLITE_CONSTRAINT_FOREIGNKEY
+        else => fallback,
+    };
+}
+
 fn execSavepointStmt(d: *SQLiteDriver, stmt: []const u8, name: []const u8) !void {
     const sql = try std.fmt.allocPrint(d.allocator, "{s} \"{s}\"", .{ stmt, name });
     defer d.allocator.free(sql);
@@ -394,6 +410,7 @@ const SQLiteRows = struct {
     stmt: *c.sqlite3_stmt,
     allocator: std.mem.Allocator,
     done: bool,
+    next_error: ?driver.Error = null,
     cache: ?*cache.PreparedCache(16, *c.sqlite3_stmt) = null,
     cache_sql_hash: u64 = 0,
     cache_sql_len: usize = 0,
@@ -401,8 +418,13 @@ const SQLiteRows = struct {
     const vtable = driver.Rows.VTable{
         .next = next,
         .deinit = deinit,
-        .nextError = null,
+        .nextError = nextErrorFn,
     };
+
+    fn nextErrorFn(ptr: *anyopaque) ?driver.Error {
+        const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
+        return self.next_error;
+    }
 
     fn next(ptr: *anyopaque) ?driver.Row {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
@@ -413,7 +435,14 @@ const SQLiteRows = struct {
             return null;
         }
         if (rc != c.SQLITE_ROW) {
+            // A step error (e.g. a NOT NULL/UNIQUE constraint hit mid-INSERT
+            // ... RETURNING) must be surfaced via nextError, not swallowed as
+            // "no more rows" (which used to surface as error.NotFound).
             self.done = true;
+            if (rc == c.SQLITE_CONSTRAINT) {
+                const db = c.sqlite3_db_handle(self.stmt) orelse return null;
+                self.next_error = sqliteErrnoToDriver(db, error.ExecFailed);
+            }
             return null;
         }
         return driver.Row{
