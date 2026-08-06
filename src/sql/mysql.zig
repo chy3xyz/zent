@@ -29,6 +29,7 @@ pub fn errnoToError(errno: c_uint) driver.Error {
         1142, 1143 => error.ExecFailed, // Permission denied
         1205, 1213 => error.TxFailed, // Lock wait / deadlock
         1317, 1406 => error.ExecFailed, // Query interrupted / data too long
+        1969 => error.QueryTimeout, // MariaDB ER_STATEMENT_TIMEOUT
         2002, 2003, 2006, 2013 => error.ConnectionFailed, // Connection lost
         3024 => error.QueryTimeout, // ER_QUERY_TIMEOUT
         else => error.DriverFailed,
@@ -159,6 +160,32 @@ pub const MySQLDriver = struct {
     fn restoreSocketTimeout(self: *MySQLDriver, saved: SavedTimeouts) void {
         _ = c.mysql_options(self.conn, c.MYSQL_OPT_READ_TIMEOUT, &saved.read);
         _ = c.mysql_options(self.conn, c.MYSQL_OPT_WRITE_TIMEOUT, &saved.write);
+    }
+
+    /// Server-side statement timeout. Socket read timeouts do not interrupt a
+    /// query the server is already executing, so SELECTs with a deadline also
+    /// set max_execution_time (MySQL 8) or max_statement_time (MariaDB; the
+    /// variable name is unknown to MySQL and vice versa, hence the fallback).
+    /// max_execution_time takes milliseconds; max_statement_time takes seconds.
+    fn applyServerTimeout(self: *MySQLDriver, ctx: ?*const driver.ExecutionContext) driver.Error!void {
+        const ms_opt = if (ctx) |cx| cx.remainingMs() else null;
+        const ms = ms_opt orelse return {};
+        const sql = try std.fmt.allocPrint(self.allocator, "SET SESSION max_execution_time = {d}", .{ms});
+        defer self.allocator.free(sql);
+        if (self.exec(sql, &.{})) |_| {
+            return {};
+        } else |_| {
+            const sec: u32 = if (ms == 0) 1 else @intCast((ms + 999) / 1000);
+            const sql2 = try std.fmt.allocPrint(self.allocator, "SET SESSION max_statement_time = {d}", .{sec});
+            defer self.allocator.free(sql2);
+            _ = self.exec(sql2, &.{}) catch {};
+        }
+    }
+
+    fn resetServerTimeout(self: *MySQLDriver) void {
+        _ = self.exec("SET SESSION max_execution_time = DEFAULT", &.{}) catch {
+            _ = self.exec("SET SESSION max_statement_time = DEFAULT", &.{}) catch {};
+        };
     }
 
     /// Bind `args` to `binds`/`str_bufs`/`int_bufs`/`float_bufs`/`bool_bufs`.
@@ -294,9 +321,10 @@ pub const MySQLDriver = struct {
         }
 
         if (c.mysql_stmt_execute(stmt) != 0) {
-            logMySQLError(self.conn, "stmt_execute");
             const err = errnoToError(c.mysql_errno(self.conn));
+            // Statement timeouts are the intended outcome of withTimeout.
             if (err == error.QueryTimeout) return err;
+            logMySQLError(self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
 
@@ -364,9 +392,10 @@ pub const MySQLDriver = struct {
         }
 
         if (c.mysql_stmt_execute(stmt) != 0) {
-            logMySQLError(self.conn, "stmt_execute");
             const err = errnoToError(c.mysql_errno(self.conn));
+            // Statement timeouts are the intended outcome of withTimeout.
             if (err == error.QueryTimeout) return err;
+            logMySQLError(self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
 
@@ -383,6 +412,9 @@ pub const MySQLDriver = struct {
 
         // Store result on client side
         if (c.mysql_stmt_store_result(stmt) != 0) {
+            const err = errnoToError(c.mysql_errno(self.conn));
+            // Statement timeouts are the intended outcome of withTimeout.
+            if (err == error.QueryTimeout) return err;
             logMySQLError(self.conn, "stmt_store_result");
             return error.MySQLStmtFailed;
         }
@@ -516,6 +548,8 @@ pub const MySQLDriver = struct {
                 var saved: SavedTimeouts = undefined;
                 try self_ptr.applySocketTimeout(ctx, &saved);
                 defer self_ptr.restoreSocketTimeout(saved);
+                try self_ptr.applyServerTimeout(ctx);
+                defer self_ptr.resetServerTimeout();
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,

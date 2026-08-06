@@ -644,10 +644,20 @@ test "Postgres: slow query times out" {
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
+    // Insert a row first: on an empty table the WHERE clause is never
+    // evaluated, so pg_sleep never runs and the query returns instantly
+    // without ever hitting statement_timeout.
+    var cb = try client.user.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("name", "slow");
+    _ = try cb.setFieldValue("age", 1);
+    var saved = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+
     var q = client.user.Query();
     defer q.deinit();
     _ = q.withTimeout(100);
-    _ = try q.Where(&.{sql.Raw("pg_sleep(2) IS NOT DISTINCT FROM 1")});
+    _ = try q.Where(&.{sql.Raw("pg_sleep(2) IS NULL")});
     const result = q.All();
     try testing.expectError(error.QueryTimeout, result);
 

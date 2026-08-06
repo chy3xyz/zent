@@ -618,12 +618,31 @@ test "MySQL: slow query times out" {
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
+    // Insert a row first: on an empty table the WHERE clause is never
+    // evaluated, so SLEEP never runs and the query returns instantly
+    // without ever hitting the timeout.
+    var cb = try client.user.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("name", "slow");
+    _ = try cb.setFieldValue("age", 1);
+    var saved = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+
     var q = client.user.Query();
     defer q.deinit();
     _ = q.withTimeout(100);
     _ = try q.Where(&.{zent.sql.Raw("SLEEP(2) = 0")});
     const result = q.All();
-    try testing.expectError(error.QueryTimeout, result);
+    // MySQL/MariaDB interrupt SLEEP() server-side by returning 1 instead of
+    // 0 (so `1 = 0` yields zero rows) rather than raising a timeout error.
+    // Either zero rows (interrupted) or a QueryTimeout error proves the slow
+    // query was cut short; an un-interrupted run would return the row.
+    if (result) |rows| {
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 0), rows.items.len);
+    } else |err| {
+        try testing.expectEqual(error.QueryTimeout, err);
+    }
 
     // Driver should still be usable after the timeout.
     try drv.ping();

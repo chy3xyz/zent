@@ -397,7 +397,13 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
     try buf.appendSlice(" (\n");
 
     for (table.columns, 0..) |col, i| {
-        const sql_type = columnSQLType(col, dialect);
+        var sql_type = columnSQLType(col, dialect);
+        // PostgreSQL: a bare `INTEGER PRIMARY KEY` has no default, so an
+        // INSERT without an explicit id fails NOT NULL on RETURNING. Map
+        // auto-increment ids to SERIAL/BIGSERIAL (which own a sequence).
+        if (col.auto_increment and std.mem.eql(u8, dialect.name, "postgres")) {
+            sql_type = if (std.ascii.eqlIgnoreCase(sql_type, "BIGINT")) "BIGSERIAL" else "SERIAL";
+        }
         if (i > 0) try buf.appendSlice(",\n");
         try buf.appendSlice("  ");
         try quoteIdentToBuffer(dialect, &buf, col.name);

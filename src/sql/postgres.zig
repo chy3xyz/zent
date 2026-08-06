@@ -110,7 +110,7 @@ pub const PostgresDriver = struct {
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
-        const res = c.PQexec(self.conn, sql_z.ptr);
+        const res = c.PQexecParams(self.conn, sql_z.ptr, 0, null, null, null, null, 0);
         if (res == null) return error.ConnectionFailed;
         defer c.PQclear(res);
         const status = c.PQresultStatus(res);
@@ -424,8 +424,11 @@ pub const PostgresDriver = struct {
 
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_TUPLES_OK) {
-            logPgResultError(self.conn, res, "query");
-            return sqlstateToError(res.?);
+            const err = sqlstateToError(res.?);
+            // A statement timeout is the intended outcome of withTimeout,
+            // not a fault — don't log it as an error.
+            if (err != error.QueryTimeout) logPgResultError(self.conn, res, "query");
+            return err;
         }
 
         const rows_ptr = try self.allocator.create(PostgresRows);
@@ -543,20 +546,26 @@ pub const PostgresDriver = struct {
         .exec = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
+                // NOTE: the `defer` must live at function scope. Zig runs a
+                // defer when its enclosing block ends, so putting it inside
+                // the `if` would reset statement_timeout BEFORE the query
+                // runs, silently disabling withTimeout.
                 if (ctx != null) {
                     try self_ptr.setStatementTimeout(ctx);
-                    defer self_ptr.resetStatementTimeout();
                 }
+                defer self_ptr.resetStatementTimeout();
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
+                // See note in .exec above: defer at function scope so the
+                // timeout stays active while the query runs.
                 if (ctx != null) {
                     try self_ptr.setStatementTimeout(ctx);
-                    defer self_ptr.resetStatementTimeout();
                 }
+                defer self_ptr.resetStatementTimeout();
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,
