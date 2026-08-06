@@ -833,6 +833,111 @@ test "SQLite: JSONValue untyped document field round-trips" {
     try testing.expectEqualStrings("plain-doc", docs.items[0].payload.string);
 }
 
+test "SQLite: WhereIn chunks OR-joins IN predicates" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const CodeBase = schema("WhereInCode", .{
+        .fields = &.{field.Int("code")},
+    });
+    const Code = struct {
+        pub const schema_name = CodeBase.schema_name;
+        pub const fields = CodeBase.fields;
+        pub const edges = CodeBase.edges;
+        pub const indexes = CodeBase.indexes;
+        pub const policy = CodeBase.policy;
+        pub const is_view = CodeBase.is_view;
+        pub const view_sql = CodeBase.view_sql;
+        pub const soft_delete = CodeBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{Code});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Seed rows with codes 0..4 plus one row in the second chunk (500).
+    for (0..5) |i| {
+        var b = try client.where_in_code.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", @as(i64, @intCast(i)));
+        var e = try b.Save();
+        zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+    {
+        var b = try client.where_in_code.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", @as(i64, 500));
+        var e = try b.Save();
+        zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+
+    // Empty values -> error.EmptyInValues (no SQL is built).
+    {
+        var q = client.where_in_code.Query();
+        defer q.deinit();
+        try testing.expectError(error.EmptyInValues, q.WhereIn("code", &.{}));
+    }
+
+    // Single value.
+    {
+        const one = [_]zent.sql.Value{.{ .int = 3 }};
+        var q = client.where_in_code.Query();
+        defer q.deinit();
+        _ = try q.WhereIn("code", &one);
+        var items = try q.All();
+        defer {
+            for (items.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            items.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), items.items.len);
+        try testing.expectEqual(@as(i64, 3), items.items[0].code);
+    }
+
+    // Multiple values.
+    {
+        const few = [_]zent.sql.Value{ .{ .int = 1 }, .{ .int = 3 } };
+        var q = client.where_in_code.Query();
+        defer q.deinit();
+        _ = try q.WhereIn("code", &few);
+        var items = try q.All();
+        defer {
+            for (items.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            items.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), items.items.len);
+        var found_one = false;
+        var found_three = false;
+        for (items.items) |e| {
+            if (e.code == 1) found_one = true;
+            if (e.code == 3) found_three = true;
+        }
+        try testing.expect(found_one and found_three);
+    }
+
+    // >500 values force two IN chunks joined by OR (chunk_size = 500);
+    // values 0..500 cover the seeded rows across both chunk boundaries,
+    // so the second chunk must return the code-500 row.
+    {
+        var many: [501]zent.sql.Value = undefined;
+        for (0..501) |i| many[i] = .{ .int = @intCast(i) };
+        var q = client.where_in_code.Query();
+        defer q.deinit();
+        _ = try q.WhereIn("code", &many);
+        var items = try q.All();
+        defer {
+            for (items.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            items.deinit();
+        }
+        try testing.expectEqual(@as(usize, 6), items.items.len);
+        var found_500 = false;
+        for (items.items) |e| {
+            if (e.code == 500) found_500 = true;
+        }
+        try testing.expect(found_500);
+    }
+}
+
 test "SQLite: WhereEntQL has(edge) lowers to EXISTS subquery" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");
