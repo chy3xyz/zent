@@ -8,7 +8,7 @@ const cache = @import("cache.zig");
 fn toDriverError(err: anyerror) driver.Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.MySQLInitFailed, error.MySQLConnectFailed => error.ConnectionFailed,
+        error.MySQLInitFailed, error.MySQLConnectFailed, error.MySQLConfigFailed => error.ConnectionFailed,
         error.MySQLExecFailed => error.ExecFailed,
         error.MySQLStmtFailed, error.MySQLBindResultFailed, error.MySQLParamCountMismatch, error.MySQLNotAQuery => error.QueryFailed,
         error.MySQLPingFailed => error.PingFailed,
@@ -17,6 +17,21 @@ fn toDriverError(err: anyerror) driver.Error {
         error.QueryTimeout => error.QueryTimeout,
         else => error.DriverFailed,
     };
+}
+
+/// Log a failed mysql_options call (non-fatal: connection can still proceed
+/// with defaults, e.g. a missing socket timeout just loses the guard).
+fn checkOpt(name: []const u8, rc: c_int) void {
+    if (rc != 0) std.log.warn("mysql_options({s}) failed rc={d}", .{ name, rc });
+}
+
+/// Hard-fail when a security-relevant option could not be applied. Silently
+/// downgrading SSL enforcement would violate the caller's stated policy.
+fn requireOpt(name: []const u8, rc: c_int) !void {
+    if (rc != 0) {
+        std.log.err("mysql_options({s}) failed rc={d}", .{ name, rc });
+        return error.MySQLConfigFailed;
+    }
 }
 
 /// Map a MySQL errno to a driver.Error variant.
@@ -73,9 +88,9 @@ pub const MySQLDriver = struct {
         const default_write_timeout: c_uint = 30;
         {
             const connect_timeout: c_uint = 10;
-            _ = c.mysql_options(conn, c.MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout);
-            _ = c.mysql_options(conn, c.MYSQL_OPT_READ_TIMEOUT, &default_read_timeout);
-            _ = c.mysql_options(conn, c.MYSQL_OPT_WRITE_TIMEOUT, &default_write_timeout);
+            checkOpt("connect_timeout", c.mysql_options(conn, c.MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout));
+            checkOpt("read_timeout", c.mysql_options(conn, c.MYSQL_OPT_READ_TIMEOUT, &default_read_timeout));
+            checkOpt("write_timeout", c.mysql_options(conn, c.MYSQL_OPT_WRITE_TIMEOUT, &default_write_timeout));
         }
 
         // SSL mode. Note: this mariadb-connector-c build exposes
@@ -87,11 +102,11 @@ pub const MySQLDriver = struct {
             .required => {
                 _ = c.mysql_ssl_set(conn, null, null, null, null, null);
                 const enforce: c_uint = 1;
-                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce);
+                try requireOpt("ssl_enforce(required)", c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce));
             },
             .preferred => {
                 const enforce: c_uint = 0;
-                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce);
+                checkOpt("ssl_enforce(preferred)", c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce));
             },
             .disabled => {
                 // No SSL at all.
@@ -99,9 +114,9 @@ pub const MySQLDriver = struct {
             .verify_ca => {
                 _ = c.mysql_ssl_set(conn, null, null, null, null, null);
                 const enforce: c_uint = 1;
-                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce);
+                try requireOpt("ssl_enforce(verify_ca)", c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce));
                 const verify: c_uint = 1;
-                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify);
+                try requireOpt("ssl_verify_server_cert", c.mysql_options(conn, c.MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &verify));
             },
         }
 
@@ -175,17 +190,27 @@ pub const MySQLDriver = struct {
         defer self.allocator.free(sql);
         if (self.exec(sql, &.{})) |_| {
             return {};
-        } else |_| {
+        } else |err| {
+            // MySQL 8 accepts max_execution_time; MariaDB doesn't, so fall
+            // back to max_statement_time (seconds). If that also fails the
+            // query will run without a server-side timeout — log it rather
+            // than hanging silently.
             const sec: u32 = if (ms == 0) 1 else @intCast((ms + 999) / 1000);
             const sql2 = try std.fmt.allocPrint(self.allocator, "SET SESSION max_statement_time = {d}", .{sec});
             defer self.allocator.free(sql2);
-            _ = self.exec(sql2, &.{}) catch {};
+            if (self.exec(sql2, &.{})) |_| {
+                return {};
+            } else |err2| {
+                std.log.warn("mysql: could not set server-side statement timeout ({s}, {s})", .{ @errorName(err), @errorName(err2) });
+            }
         }
     }
 
     fn resetServerTimeout(self: *MySQLDriver) void {
         _ = self.exec("SET SESSION max_execution_time = DEFAULT", &.{}) catch {
-            _ = self.exec("SET SESSION max_statement_time = DEFAULT", &.{}) catch {};
+            _ = self.exec("SET SESSION max_statement_time = DEFAULT", &.{}) catch |err| {
+                std.log.warn("mysql: could not reset server-side statement timeout ({s})", .{@errorName(err)});
+            };
         };
     }
 
@@ -616,7 +641,9 @@ const MySQLSavepoint = struct {
     }
 
     fn deinit(self: *MySQLSavepoint) void {
-        self.rollback() catch {};
+        self.rollback() catch |err| {
+            std.log.warn("mysql savepoint deinit: rollback failed ({s})", .{@errorName(err)});
+        };
         self.driver.allocator.free(self.name);
         self.driver.allocator.destroy(self);
     }
@@ -646,7 +673,9 @@ const MySQLTx = struct {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
         if (self.state == .active) {
             self.driver.in_tx = false;
-            _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+            _ = self.driver.exec("ROLLBACK", &.{}) catch |err| {
+                std.log.warn("mysql tx deinit: rollback failed ({s})", .{@errorName(err)});
+            };
         }
         self.driver.allocator.destroy(self);
     }

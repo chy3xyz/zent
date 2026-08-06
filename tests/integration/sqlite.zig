@@ -393,6 +393,75 @@ test "SQLite: JSON struct field arena is freed by deinitEntity" {
     zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
 }
 
+test "SQLite: eager-loaded edge JSON is arena-owned and freed" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Settings = struct { theme: []const u8, notes: []const u8 };
+    const CarBase = schema("CarEager", .{
+        .fields = &.{ field.String("model"), field.JSON("meta", Settings) },
+    });
+    const UserBase = schema("UserEager", .{
+        .fields = &.{ field.String("name"), field.JSON("settings", Settings) },
+    });
+    const Car = struct {
+        pub const schema_name = CarBase.schema_name;
+        pub const fields = CarBase.fields;
+        pub const edges = CarBase.edges;
+        pub const indexes = CarBase.indexes;
+        pub const policy = CarBase.policy;
+        pub const is_view = CarBase.is_view;
+        pub const view_sql = CarBase.view_sql;
+        pub const soft_delete = CarBase.soft_delete;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{edge.To("cars", CarBase)};
+        pub const indexes = UserBase.indexes;
+        pub const policy = UserBase.policy;
+        pub const is_view = UserBase.is_view;
+        pub const view_sql = UserBase.view_sql;
+        pub const soft_delete = UserBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{ User, Car });
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var ub = try client.user_eager.Create();
+    defer ub.deinit();
+    _ = try ub.setFieldValue("name", "u");
+    _ = try ub.setFieldValue("settings", Settings{ .theme = "dark", .notes = "n1\nn2" });
+    var u = try ub.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &u, allocator);
+
+    var cb = try client.car_eager.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("model", "m");
+    _ = try cb.setFieldValue("meta", Settings{ .theme = "red", .notes = "x\ny" });
+    // user_eager_id is the NOT NULL FK column the To edge generated.
+    _ = try cb.setFieldValue("user_eager_id", u.id);
+    var c = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[1], &c, allocator);
+
+    // Eager-load cars (including their JSON) and deinit the parent: the
+    // loaded edge items' json_arena must be freed too (leak check).
+    var q = client.user_eager.Query();
+    defer q.deinit();
+    _ = try q.WithEdge("cars");
+    var users = try q.All();
+    defer {
+        for (users.items) |*it| zent.codegen.deinitEntity(infos, infos[0], it, allocator);
+        users.deinit();
+    }
+    try testing.expect(users.items.len == 1);
+    try testing.expect(users.items[0].edges.cars != null);
+    try testing.expect(users.items[0].edges.cars.?.len == 1);
+    try testing.expectEqualStrings("x\ny", users.items[0].edges.cars.?[0].meta.notes);
+}
+
 test "SQLite: scan-path JSON is arena-owned and freed by deinitEntity" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");

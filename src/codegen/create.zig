@@ -198,7 +198,9 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .create) {
-                        if (h.after) |f| f(&hook_ctx) catch {};
+                        if (h.after) |f| f(&hook_ctx) catch |err| {
+                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        };
                     }
                 }
             }
@@ -415,7 +417,9 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .create) {
-                    if (h.after) |f| f(&hook_ctx) catch {};
+                    if (h.after) |f| f(&hook_ctx) catch |err| {
+                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                    };
                 }
             }
 
@@ -626,10 +630,16 @@ pub fn fillAuditUser(
     }.fieldSet;
 
     if (!is_update and has_created_by and !set(values.items, "created_by")) {
-        values.append(.{ .name = "created_by", .value = .{ .int = user.? } }) catch {};
+        values.append(.{ .name = "created_by", .value = .{ .int = user.? } }) catch |err| {
+            // Audit columns are best-effort; the write still proceeds, but an
+            // OOM dropping created_by silently would corrupt the audit trail.
+            std.log.warn("fillAuditUser: created_by dropped ({s})", .{@errorName(err)});
+        };
     }
     if (has_updated_by and !set(values.items, "updated_by")) {
-        values.append(.{ .name = "updated_by", .value = .{ .int = user.? } }) catch {};
+        values.append(.{ .name = "updated_by", .value = .{ .int = user.? } }) catch |err| {
+            std.log.warn("fillAuditUser: updated_by dropped ({s})", .{@errorName(err)});
+        };
     }
 }
 
@@ -877,7 +887,9 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .create) {
-                        if (h.after) |f| f(&hook_ctx) catch {};
+                        if (h.after) |f| f(&hook_ctx) catch |err| {
+                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        };
                     }
                 }
             }
@@ -977,7 +989,9 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .create) {
-                    if (h.after) |f| f(&hook_ctx) catch {};
+                    if (h.after) |f| f(&hook_ctx) catch |err| {
+                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                    };
                 }
             }
 

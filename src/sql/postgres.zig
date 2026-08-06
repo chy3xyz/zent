@@ -631,7 +631,9 @@ const PostgresSavepoint = struct {
     }
 
     fn deinit(self: *PostgresSavepoint) void {
-        self.rollback() catch {};
+        self.rollback() catch |err| {
+            std.log.warn("postgres savepoint deinit: rollback failed ({s})", .{@errorName(err)});
+        };
         self.driver.allocator.free(self.name);
         self.driver.allocator.destroy(self);
     }
@@ -658,7 +660,9 @@ const PostgresTx = struct {
     fn deinit(ptr: *anyopaque) void {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
         if (self.state == .active) {
-            _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+            _ = self.driver.exec("ROLLBACK", &.{}) catch |err| {
+                std.log.warn("postgres tx deinit: rollback failed ({s})", .{@errorName(err)});
+            };
         }
         self.driver.allocator.destroy(self);
     }

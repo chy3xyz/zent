@@ -144,7 +144,17 @@ fn loadEdgePath(
             }
 
             while (rows.next()) |row| {
-                const target = try sql_scan.scanRow(TargetEntity, allocator, row);
+                // Eager-loaded targets get the same arena-based JSON ownership
+                // contract as full entities (deinitEntityEdges releases it).
+                const target = if (comptime @hasField(TargetEntity, "json_arena")) blk: {
+                    const arena = try allocator.create(std.heap.ArenaAllocator);
+                    arena.* = std.heap.ArenaAllocator.init(allocator);
+                    errdefer {
+                        arena.deinit();
+                        allocator.destroy(arena);
+                    }
+                    break :blk try sql_scan.scanRowWithArena(TargetEntity, allocator, row, arena);
+                } else try sql_scan.scanRow(TargetEntity, allocator, row);
                 const fk_idx = sql_scan.findColumnIndex(row, "__fk") orelse return error.MissingColumn;
                 const parent_id: IdType = if (comptime IdType == i64)
                     row.getInt(fk_idx) orelse return error.TypeMismatch

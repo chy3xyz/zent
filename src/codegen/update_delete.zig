@@ -331,7 +331,9 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                     rthook.globalAfter(&hook_ctx);
                     for (self.hooks) |h| {
                         if (h.op == .update) {
-                            if (h.after) |f| f(&hook_ctx) catch {};
+                            if (h.after) |f| f(&hook_ctx) catch |err| {
+                                std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                            };
                         }
                     }
                 }
@@ -440,7 +442,9 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .update) {
-                    if (h.after) |f| f(&hook_ctx) catch {};
+                    if (h.after) |f| f(&hook_ctx) catch |err| {
+                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                    };
                 }
             }
             after_hooks_fired = true;
@@ -648,7 +652,9 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     rthook.globalAfter(&hook_ctx);
                     for (self.hooks) |h| {
                         if (h.op == .delete) {
-                            if (h.after) |f| f(&hook_ctx) catch {};
+                            if (h.after) |f| f(&hook_ctx) catch |err| {
+                                std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                            };
                         }
                     }
                 }
@@ -701,7 +707,9 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
-                    if (h.after) |f| f(&hook_ctx) catch {};
+                    if (h.after) |f| f(&hook_ctx) catch |err| {
+                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                    };
                 }
             }
             after_hooks_fired = true;
@@ -751,7 +759,9 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     rthook.globalAfter(&hook_ctx);
                     for (self.hooks) |h| {
                         if (h.op == .delete) {
-                            if (h.after) |f| f(&hook_ctx) catch {};
+                            if (h.after) |f| f(&hook_ctx) catch |err| {
+                                std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                            };
                         }
                     }
                 }
@@ -793,7 +803,9 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
-                    if (h.after) |f| f(&hook_ctx) catch {};
+                    if (h.after) |f| f(&hook_ctx) catch |err| {
+                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                    };
                 }
             }
             after_hooks_fired = true;
@@ -945,7 +957,9 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .update) {
-                        if (h.after) |f| f(&hook_ctx) catch {};
+                        if (h.after) |f| f(&hook_ctx) catch |err| {
+                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        };
                     }
                 }
             }
@@ -971,7 +985,9 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .update) {
-                    if (h.after) |f| f(&hook_ctx) catch {};
+                    if (h.after) |f| f(&hook_ctx) catch |err| {
+                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                    };
                 }
             }
 
@@ -1124,7 +1140,9 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 rthook.globalAfter(&hook_ctx);
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
-                        if (h.after) |f| f(&hook_ctx) catch {};
+                        if (h.after) |f| f(&hook_ctx) catch |err| {
+                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        };
                     }
                 }
             }
@@ -1139,7 +1157,9 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             rthook.globalAfter(&hook_ctx);
             for (self.hooks) |h| {
                 if (h.op == .delete) {
-                    if (h.after) |f| f(&hook_ctx) catch {};
+                    if (h.after) |f| f(&hook_ctx) catch |err| {
+                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                    };
                 }
             }
 

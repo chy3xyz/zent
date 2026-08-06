@@ -28,9 +28,11 @@ fn toSnakeCase(name: []const u8) []const u8 {
 fn PlainFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     _ = infos;
     comptime {
-        var field_names: [info.fields.len][:0]const u8 = undefined;
-        var field_types: [info.fields.len]type = undefined;
-        var field_attrs: [info.fields.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+        // +1 for the json_arena member so eager-loaded targets get the same
+        // arena-based JSON ownership contract as full entities.
+        var field_names: [info.fields.len + 1][:0]const u8 = undefined;
+        var field_types: [info.fields.len + 1]type = undefined;
+        var field_attrs: [info.fields.len + 1]std.builtin.Type.Struct.FieldAttributes = undefined;
         for (info.fields, 0..) |f, i| {
             const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
             field_names[i] = (f.name)[0..f.name.len :0];
@@ -41,6 +43,14 @@ fn PlainFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
                 .@"align" = @alignOf(FieldType),
             };
         }
+        const i = info.fields.len;
+        field_names[i] = "json_arena";
+        field_types[i] = ?*std.heap.ArenaAllocator;
+        field_attrs[i] = .{
+            .default_value_ptr = null,
+            .@"comptime" = false,
+            .@"align" = @alignOf(?*std.heap.ArenaAllocator),
+        };
         return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
     }
 }
@@ -280,6 +290,15 @@ fn deinitEntityEdges(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         const edges_ptr: *?[]ItemType = &@field(self.edges, e.name);
         if (edges_ptr.*) |arr| {
             for (arr) |*item| {
+                // Eager-loaded targets carry their own JSON arena (see
+                // loadEdgePath); release it before the owning fields.
+                if (comptime @hasField(ItemType, "json_arena")) {
+                    if (item.json_arena) |arena| {
+                        arena.deinit();
+                        allocator.destroy(arena);
+                        item.json_arena = null;
+                    }
+                }
                 inline for (target_info.fields) |tf| {
                     if (!comptime isOwningField(tf.zig_type)) continue;
                     const item_field_type = if (tf.optional) ?tf.zig_type else tf.zig_type;
