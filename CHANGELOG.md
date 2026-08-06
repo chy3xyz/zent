@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-06
+
 ### Added
 - EntQL `has(edge)` / `not_has(edge)` / `has(edge, expr)` — the parser now
   accepts them and `QueryBuilder.WhereEntQL()` lowers them to schema-aware
