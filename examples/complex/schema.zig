@@ -29,10 +29,6 @@ fn withEdges(comptime Base: type, comptime es: []const edge.Edge) type {
     };
 }
 
-fn activeOnly(op: zent.privacy.Op, _: []const u8) zent.privacy.Decision {
-    return if (op == .query) .allow else .allow;
-}
-
 // ---------------------------------------------------------------------------
 // Schema definitions
 // ---------------------------------------------------------------------------

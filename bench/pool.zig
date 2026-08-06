@@ -24,6 +24,13 @@ fn benchBorrowRelease(allocator: std.mem.Allocator, io: std.Io) !Result {
     });
     defer pool.deinit();
 
+    // One-shot correctness check: a borrowed connection must be usable.
+    {
+        const c = try pool.borrow();
+        defer pool.release(c);
+        try c.ping();
+    }
+
     var ctx = PoolCtx{ .pool = &pool };
     return main.runForCtx(io, std.time.ns_per_s, &ctx, struct {
         fn body(ptr: *anyopaque) !void {
@@ -42,6 +49,13 @@ fn benchBorrowReleaseNoHealthCheck(allocator: std.mem.Allocator, io: std.Io) !Re
         .health_check_on_borrow = false,
     });
     defer pool.deinit();
+
+    // One-shot correctness check: a borrowed connection must be usable.
+    {
+        const c = try pool.borrow();
+        defer pool.release(c);
+        try c.ping();
+    }
 
     var ctx = PoolCtx{ .pool = &pool };
     return main.runForCtx(io, std.time.ns_per_s, &ctx, struct {

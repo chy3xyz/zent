@@ -74,6 +74,14 @@ const ScanCtx = struct {
 };
 
 fn benchScanSingle(allocator: std.mem.Allocator, io: std.Io) !Result {
+    // One-shot correctness check: the mock row must scan to the expected values.
+    {
+        const u = try sql_scan.scanRow(User, allocator, makeRow());
+        defer allocator.free(u.name);
+        if (u.id != 42 or u.age != 30 or u.score != 100 or !std.mem.eql(u8, u.name, "Alice")) {
+            return error.BenchmarkMismatch;
+        }
+    }
     var ctx = ScanCtx{ .allocator = allocator, .row = makeRow() };
     return main.runForCtx(io, std.time.ns_per_s, &ctx, struct {
         fn body(ptr: *anyopaque) !void {
@@ -91,6 +99,14 @@ const ScanBatchCtx = struct {
 };
 
 fn benchScanBatch100(allocator: std.mem.Allocator, io: std.Io) !Result {
+    // One-shot correctness check on the first row of a batch.
+    {
+        const u = try sql_scan.scanRow(User, allocator, makeRow());
+        defer allocator.free(u.name);
+        if (u.id != 42 or u.age != 30 or u.score != 100 or !std.mem.eql(u8, u.name, "Alice")) {
+            return error.BenchmarkMismatch;
+        }
+    }
     var ctx = ScanBatchCtx{ .allocator = allocator, .row = makeRow(), .batch_size = 100 };
     return main.runForCtx(io, std.time.ns_per_s, &ctx, struct {
         fn body(ptr: *anyopaque) !void {

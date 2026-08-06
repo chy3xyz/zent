@@ -53,8 +53,11 @@ pub fn main() !void {
 
     for (cases) |bench| {
         const result = bench.run(allocator, io) catch |err| {
+            // A correctness check failed (or the bench errored): fail loudly
+            // instead of printing and continuing — CI treats this as a
+            // regression signal.
             std.debug.print("{s:40} ERROR: {s}\n", .{ bench.name, @errorName(err) });
-            continue;
+            return err;
         };
         std.debug.print("{s:40} {d:>12} {d:>12}\n", .{
             bench.name,

@@ -6,7 +6,8 @@
 //!   or_expr  = and_expr ("OR" and_expr)*
 //!   and_expr = not_expr ("AND" not_expr)*
 //!   not_expr = "NOT" not_expr | primary
-//!   primary  = "(" expr ")" | comparison
+//!   primary  = "(" expr ")" | comparison | has_expr
+//!   has_expr = ("has" | "not_has") "(" IDENTIFIER ["," expr] ")"
 //!   comparison = field op value
 //!   op       = "=" | "!=" | ">" | "<" | ">=" | "<=" | "IN" | "CONTAINS"
 //!   field    = IDENTIFIER
@@ -19,6 +20,9 @@
 //!   name CONTAINS "ali"
 //!   age IS NULL
 //!   (name = "alice" OR name = "bob") AND age > 18
+//!   has(cars)                         -- schema-aware: use QueryBuilder.WhereEntQL
+//!   has(cars, price > 50)
+//!   not_has(pets)
 
 const std = @import("std");
 const sql = @import("../sql/builder.zig");
@@ -213,20 +217,12 @@ const ParseError = error{
     ExpectedLParen,
     ExpectedRParen,
     MismatchedTypes,
-    UnimplementedHasEdge,
     OutOfMemory,
     UnterminatedString,
     UnknownToken,
     InvalidCharacter,
     Overflow,
 };
-
-fn unimplementedHasEdge() ParseError {
-    if (@inComptime()) {
-        @compileError("EntQL 'has'/'not_has' requires schema-aware codegen; not yet supported");
-    }
-    return ParseError.UnimplementedHasEdge;
-}
 
 const ParserContext = struct {
     lexer: Lexer,
@@ -362,10 +358,42 @@ fn parsePrimary(ctx: *ParserContext) ParseError!sql.Predicate {
                 else => return ParseError.ExpectedRParen,
             }
         },
-        .kw_has, .kw_not_has => return unimplementedHasEdge(),
+        .kw_has, .kw_not_has => {
+            const is_not = tok == .kw_not_has;
+            _ = try ctx.next(); // consume has/not_has
+            return try parseHasEdge(ctx, is_not);
+        },
         .ident => return try parseComparison(ctx),
         else => return ParseError.ExpectedExpression,
     }
+}
+
+/// Parse `has(edge_name [, expr])` / `not_has(edge_name)`.
+/// Produces schema-unaware `.has_edge` / `.not_has_edge` placeholders; the
+/// codegen layer (QueryBuilder.WhereEntQL) lowers them to EXISTS subqueries
+/// using schema metadata.
+fn parseHasEdge(ctx: *ParserContext, is_not: bool) ParseError!sql.Predicate {
+    if (ctx.peek() != .lparen) return ParseError.ExpectedLParen;
+    _ = try ctx.next(); // consume (
+    const edge_name = try ctx.expectIdent();
+    if (edge_name.len == 0) return ParseError.ExpectedIdentifier;
+
+    var nested: ?*const sql.Predicate = null;
+    if (ctx.peek() == .comma) {
+        if (is_not) return ParseError.ExpectedRParen; // not_has takes no predicate
+        _ = try ctx.next(); // consume ,
+        const inner = try parseExpr(ctx);
+        const p = try ctx.allocator.create(sql.Predicate);
+        p.* = inner;
+        nested = p;
+    }
+    if (ctx.peek() != .rparen) return ParseError.ExpectedRParen;
+    _ = try ctx.next(); // consume )
+
+    if (is_not) {
+        return sql.Predicate{ .not_has_edge = .{ .edge_name = edge_name, .fk_col = "" } };
+    }
+    return sql.Predicate{ .has_edge = .{ .edge_name = edge_name, .fk_col = "", .pred = nested } };
 }
 
 fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
@@ -526,6 +554,14 @@ pub fn deinitPred(allocator: std.mem.Allocator, pred: *const sql.Predicate) void
             if (h.pred) |p| {
                 deinitPred(allocator, p);
                 allocator.destroy(p);
+            }
+        },
+        .has_neighbors_with => |h| {
+            // Owned slice produced by lowerHasEdge (empty means the static
+            // `&.{}` placeholder — do not free it).
+            if (h.preds.len > 0) {
+                for (h.preds) |*sub| deinitPred(allocator, sub);
+                allocator.free(h.preds);
             }
         },
         .and_ => |p| {
@@ -702,12 +738,28 @@ test "EntQL: EQFold =~" {
     }, p);
 }
 
-test "EntQL: has and not_has require schema-aware codegen" {
+test "EntQL: has and not_has parse into edge placeholders" {
     const allocator = std.testing.allocator;
 
-    try std.testing.expectError(error.UnimplementedHasEdge, parse(allocator, "has(pets)"));
-    try std.testing.expectError(error.UnimplementedHasEdge, parse(allocator, "has(pets, name = \"fido\")"));
-    try std.testing.expectError(error.UnimplementedHasEdge, parse(allocator, "not_has(pets)"));
+    {
+        var p = try parse(allocator, "has(pets)");
+        defer deinitPred(allocator, &p);
+        try std.testing.expectEqualStrings("pets", p.has_edge.edge_name);
+        try std.testing.expect(p.has_edge.pred == null);
+    }
+    {
+        var p = try parse(allocator, "not_has(pets)");
+        defer deinitPred(allocator, &p);
+        try std.testing.expectEqualStrings("pets", p.not_has_edge.edge_name);
+    }
+    {
+        // Nested predicate: has(pets, name = "fido")
+        var p = try parse(allocator, "has(pets, name = \"fido\")");
+        defer deinitPred(allocator, &p);
+        try std.testing.expectEqualStrings("pets", p.has_edge.edge_name);
+        try std.testing.expect(p.has_edge.pred != null);
+        try std.testing.expectEqualStrings("name", p.has_edge.pred.?.eq.column);
+    }
 }
 
 test "EntQL: SQL builder rejects schema-unaware edge predicates" {

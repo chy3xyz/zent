@@ -763,6 +763,145 @@ test "SQLite: Deny policy blocks query and create" {
     }
 }
 
+test "SQLite: WhereEntQL has(edge) lowers to EXISTS subquery" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const CarBase = schema("EntqlCar", .{
+        .fields = &.{ field.String("model"), field.Int("price") },
+    });
+    const UserBase = schema("EntqlUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const Car = struct {
+        pub const schema_name = CarBase.schema_name;
+        pub const fields = CarBase.fields;
+        pub const edges = CarBase.edges;
+        pub const indexes = CarBase.indexes;
+        pub const policy = CarBase.policy;
+        pub const is_view = CarBase.is_view;
+        pub const view_sql = CarBase.view_sql;
+        pub const soft_delete = CarBase.soft_delete;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{edge.To("cars", CarBase)};
+        pub const indexes = UserBase.indexes;
+        pub const policy = UserBase.policy;
+        pub const is_view = UserBase.is_view;
+        pub const view_sql = UserBase.view_sql;
+        pub const soft_delete = UserBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{ User, Car });
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Two users; only alice gets a car.
+    var b1 = try client.entql_user.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("name", "alice");
+    var user1 = try b1.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &user1, allocator);
+
+    var b2 = try client.entql_user.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("name", "bob");
+    var user2 = try b2.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &user2, allocator);
+
+    var cb = try client.entql_car.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("model", "x");
+    _ = try cb.setFieldValue("price", 10);
+    _ = try cb.setFieldValue("entql_user_id", user1.id);
+    var c = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[1], &c, allocator);
+
+    // has(cars) -> only alice (EXISTS subquery on the edge FK).
+    {
+        var q = client.entql_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(cars)");
+        var users = try q.All();
+        defer {
+            for (users.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            users.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), users.items.len);
+        try testing.expectEqualStrings("alice", users.items[0].name);
+    }
+
+    // has(cars, price > 5) also matches alice; not_has(cars) matches bob.
+    {
+        var q = client.entql_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(cars, price > 5)");
+        var users = try q.All();
+        defer {
+            for (users.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            users.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), users.items.len);
+    }
+    {
+        var q = client.entql_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("not_has(cars)");
+        var users = try q.All();
+        defer {
+            for (users.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            users.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), users.items.len);
+        try testing.expectEqualStrings("bob", users.items[0].name);
+    }
+}
+
+test "SQLite: OnCreate denies create but allows query (per-op)" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const User = schema("OnCreateUser", .{
+        .fields = &.{field.String("name")},
+        .policy = zent.privacy.OnCreate,
+    });
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    const ctx = zent.privacy.PrivacyContext{ .user_id = 1 };
+    const user_client = client.on_create_user.withContext(ctx);
+
+    // create must be denied (OnCreate fires for op == .create).
+    {
+        var b = try user_client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "x");
+        if (b.Save()) |_| {
+            return error.UnexpectedAllow;
+        } else |err| {
+            try testing.expectEqual(error.PrivacyDenied, err);
+        }
+    }
+
+    // query must pass (OnCreate does not match op == .query).
+    {
+        var q = user_client.Query();
+        defer q.deinit();
+        var users = try q.All();
+        defer {
+            for (users.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            users.deinit();
+        }
+        try testing.expectEqual(@as(usize, 0), users.items.len);
+    }
+}
+
 test "SQLite: privacy WithContext propagates context to allow/deny decisions" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");

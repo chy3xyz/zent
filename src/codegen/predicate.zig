@@ -193,6 +193,87 @@ fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) Typ
     @compileError("TypeInfo not found: " ++ name);
 }
 
+/// Lower schema-unaware `.has_edge` / `.not_has_edge` placeholders produced by
+/// the EntQL parser into schema-aware EXISTS predicates, reusing the same
+/// machinery as the generated `Has{Edge}()` / `Has{Edge}With()` functions.
+/// Recurses into AND/OR/NOT and nested `has()` predicates.
+///
+/// Ownership: nested predicate nodes are copied into a heap slice owned by the
+/// resulting `.has_neighbors_with` and the original nodes are destroyed; the
+/// caller must release the tree with `entql.deinitPred` (which frees
+/// `.has_neighbors_with` slices recursively).
+pub fn lowerHasEdge(
+    comptime infos: []const TypeInfo,
+    comptime info: TypeInfo,
+    allocator: std.mem.Allocator,
+    pred: *sql.Predicate,
+) error{ UnknownEdge, OutOfMemory }!void {
+    switch (pred.*) {
+        .has_edge => |*h| {
+            // Comptime edge-name -> Step table (Step values are runtime
+            // readable), matched by the runtime edge_name string.
+            const edge_steps = comptime blk: {
+                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step } = undefined;
+                for (info.edges, 0..) |e, i| {
+                    const target_info = findTypeInfo(infos, e.target_name);
+                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info) };
+                }
+                break :blk steps;
+            };
+            var lowered = false;
+            for (edge_steps) |es| {
+                if (std.mem.eql(u8, es.name, h.edge_name)) {
+                    if (h.pred) |nested| {
+                        try lowerHasEdge(infos, info, allocator, @constCast(nested));
+                        const preds = try allocator.alloc(sql.Predicate, 1);
+                        preds[0] = nested.*;
+                        allocator.destroy(nested);
+                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = preds } };
+                    } else {
+                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{} } };
+                    }
+                    lowered = true;
+                    break;
+                }
+            }
+            if (!lowered) return error.UnknownEdge;
+        },
+        .not_has_edge => |*h| {
+            const edge_steps = comptime blk: {
+                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step } = undefined;
+                for (info.edges, 0..) |e, i| {
+                    const target_info = findTypeInfo(infos, e.target_name);
+                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info) };
+                }
+                break :blk steps;
+            };
+            var lowered = false;
+            for (edge_steps) |es| {
+                if (std.mem.eql(u8, es.name, h.edge_name)) {
+                    const inner = try allocator.create(sql.Predicate);
+                    inner.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{} } };
+                    pred.* = .{ .not_ = inner };
+                    lowered = true;
+                    break;
+                }
+            }
+            if (!lowered) return error.UnknownEdge;
+        },
+        .and_ => |*a| {
+            try lowerHasEdge(infos, info, allocator, @constCast(a.left));
+            try lowerHasEdge(infos, info, allocator, @constCast(a.right));
+        },
+        .or_ => |*o| {
+            try lowerHasEdge(infos, info, allocator, @constCast(o.left));
+            try lowerHasEdge(infos, info, allocator, @constCast(o.right));
+        },
+        .not_ => |*n| {
+            try lowerHasEdge(infos, info, allocator, @constCast(n.*));
+        },
+        else => {},
+    }
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------

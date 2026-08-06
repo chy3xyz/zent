@@ -294,7 +294,8 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         /// Execute the UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .update;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
                 const filters = result.getFilters();
@@ -315,7 +316,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 .mutated = mutated,
                 .privacy = blk: {
                     var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
-                    pc.op = .create;
+                    pc.op = .update;
                     break :blk pc;
                 },
             };
@@ -606,7 +607,8 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         pub fn Restore(self: *Self, id: i64) !bool {
             if (!info.soft_delete) @compileError("Restore requires soft_delete on the entity");
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .update;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
@@ -622,7 +624,8 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
         fn execSoftDelete(self: *Self) ExecError!usize {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .delete;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
                 const filters = result.getFilters();
@@ -636,7 +639,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = blk: {
                     var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
-                    pc.op = .create;
+                    pc.op = .delete;
                     break :blk pc;
                 },
             };
@@ -729,7 +732,8 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
         fn execHardDelete(self: *Self) ExecError!usize {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .delete;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
                 const filters = result.getFilters();
@@ -743,7 +747,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = blk: {
                     var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
-                    pc.op = .create;
+                    pc.op = .delete;
                     break :blk pc;
                 },
             };
@@ -929,7 +933,8 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .update;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
                 const filters = result.getFilters();
@@ -943,7 +948,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = blk: {
                     var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
-                    pc.op = .create;
+                    pc.op = .update;
                     break :blk pc;
                 },
             };
@@ -1080,7 +1085,8 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         /// delete. No hooks fire (management operation).
         fn execSoftDelete(self: *Self) ExecError!usize {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .delete;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
@@ -1110,7 +1116,8 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
 
         fn execHardDelete(self: *Self) ExecError!usize {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .delete;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
                 const filters = result.getFilters();
@@ -1126,7 +1133,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 .table_name = info.table_name,
                 .privacy = blk: {
                     var pc = self.privacy_ctx orelse privacy.PrivacyContext{};
-                    pc.op = .create;
+                    pc.op = .delete;
                     break :blk pc;
                 },
             };

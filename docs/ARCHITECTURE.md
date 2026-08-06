@@ -86,8 +86,10 @@ consumer links its own sqlite/libpq/mariadb (see README "Consumer wiring").
   (`dialect.zig`, a `src/sql/<name>.zig`), then wire discovery in
   `build.zig` (see PG/MySQL helpers).
 - **Hooks / privacy**: `src/runtime/hook.zig` (before/after chains) and
-  `src/privacy/policy.zig` (deny/filter) apply across create/update/delete/
-  query paths.
+  `src/privacy/policy.zig` (deny/filter/on_op) apply across create/update/
+  delete/query paths. The codegen layer sets `PrivacyContext.op` per
+  operation, so `OnCreate`/`OnUpdate`/`OnDelete`/`OnQuery` deny only their
+  own operation (other ops pass through).
 
 ## Docs
 

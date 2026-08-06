@@ -10,6 +10,21 @@ const SimpleCtx = struct {
 };
 
 fn benchSimpleSelect(allocator: std.mem.Allocator, io: std.Io) !Result {
+    // One-shot correctness check: the generated SQL must match the expected
+    // dialect output, or the benchmark would measure a silently broken path.
+    {
+        var check = sql.Builder.init(allocator, .sqlite);
+        defer check.deinit();
+        try check.writeString("SELECT ");
+        try sql.Table("users").c("id").appendTo(&check);
+        try check.writeString(", ");
+        try sql.Table("users").c("name").appendTo(&check);
+        try check.writeString(" FROM ");
+        try sql.Table("users").appendTo(&check);
+        if (!std.mem.eql(u8, check.buffer.items, "SELECT \"users\".\"id\", \"users\".\"name\" FROM \"users\"")) {
+            return error.BenchmarkMismatch;
+        }
+    }
     var b = sql.Builder.initCapacity(allocator, 256, 8, .sqlite) catch sql.Builder.init(allocator, .sqlite);
     defer b.deinit();
     var ctx = SimpleCtx{ .b = &b };
@@ -54,6 +69,35 @@ fn benchComplexWhere(allocator: std.mem.Allocator, io: std.Io) !Result {
         .predicates = predicates,
         .order_terms = order_terms,
     };
+
+    // One-shot correctness check: WHERE/ORDER BY/LIMIT fragments must render.
+    {
+        const preds: []const sql.Predicate = predicates;
+        const orders: []const sql.Order = order_terms;
+        try b.buffer.appendSlice("SELECT * FROM ");
+        try sql.Table("users").appendTo(&b);
+        try b.buffer.appendSlice(" WHERE ");
+        for (preds, 0..) |p, i| {
+            if (i > 0) try b.buffer.appendSlice(" AND ");
+            try p.appendTo(&b);
+        }
+        try b.buffer.appendSlice(" ORDER BY ");
+        for (orders, 0..) |o, i| {
+            if (i > 0) try b.buffer.appendSlice(", ");
+            try o.appendTo(&b);
+        }
+        try b.buffer.appendSlice(" LIMIT ");
+        try b.arg(.{ .int = 10 });
+        const sql_text = b.query().sql;
+        if (std.mem.indexOf(u8, sql_text, "WHERE") == null or
+            std.mem.indexOf(u8, sql_text, "ORDER BY") == null or
+            std.mem.indexOf(u8, sql_text, "LIMIT") == null)
+        {
+            return error.BenchmarkMismatch;
+        }
+        b.buffer.clearRetainingCapacity();
+        b.args.clearRetainingCapacity();
+    }
 
     return main.runForCtx(io, std.time.ns_per_s, &ctx, struct {
         fn body(ptr: *anyopaque) !void {

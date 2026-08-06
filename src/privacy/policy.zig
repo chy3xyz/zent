@@ -7,6 +7,7 @@ pub const Decision = rtp.Decision;
 pub const DecisionSet = rtp.DecisionSet;
 pub const FilterRule = rtp.FilterRule;
 pub const Rule = rtp.Rule;
+pub const Op = rtp.Op;
 
 // Convenience rule constants.
 pub const Allow = Rule.allow;
@@ -45,12 +46,18 @@ pub const AlwaysAllow = Policy{ .rules = &.{Allow} };
 /// Always deny — blocks all access.
 pub const AlwaysDeny = Policy{ .rules = &.{Deny} };
 
-/// Deny all — used as placeholders for operation-specific policies
-/// that will be wired by Task 3 (codegen layer).
-pub const OnCreate = Policy{ .rules = &.{Deny} };
-pub const OnUpdate = Policy{ .rules = &.{Deny} };
-pub const OnDelete = Policy{ .rules = &.{Deny} };
-pub const OnQuery = Policy{ .rules = &.{Deny} };
+/// Deny only the matching operation; other operations pass through.
+/// The codegen layer sets `PrivacyContext.op` per operation (query/create/
+/// update/delete), so a schema with `.policy = OnCreate` blocks creates but
+/// still allows reads/writes/deletes. Combine with other rules as needed,
+/// e.g. `Policy{ .rules = &.{ OnCreate.rules[0], OnQuery.rules[0] } }`.
+fn on(comptime op: Op) Rule {
+    return .{ .on_op = .{ .op = op, .decision = .deny } };
+}
+pub const OnCreate = Policy{ .rules = &.{on(.create)} };
+pub const OnUpdate = Policy{ .rules = &.{on(.update)} };
+pub const OnDelete = Policy{ .rules = &.{on(.delete)} };
+pub const OnQuery = Policy{ .rules = &.{on(.query)} };
 
 // ------------------------------------------------------------------
 // Tests
@@ -69,12 +76,16 @@ test "Policy: AlwaysDeny" {
     try std.testing.expectEqual(Decision.deny, result.decision);
 }
 
-test "Policy: OnCreate/OnUpdate/OnDelete/OnQuery all deny" {
-    const ctx = PrivacyContext{};
-    try std.testing.expectEqual(Decision.deny, OnCreate.eval(ctx).decision);
-    try std.testing.expectEqual(Decision.deny, OnUpdate.eval(ctx).decision);
-    try std.testing.expectEqual(Decision.deny, OnDelete.eval(ctx).decision);
-    try std.testing.expectEqual(Decision.deny, OnQuery.eval(ctx).decision);
+test "Policy: On* policies deny only their own operation" {
+    // Matching op -> deny; other ops -> allow (rule skipped).
+    try std.testing.expectEqual(Decision.deny, OnCreate.eval(.{ .op = .create }).decision);
+    try std.testing.expectEqual(Decision.allow, OnCreate.eval(.{ .op = .query }).decision);
+    try std.testing.expectEqual(Decision.deny, OnUpdate.eval(.{ .op = .update }).decision);
+    try std.testing.expectEqual(Decision.allow, OnUpdate.eval(.{ .op = .create }).decision);
+    try std.testing.expectEqual(Decision.deny, OnDelete.eval(.{ .op = .delete }).decision);
+    try std.testing.expectEqual(Decision.allow, OnDelete.eval(.{ .op = .update }).decision);
+    try std.testing.expectEqual(Decision.deny, OnQuery.eval(.{ .op = .query }).decision);
+    try std.testing.expectEqual(Decision.allow, OnQuery.eval(.{ .op = .delete }).decision);
 }
 
 test "Filter factory creates valid rule" {

@@ -208,6 +208,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
         predicates: std.array_list.Managed(sql.Predicate),
+        /// EntQL predicate trees owned by this builder (added via WhereEntQL).
+        /// The element values are shallow copies of the ones in `predicates`;
+        /// deinit releases their internal allocations here, then the array.
+        entql_owned: std.array_list.Managed(sql.Predicate),
         order_terms: std.array_list.Managed(sql.Order),
         limit_val: ?usize,
         offset_val: ?usize,
@@ -236,6 +240,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 .allocator = allocator,
                 .driver = driver,
                 .predicates = std.array_list.Managed(sql.Predicate).init(allocator),
+                .entql_owned = std.array_list.Managed(sql.Predicate).init(allocator),
                 .order_terms = std.array_list.Managed(sql.Order).init(allocator),
                 .limit_val = null,
                 .offset_val = null,
@@ -254,6 +259,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn deinit(self: *Self) void {
             for (self.or_in_chunks.items) |chunks| self.allocator.free(chunks);
             self.or_in_chunks.deinit(self.allocator);
+            // Release internal allocations of EntQL trees (predicates array
+            // itself only holds shallow copies).
+            const entql = @import("../entql/parser.zig");
+            for (self.entql_owned.items) |*p| entql.deinitPred(self.allocator, p);
+            self.entql_owned.deinit();
             self.predicates.deinit();
             self.order_terms.deinit();
             self.with_edges.deinit(self.allocator);
@@ -312,6 +322,21 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 },
                 else => @compileError("Where expects a tuple or slice of sql.Predicate"),
             }
+            return self;
+        }
+
+        /// Parse an EntQL expression string and add it as a WHERE predicate.
+        /// `has(edge)` / `not_has(edge)` / `has(edge, expr)` are lowered to
+        /// schema-aware EXISTS subqueries (see predicate.lowerHasEdge).
+        /// The predicate tree is owned by the builder and freed on deinit.
+        pub fn WhereEntQL(self: *Self, input: []const u8) !*Self {
+            const entql = @import("../entql/parser.zig");
+            const lowerHasEdge = @import("predicate.zig").lowerHasEdge;
+            var parsed = try entql.parse(self.allocator, input);
+            errdefer entql.deinitPred(self.allocator, &parsed);
+            try lowerHasEdge(infos, info, self.allocator, &parsed);
+            try self.predicates.append(parsed);
+            try self.entql_owned.append(parsed);
             return self;
         }
 
@@ -566,7 +591,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         fn checkPolicy(self: *const Self) error{PrivacyDenied}!privacy.DecisionSet {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .query;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
                 return result;

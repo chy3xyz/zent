@@ -53,6 +53,9 @@ pub const Rule = union(enum) {
     deny,
     allow,
     filter: FilterRule,
+    /// Applies `decision` only when ctx.op matches `op`; otherwise the rule
+    /// is skipped. Flat on purpose (an `on: {op, rule}` would recurse).
+    on_op: struct { op: Op, decision: Decision },
 };
 
 /// Evaluate privacy rules in order with AND semantics.
@@ -83,6 +86,12 @@ pub fn evalPolicy(
                     result.filters[result.filter_count] = pred;
                     result.filter_count += 1;
                 }
+            },
+            .on_op => |o| {
+                // Operation-specific rule: active only for its own op.
+                if (ctx.op != o.op) continue;
+                if (o.decision == .deny) return .{ .decision = .deny };
+                // allow: lock in allow, keep scanning for filters.
             },
         }
     }

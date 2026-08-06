@@ -167,7 +167,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
         fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!Entity {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .create;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
@@ -864,7 +865,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
 
         fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!std.array_list.Managed(i64) {
             if (info.policy) |p| {
-                const ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .create;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
