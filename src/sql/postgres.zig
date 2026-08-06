@@ -779,7 +779,9 @@ test "Postgres quote ident" {
 
 test "PostgresDriver cache field is optional" {
     // Verifies the cache field defaults to null and can be set.
-    var drv: PostgresDriver = undefined;
+    // `.{}`-style init with explicit placeholders: reading `cache` from an
+    // `undefined` struct is UB and flaky across std/compiler versions.
+    var drv: PostgresDriver = .{ .conn = undefined, .allocator = undefined };
     try std.testing.expect(drv.cache == null);
 
     drv.cache = PreparedCache(16, *c.PGresult){};

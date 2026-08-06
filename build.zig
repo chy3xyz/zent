@@ -170,6 +170,7 @@ pub fn build(b: *std.Build) void {
     migrate_mod.addImport("sqlite3_c", sqlite_c_mod);
     if (pg_c_mod) |m| migrate_mod.addImport("pg_c", m);
     if (my_c_mod) |m| migrate_mod.addImport("mysql_c", m);
+    migrate_mod.addImport("build_options", build_options_mod);
     linkSqlite(migrate_mod);
     if (pg_include_dir) |inc| linkPg(migrate_mod, inc, pg_lib_dir.?);
     if (my_include_dir) |inc| linkMySQL(migrate_mod, inc, my_lib_dir.?);
@@ -279,7 +280,9 @@ fn discoverPg(b: *std.Build) ?PgInfo {
 }
 
 fn discoverPgHomebrew(b: *std.Build) ?PgInfo {
-    const versions = [_][]const u8{ "postgresql@18", "postgresql@17", "postgresql@16", "postgresql@15", "postgresql@14", "postgresql" };
+    // `libpq` is the keg-only brew package name (no pg_config binary); the
+    // postgresql@N formulas expose the same header under a versioned prefix.
+    const versions = [_][]const u8{ "postgresql@18", "postgresql@17", "postgresql@16", "postgresql@15", "postgresql@14", "postgresql", "libpq" };
     const homes = [_][]const u8{ "/opt/homebrew/opt", "/usr/local/opt" };
     for (homes) |home| {
         for (versions) |pkg| {
@@ -288,7 +291,11 @@ fn discoverPgHomebrew(b: *std.Build) ?PgInfo {
             const header = if (pathExists(b, versioned)) versioned else if (pathExists(b, plain)) plain else continue;
             const include_dir = std.fs.path.dirname(header).?;
             const lib_home = if (std.mem.eql(u8, home, "/opt/homebrew/opt")) "/opt/homebrew/lib" else "/usr/local/lib";
-            const lib_dir = b.fmt("{s}/{s}", .{ lib_home, pkg });
+            // keg-only packages keep their libraries under the opt prefix.
+            const lib_dir = if (std.mem.eql(u8, pkg, "libpq"))
+                b.fmt("{s}/libpq/lib", .{home})
+            else
+                b.fmt("{s}/{s}", .{ lib_home, pkg });
             return .{ .include_dir = include_dir, .lib_dir = lib_dir };
         }
     }

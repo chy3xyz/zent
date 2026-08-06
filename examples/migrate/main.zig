@@ -1,9 +1,14 @@
 const std = @import("std");
 const zent = @import("zent");
+const build_options = @import("build_options");
 
 const SQLiteDriver = zent.sql_sqlite.SQLiteDriver;
-const PostgresDriver = zent.sql_postgres.PostgresDriver;
-const MySQLDriver = zent.sql_mysql.MySQLDriver;
+// PG/MySQL are only referenced when their C bindings were discovered at
+// build time (see build.zig discoverPg/discoverMySQL); a `void` placeholder
+// keeps the union uniform on machines without the headers, and every use is
+// guarded by a comptime branch so the placeholder is never analyzed.
+const PostgresDriver = if (build_options.have_pg) zent.sql_postgres.PostgresDriver else void;
+const MySQLDriver = if (build_options.have_mysql) zent.sql_mysql.MySQLDriver else void;
 const migrate = zent.sql_schema;
 
 const AnyDriver = union(enum) {
@@ -13,13 +18,27 @@ const AnyDriver = union(enum) {
 
     fn asDriver(self: *AnyDriver) zent.sql_driver.Driver {
         switch (self.*) {
-            inline else => |*drv| return drv.asDriver(),
+            .sqlite => |*drv| return drv.asDriver(),
+            .postgres => |*drv| {
+                if (comptime build_options.have_pg) return drv.asDriver();
+                unreachable;
+            },
+            .mysql => |*drv| {
+                if (comptime build_options.have_mysql) return drv.asDriver();
+                unreachable;
+            },
         }
     }
 
     fn close(self: *AnyDriver) void {
         switch (self.*) {
-            inline else => |*drv| drv.close(),
+            .sqlite => |*drv| drv.close(),
+            .postgres => |*drv| {
+                if (comptime build_options.have_pg) drv.close();
+            },
+            .mysql => |*drv| {
+                if (comptime build_options.have_mysql) drv.close();
+            },
         }
     }
 };
@@ -56,19 +75,25 @@ fn connectFromDsn(allocator: std.mem.Allocator, dsn: []const u8) !AnyDriver {
     }
 
     if (std.mem.startsWith(u8, dsn, "postgres://") or std.mem.startsWith(u8, dsn, "postgresql://")) {
-        return .{ .postgres = try PostgresDriver.connect(allocator, dsn) };
+        if (comptime build_options.have_pg) {
+            return .{ .postgres = try PostgresDriver.connect(allocator, dsn) };
+        }
+        return error.UnsupportedDriver;
     }
 
     if (std.mem.startsWith(u8, dsn, "mysql://")) {
-        const parsed = try parseMysqlDsn(allocator, dsn[8..]);
-        return .{ .mysql = try MySQLDriver.connect(
-            allocator,
-            try allocator.dupeSentinel(u8, parsed.host, 0),
-            parsed.port,
-            try allocator.dupeSentinel(u8, parsed.user, 0),
-            try allocator.dupeSentinel(u8, parsed.pass, 0),
-            try allocator.dupeSentinel(u8, parsed.db, 0),
-        ) };
+        if (comptime build_options.have_mysql) {
+            const parsed = try parseMysqlDsn(allocator, dsn[8..]);
+            return .{ .mysql = try MySQLDriver.connect(
+                allocator,
+                try allocator.dupeSentinel(u8, parsed.host, 0),
+                parsed.port,
+                try allocator.dupeSentinel(u8, parsed.user, 0),
+                try allocator.dupeSentinel(u8, parsed.pass, 0),
+                try allocator.dupeSentinel(u8, parsed.db, 0),
+            ) };
+        }
+        return error.UnsupportedDriver;
     }
 
     return error.UnsupportedDriver;
