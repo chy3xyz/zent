@@ -81,11 +81,28 @@ pub fn scanRowNamed(comptime T: type, allocator: std.mem.Allocator, row: Row) !T
     return scanRowNamedWithArena(T, allocator, row, null);
 }
 
+/// Field-by-field zero-initialization. `std.mem.zeroes` rejects structs that
+/// carry a `std.json.Value` field (std forbids zeroing Value), so those
+/// fields default to `.null` while everything else is zeroed. Used by entity
+/// scans and the create path.
+pub fn zeroInit(comptime T: type) T {
+    var value: T = undefined;
+    const ei = @typeInfo(T).@"struct";
+    inline for (ei.field_names, ei.field_types) |fname, ftype| {
+        if (comptime ftype == std.json.Value) {
+            @field(value, fname) = .null;
+        } else {
+            @field(value, fname) = std.mem.zeroes(ftype);
+        }
+    }
+    return value;
+}
+
 /// Like `scanRowNamed`, but JSON struct fields are parsed into `json_arena`.
 pub fn scanRowNamedWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanRowNamed supports structs only");
-    var value: T = std.mem.zeroes(T);
+    var value: T = zeroInit(T);
     inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
         if (comptime std.mem.eql(u8, field_name, "edges")) {
             @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
@@ -267,6 +284,15 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
             // caller-owned (unfreed by deinitEntity).
             const a = if (json_arena) |arena| arena.allocator() else allocator;
             return std.json.parseFromSliceLeaky(T, a, text, .{}) catch return error.TypeMismatch;
+        },
+        .@"union" => {
+            // Only std.json.Value (field.JSONValue) is supported as an
+            // untyped JSON document.
+            if (T != std.json.Value)
+                @compileError("Unsupported union type for scanning: " ++ @typeName(T));
+            const text = row.getText(index) orelse return error.TypeMismatch;
+            const a = if (json_arena) |arena| arena.allocator() else allocator;
+            return std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.TypeMismatch;
         },
         else => @compileError("Unsupported column type for scanning: " ++ @typeName(T)),
     }

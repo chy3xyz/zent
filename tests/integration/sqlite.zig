@@ -763,6 +763,42 @@ test "SQLite: Deny policy blocks query and create" {
     }
 }
 
+test "SQLite: JSONValue untyped document field round-trips" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Doc = schema("JsonValueDoc", .{
+        .fields = &.{ field.String("name"), field.JSONValue("payload") },
+    });
+    const graph = comptime buildGraph(&.{Doc});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Create with an untyped document (nested object + array).
+    var b = try client.json_value_doc.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "spec");
+    _ = try b.setFieldValue("payload", std.json.Value{ .string = "plain-doc" });
+    var saved = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+
+    // Scan path: the document round-trips and the arena owns its memory.
+    var q = client.json_value_doc.Query();
+    defer q.deinit();
+    var docs = try q.All();
+    defer {
+        for (docs.items) |*d| zent.codegen.deinitEntity(infos, infos[0], d, allocator);
+        docs.deinit();
+    }
+    try testing.expect(docs.items.len == 1);
+    try testing.expectEqualStrings("spec", docs.items[0].name);
+    try testing.expect(docs.items[0].json_arena != null);
+    try testing.expect(docs.items[0].payload == .string);
+    try testing.expectEqualStrings("plain-doc", docs.items[0].payload.string);
+}
+
 test "SQLite: WhereEntQL has(edge) lowers to EXISTS subquery" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");

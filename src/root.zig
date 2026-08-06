@@ -33,6 +33,7 @@ pub const codegen = struct {
     pub const query = @import("codegen/query.zig").QueryBuilder;
     pub const update_delete = @import("codegen/update_delete.zig");
     pub const client = @import("codegen/client.zig");
+    pub const beginTx = @import("codegen/client.zig").beginTx;
 };
 
 pub const crud = @import("crud.zig");

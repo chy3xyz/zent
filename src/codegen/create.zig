@@ -123,7 +123,9 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                                 if (!valid) @compileError("Invalid enum value for field '" ++ field_name ++ "': '" ++ value ++ "'");
                             }
                         }
-                        if (f.field_type == .json and @typeInfo(Actual) == .@"struct") {
+                        if (f.field_type == .json and
+                            (@typeInfo(Actual) == .@"struct" or Actual == std.json.Value))
+                        {
                             needs_json = true;
                         }
                         found = true;
@@ -238,7 +240,10 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
-            var entity: Entity = std.mem.zeroes(Entity);
+            // std.mem.zeroes(Entity) is not allowed when an entity carries a
+            // std.json.Value field (std rejects zeroing Value); zeroInit
+            // handles that (Value fields default to .null).
+            var entity: Entity = @import("../sql/scan.zig").zeroInit(Entity);
             if (supports_returning) {
                 var builder = if (or_replace and is_sqlite)
                     sql.InsertOrReplace(self.allocator, dialect, info.table_name)
@@ -828,7 +833,9 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                                 if (!valid) @compileError("Invalid enum value for field '" ++ field_name ++ "': '" ++ value ++ "'");
                             }
                         }
-                        if (f.field_type == .json and @typeInfo(Actual) == .@"struct") {
+                        if (f.field_type == .json and
+                            (@typeInfo(Actual) == .@"struct" or Actual == std.json.Value))
+                        {
                             needs_json = true;
                         }
                         found = true;

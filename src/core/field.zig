@@ -203,6 +203,14 @@ pub fn JSON(name: []const u8, comptime T: type) Field {
     return .{ .name = name, .field_type = .json, .zig_type = T };
 }
 
+/// JSON field with an untyped document value (`std.json.Value`) — for
+/// dynamic-shape data (product specs, config blobs) where a fixed struct
+/// type is unknown at schema time. The parsed value lives in the entity's
+/// json_arena and is freed by deinitEntity, same as typed JSON fields.
+pub fn JSONValue(name: []const u8) Field {
+    return JSON(name, std.json.Value);
+}
+
 pub fn Enum(name: []const u8, comptime values: []const []const u8) Field {
     return .{ .name = name, .field_type = .enum_, .enum_values = values };
 }

@@ -361,7 +361,33 @@ pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
 /// Add virtual FieldInfo entries for edge foreign-key columns.
 /// This ensures generated entity structs include FK fields so that
 /// setFieldValue works for edge columns like "owner_id".
-fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TypeInfo {
+/// A To edge (from `source`) whose target is the entity being processed.
+const IncomingEdge = struct { source: TypeInfo, edge: EdgeInfo };
+
+/// Precompute, for every entity, the list of To edges pointing at it. This
+/// turns addEdgeFields' per-entity `for (all_infos)` scan into a table
+/// lookup — overall comptime cost drops from O(n²·e·(e+f)) to
+/// O(n²·e + T·(e+f)) where T = total To-edge count (large win for sparse
+/// edge sets; 30-table stress schema goes from ~900 to ~30 inner steps).
+fn buildIncomingTable(comptime infos: []const TypeInfo) [infos.len][]const IncomingEdge {
+    comptime {
+        var table: [infos.len][]const IncomingEdge = undefined;
+        for (infos, 0..) |info, i| {
+            var list: []const IncomingEdge = &.{};
+            for (infos) |other| {
+                for (other.edges) |e| {
+                    if (e.kind == .to and std.mem.eql(u8, e.target_name, info.name)) {
+                        list = list ++ &[_]IncomingEdge{.{ .source = other, .edge = e }};
+                    }
+                }
+            }
+            table[i] = list;
+        }
+        return table;
+    }
+}
+
+fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdge) TypeInfo {
     comptime {
         @setEvalBranchQuota(100000);
         var fields: []const FieldInfo = info.fields;
@@ -389,53 +415,52 @@ fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) 
             }
         }
 
-        // Cross-referenced To edges: if another entity has a To edge pointing here
-        // with O2M relation and we do NOT have a corresponding From edge,
-        // add the FK column to this entity's fields.
-        for (all_infos) |other_info| {
-            for (other_info.edges) |e| {
-                if (e.kind == .to and std.mem.eql(u8, e.target_name, info.name)) {
-                    var has_from_inverse = false;
-                    for (info.edges) |my_edge| {
-                        if (my_edge.kind == .from and
-                            std.mem.eql(u8, my_edge.target_name, other_info.name) and
-                            my_edge.ref != null and
-                            std.mem.eql(u8, my_edge.ref.?, e.name))
-                        {
-                            has_from_inverse = true;
-                            break;
-                        }
-                    }
-                    if (has_from_inverse) continue;
+        // Cross-referenced To edges: if another entity has a To edge pointing
+        // here with O2M relation and we do NOT have a corresponding From
+        // edge, add the FK column to this entity's fields. `incoming` is the
+        // precomputed table of such edges (see buildIncomingTable).
+        for (incoming) |inc| {
+            const other_info = inc.source;
+            const e = inc.edge;
+            var has_from_inverse = false;
+            for (info.edges) |my_edge| {
+                if (my_edge.kind == .from and
+                    std.mem.eql(u8, my_edge.target_name, other_info.name) and
+                    my_edge.ref != null and
+                    std.mem.eql(u8, my_edge.ref.?, e.name))
+                {
+                    has_from_inverse = true;
+                    break;
+                }
+            }
+            if (has_from_inverse) continue;
 
-                    if (e.relation == .o2m) {
-                        const fk_col_name = e.field_name orelse toSnakeCase(other_info.name) ++ "_id";
-                        var exists = false;
-                        for (fields) |f| {
-                            if (std.mem.eql(u8, f.name, fk_col_name)) {
-                                exists = true;
-                                break;
-                            }
-                        }
-                        if (!exists) {
-                            fields = fields ++ &[_]FieldInfo{FieldInfo{
-                                .name = fk_col_name,
-                                .field_type = .int,
-                                .zig_type = i64,
-                                .sql_type = "INTEGER",
-                                .optional = false,
-                                .nillable = false,
-                                .unique = false,
-                                .immutable = false,
-                                .default = .none,
-                                .validators = &.{},
-                                .enum_values = &.{},
-                                .is_id = false,
-                                .is_version = false,
-                                .sensitive = false,
-                            }};
-                        }
+            if (e.relation == .o2m) {
+                const fk_col_name = e.field_name orelse toSnakeCase(other_info.name) ++ "_id";
+                var exists = false;
+                for (fields) |f| {
+                    if (std.mem.eql(u8, f.name, fk_col_name)) {
+                        exists = true;
+                        break;
                     }
+                }
+                if (!exists) {
+                    fields = fields ++ &[_]FieldInfo{FieldInfo{
+                        .name = fk_col_name,
+                        .field_type = .int,
+                        .zig_type = i64,
+                        .sql_type = "INTEGER",
+                        .optional = false,
+                        .nillable = false,
+                        .unique = false,
+                        .immutable = false,
+                        .default = .none,
+                        .validators = &.{},
+                        .enum_values = &.{},
+                        .is_id = false,
+                        .is_version = false,
+                        .sensitive = false,
+                    }};
                 }
             }
         }
@@ -458,9 +483,10 @@ fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) 
 fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
     comptime {
         @setEvalBranchQuota(100000);
+        const incoming = buildIncomingTable(infos);
         var result: []const TypeInfo = &.{};
-        for (infos) |info| {
-            result = result ++ &[_]TypeInfo{addEdgeFields(info, infos)};
+        for (infos, 0..) |info, i| {
+            result = result ++ &[_]TypeInfo{addEdgeFields(info, incoming[i])};
         }
         return result;
     }

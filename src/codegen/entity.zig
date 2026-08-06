@@ -199,7 +199,9 @@ fn FreeField(comptime FieldType: type, field_ptr: *FieldType, allocator: std.mem
 
 fn hasJsonStructField(comptime info: TypeInfo) bool {
     inline for (info.fields) |f| {
-        if (f.field_type == .json and @typeInfo(f.zig_type) == .@"struct") return true;
+        // Any .json field needs the arena — typed structs AND untyped
+        // std.json.Value documents (the parsed value is arena-owned).
+        if (f.field_type == .json) return true;
     }
     return false;
 }
