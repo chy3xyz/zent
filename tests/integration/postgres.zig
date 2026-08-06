@@ -624,6 +624,43 @@ test "Postgres: ForUpdate / ForShare in transaction" {
     }
 }
 
+test "Postgres: TimeMixin audit columns build (epoch BIGINT)" {
+    // .time columns must map to BIGINT: the audit default is
+    // EXTRACT(EPOCH FROM now())::bigint, so TIMESTAMPTZ + bigint default
+    // made CREATE TABLE fail on Postgres.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const T = schema("TmAudit", .{
+        .fields = &.{field.String("name")},
+        .mixins = &.{zent.core.mixin.TimeMixin},
+    });
+    const graph = comptime buildGraph(&.{T});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS tm_audit", &.{}) catch {};
+
+    // Insert picks up the epoch default and round-trips as i64.
+    var cb = try Client.makeClient(infos, allocator, drv.asDriver()).tm_audit.Create();
+    defer cb.deinit();
+    _ = try cb.setFieldValue("name", "x");
+    var saved = try cb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+
+    // created_at is set by the DB default; read it back via a query.
+    var q = Client.makeClient(infos, allocator, drv.asDriver()).tm_audit.Query();
+    defer q.deinit();
+    var rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), rows.items.len);
+    try testing.expect(rows.items[0].created_at.? > 0);
+    try testing.expect(rows.items[0].updated_at.? > 0);
+}
+
 test "Postgres: slow query times out" {
     if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const allocator = testing.allocator;

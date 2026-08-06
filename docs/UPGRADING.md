@@ -36,8 +36,13 @@ defer {
 
 - `std.time.milliTimestamp()` / `nanoTimestamp()` no longer exist; use
   `std.time.Instant` or zent's `zent.sql_logger.nowUs()`.
-- `field.Time` columns are stored as i64 epoch (seconds/millis per your
-  schema); time predicates take `.int` values:
+- `field.Time` columns are **BIGINT epoch seconds on every dialect**
+  (PostgreSQL included): the application layer reads/writes `i64` epochs and
+  the audit default is `EXTRACT(EPOCH FROM now())::bigint` /
+  `UNIX_TIMESTAMP()` / `unixepoch()`. Do not expect a `TIMESTAMPTZ` /
+  `DATETIME` column — earlier releases mapped `.time` to those types, which
+  disagreed with the bigint default and broke CREATE TABLE on Postgres.
+- Time predicates take `.int` epoch values:
   `q.Where(.{client.e.timestampGTE(.{ .int = epoch })})`.
 
 ## 4. JSON field ownership
@@ -69,11 +74,22 @@ use `field.JSON(name, T)`; untyped documents use `field.JSONValue(name)`
 
 ## 7. Queries
 
-- `q.paged(page, size)` returns `{ items, total }` (one-call pagination).
+- `q.paged(page, size)` returns `PagedResult{ items: Managed(Entity), total }`
+  — note `items` is a `Managed` list, so iterate `page.items.items` (not
+  `page.items`); `All()` returns the `Managed` list directly. Both require
+  `deinitEntity` per entity + `deinit()`.
 - `q.WhereEntQL("has(cars)")` / `not_has(...)` / `has(cars, price > 5)`
   parse EntQL into EXISTS subqueries (schema-aware).
 - `q.All()` returns `Managed(Entity)`; `deinitEntity` per item then
   `users.deinit()`.
+
+## 7a. Comptime budget (large schemas)
+
+- Codegen runs under `@setEvalBranchQuota` (predicates/migrations: 100000,
+  graph lowering: 100000). 30-table schemas compile fine; if a very large
+  graph ever hits a quota error, raise the value in the relevant
+  `src/codegen/*.zig` file rather than splitting the graph — the graph is
+  meant to span all tables of an application (edges resolve across it).
 
 ## 8. Build & toolchain
 

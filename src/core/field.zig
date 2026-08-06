@@ -244,9 +244,12 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
             return "BLOB";
         },
         .time => {
-            if (std.mem.eql(u8, dialect.name, "mysql")) return "DATETIME";
-            if (std.mem.eql(u8, dialect.name, "postgres")) return "TIMESTAMPTZ";
-            return "DATETIME";
+            // Epoch-second integer everywhere: the application layer reads and
+            // writes i64 epochs (zigType(.time) == i64) and the audit default
+            // is EXTRACT(EPOCH FROM now()) — mapping this to TIMESTAMPTZ
+            // (PG) / DATETIME (MySQL) made the column type disagree with the
+            // bigint default expression, breaking CREATE TABLE on Postgres.
+            return "BIGINT";
         },
         .json => {
             if (std.mem.eql(u8, dialect.name, "postgres")) return "JSONB";
@@ -289,8 +292,10 @@ test "Field builders" {
 test "SQL type mapping" {
     try std.testing.expectEqualStrings("INTEGER", sqlType(.int, .{ .name = "sqlite3" }));
     try std.testing.expectEqualStrings("TEXT", sqlType(.string, .{ .name = "sqlite3" }));
-    try std.testing.expectEqualStrings("DATETIME", sqlType(.time, .{ .name = "mysql" }));
-    try std.testing.expectEqualStrings("TIMESTAMPTZ", sqlType(.time, .{ .name = "postgres" }));
+    // .time maps to BIGINT epoch seconds on every dialect (see the sqlType
+    // comment: TIMESTAMPTZ/DATETIME disagreed with the bigint audit default).
+    try std.testing.expectEqualStrings("BIGINT", sqlType(.time, .{ .name = "mysql" }));
+    try std.testing.expectEqualStrings("BIGINT", sqlType(.time, .{ .name = "postgres" }));
     try std.testing.expectEqualStrings("JSONB", sqlType(.json, .{ .name = "postgres" }));
     try std.testing.expectEqualStrings("UUID", sqlType(.uuid, .{ .name = "postgres" }));
     try std.testing.expectEqualStrings("BLOB", sqlType(.bytes, .{ .name = "sqlite3" }));

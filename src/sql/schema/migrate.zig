@@ -1757,7 +1757,7 @@ test "PostgreSQL migration SQL resolves logical field types" {
     const sql = try createTableSQL(table, Dialect.postgres);
     defer std.heap.page_allocator.free(sql);
 
-    try std.testing.expect(std.mem.indexOf(u8, sql, "\"occurred_at\" TIMESTAMPTZ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"occurred_at\" BIGINT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"payload\" JSONB") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"external_id\" UUID") != null);
 }
