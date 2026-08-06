@@ -78,19 +78,20 @@ pub const MySQLDriver = struct {
             _ = c.mysql_options(conn, c.MYSQL_OPT_WRITE_TIMEOUT, &default_write_timeout);
         }
 
-        // Set SSL mode via mysql_ssl_set / MYSQL_OPT_SSL_ENFORCE
-        // (MYSQL_OPT_SSL_MODE is only available in newer libmariadb).
+        // SSL mode. Note: this mariadb-connector-c build exposes
+        // MYSQL_OPT_SSL_ENFORCE but not MYSQL_OPT_SSL_MODE; calling
+        // mysql_ssl_set implicitly enforces SSL (that combination broke
+        // plain servers like the CI mariadb container), so PREFERRED only
+        // sets ENFORCE=0 and lets the client fall back to plaintext.
         switch (ssl_mode) {
             .required => {
-                // Enable SSL with no specific cert requirements; fail if
-                // the server doesn't support SSL.
                 _ = c.mysql_ssl_set(conn, null, null, null, null, null);
                 const enforce: c_uint = 1;
                 _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce);
             },
             .preferred => {
-                // Try SSL, fall back to non-SSL (MySQL/MariaDB default).
-                _ = c.mysql_ssl_set(conn, null, null, null, null, null);
+                const enforce: c_uint = 0;
+                _ = c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce);
             },
             .disabled => {
                 // No SSL at all.
