@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.2] - 2026-08-07
+
 ### Fixed
 - Migration version hashing (`computeMigrationVersion`) now runs at runtime
   instead of comptime. The migrate loop is `inline for (infos)`, so the old
