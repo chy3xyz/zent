@@ -6,6 +6,36 @@ const buildEdgeStep = @import("graph.zig").buildEdgeStep;
 const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
 const sql_scan = @import("../sql/scan.zig");
+
+/// Scan an entity row, routing JSON struct fields into a per-entity arena
+/// that deinitEntity releases — the same ownership contract as the Create
+/// path. Bare (non-entity) scans keep the caller-owned behavior.
+fn scanEntity(comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Row) !T {
+    if (comptime @hasField(T, "json_arena")) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer {
+            arena.deinit();
+            allocator.destroy(arena);
+        }
+        return try sql_scan.scanRowWithArena(T, allocator, row, arena);
+    }
+    return sql_scan.scanRow(T, allocator, row);
+}
+
+/// Like `scanEntity` for the name-based (partial projection) scanner.
+fn scanEntityNamed(comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Row) !T {
+    if (comptime @hasField(T, "json_arena")) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer {
+            arena.deinit();
+            allocator.destroy(arena);
+        }
+        return try sql_scan.scanRowNamedWithArena(T, allocator, row, arena);
+    }
+    return sql_scan.scanRowNamed(T, allocator, row);
+}
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
@@ -497,9 +527,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     return null;
                 };
                 const entity = if (self.select_cols != null)
-                    try sql_scan.scanRowNamed(Entity, self.allocator, row)
+                    try scanEntityNamed(Entity, self.allocator, row)
                 else
-                    try sql_scan.scanRow(Entity, self.allocator, row);
+                    try scanEntity(Entity, self.allocator, row);
                 self.current = entity;
                 return entity;
             }
@@ -561,9 +591,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
             while (rows.next()) |row| {
                 var entity = if (self.select_cols != null)
-                    try sql_scan.scanRowNamed(Entity, self.allocator, row)
+                    try scanEntityNamed(Entity, self.allocator, row)
                 else
-                    try sql_scan.scanRow(Entity, self.allocator, row);
+                    try scanEntity(Entity, self.allocator, row);
                 errdefer deinitEntity(infos, info, &entity, self.allocator);
                 try result.append(entity);
             }
@@ -635,9 +665,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 return null;
             };
             var entity = if (self.select_cols != null)
-                try sql_scan.scanRowNamed(Entity, self.allocator, row)
+                try scanEntityNamed(Entity, self.allocator, row)
             else
-                try sql_scan.scanRow(Entity, self.allocator, row);
+                try scanEntity(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
 
             const duration_us: u64 = nowUs() - start;
@@ -673,9 +703,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 return error.NotFound;
             };
             var entity = if (self.select_cols != null)
-                try sql_scan.scanRowNamed(Entity, self.allocator, row)
+                try scanEntityNamed(Entity, self.allocator, row)
             else
-                try sql_scan.scanRow(Entity, self.allocator, row);
+                try scanEntity(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
             if (rows.next()) |_| return error.NotSingular;
             if (rows.nextError()) |e| return e;

@@ -9,11 +9,19 @@ const Row = @import("driver.zig").Row;
 /// matching the SELECT projection — no name-based lookup is performed.
 /// This eliminates O(n*m) string comparisons per row.
 ///
-/// NOTE: scanRow does not have access to the entity, so JSON struct fields
-/// parsed here are allocated directly into `allocator` and are NOT freed by
-/// deinitEntity. The caller must free them manually, or use the codegen Create
-/// path which stores parsed JSON in the entity's json_arena.
+/// NOTE: bare scanRow has no access to the entity, so JSON struct fields
+/// parsed here are allocated into `allocator` and are NOT freed by
+/// deinitEntity. Entity scans must use `scanRowWithArena` (or the named/
+/// offset variants), which routes JSON parsing into a per-entity arena that
+/// deinitEntity frees — see src/codegen/query.zig.
 pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
+    return scanRowWithArena(T, allocator, row, null);
+}
+
+/// Like `scanRow`, but JSON struct fields are parsed into `json_arena` so a
+/// single arena deinit releases them. Used by entity scans; the entity's
+/// json_arena field is set to `json_arena` so deinitEntity can free it.
+pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
         .int => |int| {
@@ -44,7 +52,7 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
         },
         .optional => |opt| {
             if (row.isNull(0)) return null;
-            return try scanRow(opt.child, allocator, row);
+            return try scanRowWithArena(opt.child, allocator, row, json_arena);
         },
         .@"struct" => |s| {
             var value: T = undefined;
@@ -53,9 +61,9 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
                 if (comptime std.mem.eql(u8, field_name, "edges")) {
                     @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
                 } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
-                    @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), null);
+                    @field(value, field_name) = json_arena;
                 } else {
-                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx);
+                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx, json_arena);
                     col_idx += 1;
                 }
             }
@@ -70,6 +78,11 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
 /// columns; unselected fields keep their zero value and must not be freed
 /// (treat projected entities as read-only).
 pub fn scanRowNamed(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
+    return scanRowNamedWithArena(T, allocator, row, null);
+}
+
+/// Like `scanRowNamed`, but JSON struct fields are parsed into `json_arena`.
+pub fn scanRowNamedWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanRowNamed supports structs only");
     var value: T = std.mem.zeroes(T);
@@ -77,10 +90,10 @@ pub fn scanRowNamed(comptime T: type, allocator: std.mem.Allocator, row: Row) !T
         if (comptime std.mem.eql(u8, field_name, "edges")) {
             @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
         } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
-            @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), null);
+            @field(value, field_name) = json_arena;
         } else {
             if (findColumnIndex(row, field_name)) |idx| {
-                @field(value, field_name) = try scanColumn(field_type, allocator, row, idx);
+                @field(value, field_name) = try scanColumn(field_type, allocator, row, idx, json_arena);
             }
         }
     }
@@ -92,7 +105,12 @@ pub fn scanRowNamed(comptime T: type, allocator: std.mem.Allocator, row: Row) !T
 /// column `offset + i`. Used when the entity is part of a larger
 /// multi-table projection.
 pub fn scanRowOffset(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize) !T {
-    return scanRowInner(T, allocator, row, offset);
+    return scanRowInner(T, allocator, row, offset, null);
+}
+
+/// Like `scanRowOffset`, but JSON struct fields are parsed into `json_arena`.
+pub fn scanRowOffsetWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize, json_arena: ?*std.heap.ArenaAllocator) !T {
+    return scanRowInner(T, allocator, row, offset, json_arena);
 }
 
 /// Scan a database row into a value of type T without using an allocator.
@@ -175,10 +193,10 @@ fn scanRowInnerNoAlloc(comptime T: type, row: Row, comptime offset: usize) !T {
     return value;
 }
 
-fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize) !T {
+fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
-        .int, .float, .bool, .pointer, .optional => return scanRow(T, allocator, row),
+        .int, .float, .bool, .pointer, .optional => return scanRowWithArena(T, allocator, row, json_arena),
         .@"struct" => |s| {
             var value: T = undefined;
             var col_idx: usize = offset;
@@ -186,9 +204,9 @@ fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, compti
                 if (comptime std.mem.eql(u8, field_name, "edges")) {
                     @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
                 } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
-                    @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), null);
+                    @field(value, field_name) = json_arena;
                 } else {
-                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx);
+                    @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx, json_arena);
                     col_idx += 1;
                 }
             }
@@ -208,7 +226,7 @@ pub fn findColumnIndex(row: Row, name: []const u8) ?usize {
     return null;
 }
 
-fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: usize) !T {
+fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: usize, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
         .int => |int| {
@@ -239,14 +257,16 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
         },
         .optional => |opt| {
             if (row.isNull(index)) return null;
-            return try scanColumn(opt.child, allocator, row, index);
+            return try scanColumn(opt.child, allocator, row, index, json_arena);
         },
         .@"struct" => {
             const text = row.getText(index) orelse return error.TypeMismatch;
-            // NOTE: scanRow does not have access to the entity, so JSON structs
-            // parsed here are allocated directly into `allocator`. Ownership is
-            // leaked to the caller unless they free the data manually.
-            return std.json.parseFromSliceLeaky(T, allocator, text, .{}) catch return error.TypeMismatch;
+            // Entity scans pass a per-entity arena so deinitEntity frees the
+            // parsed JSON in one shot; bare scans (json_arena == null) fall
+            // back to the caller's allocator, so those strings stay
+            // caller-owned (unfreed by deinitEntity).
+            const a = if (json_arena) |arena| arena.allocator() else allocator;
+            return std.json.parseFromSliceLeaky(T, a, text, .{}) catch return error.TypeMismatch;
         },
         else => @compileError("Unsupported column type for scanning: " ++ @typeName(T)),
     }

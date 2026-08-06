@@ -246,7 +246,10 @@ pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, s
         if (ptr_info.attrs.@"const") @compileError("deinitEntity requires a mutable entity pointer");
     }
 
-    if (comptime hasJsonStructField(info)) {
+    // Release the per-entity JSON arena: both the Create path and the scan
+    // path (scanRowWithArena) attach one when the entity carries JSON
+    // fields. Entities without JSON fields have no json_arena member.
+    if (comptime @hasField(@TypeOf(self.*), "json_arena")) {
         if (self.json_arena) |arena| {
             arena.deinit();
             allocator.destroy(arena);

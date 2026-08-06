@@ -80,6 +80,7 @@ pub fn fromSchema(comptime S: type) TypeInfo {
 /// to produce dialect-correct `sql_type` values on FieldInfo entries.
 pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
     comptime {
+        @setEvalBranchQuota(100000);
         const schema_fields = S.fields;
         const schema_edges = S.edges;
         const schema_indexes = S.indexes;
@@ -141,6 +142,7 @@ fn toFieldInfo(comptime f: field_mod.Field) FieldInfo {
 
 fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect) FieldInfo {
     comptime {
+        @setEvalBranchQuota(100000);
         const is_id = std.mem.eql(u8, f.name, "id");
         return FieldInfo{
             .name = f.name,
@@ -163,6 +165,7 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect) Fi
 
 fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
     comptime {
+        @setEvalBranchQuota(100000);
         var relation: edge_mod.Relation = .m2m;
         var inverse_name: ?[]const u8 = null;
 
@@ -235,6 +238,7 @@ fn findInverse(comptime edges: []const edge_mod.Edge, edge_name: []const u8) ?ed
 
 fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8) IndexInfo {
     comptime {
+        @setEvalBranchQuota(100000);
         const name = i.name orelse generateIndexName(type_name, i.columns);
         return IndexInfo{
             .name = name,
@@ -246,6 +250,7 @@ fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8) Inde
 
 fn generateIndexName(comptime type_name: []const u8, comptime columns: []const []const u8) []const u8 {
     comptime {
+        @setEvalBranchQuota(100000);
         var result: []const u8 = type_name;
         for (columns) |col| {
             result = result ++ "_" ++ col;
@@ -256,6 +261,7 @@ fn generateIndexName(comptime type_name: []const u8, comptime columns: []const [
 
 fn toSnakeCase(name: []const u8) []const u8 {
     comptime {
+        @setEvalBranchQuota(100000);
         var result: []const u8 = "";
         for (name, 0..) |c, i| {
             if (std.ascii.isUpper(c) and i > 0) {
@@ -288,6 +294,7 @@ fn makeEdgeForResolve(kind: edge_mod.EdgeKind, unique: bool) edge_mod.Edge {
 /// don't have edges defined, causing inverse edge lookup to fail in fromSchema.
 pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
     comptime {
+        @setEvalBranchQuota(100000);
         var result: []const TypeInfo = &.{};
         for (infos) |info| {
             var resolved_edges: []const EdgeInfo = &.{};
@@ -356,6 +363,7 @@ pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
 /// setFieldValue works for edge columns like "owner_id".
 fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TypeInfo {
     comptime {
+        @setEvalBranchQuota(100000);
         var fields: []const FieldInfo = info.fields;
 
         // Own From edges generate FK columns in this table.
@@ -449,6 +457,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) 
 
 fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
     comptime {
+        @setEvalBranchQuota(100000);
         var result: []const TypeInfo = &.{};
         for (infos) |info| {
             result = result ++ &[_]TypeInfo{addEdgeFields(info, infos)};
@@ -533,6 +542,7 @@ pub const Graph = struct {
 
 pub fn buildGraph(comptime schemas: []const type) Graph {
     comptime {
+        @setEvalBranchQuota(100000);
         var types: []const TypeInfo = &.{};
         for (schemas) |S| {
             types = types ++ &[_]TypeInfo{fromSchema(S)};

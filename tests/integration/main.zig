@@ -12,6 +12,7 @@ pub fn main() !void {
     // postgres/mysql are only imported when their C bindings were discovered.
     _ = @import("sqlite.zig");
     _ = @import("pool.zig");
+    _ = @import("pressure.zig");
     if (comptime build_options.have_pg) _ = @import("postgres.zig");
     if (comptime build_options.have_mysql) _ = @import("mysql.zig");
 }
@@ -19,6 +20,7 @@ pub fn main() !void {
 test {
     _ = @import("sqlite.zig");
     _ = @import("pool.zig");
+    _ = @import("pressure.zig");
     if (comptime build_options.have_pg) _ = @import("postgres.zig");
     if (comptime build_options.have_mysql) _ = @import("mysql.zig");
 }

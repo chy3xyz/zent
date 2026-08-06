@@ -393,6 +393,50 @@ test "SQLite: JSON struct field arena is freed by deinitEntity" {
     zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
 }
 
+test "SQLite: scan-path JSON is arena-owned and freed by deinitEntity" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Settings = struct {
+        theme: []const u8,
+        notes: []const u8,
+        notifications: bool,
+    };
+    const JsonUser = schema("JsonUserScan", .{
+        .fields = &.{ field.String("name"), field.JSON("settings", Settings) },
+    });
+    const graph = comptime buildGraph(&.{JsonUser});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Create path (arena) is a prerequisite for the scan path below.
+    var b = try client.json_user_scan.Create();
+    defer b.deinit();
+    // Escaped string forces std.json to allocate (zero-copy only for
+    // unescaped short strings), exercising the arena ownership contract.
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("settings", Settings{ .theme = "dark", .notes = "line1\nline2", .notifications = true });
+    var saved = try b.Save();
+    zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+
+    // Scan path: JSON must land in the entity's json_arena so a single
+    // deinitEntity frees it (leak check catches regressions).
+    var q = client.json_user_scan.Query();
+    defer q.deinit();
+    var users = try q.All();
+    defer {
+        for (users.items) |*u| zent.codegen.deinitEntity(infos, infos[0], u, allocator);
+        users.deinit();
+    }
+    try testing.expect(users.items.len == 1);
+    try testing.expect(users.items[0].json_arena != null);
+    try testing.expectEqualStrings("dark", users.items[0].settings.theme);
+    try testing.expectEqualStrings("line1\nline2", users.items[0].settings.notes);
+    try testing.expectEqual(true, users.items[0].settings.notifications);
+}
+
 test "SQLite: migrateSchema is idempotent with zent_schema_migrations" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");
