@@ -23,6 +23,10 @@ const HookError = zent.runtime.hook.HookError;
 const Op = zent.runtime.hook.Op;
 
 fn connect(allocator: std.mem.Allocator) !MySQLDriver {
+    // Symmetric with SKIP_PG in postgres.zig: setting SKIP_MYSQL skips every
+    // MySQL integration test without needing a server. connect() is the
+    // shared entry point, so one check covers all tests.
+    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_MYSQL") != null) return error.SkipZigTest;
     const host = std.process.Environ.getPosix(std.testing.environ, "MYSQL_HOST") orelse "localhost";
     const port_s = std.process.Environ.getPosix(std.testing.environ, "MYSQL_PORT") orelse "3306";
     const user = std.process.Environ.getPosix(std.testing.environ, "MYSQL_USER") orelse "root";

@@ -283,7 +283,12 @@ fn deinitEntityEdges(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     const item_fp: *item_field_type = &@field(item, tf.name);
                     FreeField(item_field_type, item_fp, allocator);
                 }
-                deinitEntityEdges(infos, target_info, item, allocator);
+                // Terminal targets (PlainFields) carry no edges container;
+                // the comptime guard stops that instantiation from being
+                // analyzed.
+                if (comptime @hasField(ItemType, "edges")) {
+                    deinitEntityEdges(infos, target_info, item, allocator);
+                }
             }
             allocator.free(arr);
         }

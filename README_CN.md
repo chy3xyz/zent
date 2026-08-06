@@ -110,19 +110,25 @@ pub fn main() !void {
     var client = zent.codegen.client.makeClient(graph.types, allocator, drv.asDriver());
 
     // 创建用户
-    var create_builder = client.user.Create();
+    var create_builder = try client.user.Create();
     defer create_builder.deinit();
-    _ = create_builder.setFieldValue("name", "Alice")
-        .setFieldValue("age", 30)
-        .setFieldValue("status", "active");
-    const alice = try create_builder.Save();
+    _ = try create_builder.setFieldValue("name", "Alice");
+    _ = try create_builder.setFieldValue("age", 30);
+    _ = try create_builder.setFieldValue("status", "active");
+    _ = try create_builder.setFieldValue("settings", UserSettings{ .theme = "dark", .notifications = true });
+    _ = try create_builder.Save();
 
     // 查询用户
     var qbuilder = client.user.Query();
     defer qbuilder.deinit();
-    _ = qbuilder.Where(.{client.user.predicates.ageEQ(.{ .int = 30 })});
+    _ = try qbuilder.Where(.{client.user.predicates.ageEQ(.{ .int = 30 })});
     var users = try qbuilder.All();
-    defer users.deinit();
+    defer {
+        // 每个实体拥有自己的字符串字段，需逐行释放后再释放切片。
+        // graph.types[0] 是 UserWithEdges 的 TypeInfo。
+        for (users.items) |*u| zent.codegen.deinitEntity(graph.types, graph.types[0], u, allocator);
+        users.deinit();
+    }
 }
 ```
 

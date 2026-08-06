@@ -24,7 +24,9 @@ for f in README.md README_CN.md; do
 done
 
 # Drift guard: latest tag (e.g. v0.18.0) must not be newer than the package.
-LATEST_TAG="$(git tag | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+# `git tag --sort=-v:refname` uses git's built-in version sort, so this works
+# on macOS (BSD sort has no -V) as well as Linux.
+LATEST_TAG="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 || true)"
 if [[ -n "$LATEST_TAG" ]]; then
   TAG_VER="${LATEST_TAG#v}"
   older() { # $1 < $2 as semver

@@ -65,6 +65,13 @@ pub fn build(b: *std.Build) void {
     if (pg_c_mod) |m| zent_mod.addImport("pg_c", m);
     if (my_c_mod) |m| zent_mod.addImport("mysql_c", m);
 
+    // Build options: tell the test roots which DB C bindings are available,
+    // so `zig build test` still compiles on machines without libpq/libmariadb.
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "have_pg", pg_c_mod != null);
+    build_options.addOption(bool, "have_mysql", my_c_mod != null);
+    const build_options_mod = build_options.createModule();
+
     // -------------------------------------------------------------
     // Library unit tests
     // -------------------------------------------------------------
@@ -77,6 +84,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("sqlite3_c", sqlite_c_mod);
     if (pg_c_mod) |m| test_mod.addImport("pg_c", m);
     if (my_c_mod) |m| test_mod.addImport("mysql_c", m);
+    test_mod.addImport("build_options", build_options_mod);
     linkSqlite(test_mod);
     if (pg_include_dir) |inc| linkPg(test_mod, inc, pg_lib_dir.?);
     if (my_include_dir) |inc| linkMySQL(test_mod, inc, my_lib_dir.?);
@@ -221,6 +229,7 @@ pub fn build(b: *std.Build) void {
     integ_mod.addImport("sqlite3_c", sqlite_c_mod);
     if (pg_c_mod) |m| integ_mod.addImport("pg_c", m);
     if (my_c_mod) |m| integ_mod.addImport("mysql_c", m);
+    integ_mod.addImport("build_options", build_options_mod);
     linkSqlite(integ_mod);
     if (pg_include_dir) |inc| linkPg(integ_mod, inc, pg_lib_dir.?);
     if (my_include_dir) |inc| linkMySQL(integ_mod, inc, my_lib_dir.?);

@@ -58,16 +58,31 @@ pub const entql = @import("entql/parser.zig");
 
 // Force analysis of sub-file test blocks so `zig build test` reflects real state.
 test {
-    std.testing.refAllDecls(@This());
-    // Recurse into nested namespaces so sub-module test blocks are analysed.
+    // sql_postgres / sql_mysql are excluded from automatic collection: their
+    // C bindings (pg_c / mysql_c) are only wired when libpq / libmariadb
+    // headers are discovered, so force-analyzing them would break
+    // `zig build test` on machines without those headers. They are
+    // re-collected below when available (and covered by tests/integration).
+    const db_drivers = comptime [_][]const u8{ "sql_postgres", "sql_mysql" };
     const info = @typeInfo(@This()).@"struct";
     inline for (info.decl_names) |name| {
         if (comptime std.mem.eql(u8, name, "std")) continue;
+        const skipped = comptime blk: {
+            for (db_drivers) |d| {
+                if (std.mem.eql(u8, d, name)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (comptime skipped) continue;
         const nested = @field(@This(), name);
         if (@typeInfo(@TypeOf(nested)) == .@"struct") {
             std.testing.refAllDecls(nested);
         }
     }
+    // DB-specific driver tests only when the C bindings are available.
+    const build_options = @import("build_options");
+    if (comptime build_options.have_pg) _ = @import("sql/postgres.zig");
+    if (comptime build_options.have_mysql) _ = @import("sql/mysql.zig");
     // Regression tests for generated query helpers live in a dedicated file
     // because the modules above expose generated types rather than namespaces.
     _ = @import("codegen/query_aggregate_test.zig");

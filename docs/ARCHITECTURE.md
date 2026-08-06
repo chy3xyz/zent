@@ -40,25 +40,24 @@ cross-cutting:
 
 ## Compile-time flow
 
-1. User defines a schema: `schema("User", .{ .fields = …, .edges = … })`
+1. User defines a schema: `Schema("User", .{ .fields = …, .edges = … })`
    (`src/core/`). Field/edge/index/mixin descriptors carry Zig types,
    validators, SQL types and enum values.
 2. `fromSchema` (`src/codegen/graph.zig`) lowers the schema into a comptime
    `TypeInfo`/`EdgeInfo` IR.
-3. `EntityGen`/`CreateGen`/`QueryGen`/`UpdateDeleteGen`/`PredGen` instantiate
+3. `codegen/client.zig` (`Client(infos)`, `EntityClient`) instantiates
    fluent, fully-typed builders bound to that IR (`makeClient`).
 4. SQL is emitted per-dialect at runtime through `sql_driver.Driver`
    (placeholder `?` vs `$n`, quoting, `RETURNING` vs `last_insert_id`).
 
 ## Memory ownership contract
 
-- **Rows** — `q.All()` returns `[]Entity`; each item's strings are owned by
-  the caller: `deinitEntity(infos, info, &entity, alloc)` per item, then
-  `allocator.free(slice)`. `freeScanned` is the sqlx-style equivalent.
-- **QueryResult(T)** — from `queryRows`: arena-backed; strings borrow one
-  arena. `deinit(allocator)` frees it **once** — never pair it with per-item
-  `freeScanned` (double free). `QueryResult.take()` transfers `items + arena`
-  out (e.g. into a `PagedResult` / `ResultSet`).
+- **Rows** — `q.All()` returns `std.array_list.Managed(Entity)`; each
+  item's strings are owned by the caller: `deinitEntity(infos, info,
+  &entity, alloc)` per item, then `users.deinit()`.
+- **QueryResult / OwnedQuery** — `sql.QueryResult` (`{ sql, args }`)
+  borrows from the builder; `OwnedQuery` (from `Builder.takeQuery()`)
+  transfers ownership and MUST be `deinit`'d.
 - **OwnedQuery** — `Builder.takeQuery()` results MUST be `deinit`'d.
 - **Tx** — `driver.Tx` MUST be `deinit`'d exactly once regardless of
   `commit`/`rollback`.
@@ -78,7 +77,9 @@ consumer links its own sqlite/libpq/mariadb (see README "Consumer wiring").
 ## Extension points
 
 - **New field types**: extend `src/core/field.zig` descriptors + the scan
-  `valueToType` mapping in `src/codegen/create.zig`/`src/sql/scan.zig`.
+  mapping in `src/codegen/create.zig` (`valueToType`) and the row scanners
+  in `src/sql/scan.zig` (`scanRow` / `scanRowNamed` / `scanRowOffset` /
+  `scanRowNoAlloc`).
 - **New predicates**: add to `src/codegen/predicate.zig` + the generated
   `makePredicates`; keep the SQL renderer in `src/sql/builder.zig`.
 - **New dialect**: implement the driver vtable + dialect quirks

@@ -140,12 +140,17 @@ fn loadEdgePath(
                 }
             }
 
-            // Recurse one level into the loaded targets.
-            if (split.rest.len > 0) {
-                for (entities) |*e| {
-                    const arr = @field(e.edges, edge.name);
-                    if (arr) |items| {
-                        try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest);
+            // Recurse one level into the loaded targets. The terminal
+            // eager-load target (PlainFields) carries no edges container;
+            // the comptime guard stops its instantiation from being
+            // analyzed (a third nesting level stays a compile error).
+            if (comptime @hasField(TargetEntity, "edges")) {
+                if (split.rest.len > 0) {
+                    for (entities) |*e| {
+                        const arr = @field(e.edges, edge.name);
+                        if (arr) |items| {
+                            try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest);
+                        }
                     }
                 }
             }
@@ -473,6 +478,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub const QueryIterator = struct {
             rows: sql_driver.Rows,
             allocator: std.mem.Allocator,
+            select_cols: ?[]const []const u8 = null,
             current: ?Entity = null,
 
             const IterSelf = @This();
@@ -609,6 +615,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return QueryIterator{
                 .rows = rows,
                 .allocator = self.allocator,
+                .select_cols = self.select_cols,
             };
         }
 

@@ -111,12 +111,13 @@ pub fn main() !void {
     var client = zent.codegen.client.makeClient(graph.types, allocator, drv.asDriver());
 
     // Create user
-    var create_builder = client.user.Create();
+    var create_builder = try client.user.Create();
     defer create_builder.deinit();
     _ = try create_builder.setFieldValue("name", "Alice");
     _ = try create_builder.setFieldValue("age", 30);
     _ = try create_builder.setFieldValue("status", "active");
-    const alice = try create_builder.Save();
+    _ = try create_builder.setFieldValue("settings", UserSettings{ .theme = "dark", .notifications = true });
+    _ = try create_builder.Save();
 
     // Query users
     var qbuilder = client.user.Query();
@@ -124,7 +125,9 @@ pub fn main() !void {
     _ = try qbuilder.Where(.{client.user.predicates.ageEQ(.{ .int = 30 })});
     var users = try qbuilder.All();
     defer {
-        for (users.items) |*u| deinitEntity(infos, user_info, u, allocator);
+        // Each entity owns its string fields; release them per row, then
+        // the slice. `graph.types[0]` is the UserWithEdges TypeInfo.
+        for (users.items) |*u| zent.codegen.deinitEntity(graph.types, graph.types[0], u, allocator);
         users.deinit();
     }
 }

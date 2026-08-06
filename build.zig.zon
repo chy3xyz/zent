@@ -10,5 +10,7 @@
         "src",
         "LICENSE",
         "README.md",
+        "README_CN.md",
+        "CHANGELOG.md",
     },
 }

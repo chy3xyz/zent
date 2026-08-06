@@ -1382,7 +1382,13 @@ fn parseMigrationFilename(name: []const u8, direction: []const u8) !?i64 {
 fn fileChecksum(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(data);
-    const crc = std.hash.crc.@"CRC-32/ISO-HDLC".hash(data);
+    // zig std renamed the CRC-32 catalog entry between 0.17 dev builds:
+    // `Crc32` (dev.813 / CI) vs `@"CRC-32/ISO-HDLC"` (newer dev). Probe at
+    // comptime so both std versions compile.
+    const crc = if (@hasDecl(std.hash.crc, "Crc32"))
+        std.hash.crc.Crc32.hash(data)
+    else
+        std.hash.crc.@"CRC-32/ISO-HDLC".hash(data);
     return try std.fmt.allocPrint(allocator, "{x:0>8}", .{crc});
 }
 
