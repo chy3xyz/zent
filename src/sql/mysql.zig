@@ -282,8 +282,12 @@ pub const MySQLDriver = struct {
             defer self.allocator.free(sql_z);
 
             if (c.mysql_real_query(self.conn, sql_z.ptr, @intCast(sql_z.len)) != 0) {
-                logMySQLError(self.conn, "exec");
-                const err = errnoToError(c.mysql_errno(self.conn));
+                const errno = c.mysql_errno(self.conn);
+                // 1193 = "Unknown system variable": this is the expected
+                // probe failure when applyServerTimeout tries
+                // max_execution_time against MariaDB — not a real error.
+                if (errno != 1193) logMySQLError(self.conn, "exec");
+                const err = errnoToError(errno);
                 // Timeouts and constraint violations are distinct outcomes
                 // (callers rely on e.g. UniqueViolation for upsert fallbacks);
                 // everything else collapses to the generic exec failure.
