@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.3] - 2026-08-07
+
 ### Fixed
 - `QueryBuilder.WhereIn` now compiles on Zig 0.17: it appended to
   `std.array_list.Managed` with an explicit allocator argument, but 0.17's
