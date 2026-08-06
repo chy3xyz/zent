@@ -201,7 +201,10 @@ forces C linkage on consumers:
 ```zig
 // build.zig.zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.28.0.tar.gz",
+    // Prefer the git dependency: GitHub tarball archives are not stable
+    // across fetches on zig 0.17-dev (hash churn), while a pinned commit
+    // ref always resolves to the same content.
+    .url = "git+https://github.com/chy3xyz/zent.git#v0.28.0",
     .hash = "…", // run `zig fetch --save <url>` to fill this in
 },
 
@@ -214,7 +217,7 @@ mod.linkSystemLibrary("sqlite3", .{}); // or libpq / mariadb-connector-c
 After every zent release the pinned hash must be refreshed:
 
 ```bash
-zig fetch --save https://github.com/chy3xyz/zent/archive/refs/tags/vX.Y.Z.tar.gz
+zig fetch --save git+https://github.com/chy3xyz/zent.git#vX.Y.Z
 ```
 
 ## Contributing

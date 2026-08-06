@@ -212,7 +212,7 @@ mod.linkSystemLibrary("sqlite3", .{}); // 或 libpq / mariadb-connector-c
 每次 zent 发版后需要刷新锁定 hash：
 
 ```bash
-zig fetch --save https://github.com/chy3xyz/zent/archive/refs/tags/vX.Y.Z.tar.gz
+zig fetch --save git+https://github.com/chy3xyz/zent.git#vX.Y.Z
 ```
 
 ## 贡献
