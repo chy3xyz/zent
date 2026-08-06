@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Constraint error taxonomy: `UniqueViolation` / `NotNullViolation` /
+  `ForeignKeyViolation` across all three drivers — duplicate keys and NOT
+  NULL violations no longer surface as `error.NotFound` (SQLite INSERT...
+  RETURNING previously swallowed the step error).
+- `field.JSONValue(name)`: untyped JSON document fields backed by
+  `std.json.Value` (specs, config blobs), with full create/scan/arena
+  ownership support.
+- `QueryBuilder.WhereEntQL` supports `has(edge)` / `not_has(edge)` /
+  `has(edge, expr)` lowered to schema-aware EXISTS subqueries.
+- Privacy `OnCreate` / `OnUpdate` / `OnDelete` / `OnQuery` are now
+  operation-scoped (the codegen layer sets `PrivacyContext.op` per op).
+- `examples/advanced`: composite UNIQUE index, paged listing with total,
+  sensitive-field masking and the transactional outbox (`run-advanced`).
+- `docs/UPGRADING.md`: v0.12 → v0.28+ migration guide.
+- 30-table codegen stress test; benchmark assertions; cross-driver
+  (Postgres/MySQL) JSONValue + WhereEntQL integration tests.
+
+### Changed
+- `field.Time` maps to **BIGINT epoch seconds on every dialect** (was
+  TIMESTAMPTZ on Postgres) so the column type agrees with the bigint audit
+  default — this fixes CREATE TABLE failing on Postgres for TimeMixin
+  schemas, and is a breaking change for existing PG tables.
+- addEdgeFields uses a precomputed incoming-edge table (comptime cost drops
+  from O(n²·e·(e+f)) to O(n²·e + T·(e+f))).
+- `SKIP_PG` centralized in `connect()` (mirrors `SKIP_MYSQL`).
+- `shard.route()` uses `@bitCast` for negative tenant ids (no panic/UB);
+  the global hook registry is an atomic pointer.
+
+### Fixed
+- Silent error drops logged: 14 after-hook sites, audit-column OOM,
+  Tx/Savepoint rollback, mysql_options failures (SSL enforcement now
+  hard-fails instead of silently downgrading).
+- JSON ownership unified across create/scan/eager-load paths (per-entity
+  arena); `toMaskedJson` skips the injected json_arena defensively.
+- `withTimeout` on Postgres actually interrupts queries (defer was scoped to
+  an if block); PG auto-increment ids emit SERIAL/BIGSERIAL.
+- MySQL preferred SSL falls back to plaintext; statement timeouts apply to
+  SELECTs.
+- README/README_CN/RELEASING dependency examples use `git+https` refs
+  (tarball hashes are unstable on 0.17-dev).
+- Examples build on current dev zig (`.edges` recursion, `hash.crc`,
+  `QueryIterator.select_cols`).
+
 ## [0.28.0] - 2026-08-06
 
 ### Added
