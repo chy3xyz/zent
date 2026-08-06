@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Migration version hashing (`computeMigrationVersion`) now runs at runtime
+  instead of comptime. The migrate loop is `inline for (infos)`, so the old
+  comptime version instantiated a hash loop for every table × operation and
+  could blow the eval branch quota as schema table counts grew; the version
+  numbers themselves are unchanged (FNV-1a is deterministic), so applied
+  migration records remain valid.
+
 ## [0.29.1] - 2026-08-06
 
 ### Fixed
