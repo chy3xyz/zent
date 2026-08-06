@@ -133,7 +133,7 @@ jobs:
         with:
           version: 0.17.0-dev.1567+f0354179a
 
-      - name: Build zmodu CLI from zigmodu (pinned v0.15.5)
+      - name: Build zmodu CLI from zigmodu (pinned v0.15.10)
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
