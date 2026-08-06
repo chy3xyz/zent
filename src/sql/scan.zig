@@ -182,8 +182,8 @@ fn scanColumnNoAlloc(comptime T: type, row: Row, index: usize) !T {
             @compileError("Unsupported float type for scanning: " ++ @typeName(T));
         },
         .bool => {
-            const v = row.getInt(index) orelse return error.TypeMismatch;
-            return v != 0;
+            const v = row.getBool(index) orelse return error.TypeMismatch;
+            return v;
         },
         .optional => |opt| {
             if (row.isNull(index)) return null;
@@ -262,8 +262,8 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
             @compileError("Unsupported float type for scanning: " ++ @typeName(T));
         },
         .bool => {
-            const v = row.getInt(index) orelse return error.TypeMismatch;
-            return v != 0;
+            const v = row.getBool(index) orelse return error.TypeMismatch;
+            return v;
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {

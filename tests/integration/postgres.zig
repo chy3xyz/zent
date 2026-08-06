@@ -818,3 +818,65 @@ test "Postgres: slow query times out" {
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
 }
+
+test "Postgres: boolean column scans via getBool (t/f wire format)" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const FlagBase = schema("PqFlag", .{
+        .fields = &.{ field.String("name"), field.Bool("active") },
+    });
+    const Flag = struct {
+        pub const schema_name = FlagBase.schema_name;
+        pub const fields = FlagBase.fields;
+        pub const edges = FlagBase.edges;
+        pub const indexes = FlagBase.indexes;
+        pub const policy = FlagBase.policy;
+        pub const is_view = FlagBase.is_view;
+        pub const view_sql = FlagBase.view_sql;
+        pub const soft_delete = FlagBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{Flag});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pq_flag", &.{}) catch {};
+
+    var c = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Rows with both boolean values; Postgres stores them as "t"/"f".
+    var b1 = try c.pq_flag.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("name", "on");
+    _ = try b1.setFieldValue("active", true);
+    var e1 = try b1.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &e1, allocator);
+
+    var b2 = try c.pq_flag.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("name", "off");
+    _ = try b2.setFieldValue("active", false);
+    var e2 = try b2.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &e2, allocator);
+
+    var q = c.pq_flag.Query();
+    defer q.deinit();
+    var rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 2), rows.items.len);
+    var seen_on = false;
+    var seen_off = false;
+    for (rows.items) |e| {
+        if (std.mem.eql(u8, e.name, "on")) {
+            try testing.expect(e.active);
+            seen_on = true;
+        } else {
+            try testing.expect(!e.active);
+            seen_off = true;
+        }
+    }
+    try testing.expect(seen_on and seen_off);
+}
