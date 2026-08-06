@@ -368,6 +368,12 @@ pub fn toMaskedJson(
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '{');
     inline for (info.fields, 0..) |f, i| {
+        // json_arena is an injected bookkeeping field (entity struct only),
+        // never business data — skip it defensively in case TypeInfo ever
+        // carries injected fields (serializing it would walk into
+        // std.mem.Allocator's fn-pointer vtable, rejected as comptime-only
+        // by newer zig dev). Must be skipped before the comma logic.
+        if (comptime std.mem.eql(u8, f.name, "json_arena")) continue;
         if (i > 0) try buf.appendSlice(allocator, ",");
         try buf.appendSlice(allocator, "\"");
         try buf.appendSlice(allocator, f.name);
@@ -411,6 +417,30 @@ test "toMaskedJson masks sensitive fields" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"api_key\":\"***\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"alice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "sk-secret-123") == null);
+}
+
+test "toMaskedJson on JSON-field entity never emits json_arena" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Settings = struct { theme: []const u8 };
+    const User = Schema("MaskedJsonUser", .{
+        .fields = &.{ field.String("name"), field.JSON("settings", Settings) },
+    });
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+    const UserEntity = Entity(infos, infos[0]);
+
+    var u = UserEntity{ .id = 1, .name = "alice", .settings = .{ .theme = "dark" }, .json_arena = null };
+    const json = try toMaskedJson(allocator, infos, infos[0], &u);
+    defer allocator.free(json);
+    // The injected arena field must never appear in masked output, and the
+    // JSON business field must serialize normally.
+    try std.testing.expect(std.mem.indexOf(u8, json, "json_arena") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"settings\":{\"theme\":\"dark\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"alice\"") != null);
 }
 
 test "Entity struct generation" {
