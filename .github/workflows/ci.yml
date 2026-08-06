@@ -137,7 +137,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
-          git clone --depth 1 --branch v0.15.5 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
+          git clone --depth 1 --branch v0.15.10 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
           cd /tmp/zigmodu && zig build -Ddb=sqlite
 
       - name: Check dead-code baseline

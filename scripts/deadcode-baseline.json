@@ -51,14 +51,14 @@
     },
     {
       "file": "src/codegen/entity.zig",
-      "line": 76,
+      "line": 150,
       "kind": "function",
       "name": "EntityFields",
       "parent": null
     },
     {
       "file": "src/codegen/graph.zig",
-      "line": 133,
+      "line": 139,
       "kind": "function",
       "name": "toFieldInfo",
       "parent": null
@@ -79,21 +79,21 @@
     },
     {
       "file": "src/codegen/query.zig",
-      "line": 12,
+      "line": 42,
       "kind": "constant",
       "name": "LogContext",
       "parent": null
     },
     {
       "file": "src/codegen/query.zig",
-      "line": 15,
+      "line": 45,
       "kind": "constant",
       "name": "EntityGen",
       "parent": null
     },
     {
       "file": "src/codegen/query.zig",
-      "line": 17,
+      "line": 46,
       "kind": "constant",
       "name": "graph_step",
       "parent": null
@@ -121,35 +121,35 @@
     },
     {
       "file": "src/entql/parser.zig",
-      "line": 76,
+      "line": 80,
       "kind": "function",
       "name": "advance",
       "parent": "Lexer"
     },
     {
       "file": "src/entql/parser.zig",
-      "line": 208,
+      "line": 212,
       "kind": "error",
       "name": "UnexpectedToken",
       "parent": "ParseError"
     },
     {
       "file": "src/entql/parser.zig",
-      "line": 220,
+      "line": 223,
       "kind": "error",
       "name": "InvalidCharacter",
       "parent": "ParseError"
     },
     {
       "file": "src/entql/parser.zig",
-      "line": 221,
+      "line": 224,
       "kind": "error",
       "name": "Overflow",
       "parent": "ParseError"
     },
     {
       "file": "src/graph/neighbors.zig",
-      "line": 270,
+      "line": 320,
       "kind": "function",
       "name": "runSQL",
       "parent": null
