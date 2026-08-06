@@ -609,6 +609,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
+        /// Fetch every matching row. Returns `std.array_list.Managed(Entity)`:
+        /// iterate via `result.items` (a slice) and free each entity with
+        /// `deinitEntity(infos, info, &item, allocator)` before `result.deinit()`.
+        /// Contrast with `paged()`, which returns a `PagedResult` whose rows
+        /// live at `result.items.items` and whose `deinit()` frees the entities.
         pub fn All(self: *Self) QueryError!std.array_list.Managed(Entity) {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
@@ -817,6 +822,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// One-call pagination: total via Count, page slice via All with
         /// limit/offset. Reuses the same predicates/order — no duplicate
         /// count+fetch loops or per-module free helpers.
+        /// Returns a `PagedResult`: rows live at `result.items.items` (the
+        /// inner `std.array_list.Managed(Entity)`), `result.total` is the
+        /// count, and `result.deinit()` frees both entities and the list —
+        /// do NOT call `deinitEntity` per row yourself. Contrast with `All()`,
+        /// which returns the plain `std.array_list.Managed(Entity)`.
         pub fn paged(self: *Self, page: usize, page_size: usize) (QueryError || error{InvalidPageSize})!PagedResult {
             if (page_size == 0) return error.InvalidPageSize;
             const total = try self.Count();
