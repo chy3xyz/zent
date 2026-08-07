@@ -257,7 +257,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
                 // Build the full SQL: q.sql + PG/SQLite UPSERT suffix + RETURNING.
                 // MySQL never reaches this branch because it does not support RETURNING.
-                const ret_suffix = " RETURNING \"id\"";
+                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{info.pk_field});
+                defer self.allocator.free(ret_suffix);
 
                 const full_sql_len = q.sql.len + upsert_suffix.len + ret_suffix.len;
                 const full_sql = try self.allocator.alloc(u8, full_sql_len);
@@ -326,14 +327,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const start = nowUs();
                 const res = try self.driver.execCtx(&self.execution_context, full_sql, q.args);
                 const duration_us: u64 = nowUs() - start;
-                if (comptime @TypeOf(entity.id) == i64) {
-                    entity.id = @intCast(res.last_insert_id orelse 0);
+                if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
+                    @field(entity, info.pk_field) = @intCast(res.last_insert_id orelse 0);
                 } else {
                     // Textual primary key (uuid) on MySQL: no RETURNING — keep
                     // the caller-provided id from the values.
                     for (self.values.items) |fv| {
-                        if (std.mem.eql(u8, fv.name, "id") and fv.value == .string) {
-                            entity.id = try self.allocator.dupe(u8, fv.value.string);
+                        if (std.mem.eql(u8, fv.name, info.pk_field) and fv.value == .string) {
+                            @field(entity, info.pk_field) = try self.allocator.dupe(u8, fv.value.string);
                         }
                     }
                 }
@@ -971,7 +972,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
 
             if (supports_returning) {
                 // SQLite / PostgreSQL: append RETURNING clause and query.
-                const ret_suffix = " RETURNING \"id\"";
+                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{info.pk_field});
+                defer self.allocator.free(ret_suffix);
                 const full_sql = try self.allocator.alloc(u8, query.sql.len + upsert_suffix.len + ret_suffix.len);
                 defer self.allocator.free(full_sql);
                 var pos: usize = 0;

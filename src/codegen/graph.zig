@@ -359,6 +359,7 @@ pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
             result = result ++ &[_]TypeInfo{TypeInfo{
                 .name = info.name,
                 .table_name = info.table_name,
+                .pk_field = info.pk_field,
                 .fields = info.fields,
                 .edges = resolved_edges,
                 .indexes = info.indexes,
@@ -483,6 +484,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdg
         return TypeInfo{
             .name = info.name,
             .table_name = info.table_name,
+            .pk_field = info.pk_field,
             .fields = fields,
             .edges = info.edges,
             .indexes = info.indexes,
