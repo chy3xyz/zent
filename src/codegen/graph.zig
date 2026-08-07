@@ -91,6 +91,10 @@ pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
         const schema_annotations = if (@hasDecl(S, "annotations")) S.annotations else &.{};
         const name = S.schema_name;
 
+        // Physical table name: explicit override wins, else snake_case of the
+        // schema name (compat with schemas built without `Schema()`).
+        const table_name = if (@hasDecl(S, "table_name")) (if (S.table_name) |t| t else toSnakeCase(name)) else toSnakeCase(name);
+
         // Auto-inject ID if not present.
         const has_id = hasFieldNamed(schema_fields, "id");
         const id_field = if (!has_id)
@@ -116,7 +120,7 @@ pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
 
         return TypeInfo{
             .name = name,
-            .table_name = toSnakeCase(name),
+            .table_name = table_name,
             .fields = fields,
             .edges = edges,
             .indexes = indexes,
@@ -636,6 +640,20 @@ test "Graph from schemas" {
     try std.testing.expectEqualStrings("cars", car_edge.name);
     try std.testing.expectEqual(edge_mod.Relation.o2m, car_edge.relation);
     try std.testing.expectEqualStrings("owner", car_edge.inverse_name.?);
+}
+
+test "explicit table_name override wins over snake_case" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+
+    const LegacyTag = schema("Tag", .{
+        .fields = &.{ field.String("name") },
+        .table_name = "zigshop_tag",
+    });
+
+    const info = comptime fromSchema(LegacyTag);
+    try std.testing.expectEqualStrings("Tag", info.name);
+    try std.testing.expectEqualStrings("zigshop_tag", info.table_name);
 }
 
 test "Auto-injected ID" {
