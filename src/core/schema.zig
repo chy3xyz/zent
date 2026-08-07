@@ -72,6 +72,10 @@ pub fn Schema(comptime name: []const u8, comptime config: struct {
     /// Optional physical table name. Defaults to `toSnakeCase(name)`.
     /// Lets schemas map onto pre-existing tables (e.g. `zigshop_tag`).
     table_name: ?[]const u8 = null,
+    /// Optional primary-key field name. Defaults to `"id"`. Set it when the
+    /// pre-existing table's PK is named differently (e.g. `push_id`); the
+    /// schema must declare a field with that name.
+    pk: ?[]const u8 = null,
 }) type {
     const all_fields = mergeMixinFields(config.fields, config.mixins);
     const all_edges = mergeMixinEdges(config.edges, config.mixins);
@@ -81,6 +85,7 @@ pub fn Schema(comptime name: []const u8, comptime config: struct {
     return struct {
         pub const schema_name = name;
         pub const table_name = config.table_name;
+        pub const pk = config.pk;
         pub const fields = all_fields;
         pub const edges = all_edges;
         pub const indexes = all_indexes;
@@ -126,4 +131,3 @@ test "Schema definition" {
     try @import("std").testing.expectEqual(@as(usize, 1), User.edges.len);
     try @import("std").testing.expectEqual(@as(usize, 1), User.indexes.len);
 }
-

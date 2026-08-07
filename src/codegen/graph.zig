@@ -60,6 +60,9 @@ pub const IndexInfo = struct {
 pub const TypeInfo = struct {
     name: []const u8,
     table_name: []const u8,
+    /// Primary-key field name. Defaults to `"id"`; schemas with a custom PK
+    /// (e.g. `push_id`) declare it via `Schema(..., .pk = "push_id")`.
+    pk_field: []const u8 = "id",
     fields: []const FieldInfo,
     edges: []const EdgeInfo,
     indexes: []const IndexInfo,
@@ -95,17 +98,24 @@ pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
         // schema name (compat with schemas built without `Schema()`).
         const table_name = if (@hasDecl(S, "table_name")) (if (S.table_name) |t| t else toSnakeCase(name)) else toSnakeCase(name);
 
-        // Auto-inject ID if not present.
+        // Primary-key field: explicit override wins, else `id`.
+        const pk_field = if (@hasDecl(S, "pk")) (if (S.pk) |p| p else "id") else "id";
         const has_id = hasFieldNamed(schema_fields, "id");
-        const id_field = if (!has_id)
+
+        // Auto-inject ID only when the PK is the default `id` and no `id`
+        // field is declared. Custom-PK schemas must declare the PK field.
+        const has_pk = hasFieldNamed(schema_fields, pk_field);
+        const id_field = if (!has_id and std.mem.eql(u8, pk_field, "id"))
             &[_]field_mod.Field{field_mod.Int("id")}
+        else if (!has_pk)
+            @compileError("schema '" ++ name ++ "' declares pk='" ++ pk_field ++ "' but no such field exists")
         else
             &[_]field_mod.Field{};
         const all_schema_fields = id_field ++ schema_fields;
 
         var fields: []const FieldInfo = &.{};
         for (all_schema_fields) |f| {
-            fields = fields ++ &[_]FieldInfo{toFieldInfoDialect(f, dialect)};
+            fields = fields ++ &[_]FieldInfo{toFieldInfoDialect(f, dialect, pk_field)};
         }
 
         var edges: []const EdgeInfo = &.{};
@@ -121,6 +131,7 @@ pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
         return TypeInfo{
             .name = name,
             .table_name = table_name,
+            .pk_field = pk_field,
             .fields = fields,
             .edges = edges,
             .indexes = indexes,
@@ -141,13 +152,13 @@ fn hasFieldNamed(comptime fields: []const field_mod.Field, name: []const u8) boo
 }
 
 fn toFieldInfo(comptime f: field_mod.Field) FieldInfo {
-    return toFieldInfoDialect(f, Dialect.sqlite);
+    return toFieldInfoDialect(f, Dialect.sqlite, "id");
 }
 
-fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect) FieldInfo {
+fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, comptime pk_field: []const u8) FieldInfo {
     comptime {
         @setEvalBranchQuota(100000);
-        const is_id = std.mem.eql(u8, f.name, "id");
+        const is_id = std.mem.eql(u8, f.name, pk_field);
         return FieldInfo{
             .name = f.name,
             .field_type = f.field_type,
@@ -647,13 +658,36 @@ test "explicit table_name override wins over snake_case" {
     const schema = @import("../core/schema.zig").Schema;
 
     const LegacyTag = schema("Tag", .{
-        .fields = &.{ field.String("name") },
+        .fields = &.{field.String("name")},
         .table_name = "zigshop_tag",
     });
 
     const info = comptime fromSchema(LegacyTag);
     try std.testing.expectEqualStrings("Tag", info.name);
     try std.testing.expectEqualStrings("zigshop_tag", info.table_name);
+    try std.testing.expectEqualStrings("id", info.pk_field);
+}
+
+test "custom pk field is honored and not auto-injected" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+
+    const HomePush = schema("HomePush", .{
+        .fields = &.{
+            field.Int("push_id"),
+            field.String("title"),
+        },
+        .pk = "push_id",
+    });
+
+    const info = comptime fromSchema(HomePush);
+    try std.testing.expectEqualStrings("HomePush", info.name);
+    try std.testing.expectEqualStrings("push_id", info.pk_field);
+    // Exactly the declared fields: no auto-injected `id`.
+    try std.testing.expectEqual(@as(usize, 2), info.fields.len);
+    try std.testing.expectEqualStrings("push_id", info.fields[0].name);
+    try std.testing.expect(info.fields[0].is_id);
+    try std.testing.expect(!info.fields[1].is_id);
 }
 
 test "Auto-injected ID" {

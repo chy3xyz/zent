@@ -99,7 +99,7 @@ fn loadEdgePath(
 
     // Support both integer and textual (uuid) primary keys: the neighbor map
     // and __fk read are selected at compile time.
-    const IdType = @TypeOf(@as(ParentEntity, undefined).id);
+    const IdType = @TypeOf(@field(@as(ParentEntity, undefined), ParentInfo.pk_field));
 
     inline for (ParentInfo.edges) |edge| {
         if (std.mem.eql(u8, edge.name, split.head)) {
@@ -120,7 +120,7 @@ fn loadEdgePath(
             var parent_id_values = try allocator.alloc(sql.Value, entities.len);
             defer allocator.free(parent_id_values);
             for (entities, 0..) |e, i| {
-                parent_id_values[i] = idValue(e.id);
+                parent_id_values[i] = idValue(@field(e, ParentInfo.pk_field));
             }
 
             var b = sql.Builder.init(allocator, driver.dialect());
@@ -174,7 +174,7 @@ fn loadEdgePath(
             if (rows.nextError()) |e| return e;
 
             for (entities) |*e| {
-                if (map.get(e.id)) |list| {
+                if (map.get(@field(e, ParentInfo.pk_field))) |list| {
                     const slice = try allocator.dupe(TargetEntity, list.items);
                     @field(e.edges, edge.name) = slice;
                 }
@@ -438,10 +438,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return self;
         }
 
-        /// Set a cursor to page after a given entity, using its `id` field.
+        /// Set a cursor to page after a given entity, using its primary-key field.
         pub fn CursorAfter(self: *Self, entity: Entity) *Self {
-            self.cursor_col = "id";
-            self.cursor_val = idValue(entity.id);
+            self.cursor_col = info.pk_field;
+            self.cursor_val = idValue(@field(entity, info.pk_field));
             self.cursor_id = null;
             self.cursor_desc = false;
             self.offset_val = null;
@@ -1016,9 +1016,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                         const col_cmp = if (self.cursor_desc) sql.LT(col, val) else sql.GT(col, val);
                         const col_eq = sql.EQ(col, val);
                         const id_cmp = if (self.cursor_desc)
-                            sql.LT("id", .{ .int = id_val })
+                            sql.LT(info.pk_field, .{ .int = id_val })
                         else
-                            sql.GT("id", .{ .int = id_val });
+                            sql.GT(info.pk_field, .{ .int = id_val });
                         _ = try selector.where(sql.Or(&col_cmp, &sql.And(&col_eq, &id_cmp)));
                     } else {
                         // Single-column cursor (backward compatible).
@@ -1048,13 +1048,13 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                         _ = try selector.orderBy(sql.OrderAsc(col));
                     }
                 }
-                // Auto-add id tie-breaker for stable keyset pagination
-                if (!std.mem.eql(u8, col, "id")) {
+                // Auto-add pk tie-breaker for stable keyset pagination
+                if (!std.mem.eql(u8, col, info.pk_field)) {
                     var has_id: bool = false;
                     for (self.order_terms.items) |term| {
                         switch (term) {
                             .column => |o| {
-                                if (std.mem.eql(u8, o.name, "id")) {
+                                if (std.mem.eql(u8, o.name, info.pk_field)) {
                                     has_id = true;
                                     break;
                                 }
@@ -1064,9 +1064,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     }
                     if (!has_id) {
                         if (self.cursor_desc) {
-                            _ = try selector.orderBy(sql.OrderDesc("id"));
+                            _ = try selector.orderBy(sql.OrderDesc(info.pk_field));
                         } else {
-                            _ = try selector.orderBy(sql.OrderAsc("id"));
+                            _ = try selector.orderBy(sql.OrderAsc(info.pk_field));
                         }
                     }
                 }

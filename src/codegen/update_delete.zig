@@ -615,7 +615,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .null);
-            _ = try builder.where(sql.EQ("id", .{ .int = id }));
+            _ = try builder.where(sql.EQ(info.pk_field, .{ .int = id }));
             const q = try builder.query();
             self.ensureDeadline();
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);

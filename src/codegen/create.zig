@@ -237,7 +237,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // ON DUPLICATE KEY UPDATE (the old REPLACE prefix has been removed).
             // For plain Save (or_replace=false) the suffix is empty.
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items);
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, info.pk_field);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             // std.mem.zeroes(Entity) is not allowed when an entity carries a
@@ -280,11 +280,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     if (rows.nextError()) |e| return e;
                     return error.NotFound;
                 };
-                if (comptime @TypeOf(entity.id) == i64) {
-                    entity.id = @intCast(row.getInt(0) orelse return error.TypeMismatch);
+                if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
+                    @field(entity, info.pk_field) = @intCast(row.getInt(0) orelse return error.TypeMismatch);
                 } else {
                     // Textual primary key (uuid): RETURNING gives the value back.
-                    entity.id = try self.allocator.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
+                    @field(entity, info.pk_field) = try self.allocator.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
                 }
                 const duration_us: u64 = nowUs() - start;
 
@@ -361,7 +361,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
             // Fill other fields from mutation values
             for (self.values.items) |fv| {
-                if (std.mem.eql(u8, fv.name, "id")) continue;
+                if (std.mem.eql(u8, fv.name, info.pk_field)) continue;
                 try setEntityField(&entity, fv.name, fv.value, self.allocator);
             }
 
@@ -412,7 +412,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                             defer ib.deinit();
                             _ = try ib.columns(&.{ ji.source_col, ji.target_col });
                             _ = try ib.values(&.{
-                                .{ .int = entity.id },
+                                .{ .int = @field(entity, info.pk_field) },
                                 .{ .int = target_id },
                             });
                             var iq = ib.takeQuery() catch |err| return mapBuildError(err);
@@ -723,6 +723,7 @@ fn buildUpsertSuffix(
     is_sqlite: bool,
     is_mysql: bool,
     columns: []const []const u8,
+    pk_field: []const u8,
 ) ![]const u8 {
     if (!or_replace or is_sqlite) return "";
     if (is_mysql) {
@@ -731,9 +732,9 @@ fn buildUpsertSuffix(
         try buf.appendSlice(" ON DUPLICATE KEY UPDATE ");
         // Preserve the row id through LAST_INSERT_ID so callers receive the
         // existing auto-increment value on UPDATE as well as on INSERT.
-        try buf.appendSlice("`id`=LAST_INSERT_ID(`id`)");
+        try buf.print("`{s}`=LAST_INSERT_ID(`{s}`)", .{ pk_field, pk_field });
         for (columns) |col| {
-            if (std.mem.eql(u8, col, "id")) continue;
+            if (std.mem.eql(u8, col, pk_field)) continue;
             try buf.appendSlice(", ");
             try buf.print("`{s}`=VALUES(`{s}`)", .{ col, col });
         }
@@ -744,10 +745,13 @@ fn buildUpsertSuffix(
     _ = is_postgres;
     var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
-    try buf.appendSlice(" ON CONFLICT (\"id\") DO UPDATE SET ");
+    try buf.appendSlice(" ON CONFLICT (");
+    try buf.appendSlice("\"");
+    try buf.appendSlice(pk_field);
+    try buf.appendSlice("\") DO UPDATE SET ");
     var first = true;
     for (columns) |col| {
-        if (std.mem.eql(u8, col, "id")) continue;
+        if (std.mem.eql(u8, col, pk_field)) continue;
         if (!first) try buf.appendSlice(", ");
         first = false;
         try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
@@ -957,7 +961,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
             const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items);
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, info.pk_field);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
             const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
             defer query.deinit();
