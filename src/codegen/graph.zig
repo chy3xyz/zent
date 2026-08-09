@@ -729,3 +729,33 @@ test "Version field is marked as is_version" {
     const info = comptime fromSchema(User);
     try std.testing.expect(info.fields[1].is_version);
 }
+
+test "From edge with explicit FK field does not duplicate declared columns" {
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+
+    // 目标表 PK 非 id（如 upload_file.file_id）。
+    const File = schema("File", .{
+        .pk = "file_id",
+        .fields = &.{ field.Int("file_id"), field.String("file_url") },
+    });
+
+    // From 边显式指定 FK 列 card_id/photo_id，该列已由 schema 声明。
+    const Record = schema("Record", .{
+        .pk = "order_id",
+        .fields = &.{ field.Int("order_id"), field.Int("photo_id") },
+        .edges = &.{edge.From("photo", File).Field("photo_id")},
+    });
+
+    const record_info = comptime fromSchema(Record);
+    // 回归：FK 列已声明 → 不重复注入，fields 保持 2 个。
+    try std.testing.expectEqual(@as(usize, 2), record_info.fields.len);
+
+    const file_info = comptime fromSchema(File);
+    // 回归：buildEdgeStep 使用真实 PK（非硬编码 id）。
+    const step = comptime buildEdgeStep(record_info.edges[0], record_info, file_info);
+    try std.testing.expectEqualStrings("order_id", step.from_column);
+    try std.testing.expectEqualStrings("file_id", step.to_column);
+    try std.testing.expectEqualStrings("photo_id", step.edge_columns[0]);
+}
