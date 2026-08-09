@@ -572,9 +572,9 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
         const is_to = edge.kind == .to;
         return graph_step.Step{
             .from_table = source_table,
-            .from_column = "id",
+            .from_column = source_info.pk_field,
             .to_table = target_table,
-            .to_column = "id",
+            .to_column = target_info.pk_field,
             .edge_rel = if (is_to) .o2m else .m2o,
             .edge_table = if (is_to) target_table else source_table,
             .edge_columns = &[_][]const u8{fk_col},
