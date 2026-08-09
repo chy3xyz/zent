@@ -64,9 +64,25 @@ pub const MySQLDriver = struct {
     default_write_timeout: c_uint = 30,
     /// Tracks whether the connection currently has an active transaction.
     in_tx: bool = false,
+    /// Set when the server-side connection is lost (errno 2002/2003/2006/2013).
+    /// Once dead, every operation fails fast WITHOUT touching the C handle —
+    /// libmysqlclient dereferences freed/poisoned memory on dead connections,
+    /// which segfaults under concurrent load. Pool must close & discard it.
+    dead: bool = false,
     /// Optional prepared-statement cache. Set this field after `connect()` to
     /// enable caching; null (the default) disables it.
     cache: ?cache.PreparedCache(16, *c.MYSQL_STMT) = null,
+
+    /// Fail fast when the connection has been lost (avoids segfault on the
+    /// stale libmysqlclient handle).
+    fn ensureAlive(self: *MySQLDriver) driver.Error!void {
+        if (self.dead) return error.ConnectionFailed;
+    }
+
+    /// Mark the connection dead after a lost-connection errno.
+    fn markDead(self: *MySQLDriver, err: anyerror) void {
+        if (err == error.ConnectionFailed) self.dead = true;
+    }
 
     /// MySQL SSL mode.
     pub const SslMode = enum(u32) {
@@ -152,7 +168,9 @@ pub const MySQLDriver = struct {
         c.mysql_close(self.conn);
     }
 
-    fn logMySQLError(conn: *c.MYSQL, context: []const u8) void {
+    fn logMySQLError(drv: *MySQLDriver, conn: *c.MYSQL, context: []const u8) void {
+        // 连接已死时禁止触碰 C 句柄（mysql_error 在已释放句柄上会段错误）。
+        if (drv.dead) return;
         const msg = c.mysql_error(conn);
         const errno = c.mysql_errno(conn);
         std.log.err("mysql error ({s}) [errno={d}]: {s}", .{ context, errno, std.mem.span(msg) });
@@ -276,6 +294,7 @@ pub const MySQLDriver = struct {
     }
 
     pub fn exec(self: *MySQLDriver, sql: []const u8, args: []const Value) !driver.Result {
+        try self.ensureAlive();
         if (args.len == 0) {
             // Simple query without parameters
             const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
@@ -286,8 +305,9 @@ pub const MySQLDriver = struct {
                 // 1193 = "Unknown system variable": this is the expected
                 // probe failure when applyServerTimeout tries
                 // max_execution_time against MariaDB — not a real error.
-                if (errno != 1193) logMySQLError(self.conn, "exec");
+                if (errno != 1193) logMySQLError(self, self.conn, "exec");
                 const err = errnoToError(errno);
+                self.markDead(err);
                 // Timeouts and constraint violations are distinct outcomes
                 // (callers rely on e.g. UniqueViolation for upsert fallbacks);
                 // everything else collapses to the generic exec failure.
@@ -355,17 +375,18 @@ pub const MySQLDriver = struct {
         try bindParams(self.allocator, args, binds, is_nulls, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
 
         if (c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) {
-            logMySQLError(self.conn, "stmt_bind_param");
+            logMySQLError(self, self.conn, "stmt_bind_param");
             return error.MySQLStmtFailed;
         }
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             const err = errnoToError(c.mysql_errno(self.conn));
+            self.markDead(err);
             // Statement timeouts and constraint violations are distinct
             // outcomes; the rest collapse to the generic stmt failure.
             if (err == error.QueryTimeout or err == error.UniqueViolation or
                 err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
-            logMySQLError(self.conn, "stmt_execute");
+            logMySQLError(self, self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
 
@@ -376,6 +397,7 @@ pub const MySQLDriver = struct {
     }
 
     pub fn query(self: *MySQLDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
+        try self.ensureAlive();
         const stmt = if (self.cache) |*cached|
             try cached.takeOrPrepare(query_sql, self, prepareMySQLStmt)
         else
@@ -420,7 +442,7 @@ pub const MySQLDriver = struct {
         try bindParams(self.allocator, args, binds, is_nulls, &str_bufs, &int_bufs, &float_bufs, &bool_bufs);
 
         if (c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) {
-            logMySQLError(self.conn, "stmt_bind_param");
+            logMySQLError(self, self.conn, "stmt_bind_param");
             return error.MySQLStmtFailed;
         }
 
@@ -428,17 +450,18 @@ pub const MySQLDriver = struct {
         // we can size row buffers accurately and avoid silent truncation.
         var update_max_length: c.my_bool = 1;
         if (c.mysql_stmt_attr_set(stmt, c.STMT_ATTR_UPDATE_MAX_LENGTH, &update_max_length) != 0) {
-            logMySQLError(self.conn, "stmt_attr_set");
+            logMySQLError(self, self.conn, "stmt_attr_set");
             return error.MySQLStmtFailed;
         }
 
         if (c.mysql_stmt_execute(stmt) != 0) {
             const err = errnoToError(c.mysql_errno(self.conn));
+            self.markDead(err);
             // Statement timeouts and constraint violations are distinct
             // outcomes; the rest collapse to the generic stmt failure.
             if (err == error.QueryTimeout or err == error.UniqueViolation or
                 err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
-            logMySQLError(self.conn, "stmt_execute");
+            logMySQLError(self, self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
 
@@ -458,7 +481,7 @@ pub const MySQLDriver = struct {
             const err = errnoToError(c.mysql_errno(self.conn));
             // Statement timeouts are the intended outcome of withTimeout.
             if (err == error.QueryTimeout) return err;
-            logMySQLError(self.conn, "stmt_store_result");
+            logMySQLError(self, self.conn, "stmt_store_result");
             return error.MySQLStmtFailed;
         }
 
@@ -484,8 +507,10 @@ pub const MySQLDriver = struct {
     }
 
     pub fn ping(self: *MySQLDriver) !void {
+        try self.ensureAlive();
         if (c.mysql_ping(self.conn) != 0) {
-            logMySQLError(self.conn, "ping");
+            logMySQLError(self, self.conn, "ping");
+            self.markDead(error.ConnectionFailed);
             return error.MySQLPingFailed;
         }
     }
@@ -496,6 +521,7 @@ pub const MySQLDriver = struct {
     }
 
     pub fn beginTx(self: *MySQLDriver) !driver.Tx {
+        try self.ensureAlive();
         // MySQL autocommit is on by default, so BEGIN disables it within the tx
         _ = try self.exec("BEGIN", &.{});
         self.in_tx = true;
@@ -991,9 +1017,10 @@ fn closeStmt(_: void, stmt: *c.MYSQL_STMT) void {
 }
 
 fn prepareMySQLStmt(drv: *MySQLDriver, sql: []const u8) !*c.MYSQL_STMT {
+    try drv.ensureAlive();
     const stmt = c.mysql_stmt_init(drv.conn);
     if (stmt == null) {
-        MySQLDriver.logMySQLError(drv.conn, "stmt_init");
+        MySQLDriver.logMySQLError(drv, drv.conn, "stmt_init");
         return error.MySQLStmtFailed;
     }
     errdefer _ = c.mysql_stmt_close(stmt);
@@ -1002,7 +1029,7 @@ fn prepareMySQLStmt(drv: *MySQLDriver, sql: []const u8) !*c.MYSQL_STMT {
     defer drv.allocator.free(sql_z);
 
     if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
-        MySQLDriver.logMySQLError(drv.conn, "stmt_prepare");
+        MySQLDriver.logMySQLError(drv, drv.conn, "stmt_prepare");
         return error.MySQLStmtFailed;
     }
     return stmt;

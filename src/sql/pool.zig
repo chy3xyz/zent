@@ -349,12 +349,18 @@ pub fn ConnPool(comptime D: type) type {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             if (self.closed) return;
-
-            // Verify the connection still belongs to the pool.
             const found = for (self.all.items) |*item| {
                 if (item == entry) break true;
             } else false;
             if (!found) return;
+
+            // 连接已死（Lost connection）→ 直接关闭丢弃，不再回池复用；
+            // 否则后续操作触碰 libmysql 已释放句柄会段错误。
+            if (@hasField(D, "dead") and conn.dead) {
+                self.closeConnection(entry);
+                self.cond.signal(io);
+                return;
+            }
 
             // Transaction leak protection: if the connection was returned with
             // an active transaction, roll it back before returning it to the
@@ -412,6 +418,39 @@ pub fn ConnPool(comptime D: type) type {
             finished: bool = false,
         };
 
+        /// Query rows wrapper that holds the borrowed connection until
+        /// `deinit()`, so callers can safely iterate rows without another
+        /// thread reusing the connection (and its prepared statements).
+        const PooledRows = struct {
+            pool: *Self,
+            conn: *D,
+            inner: driver.Rows,
+
+            fn next(ptr: *anyopaque) ?driver.Row {
+                const self: *PooledRows = @ptrCast(@alignCast(ptr));
+                return self.inner.next();
+            }
+
+            fn nextError(ptr: *anyopaque) ?driver.Error {
+                const self: *PooledRows = @ptrCast(@alignCast(ptr));
+                if (self.inner.vtable.nextError) |ne| return ne(self.inner.ptr);
+                return null;
+            }
+
+            fn deinit(ptr: *anyopaque) void {
+                const self: *PooledRows = @ptrCast(@alignCast(ptr));
+                self.inner.deinit();
+                self.pool.release(self.conn);
+                self.pool.allocator.destroy(self);
+            }
+        };
+
+        const pooled_rows_vtable = driver.Rows.VTable{
+            .next = PooledRows.next,
+            .deinit = PooledRows.deinit,
+            .nextError = PooledRows.nextError,
+        };
+
         fn pooledCommit(ptr: *anyopaque) driver.Error!void {
             const wrapper: *PooledTx = @ptrCast(@alignCast(ptr));
             if (wrapper.finished) return;
@@ -467,21 +506,33 @@ pub fn ConnPool(comptime D: type) type {
         fn driverQuery(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const Value) driver.Error!driver.Rows {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             const conn = try pool.borrowForDriver();
-            defer pool.release(conn);
             var merged = pool.mergeExecutionContext(ctx);
             const ctx_ptr: ?*const driver.ExecutionContext = if (merged.deadline_ns != null) &merged else null;
-            if (pool.options.slow_query_threshold_ms > 0) {
+            const result = if (pool.options.slow_query_threshold_ms > 0) blk: {
                 const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
-                const result = conn.asDriver().queryCtx(ctx_ptr, query_sql, args);
+                const inner = conn.asDriver().queryCtx(ctx_ptr, query_sql, args);
                 const elapsed_ms: u64 = @intCast(start.untilNow(pool.io).raw.toMilliseconds());
                 if (elapsed_ms >= pool.options.slow_query_threshold_ms) {
                     if (pool.options.metrics.onSlowQuery) |cb| {
                         cb(pool.options.metrics.context, query_sql, elapsed_ms);
                     }
                 }
-                return result;
-            }
-            return conn.asDriver().queryCtx(ctx_ptr, query_sql, args);
+                break :blk inner;
+            } else conn.asDriver().queryCtx(ctx_ptr, query_sql, args);
+
+            // 关键：Rows 持有连接直到 deinit。若在此 release，调用方迭代 Rows 时
+            // 连接已回池，另一线程借出执行查询（预编译缓存驱逐 stmt）→ use-after-free。
+            const inner = result catch |err| {
+                pool.release(conn);
+                return err;
+            };
+            const wrapper = pool.allocator.create(PooledRows) catch {
+                inner.deinit();
+                pool.release(conn);
+                return error.OutOfMemory;
+            };
+            wrapper.* = .{ .pool = pool, .conn = conn, .inner = inner };
+            return .{ .ptr = wrapper, .vtable = &pooled_rows_vtable };
         }
 
         fn driverBeginTx(ptr: *anyopaque) driver.Error!driver.Tx {
