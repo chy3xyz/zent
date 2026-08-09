@@ -902,7 +902,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return true;
         }
 
-        pub fn Sum(self: *Self, comptime field_name: []const u8) QueryError!i64 {
+        pub fn Sum(self: *Self, comptime field_name: []const u8) QueryError!f64 {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
@@ -914,7 +914,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (rows.nextError()) |e| return e;
                 return error.NotFound;
             };
-            return row.getInt(0) orelse return error.TypeMismatch;
+            // numeric SUM (int8/int4/numeric) parses via the text representation.
+            return row.getFloat(0) orelse return error.TypeMismatch;
         }
 
         pub fn Avg(self: *Self, comptime field_name: []const u8) QueryError!f64 {
