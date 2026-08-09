@@ -32,7 +32,7 @@ fn edgePredName(comptime prefix: []const u8, comptime edge_name: []const u8) [:0
 pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     _ = infos;
     comptime {
-        @setEvalBranchQuota(100000);
+        @setEvalBranchQuota(1000000);
 
         // Count fields
         var total_fields: usize = 0;
@@ -108,7 +108,7 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
 /// Instantiate the predicate namespace with actual function values.
 pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) Predicates(infos, info) {
     comptime {
-        @setEvalBranchQuota(100000);
+        @setEvalBranchQuota(1000000);
         var result: Predicates(infos, info) = undefined;
 
         // Field-based predicates
