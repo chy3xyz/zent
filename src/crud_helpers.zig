@@ -39,6 +39,13 @@ fn FirstResult(comptime Accessor: type) type {
     return @TypeOf(@as(*QB, undefined).First());
 }
 
+/// Resolve the `QueryError![]Entity` result type of an entity accessor's
+/// `All()` builder.
+fn AllResult(comptime Accessor: type) type {
+    const QB = @TypeOf(@as(Accessor, undefined).Query());
+    return @TypeOf(@as(*QB, undefined).All());
+}
+
 /// One-row query on an entity accessor: adds `predicates`, runs `First()`,
 /// and hands back the owned entity or `null`. The query lifecycle is handled
 /// here; the caller frees the entity with `deinitEntity` and maps it (capture
@@ -48,6 +55,30 @@ pub fn first(accessor: anytype, predicates: anytype) FirstResult(@TypeOf(accesso
     defer q.deinit();
     _ = try q.Where(predicates);
     return try q.First();
+}
+
+/// List query on an entity accessor: adds `predicates`, runs `All()`, hands
+/// back the owned row list. The query lifecycle is handled here; the caller
+/// frees with `deinitRows(infos, info, rows, alloc)`.
+pub fn all(accessor: anytype, predicates: anytype) AllResult(@TypeOf(accessor)) {
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+    return try q.All();
+}
+
+/// Row-count query on an entity accessor: adds `predicates`, runs `Count()`.
+pub fn count(accessor: anytype, predicates: anytype) CountResult(@TypeOf(accessor)) {
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+    return try q.Count();
+}
+
+/// Resolve the `QueryError!i64` result type of an entity accessor's `Count()`.
+fn CountResult(comptime Accessor: type) type {
+    const QB = @TypeOf(@as(Accessor, undefined).Query());
+    return @TypeOf(@as(*QB, undefined).Count());
 }
 
 /// Resolve the `SaveError!Entity` result type of an entity accessor's
@@ -218,9 +249,9 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     // deinitRows over an All() result frees items + list
     var all_q = client.product.Query();
     defer all_q.deinit();
-    const all = try all_q.All();
-    defer deinitRows(infos, PRODUCT_INFO, all, allocator);
-    _ = all.items.len;
+    const all_rows = try all_q.All();
+    defer deinitRows(infos, PRODUCT_INFO, all_rows, allocator);
+    _ = all_rows.items.len;
 
     var gone = try first(client.product, .{client.product.predicates.product_idEQ(.{ .int = created.product_id })});
     defer if (gone) |*e| deinitEntity(infos, PRODUCT_INFO, e, allocator);
@@ -298,4 +329,42 @@ test "crud_helpers: first with no match returns null (not error)" {
     var missing = try first(client.tag, .{client.tag.predicates.tag_idEQ(.{ .int = 999 })});
     defer if (missing) |*e| deinitEntity(infos, infos[0], e, allocator);
     try std.testing.expect(missing == null);
+}
+
+test "crud_helpers: all + count over predicates" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+
+    const Tag = Schema("Tag", .{
+        .table_name = "zigshop_tag",
+        .pk = "tag_id",
+        .fields = &.{ field.Int("tag_id"), field.String("name"), field.Int("is_delete").Default(0) },
+    });
+    const info = comptime fromSchema(Tag);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    var client = client_mod.makeClient(infos, allocator, driver);
+
+    var c1 = try create(client.tag, .{ .name = "a" });
+    defer deinitEntity(infos, info, &c1, allocator);
+    var c2 = try create(client.tag, .{ .name = "b" });
+    defer deinitEntity(infos, info, &c2, allocator);
+    var c3 = try create(client.tag, .{ .name = "c" });
+    defer deinitEntity(infos, info, &c3, allocator);
+    const total = try count(client.tag, .{client.tag.predicates.is_deleteEQ(.{ .int = 0 })});
+    try std.testing.expectEqual(@as(i64, 3), total);
+
+    const preds = client.tag.predicates;
+    const rows = try all(client.tag, .{preds.is_deleteEQ(.{ .int = 0 })});
+    defer deinitRows(infos, info, rows, allocator);
+    try std.testing.expectEqual(@as(usize, 3), rows.items.len);
 }
