@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.4] - 2026-08-10
+
 ### Added
 - `Schema` accepts a `table_name` override to map onto pre-existing
   physical tables (defaults to `toSnakeCase(name)`), and a `pk` override
