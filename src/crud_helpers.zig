@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const graph_mod = @import("codegen/graph.zig");
+const deinitEntity = @import("codegen/entity.zig").deinitEntity;
 
 /// Resolve the `QueryError!?Entity` result type of an entity accessor's
 /// `Query()` builder via its `First()` method signature.
@@ -88,6 +89,19 @@ pub fn delete(accessor: anytype, predicates: anytype) !usize {
     return try del.Exec();
 }
 
+/// Free every row of an `All()` result plus the list itself. Centralizes the
+/// memory contract so persistence code is terse: map each `rows.items[i]`,
+/// then `deinitRows(infos, info, rows, alloc)` in one call.
+pub fn deinitRows(
+    comptime infos: []const graph_mod.TypeInfo,
+    comptime info: graph_mod.TypeInfo,
+    rows: anytype,
+    allocator: std.mem.Allocator,
+) void {
+    for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+    rows.deinit();
+}
+
 // ── Tests ────────────────────────────────────────────────────
 
 test "crud_helpers: first/create/update/delete round-trip on sqlite" {
@@ -98,8 +112,6 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
     const client_mod = @import("codegen/client.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
-
     const Product = Schema("Product", .{
         .table_name = "zigshop_product",
         .pk = "product_id",
@@ -147,6 +159,13 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     const deleted = try delete(client.product, .{client.product.predicates.product_idEQ(.{ .int = created.product_id })});
     try std.testing.expectEqual(@as(usize, 1), deleted);
 
+    // deinitRows over an All() result frees items + list
+    var all_q = client.product.Query();
+    defer all_q.deinit();
+    const all = try all_q.All();
+    defer deinitRows(infos, PRODUCT_INFO, all, allocator);
+    _ = all.items.len;
+
     var gone = try first(client.product, .{client.product.predicates.product_idEQ(.{ .int = created.product_id })});
     defer if (gone) |*e| deinitEntity(infos, PRODUCT_INFO, e, allocator);
     try std.testing.expect(gone == null);
@@ -160,8 +179,6 @@ test "crud_helpers: first with no match returns null (not error)" {
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
     const client_mod = @import("codegen/client.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
-
     const Tag = Schema("Tag", .{
         .table_name = "zigshop_tag",
         .pk = "tag_id",
