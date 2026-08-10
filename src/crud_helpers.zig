@@ -141,12 +141,14 @@ fn freeStrings(comptime T: type, items: []T, allocator: std.mem.Allocator) void 
 }
 
 /// Run a raw driver query and collect the rows into an owned `Rows(T)` slice.
-/// `mapRow(allocator, row)` returns one `T` per result row (dupe strings with
-/// the passed allocator). Example:
+/// `mapRow(allocator, row)` returns one `T` per result row and MAY return an
+/// error union (`!T`). Contract: every string field of the returned `T` must
+/// be allocated with the passed `allocator` (dupe borrowed row text) so
+/// `Rows(T).deinit()` can free it exactly once. Example:
 /// ```zig
 /// const r = try zent.crud_helpers.queryRows(ProductRow, driver, sql, args, alloc,
-///     struct { fn f(a: std.mem.Allocator, row: sql_driver.Row) ProductRow {
-///         return .{ .id = row.getInt(0) orelse 0, .name = a.dupe(u8, row.getText(1) orelse "") catch "" };
+///     struct { fn f(a: std.mem.Allocator, row: sql_driver.Row) !ProductRow {
+///         return .{ .id = row.getInt(0) orelse 0, .name = try a.dupe(u8, row.getText(1) orelse "") };
 ///     } }.f);
 /// defer r.deinit();
 /// ```
@@ -161,10 +163,17 @@ pub fn queryRows(
     var rows = try driver.query(sql, args);
     defer rows.deinit();
     var list = std.array_list.Managed(T).init(allocator);
-    errdefer list.deinit();
-    while (rows.next()) |row| {
-        try list.append(mapRow(allocator, row));
+    errdefer {
+        // Free owned strings of any rows appended before the failure, then the
+        // backing buffer — Managed.deinit alone would leak the duped strings.
+        freeStrings(T, list.items, allocator);
+        list.deinit();
     }
+    while (rows.next()) |row| {
+        try list.append(try mapRow(allocator, row));
+    }
+    // toOwnedSlice detaches the backing; errdefer is skipped on success, so the
+    // caller owns every string + the slice via Rows(T).deinit().
     return .{ .items = try list.toOwnedSlice(), .allocator = allocator };
 }
 
@@ -286,8 +295,8 @@ test "crud_helpers: queryRows collects mapped rows into owned Rows(T)" {
 
     const RowT = struct { item_id: i64, name: []const u8 };
     const Mapper = struct {
-        fn map(a: std.mem.Allocator, row: sql_driver.Row) RowT {
-            return .{ .item_id = row.getInt(0) orelse 0, .name = a.dupe(u8, row.getText(1) orelse "") catch "" };
+        fn map(a: std.mem.Allocator, row: sql_driver.Row) !RowT {
+            return .{ .item_id = row.getInt(0) orelse 0, .name = try a.dupe(u8, row.getText(1) orelse "") };
         }
     };
 
@@ -297,6 +306,41 @@ test "crud_helpers: queryRows collects mapped rows into owned Rows(T)" {
     try std.testing.expectEqual(@as(i64, 1), result.items[0].item_id);
     try std.testing.expectEqualStrings("a", result.items[0].name);
     try std.testing.expectEqualStrings("b", result.items[1].name);
+}
+
+test "crud_helpers: queryRows error mid-collection leaks no strings" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Item = Schema("Item", .{
+        .table_name = "zigshop_item",
+        .pk = "item_id",
+        .fields = &.{ field.Int("item_id"), field.String("name") },
+    });
+    const info = comptime fromSchema(Item);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    _ = try driver.exec("INSERT INTO zigshop_item (item_id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')", &.{});
+
+    const RowT = struct { item_id: i64, name: []const u8 };
+    const FailingMapper = struct {
+        fn map(a: std.mem.Allocator, row: sql_driver.Row) !RowT {
+            if ((row.getInt(0) orelse 0) == 2) return error.Stop;
+            return .{ .item_id = row.getInt(0) orelse 0, .name = try a.dupe(u8, row.getText(1) orelse "") };
+        }
+    };
+
+    // First row's string is duped, then row 2 errors -> the partial row's
+    // string must be freed by the errdefer (std.testing.allocator detects leaks).
+    try std.testing.expectError(error.Stop, queryRows(RowT, driver, "SELECT item_id, name FROM zigshop_item ORDER BY item_id", &.{}, allocator, FailingMapper.map));
 }
 
 test "crud_helpers: first with no match returns null (not error)" {
