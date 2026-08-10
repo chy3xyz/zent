@@ -28,6 +28,8 @@
 
 const std = @import("std");
 const graph_mod = @import("codegen/graph.zig");
+const sql_driver = @import("sql/driver.zig");
+const Value = @import("sql/builder.zig").Value;
 const deinitEntity = @import("codegen/entity.zig").deinitEntity;
 
 /// Resolve the `QueryError!?Entity` result type of an entity accessor's
@@ -79,6 +81,60 @@ pub fn update(accessor: anytype, values: anytype, predicates: anytype) !usize {
     }
     _ = try upd.Where(predicates);
     return try upd.Save();
+}
+
+/// Owned row slice returned by raw-driver query helpers. Caller frees with
+/// `deinit()` — frees every `[]const u8` / `?[]const u8` field on each item
+/// (comptime reflection), then the slice itself.
+pub fn Rows(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        items: []T,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *Self) void {
+            freeStrings(T, self.items, self.allocator);
+            self.allocator.free(self.items);
+        }
+    };
+}
+
+fn freeStrings(comptime T: type, items: []T, allocator: std.mem.Allocator) void {
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, ft| {
+        if (ft == []const u8) {
+            for (items) |*it| allocator.free(@field(it, name));
+        } else if (ft == ?[]const u8) {
+            for (items) |*it| if (@field(it, name)) |s| allocator.free(s);
+        }
+    }
+}
+
+/// Run a raw driver query and collect the rows into an owned `Rows(T)` slice.
+/// `mapRow(allocator, row)` returns one `T` per result row (dupe strings with
+/// the passed allocator). Example:
+/// ```zig
+/// const r = try zent.crud_helpers.queryRows(ProductRow, driver, sql, args, alloc,
+///     struct { fn f(a: std.mem.Allocator, row: sql_driver.Row) ProductRow {
+///         return .{ .id = row.getInt(0) orelse 0, .name = a.dupe(u8, row.getText(1) orelse "") catch "" };
+///     } }.f);
+/// defer r.deinit();
+/// ```
+pub fn queryRows(
+    comptime T: type,
+    driver: anytype,
+    sql: []const u8,
+    args: []const Value,
+    allocator: std.mem.Allocator,
+    comptime mapRow: anytype,
+) !Rows(T) {
+    var rows = try driver.query(sql, args);
+    defer rows.deinit();
+    var list = std.array_list.Managed(T).init(allocator);
+    errdefer list.deinit();
+    while (rows.next()) |row| {
+        try list.append(mapRow(allocator, row));
+    }
+    return .{ .items = try list.toOwnedSlice(), .allocator = allocator };
 }
 
 /// Delete (or soft-delete) rows matching `predicates`. Returns rows affected.
@@ -169,6 +225,47 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     var gone = try first(client.product, .{client.product.predicates.product_idEQ(.{ .int = created.product_id })});
     defer if (gone) |*e| deinitEntity(infos, PRODUCT_INFO, e, allocator);
     try std.testing.expect(gone == null);
+}
+
+test "crud_helpers: queryRows collects mapped rows into owned Rows(T)" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Item = Schema("Item", .{
+        .table_name = "zigshop_item",
+        .pk = "item_id",
+        .fields = &.{
+            field.Int("item_id"),
+            field.String("name"),
+        },
+    });
+
+    const info = comptime fromSchema(Item);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    _ = try driver.exec("INSERT INTO zigshop_item (item_id, name) VALUES (1, 'a'), (2, 'b')", &.{});
+
+    const RowT = struct { item_id: i64, name: []const u8 };
+    const Mapper = struct {
+        fn map(a: std.mem.Allocator, row: sql_driver.Row) RowT {
+            return .{ .item_id = row.getInt(0) orelse 0, .name = a.dupe(u8, row.getText(1) orelse "") catch "" };
+        }
+    };
+
+    var result = try queryRows(RowT, driver, "SELECT item_id, name FROM zigshop_item ORDER BY item_id", &.{}, allocator, Mapper.map);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.items.len);
+    try std.testing.expectEqual(@as(i64, 1), result.items[0].item_id);
+    try std.testing.expectEqualStrings("a", result.items[0].name);
+    try std.testing.expectEqualStrings("b", result.items[1].name);
 }
 
 test "crud_helpers: first with no match returns null (not error)" {
