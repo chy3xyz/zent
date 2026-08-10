@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `Schema` accepts a `table_name` override to map onto pre-existing
+  physical tables (defaults to `toSnakeCase(name)`), and a `pk` override
+  for tables whose primary key is not `"id"` (the schema must declare a
+  field with that name). The custom `pk_field` propagates through graph
+  resolution, CREATE (RETURNING/upsert/keyset cursor), and edge lookups.
+- `@setEvalBranchQuota` raised to 1M so large schema graphs (174 tables)
+  compile.
+
+### Fixed
+- `addEdgeFields` no longer injects a duplicate FK column when the From
+  edge's `field_name` is already declared in the schema, and now honors
+  `edge.field_name` (upstream issue #2). `buildEdgeStep` uses the real
+  primary key instead of hardcoded `"id"`, fixing edge eager-load on
+  tables with custom PKs (e.g. `upload_file.file_id`).
+- Connection pool: rows now hold their borrowed connection until
+  `deinit()`, fixing a concurrent use-after-free where another thread
+  could reuse the connection (evicting prepared statements) while a
+  caller was still iterating rows. Dead connections are closed and
+  discarded instead of returning to the pool.
+
+### Changed
+- `Query.Sum` now returns `f64` (instead of `i64`) so numeric SUM works
+  for both int and float columns, parsed via the text representation.
+  Callers that typed the result as `i64` must switch to `f64`.
+
 ## [0.29.3] - 2026-08-07
 
 ### Fixed
