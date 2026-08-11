@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.6] - 2026-08-11
+
 ### Added
 - `zent.crud_helpers`: Enhanced business query and mutation helpers:
   - `paginatedWithOptions`: Sorting (`ASC`/`DESC`) with automatic column whitelist validation against entity schema fields (`error.InvalidSortColumn`).
