@@ -12,6 +12,7 @@ pub const sql_schema = @import("sql/schema/migrate.zig");
 pub const sql_pool = @import("sql/pool.zig");
 pub const sql_explain = @import("sql/explain.zig");
 pub const sql_logger = @import("sql/logger.zig");
+pub const sql_diagnostics = @import("sql/diagnostics.zig");
 
 pub const core = struct {
     pub const field = @import("core/field.zig");
