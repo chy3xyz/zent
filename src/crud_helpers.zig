@@ -749,6 +749,79 @@ pub fn saveOrUpdate(accessor: anytype, values: anytype, predicates: anytype) !Sa
     }
 }
 
+/// Update rows matching `predicates` with optimistic concurrency locking on `version_field`.
+/// Validates `version_field` against schema metadata.
+/// Increments `version_field` by 1 and enforces `version_field = expected_version` in SQL.
+/// Returns rows affected, or `error.OptimisticLockConflict` if version mismatch occurs on an existing record.
+pub fn updateWithVersion(
+    accessor: anytype,
+    values: anytype,
+    predicates: anytype,
+    comptime version_field: []const u8,
+    expected_version: i64,
+) !usize {
+    if (!isValidField(@TypeOf(accessor).entity_info, version_field)) {
+        return error.InvalidVersionColumn;
+    }
+    var upd = accessor.Update();
+    defer upd.deinit();
+
+    inline for (@typeInfo(@TypeOf(values)).@"struct".field_names) |name| {
+        _ = try upd.setFieldValue(name, @field(values, name));
+    }
+
+    const expr = comptime version_field ++ " + ?";
+    _ = try upd.setExprArgs(version_field, expr, &.{.{ .int = 1 }});
+
+    _ = try upd.Where(predicates);
+    const sql_builder = @import("sql/builder.zig");
+    _ = try upd.Where(.{sql_builder.EQ(version_field, .{ .int = expected_version })});
+
+    const affected = try upd.Save();
+    if (affected == 0) {
+        if (try exists(accessor, predicates)) {
+            return error.OptimisticLockConflict;
+        }
+    }
+    return affected;
+}
+
+/// Batch save or update a slice of struct items (`items`) matching a business key field `match_field`.
+/// For each item, checks if a matching record exists on `match_field`, updating if found or creating if new.
+pub fn batchSaveOrUpdate(
+    accessor: anytype,
+    items: anytype,
+    comptime match_field: []const u8,
+) !struct { created_count: usize, updated_count: usize } {
+    if (!isValidField(@TypeOf(accessor).entity_info, match_field)) {
+        return error.InvalidMatchColumn;
+    }
+
+    var created_count: usize = 0;
+    var updated_count: usize = 0;
+
+    for (items) |item| {
+        const val = @field(item, match_field);
+        const sql_builder = @import("sql/builder.zig");
+        const match_pred = sql_builder.EQ(match_field, switch (@typeInfo(@TypeOf(val))) {
+            .int, .comptime_int => .{ .int = @intCast(val) },
+            else => .{ .string = val },
+        });
+
+        var res = try saveOrUpdate(accessor, item, .{match_pred});
+        switch (res) {
+            .created => |*ent| {
+                deinitEntity(@TypeOf(accessor).entity_infos, @TypeOf(accessor).entity_info, ent, accessor.allocator);
+                created_count += 1;
+            },
+            .updated => |cnt| {
+                updated_count += cnt;
+            },
+        }
+    }
+    return .{ .created_count = created_count, .updated_count = updated_count };
+}
+
 /// Free every row of an `All()` result plus the list itself. Centralizes the
 /// memory contract so persistence code is terse: map each `rows.items[i]`,
 /// then `deinitRows(infos, info, rows, alloc)` in one call.
@@ -1339,4 +1412,59 @@ test "crud_helpers: cursorPage keyset pagination" {
 
     // Invalid cursor col error
     try std.testing.expectError(error.InvalidCursorColumn, cursorPage(client.feed_item, .{}, .{ .cursor_col = "invalid_col" }, 2));
+}
+
+test "crud_helpers: updateWithVersion optimistic locking and batchSaveOrUpdate" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Document = Schema("Document", .{
+        .table_name = "zigshop_document",
+        .pk = "doc_id",
+        .fields = &.{
+            field.Int("doc_id"),
+            field.String("doc_code").Unique(),
+            field.String("title"),
+            field.Int("version").Default(1),
+        },
+    });
+    const info = comptime fromSchema(Document);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+    const preds = client.document.predicates;
+
+    // 1. Create document
+    var d1 = try create(client.document, .{ .doc_code = "DOC_01", .title = "v1 title", .version = 1 });
+    deinitEntity(infos, info, &d1, allocator);
+
+    // 2. updateWithVersion success (expected version = 1)
+    const affected = try updateWithVersion(client.document, .{ .title = "v2 title" }, .{preds.doc_codeEQ(.{ .string = "DOC_01" })}, "version", 1);
+    try std.testing.expectEqual(@as(usize, 1), affected);
+
+    var d_v2 = try first(client.document, .{preds.doc_codeEQ(.{ .string = "DOC_01" })});
+    defer if (d_v2) |*e| deinitEntity(infos, info, e, allocator);
+    try std.testing.expect(d_v2 != null);
+    try std.testing.expectEqualStrings("v2 title", d_v2.?.title);
+    try std.testing.expectEqual(@as(i64, 2), d_v2.?.version); // Version incremented to 2
+
+    // 3. updateWithVersion conflict (expected version = 1, but db version is 2)
+    try std.testing.expectError(error.OptimisticLockConflict, updateWithVersion(client.document, .{ .title = "stale edit" }, .{preds.doc_codeEQ(.{ .string = "DOC_01" })}, "version", 1));
+
+    // 4. batchSaveOrUpdate by business key "doc_code"
+    const batch_items = &[_]struct { doc_code: []const u8, title: []const u8 }{
+        .{ .doc_code = "DOC_01", .title = "v3 title" }, // existing -> updated
+        .{ .doc_code = "DOC_02", .title = "new doc" }, // new -> created
+    };
+    const res = try batchSaveOrUpdate(client.document, batch_items, "doc_code");
+    try std.testing.expectEqual(@as(usize, 1), res.created_count);
+    try std.testing.expectEqual(@as(usize, 1), res.updated_count);
 }
