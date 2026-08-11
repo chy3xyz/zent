@@ -530,6 +530,150 @@ pub fn scopedFirst(
     return scopedFirstBy(accessor, "tenant_id", tenant_id, predicates);
 }
 
+/// Options for cursor-based keyset pagination.
+pub const CursorOptions = struct {
+    cursor_col: []const u8 = "id",
+    after: ?i64 = null,
+    before: ?i64 = null,
+    desc: bool = false,
+};
+
+/// Result of a cursor-based pagination query containing row items, next_cursor, and has_more flag.
+pub fn CursorResult(comptime Accessor: type) type {
+    const ItemsList = @typeInfo(AllResult(Accessor)).error_union.payload;
+    return struct {
+        const Self = @This();
+        items: ItemsList,
+        next_cursor: ?i64,
+        has_more: bool,
+
+        pub fn deinit(self: *Self, comptime infos: []const graph_mod.TypeInfo, comptime info: graph_mod.TypeInfo, allocator: std.mem.Allocator) void {
+            deinitRows(infos, info, self.items, allocator);
+        }
+    };
+}
+
+fn CursorPageResult(comptime Accessor: type) type {
+    const CR = CursorResult(Accessor);
+    return (error{InvalidCursorColumn} || @typeInfo(AllResult(Accessor)).error_union.error_set)!CR;
+}
+
+fn parseCursorOptions(opts: anytype) !CursorOptions {
+    const T = @TypeOf(opts);
+    if (T == CursorOptions) return opts;
+    if (@typeInfo(T) == .null) return .{};
+    if (@typeInfo(T) == .@"struct") {
+        var res = CursorOptions{};
+        if (@hasField(T, "cursor_col")) {
+            res.cursor_col = @field(opts, "cursor_col");
+        }
+        if (@hasField(T, "after")) {
+            const val = @field(opts, "after");
+            if (@typeInfo(@TypeOf(val)) == .optional) {
+                res.after = val;
+            } else {
+                res.after = val;
+            }
+        }
+        if (@hasField(T, "before")) {
+            const val = @field(opts, "before");
+            if (@typeInfo(@TypeOf(val)) == .optional) {
+                res.before = val;
+            } else {
+                res.before = val;
+            }
+        }
+        if (@hasField(T, "desc")) {
+            res.desc = @field(opts, "desc");
+        }
+        return res;
+    }
+    return error.InvalidCursorOptions;
+}
+
+fn getEntityCursorVal(comptime Entity: type, entity: *const Entity, col_name: []const u8) ?i64 {
+    inline for (@typeInfo(Entity).@"struct".field_names, @typeInfo(Entity).@"struct".field_types) |fname, FType| {
+        if (std.mem.eql(u8, fname, col_name)) {
+            const val = @field(entity, fname);
+            if (FType == i64 or FType == i32 or FType == u32 or FType == usize) {
+                return @intCast(val);
+            } else if (@typeInfo(FType) == .optional) {
+                if (val) |v| return @intCast(v);
+                return null;
+            }
+        }
+    }
+    return null;
+}
+
+/// Keyset cursor-based pagination helper.
+/// Performs fast cursor pagination without OFFSET overhead.
+/// Whitelist-checks `options.cursor_col` against entity schema fields.
+pub fn cursorPage(
+    accessor: anytype,
+    predicates: anytype,
+    options: anytype,
+    limit: usize,
+) CursorPageResult(@TypeOf(accessor)) {
+    const opts = try parseCursorOptions(options);
+    if (!isValidField(@TypeOf(accessor).entity_info, opts.cursor_col)) {
+        return error.InvalidCursorColumn;
+    }
+
+    const safe_limit = if (limit == 0) 10 else limit;
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+
+    const sql_builder = @import("sql/builder.zig");
+    if (opts.after) |after_val| {
+        const p = if (opts.desc)
+            sql_builder.LT(opts.cursor_col, .{ .int = after_val })
+        else
+            sql_builder.GT(opts.cursor_col, .{ .int = after_val });
+        _ = try q.Where(.{p});
+    }
+
+    if (opts.before) |before_val| {
+        const p = if (opts.desc)
+            sql_builder.GT(opts.cursor_col, .{ .int = before_val })
+        else
+            sql_builder.LT(opts.cursor_col, .{ .int = before_val });
+        _ = try q.Where(.{p});
+    }
+
+    if (opts.desc) {
+        _ = try q.OrderBy(&.{sql_builder.OrderDesc(opts.cursor_col)});
+    } else {
+        _ = try q.OrderBy(&.{sql_builder.OrderAsc(opts.cursor_col)});
+    }
+
+    _ = q.Limit(safe_limit + 1);
+
+    var items = try q.All();
+    var has_more = false;
+    var next_cursor: ?i64 = null;
+
+    const Entity = @typeInfo(CreateResult(@TypeOf(accessor))).error_union.payload;
+    if (items.items.len > safe_limit) {
+        has_more = true;
+        const pop_idx = safe_limit;
+        const last_entity = &items.items[pop_idx];
+        deinitEntity(@TypeOf(accessor).entity_infos, @TypeOf(accessor).entity_info, last_entity, accessor.allocator);
+        items.items.len = safe_limit;
+    }
+
+    if (items.items.len > 0) {
+        next_cursor = getEntityCursorVal(Entity, &items.items[items.items.len - 1], opts.cursor_col);
+    }
+
+    return .{
+        .items = items,
+        .next_cursor = next_cursor,
+        .has_more = has_more,
+    };
+}
+
 /// Batch create entities from a slice of struct values (`items`).
 /// Returns an owned Managed list of created Entities. Caller frees with `deinitRows`.
 pub fn batchCreate(
@@ -1138,4 +1282,61 @@ test "crud_helpers: increment and scoped tenant queries" {
 
     // 5. invalid tenant column error
     try std.testing.expectError(error.InvalidTenantColumn, scopedBy(client.inventory, "non_existent_tenant_col", 1, .{}));
+}
+
+test "crud_helpers: cursorPage keyset pagination" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const FeedItem = Schema("FeedItem", .{
+        .table_name = "zigshop_feed_item",
+        .pk = "feed_id",
+        .fields = &.{
+            field.Int("feed_id"),
+            field.String("content"),
+        },
+    });
+    const info = comptime fromSchema(FeedItem);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+
+    // Seed 5 feed items
+    inline for (1..6) |idx| {
+        var item = try create(client.feed_item, .{ .feed_id = @as(i64, @intCast(idx)), .content = "msg" });
+        deinitEntity(infos, info, &item, allocator);
+    }
+
+    // Page 1: limit 2, after null -> items 1, 2, has_more = true, next_cursor = 2
+    var cp1 = try cursorPage(client.feed_item, .{}, .{ .cursor_col = "feed_id" }, 2);
+    defer cp1.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(usize, 2), cp1.items.items.len);
+    try std.testing.expect(cp1.has_more);
+    try std.testing.expectEqual(@as(?i64, 2), cp1.next_cursor);
+
+    // Page 2: limit 2, after 2 -> items 3, 4, has_more = true, next_cursor = 4
+    var cp2 = try cursorPage(client.feed_item, .{}, .{ .cursor_col = "feed_id", .after = cp1.next_cursor }, 2);
+    defer cp2.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(usize, 2), cp2.items.items.len);
+    try std.testing.expect(cp2.has_more);
+    try std.testing.expectEqual(@as(?i64, 4), cp2.next_cursor);
+    try std.testing.expectEqual(@as(i64, 3), cp2.items.items[0].feed_id);
+
+    // Page 3: limit 2, after 4 -> item 5, has_more = false, next_cursor = 5
+    var cp3 = try cursorPage(client.feed_item, .{}, .{ .cursor_col = "feed_id", .after = cp2.next_cursor }, 2);
+    defer cp3.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(usize, 1), cp3.items.items.len);
+    try std.testing.expect(!cp3.has_more);
+    try std.testing.expectEqual(@as(?i64, 5), cp3.next_cursor);
+
+    // Invalid cursor col error
+    try std.testing.expectError(error.InvalidCursorColumn, cursorPage(client.feed_item, .{}, .{ .cursor_col = "invalid_col" }, 2));
 }
