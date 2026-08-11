@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.7] - 2026-08-11
+
 ### Added
 - Zent Builders (`QueryBuilder`, `UpdateBuilder`, `DeleteBuilder`) `Where` method now natively accepts dynamic predicate slices (`[]sql.Predicate` / `[]const sql.Predicate`), single `sql.Predicate` values, and pointers to tuples `&.{ ... }`. This enables `crud_helpers` (like `paginatedWithOptions`, `all`, `first`, `scoped`, etc.) to handle optional/dynamic query filters seamlessly.
 
