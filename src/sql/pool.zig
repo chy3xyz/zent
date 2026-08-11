@@ -395,6 +395,54 @@ pub fn ConnPool(comptime D: type) type {
             if (self.options.metrics.onRelease) |cb| cb(self.options.metrics.context);
         }
 
+        /// Proactively scan idle connections in the pool and close those that have been
+        /// idle for longer than `max_idle_secs`. Returns the number of reaped connections.
+        pub fn reapIdleConnections(self: *Self, max_idle_secs: i64) usize {
+            const io = self.io;
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.closed or max_idle_secs <= 0) return 0;
+
+            const now = unixTimestamp();
+            var reaped: usize = 0;
+            var i: usize = self.available.items.len;
+            while (i > 0) {
+                i -= 1;
+                const entry = self.available.items[i];
+                if (entry.idle_since) |idle_since| {
+                    if (now - idle_since >= max_idle_secs) {
+                        _ = self.available.swapRemove(i);
+                        self.closeConnection(entry);
+                        reaped += 1;
+                    }
+                }
+            }
+            return reaped;
+        }
+
+        /// Actively ping all idle connections in the pool and drop dead ones.
+        /// Returns the count of remaining healthy idle connections.
+        pub fn pingIdleConnections(self: *Self) usize {
+            const io = self.io;
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.closed) return 0;
+
+            var i: usize = self.available.items.len;
+            var healthy: usize = 0;
+            while (i > 0) {
+                i -= 1;
+                const entry = self.available.items[i];
+                entry.conn.asDriver().ping() catch {
+                    _ = self.available.swapRemove(i);
+                    self.closeConnection(entry);
+                    continue;
+                };
+                healthy += 1;
+            }
+            return healthy;
+        }
+
         /// Return a `driver.Driver` view of this pool.
         ///
         /// The returned handle borrows a connection per operation and returns

@@ -9,6 +9,9 @@ All notable changes to this project will be documented in this file.
 - `zent.graph.mermaid.toMermaid`: Generate Mermaid.js `erDiagram` markdown strings directly from `comptime` Schema definitions.
 - `zent.sql_diagnostics.SqlDiagnostic`: Rich diagnostic context struct for formatting detailed database execution errors (SQL, bound args, table name, DB native error codes).
 - `zent.graph.doc_exporter.toMarkdownDoc`: Export complete Markdown Data Dictionaries (fields, types, constraints, and edge relations) from `comptime` Schema definitions.
+- `zent.entql.parseOrder`: Parse `ORDER BY` clause strings into typed `sql.Order` terms.
+- `zent.sql_scan`: Added native `.enum` type scan support (supporting both integer tag values and string tag names across drivers).
+- `zent.sql_pool`: Added proactive idle connection reaping (`reapIdleConnections`) and active health pinging (`pingIdleConnections`) to `ConnPool`.
 - `zent.crud_helpers`: High-level business CRUD sugar functions including `get` (by ID), `findByIds`, `exists`, `findOrStore`, `saveOrUpdate` (with `SaveOrUpdateResult`), `paginated` (with `PageResult`), and `batchCreate`.
 
 ### Fixed

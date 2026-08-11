@@ -804,3 +804,59 @@ test "EntQL: NOT IN and EQFold with SQL builder" {
         try std.testing.expectEqualStrings("Alice", q.args[0].string);
     }
 }
+
+/// Parse an OrderBy string (e.g., "age DESC, created_at ASC") into a slice of `sql.Order` terms.
+/// Caller owns returned slice and must free each `Order.column.name` string plus slice.
+pub fn parseOrder(allocator: std.mem.Allocator, input: []const u8) ![]const sql.Order {
+    var terms = std.array_list.Managed(sql.Order).init(allocator);
+    errdefer {
+        for (terms.items) |t| {
+            switch (t) {
+                .column => |c| allocator.free(c.name),
+                else => {},
+            }
+        }
+        terms.deinit();
+    }
+
+    var iter = std.mem.splitScalar(u8, input, ',');
+    while (iter.next()) |raw_term| {
+        const term = std.mem.trim(u8, raw_term, " \t\r\n");
+        if (term.len == 0) continue;
+
+        var parts_iter = std.mem.splitScalar(u8, term, ' ');
+        const name_part = parts_iter.next() orelse continue;
+        if (name_part.len == 0) continue;
+
+        var is_desc = false;
+        while (parts_iter.next()) |dir_part| {
+            const trimmed_dir = std.mem.trim(u8, dir_part, " \t\r\n");
+            if (trimmed_dir.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(trimmed_dir, "DESC")) {
+                is_desc = true;
+            }
+        }
+
+        const name_duped = try allocator.dupe(u8, name_part);
+        try terms.append(sql.Order{ .column = .{ .name = name_duped, .desc = is_desc } });
+    }
+
+    return terms.toOwnedSlice();
+}
+
+test "EntQL: parseOrder terms" {
+    const allocator = std.testing.allocator;
+    const orders = try parseOrder(allocator, "age DESC, created_at ASC, name");
+    defer {
+        for (orders) |o| allocator.free(o.column.name);
+        allocator.free(orders);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), orders.len);
+    try std.testing.expectEqualStrings("age", orders[0].column.name);
+    try std.testing.expect(orders[0].column.desc);
+    try std.testing.expectEqualStrings("created_at", orders[1].column.name);
+    try std.testing.expect(!orders[1].column.desc);
+    try std.testing.expectEqualStrings("name", orders[2].column.name);
+    try std.testing.expect(!orders[2].column.desc);
+}

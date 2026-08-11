@@ -69,6 +69,7 @@ pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row
             }
             return value;
         },
+        .@"enum" => return try scanColumn(T, allocator, row, 0, json_arena),
         else => @compileError("Unsupported type for scanning: " ++ @typeName(T)),
     }
 }
@@ -213,7 +214,7 @@ fn scanRowInnerNoAlloc(comptime T: type, row: Row, comptime offset: usize) !T {
 fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
-        .int, .float, .bool, .pointer, .optional => return scanRowWithArena(T, allocator, row, json_arena),
+        .int, .float, .bool, .pointer, .optional, .@"enum" => return scanRowWithArena(T, allocator, row, json_arena),
         .@"struct" => |s| {
             var value: T = undefined;
             var col_idx: usize = offset;
@@ -293,6 +294,16 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
             const text = row.getText(index) orelse return error.TypeMismatch;
             const a = if (json_arena) |arena| arena.allocator() else allocator;
             return std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.TypeMismatch;
+        },
+        .@"enum" => {
+            if (row.getInt(index)) |v| {
+                const int_val = std.math.cast(@typeInfo(T).@"enum".tag_type, v) orelse return error.TypeMismatch;
+                return @fromBackingInt(@intCast(int_val));
+            }
+            if (row.getText(index)) |text| {
+                return std.meta.stringToEnum(T, text) orelse return error.TypeMismatch;
+            }
+            return error.TypeMismatch;
         },
         else => @compileError("Unsupported column type for scanning: " ++ @typeName(T)),
     }
@@ -405,5 +416,37 @@ test "scan optional null" {
     };
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
     const v = try scanRow(?i32, std.testing.allocator, row);
-    try std.testing.expect(v == null);
+    try std.testing.expectEqual(@as(?i32, null), v);
+}
+
+test "scan enum from int and string" {
+    const Status = enum { active, pending, deleted };
+
+    // Scan enum from integer index 1 (pending)
+    {
+        const data = MockRowData{
+            .ints = &.{1},
+            .floats = &.{null},
+            .texts = &.{null},
+            .bools = &.{null},
+            .nulls = &.{false},
+        };
+        const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+        const st = try scanRow(Status, std.testing.allocator, row);
+        try std.testing.expectEqual(Status.pending, st);
+    }
+
+    // Scan enum from string "deleted"
+    {
+        const data = MockRowData{
+            .ints = &.{null},
+            .floats = &.{null},
+            .texts = &.{"deleted"},
+            .bools = &.{null},
+            .nulls = &.{false},
+        };
+        const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+        const st = try scanRow(Status, std.testing.allocator, row);
+        try std.testing.expectEqual(Status.deleted, st);
+    }
 }
