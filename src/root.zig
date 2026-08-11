@@ -53,6 +53,7 @@ pub const graph = struct {
     pub const step = @import("graph/step.zig");
     pub const neighbors = @import("graph/neighbors.zig");
     pub const mermaid = @import("graph/mermaid.zig");
+    pub const doc_exporter = @import("graph/doc_exporter.zig");
 };
 
 pub const privacy = @import("privacy/policy.zig");
