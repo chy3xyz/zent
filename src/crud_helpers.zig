@@ -1468,3 +1468,68 @@ test "crud_helpers: updateWithVersion optimistic locking and batchSaveOrUpdate" 
     try std.testing.expectEqual(@as(usize, 1), res.created_count);
     try std.testing.expectEqual(@as(usize, 1), res.updated_count);
 }
+
+test "Where and crud_helpers support dynamic []sql.Predicate slices and single predicates" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const sql_mod = @import("sql/builder.zig");
+
+    const TaskItem = Schema("TaskItem", .{
+        .table_name = "zigshop_task_item",
+        .pk = "task_id",
+        .fields = &.{
+            field.Int("task_id"),
+            field.String("status"),
+            field.Int("user_id"),
+        },
+    });
+    const info = comptime fromSchema(TaskItem);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+    const preds = client.task_item.predicates;
+
+    // Seed data
+    var t1 = try create(client.task_item, .{ .status = "pending", .user_id = 10 });
+    deinitEntity(infos, info, &t1, allocator);
+    var t2 = try create(client.task_item, .{ .status = "completed", .user_id = 10 });
+    deinitEntity(infos, info, &t2, allocator);
+    var t3 = try create(client.task_item, .{ .status = "pending", .user_id = 20 });
+    deinitEntity(infos, info, &t3, allocator);
+
+    // 1. Dynamic ArrayList of predicates
+    var dyn_preds = std.array_list.Managed(sql_mod.Predicate).init(allocator);
+    defer dyn_preds.deinit();
+
+    // Dynamically append status = "pending"
+    try dyn_preds.append(preds.statusEQ(.{ .string = "pending" }));
+    // Dynamically append user_id = 10
+    try dyn_preds.append(preds.user_idEQ(.{ .int = 10 }));
+
+    // Test QueryBuilder.Where with dynamic slice []const sql.Predicate
+    var q = client.task_item.Query();
+    defer q.deinit();
+    _ = try q.Where(dyn_preds.items);
+    const rows = try q.All();
+    defer deinitRows(infos, info, rows, allocator);
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+
+    // Test crud_helpers.paginatedWithOptions with dynamic slice []const sql.Predicate
+    var page_res = try paginatedWithOptions(client.task_item, dyn_preds.items, .{}, 1, 10);
+    defer page_res.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(usize, 1), page_res.items.items.len);
+    try std.testing.expectEqual(@as(i64, 1), page_res.total);
+
+    // 2. Single predicate directly passed to Where
+    const single_res = try all(client.task_item, preds.statusEQ(.{ .string = "completed" }));
+    defer deinitRows(infos, info, single_res, allocator);
+    try std.testing.expectEqual(@as(usize, 1), single_res.items.len);
+}

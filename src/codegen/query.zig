@@ -287,23 +287,20 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const PredT = @TypeOf(predicates);
             const pred_info = @typeInfo(PredT);
             switch (pred_info) {
+                .@"union" => {
+                    try self.predicates.append(predicates);
+                },
                 .pointer => |ptr| {
-                    switch (@typeInfo(ptr.child)) {
-                        .array => {
-                            for (predicates) |p| {
-                                try self.predicates.append(p);
-                            }
-                        },
-                        .@"struct" => |s| {
-                            if (s.is_tuple) {
-                                inline for (predicates.*) |p| {
-                                    try self.predicates.append(p);
-                                }
-                            } else {
-                                @compileError("Where expects a tuple or slice of sql.Predicate");
-                            }
-                        },
-                        else => @compileError("Where expects a tuple or slice of sql.Predicate"),
+                    if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
+                        try self.predicates.append(predicates.*);
+                    } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
+                        inline for (predicates.*) |p| {
+                            try self.predicates.append(p);
+                        }
+                    } else {
+                        for (predicates) |p| {
+                            try self.predicates.append(p);
+                        }
                     }
                 },
                 .array => {
@@ -317,10 +314,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                             try self.predicates.append(p);
                         }
                     } else {
-                        @compileError("Where expects a tuple or slice of sql.Predicate");
+                        @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate");
                     }
                 },
-                else => @compileError("Where expects a tuple or slice of sql.Predicate"),
+                else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
             }
             return self;
         }

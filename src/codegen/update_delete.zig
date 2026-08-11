@@ -268,8 +268,26 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
 
         /// Add predicates for WHERE clause.
         pub fn Where(self: *Self, predicates: anytype) !*Self {
-            switch (@typeInfo(@TypeOf(predicates))) {
-                .pointer, .array => {
+            const PredT = @TypeOf(predicates);
+            const pred_info = @typeInfo(PredT);
+            switch (pred_info) {
+                .@"union" => {
+                    try self.predicates.append(predicates);
+                },
+                .pointer => |ptr| {
+                    if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
+                        try self.predicates.append(predicates.*);
+                    } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
+                        inline for (predicates.*) |p| {
+                            try self.predicates.append(p);
+                        }
+                    } else {
+                        for (predicates) |p| {
+                            try self.predicates.append(p);
+                        }
+                    }
+                },
+                .array => {
                     for (predicates) |p| {
                         try self.predicates.append(p);
                     }
@@ -280,10 +298,10 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                             try self.predicates.append(p);
                         }
                     } else {
-                        @compileError("Where expects a tuple or slice of sql.Predicate");
+                        @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate");
                     }
                 },
-                else => @compileError("Where expects a tuple or slice of sql.Predicate"),
+                else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
             }
             return self;
         }
@@ -550,8 +568,26 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
         /// Add predicates for WHERE clause.
         pub fn Where(self: *Self, predicates: anytype) !*Self {
-            switch (@typeInfo(@TypeOf(predicates))) {
-                .pointer, .array => {
+            const PredT = @TypeOf(predicates);
+            const pred_info = @typeInfo(PredT);
+            switch (pred_info) {
+                .@"union" => {
+                    try self.predicates.append(predicates);
+                },
+                .pointer => |ptr| {
+                    if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
+                        try self.predicates.append(predicates.*);
+                    } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
+                        inline for (predicates.*) |p| {
+                            try self.predicates.append(p);
+                        }
+                    } else {
+                        for (predicates) |p| {
+                            try self.predicates.append(p);
+                        }
+                    }
+                },
+                .array => {
                     for (predicates) |p| {
                         try self.predicates.append(p);
                     }
@@ -562,10 +598,10 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                             try self.predicates.append(p);
                         }
                     } else {
-                        @compileError("Where expects a tuple or slice of sql.Predicate");
+                        @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate");
                     }
                 },
-                else => @compileError("Where expects a tuple or slice of sql.Predicate"),
+                else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
             }
             return self;
         }
@@ -1050,8 +1086,26 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         /// Add predicates for the current row's WHERE clause.
         /// Groups are ORed together in the final DELETE.
         pub fn Where(self: *Self, predicates: anytype) !*Self {
-            switch (@typeInfo(@TypeOf(predicates))) {
-                .pointer, .array => {
+            const PredT = @TypeOf(predicates);
+            const pred_info = @typeInfo(PredT);
+            switch (pred_info) {
+                .@"union" => {
+                    _ = try self.b.where(predicates);
+                },
+                .pointer => |ptr| {
+                    if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
+                        _ = try self.b.where(predicates.*);
+                    } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
+                        inline for (predicates.*) |p| {
+                            _ = try self.b.where(p);
+                        }
+                    } else {
+                        for (predicates) |p| {
+                            _ = try self.b.where(p);
+                        }
+                    }
+                },
+                .array => {
                     for (predicates) |p| {
                         _ = try self.b.where(p);
                     }
@@ -1062,10 +1116,10 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                             _ = try self.b.where(p);
                         }
                     } else {
-                        @compileError("Where expects a tuple or slice of sql.Predicate");
+                        @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate");
                     }
                 },
-                else => @compileError("Where expects a tuple or slice of sql.Predicate"),
+                else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
             }
             return self;
         }
