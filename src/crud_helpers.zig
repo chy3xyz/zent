@@ -441,6 +441,95 @@ pub fn withTx(
     try tx.commit();
 }
 
+/// Atomically increment (or decrement if delta < 0) a numeric field for rows matching `predicates`.
+/// Returns rows affected.
+pub fn increment(
+    accessor: anytype,
+    comptime field_name: []const u8,
+    delta: i64,
+    predicates: anytype,
+) !usize {
+    var upd = accessor.Update();
+    defer upd.deinit();
+    const expr = comptime field_name ++ " + ?";
+    _ = try upd.setExprArgs(field_name, expr, &.{.{ .int = delta }});
+    _ = try upd.Where(predicates);
+    return try upd.Save();
+}
+
+fn ScopedAllResult(comptime Accessor: type) type {
+    const AR = AllResult(Accessor);
+    return (error{ InvalidTenantColumn, EmptyInValues } || @typeInfo(AR).error_union.error_set)!@typeInfo(AR).error_union.payload;
+}
+
+fn ScopedFirstResult(comptime Accessor: type) type {
+    const FR = FirstResult(Accessor);
+    return (error{ InvalidTenantColumn, EmptyInValues } || @typeInfo(FR).error_union.error_set)!@typeInfo(FR).error_union.payload;
+}
+
+/// Query all entities matching `predicates` scoped to a tenant ID on `tenant_col`.
+/// Validates `tenant_col` against entity schema fields.
+pub fn scopedBy(
+    accessor: anytype,
+    comptime tenant_col: []const u8,
+    tenant_id: i64,
+    predicates: anytype,
+) ScopedAllResult(@TypeOf(accessor)) {
+    if (!isValidField(@TypeOf(accessor).entity_info, tenant_col)) {
+        return error.InvalidTenantColumn;
+    }
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+
+    const val_buf = try q.allocator.alloc(Value, 1);
+    defer q.allocator.free(val_buf);
+    val_buf[0] = .{ .int = tenant_id };
+    _ = try q.WhereIn(tenant_col, val_buf);
+
+    return try q.All();
+}
+
+/// Query all entities matching `predicates` scoped to `tenant_id` on default column "tenant_id".
+pub fn scoped(
+    accessor: anytype,
+    tenant_id: i64,
+    predicates: anytype,
+) ScopedAllResult(@TypeOf(accessor)) {
+    return scopedBy(accessor, "tenant_id", tenant_id, predicates);
+}
+
+/// Query the first entity matching `predicates` scoped to a tenant ID on `tenant_col`.
+pub fn scopedFirstBy(
+    accessor: anytype,
+    comptime tenant_col: []const u8,
+    tenant_id: i64,
+    predicates: anytype,
+) ScopedFirstResult(@TypeOf(accessor)) {
+    if (!isValidField(@TypeOf(accessor).entity_info, tenant_col)) {
+        return error.InvalidTenantColumn;
+    }
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+
+    const val_buf = try q.allocator.alloc(Value, 1);
+    defer q.allocator.free(val_buf);
+    val_buf[0] = .{ .int = tenant_id };
+    _ = try q.WhereIn(tenant_col, val_buf);
+
+    return try q.First();
+}
+
+/// Query the first entity matching `predicates` scoped to `tenant_id` on default column "tenant_id".
+pub fn scopedFirst(
+    accessor: anytype,
+    tenant_id: i64,
+    predicates: anytype,
+) ScopedFirstResult(@TypeOf(accessor)) {
+    return scopedFirstBy(accessor, "tenant_id", tenant_id, predicates);
+}
+
 /// Batch create entities from a slice of struct values (`items`).
 /// Returns an owned Managed list of created Entities. Caller frees with `deinitRows`.
 pub fn batchCreate(
@@ -980,4 +1069,73 @@ test "crud_helpers: paginatedWithOptions, latest, and withTx" {
     defer if (lat3) |*e| deinitEntity(infos, info, e, allocator);
     try std.testing.expect(lat3 != null);
     try std.testing.expectEqualStrings("tx_fourth", lat3.?.title); // 500 was rolled back
+}
+
+test "crud_helpers: increment and scoped tenant queries" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Inventory = Schema("Inventory", .{
+        .table_name = "zigshop_inventory",
+        .pk = "inventory_id",
+        .fields = &.{
+            field.Int("inventory_id"),
+            field.Int("tenant_id"),
+            field.String("item_code"),
+            field.Int("stock"),
+        },
+    });
+    const info = comptime fromSchema(Inventory);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+    const preds = client.inventory.predicates;
+
+    // Seed data for tenant 1 and tenant 2
+    var inv1 = try create(client.inventory, .{ .tenant_id = 1, .item_code = "ITEM_A", .stock = 100 });
+    deinitEntity(infos, info, &inv1, allocator);
+    var inv2 = try create(client.inventory, .{ .tenant_id = 1, .item_code = "ITEM_B", .stock = 50 });
+    deinitEntity(infos, info, &inv2, allocator);
+    var inv3 = try create(client.inventory, .{ .tenant_id = 2, .item_code = "ITEM_C", .stock = 200 });
+    deinitEntity(infos, info, &inv3, allocator);
+
+    // 1. increment (+10 stock for ITEM_A)
+    const affected1 = try increment(client.inventory, "stock", 10, .{preds.item_codeEQ(.{ .string = "ITEM_A" })});
+    try std.testing.expectEqual(@as(usize, 1), affected1);
+
+    var item_a = try first(client.inventory, .{preds.item_codeEQ(.{ .string = "ITEM_A" })});
+    defer if (item_a) |*e| deinitEntity(infos, info, e, allocator);
+    try std.testing.expect(item_a != null);
+    try std.testing.expectEqual(@as(i64, 110), item_a.?.stock);
+
+    // 2. decrement (-20 stock for ITEM_A)
+    const affected2 = try increment(client.inventory, "stock", -20, .{preds.item_codeEQ(.{ .string = "ITEM_A" })});
+    try std.testing.expectEqual(@as(usize, 1), affected2);
+
+    var item_a2 = try first(client.inventory, .{preds.item_codeEQ(.{ .string = "ITEM_A" })});
+    defer if (item_a2) |*e| deinitEntity(infos, info, e, allocator);
+    try std.testing.expect(item_a2 != null);
+    try std.testing.expectEqual(@as(i64, 90), item_a2.?.stock);
+
+    // 3. scoped queries for tenant 1
+    const t1_list = try scoped(client.inventory, 1, .{});
+    defer deinitRows(infos, info, t1_list, allocator);
+    try std.testing.expectEqual(@as(usize, 2), t1_list.items.len);
+
+    // 4. scopedFirst for tenant 2
+    var t2_first = try scopedFirst(client.inventory, 2, .{});
+    defer if (t2_first) |*e| deinitEntity(infos, info, e, allocator);
+    try std.testing.expect(t2_first != null);
+    try std.testing.expectEqualStrings("ITEM_C", t2_first.?.item_code);
+
+    // 5. invalid tenant column error
+    try std.testing.expectError(error.InvalidTenantColumn, scopedBy(client.inventory, "non_existent_tenant_col", 1, .{}));
 }
