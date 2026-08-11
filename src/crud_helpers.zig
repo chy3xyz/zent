@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const graph_mod = @import("codegen/graph.zig");
+const client_mod = @import("codegen/client.zig");
 const sql_driver = @import("sql/driver.zig");
 const Value = @import("sql/builder.zig").Value;
 const deinitEntity = @import("codegen/entity.zig").deinitEntity;
@@ -249,6 +250,197 @@ pub fn paginated(
     };
 }
 
+/// Options for sorting paginated or list queries.
+pub const SortOptions = struct {
+    sort_col: ?[]const u8 = null,
+    desc: bool = false,
+};
+
+/// Check if `field_name` is a valid field defined on entity schema `info`.
+pub fn isValidField(comptime info: graph_mod.TypeInfo, field_name: []const u8) bool {
+    inline for (info.fields) |f| {
+        if (std.mem.eql(u8, f.name, field_name)) return true;
+    }
+    return false;
+}
+
+fn parseSortOptions(opts: anytype) !SortOptions {
+    const T = @TypeOf(opts);
+    if (T == SortOptions) return opts;
+    if (T == []const u8 or T == [:0]const u8) return .{ .sort_col = opts, .desc = false };
+    if (@typeInfo(T) == .null) return .{};
+    if (@typeInfo(T) == .@"struct") {
+        var res = SortOptions{};
+        if (@hasField(T, "sort_col")) {
+            const val = @field(opts, "sort_col");
+            if (@typeInfo(@TypeOf(val)) == .optional) {
+                res.sort_col = val;
+            } else {
+                res.sort_col = val;
+            }
+        }
+        if (@hasField(T, "desc")) {
+            res.desc = @field(opts, "desc");
+        }
+        return res;
+    }
+    return error.InvalidSortOptions;
+}
+
+/// Paginated list query on an entity accessor with sorting options.
+/// Validates `options.sort_col` against entity schema fields to prevent SQL injection.
+pub fn paginatedWithOptions(
+    accessor: anytype,
+    predicates: anytype,
+    options: anytype,
+    page: usize,
+    page_size: usize,
+) !PageResult(@TypeOf(accessor)) {
+    const opts = try parseSortOptions(options);
+    const total_rows = try count(accessor, predicates);
+    const safe_page = if (page == 0) 1 else page;
+    const safe_size = if (page_size == 0) 10 else page_size;
+    const offset = (safe_page - 1) * safe_size;
+
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+
+    if (opts.sort_col) |col| {
+        if (!isValidField(@TypeOf(accessor).entity_info, col)) {
+            return error.InvalidSortColumn;
+        }
+        const sql_builder = @import("sql/builder.zig");
+        if (opts.desc) {
+            _ = try q.OrderBy(&.{sql_builder.OrderDesc(col)});
+        } else {
+            _ = try q.OrderBy(&.{sql_builder.OrderAsc(col)});
+        }
+    }
+
+    _ = q.Limit(safe_size);
+    _ = q.Offset(offset);
+
+    const items = try q.All();
+    const total_pages = if (total_rows == 0) 0 else @as(usize, @intCast(@divFloor(total_rows + @as(i64, @intCast(safe_size)) - 1, @as(i64, @intCast(safe_size)))));
+
+    return .{
+        .items = items,
+        .total = total_rows,
+        .page = safe_page,
+        .page_size = safe_size,
+        .total_pages = total_pages,
+    };
+}
+
+fn LatestResult(comptime Accessor: type) type {
+    const FR = FirstResult(Accessor);
+    return (error{InvalidSortColumn} || @typeInfo(FR).error_union.error_set)!@typeInfo(FR).error_union.payload;
+}
+
+/// Query the single latest entity matching `predicates` ordered by `sort_col` DESC.
+/// Whitelist-checks `sort_col` against entity schema fields.
+/// Returns owned entity or `null` — caller frees non-null result with `deinitEntity`.
+pub fn latest(
+    accessor: anytype,
+    predicates: anytype,
+    sort_col: []const u8,
+) LatestResult(@TypeOf(accessor)) {
+    if (!isValidField(@TypeOf(accessor).entity_info, sort_col)) {
+        return error.InvalidSortColumn;
+    }
+    const sql_builder = @import("sql/builder.zig");
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+    _ = try q.OrderBy(&.{sql_builder.OrderDesc(sort_col)});
+    return try q.First();
+}
+
+fn getInfos(comptime T: type) []const graph_mod.TypeInfo {
+    if (@hasDecl(T, "entity_infos")) return T.entity_infos;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |_, FieldT| {
+        if (@hasDecl(FieldT, "entity_infos")) {
+            return FieldT.entity_infos;
+        }
+    }
+    @compileError("Cannot resolve entity_infos from type " ++ @typeName(T));
+}
+
+fn RootClientType(comptime T: type) type {
+    if (@typeInfo(T) == .pointer) {
+        const Child = @typeInfo(T).pointer.child;
+        if (@hasField(Child, "client")) {
+            return @TypeOf(@as(Child, undefined).client);
+        }
+    }
+    if (@hasField(T, "client")) {
+        return @TypeOf(@as(T, undefined).client);
+    }
+    if (!@hasDecl(T, "entity_info") and @hasField(T, "driver") and @hasField(T, "allocator")) {
+        return T;
+    }
+    if (@hasDecl(T, "entity_info")) {
+        return client_mod.Client(T.entity_infos);
+    }
+    @compileError("Cannot resolve Root Client from type " ++ @typeName(T));
+}
+
+fn getRootClient(client_or_accessor: anytype) RootClientType(@TypeOf(client_or_accessor)) {
+    const T = @TypeOf(client_or_accessor);
+    if (@typeInfo(T) == .pointer) {
+        const Child = @typeInfo(T).pointer.child;
+        if (@hasField(Child, "client")) {
+            return client_or_accessor.client;
+        }
+    }
+    if (@hasField(T, "client")) {
+        return client_or_accessor.client;
+    }
+    if (!@hasDecl(T, "entity_info") and @hasField(T, "driver") and @hasField(T, "allocator")) {
+        return client_or_accessor;
+    }
+    if (@hasDecl(T, "entity_info") and @hasField(T, "driver") and @hasField(T, "allocator")) {
+        const infos = getInfos(T);
+        return client_mod.makeClient(infos, client_or_accessor.allocator, client_or_accessor.driver);
+    }
+    @compileError("Cannot resolve Root Client from type " ++ @typeName(T));
+}
+
+fn execTxCallback(tx_fn: anytype, tx_ptr: anytype) !void {
+    const F = @TypeOf(tx_fn);
+    const info = @typeInfo(F);
+    if (info == .@"fn" or (info == .pointer and @typeInfo(info.pointer.child) == .@"fn")) {
+        return try tx_fn(tx_ptr);
+    } else if (info == .@"struct" and @hasDecl(F, "exec")) {
+        return try tx_fn.exec(tx_ptr);
+    } else if (info == .@"struct" and @hasDecl(F, "run")) {
+        return try tx_fn.run(tx_ptr);
+    } else {
+        @compileError("Unsupported callback type for withTx: " ++ @typeName(F));
+    }
+}
+
+/// Execute a transaction callback within an automatically managed transaction lifecycle.
+/// Resolves root client/driver from `client_or_accessor`.
+/// Automatically commits on success and rolls back on error. `tx.deinit()` is always called.
+pub fn withTx(
+    client_or_accessor: anytype,
+    tx_fn: anytype,
+) anyerror!void {
+    const infos = comptime getInfos(@TypeOf(client_or_accessor));
+    const root_client = getRootClient(client_or_accessor);
+
+    var tx = try client_mod.beginTx(infos, root_client);
+    defer tx.deinit();
+
+    execTxCallback(tx_fn, &tx) catch |err| {
+        _ = tx.rollback() catch {};
+        return err;
+    };
+    try tx.commit();
+}
+
 /// Batch create entities from a slice of struct values (`items`).
 /// Returns an owned Managed list of created Entities. Caller frees with `deinitRows`.
 pub fn batchCreate(
@@ -346,7 +538,6 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     const fromSchema = @import("codegen/graph.zig").fromSchema;
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
     const Product = Schema("Product", .{
         .table_name = "zigshop_product",
         .pk = "product_id",
@@ -489,7 +680,6 @@ test "crud_helpers: first with no match returns null (not error)" {
     const fromSchema = @import("codegen/graph.zig").fromSchema;
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
     const Tag = Schema("Tag", .{
         .table_name = "zigshop_tag",
         .pk = "tag_id",
@@ -521,7 +711,6 @@ test "crud_helpers: all + count over predicates" {
     const fromSchema = @import("codegen/graph.zig").fromSchema;
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
 
     const Tag = Schema("Tag", .{
         .table_name = "zigshop_tag",
@@ -559,7 +748,6 @@ test "crud_helpers: batchCreate error path frees created entities (no leak)" {
     const fromSchema = @import("codegen/graph.zig").fromSchema;
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
 
     const Category = Schema("Category", .{
         .table_name = "zigshop_category",
@@ -591,7 +779,6 @@ test "crud_helpers: exists, findOrStore, paginated, and batchCreate" {
     const fromSchema = @import("codegen/graph.zig").fromSchema;
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
 
     const Category = Schema("Category", .{
         .table_name = "zigshop_category",
@@ -654,7 +841,6 @@ test "crud_helpers: get, findByIds, and saveOrUpdate" {
     const fromSchema = @import("codegen/graph.zig").fromSchema;
     const migrate = @import("sql/schema/migrate.zig");
     const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
 
     const Account = Schema("Account", .{
         .table_name = "zigshop_account",
@@ -710,4 +896,88 @@ test "crud_helpers: get, findByIds, and saveOrUpdate" {
     const found_list = try findByIds(client.account, allocator, ids);
     defer deinitRows(infos, info, found_list, allocator);
     try std.testing.expectEqual(@as(usize, 2), found_list.items.len);
+}
+
+test "crud_helpers: paginatedWithOptions, latest, and withTx" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Article = Schema("Article", .{
+        .table_name = "zigshop_article",
+        .pk = "article_id",
+        .fields = &.{
+            field.Int("article_id"),
+            field.String("title"),
+            field.Int("created_at"),
+        },
+    });
+    const info = comptime fromSchema(Article);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+
+    // Seed articles with different timestamps
+    var a1 = try create(client.article, .{ .title = "first", .created_at = 100 });
+    deinitEntity(infos, info, &a1, allocator);
+    var a2 = try create(client.article, .{ .title = "second", .created_at = 200 });
+    deinitEntity(infos, info, &a2, allocator);
+    var a3 = try create(client.article, .{ .title = "third", .created_at = 300 });
+    deinitEntity(infos, info, &a3, allocator);
+
+    // 1. paginatedWithOptions desc
+    var p_desc = try paginatedWithOptions(client.article, .{}, .{ .sort_col = "created_at", .desc = true }, 1, 2);
+    defer p_desc.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(i64, 3), p_desc.total);
+    try std.testing.expectEqual(@as(usize, 2), p_desc.items.items.len);
+    try std.testing.expectEqualStrings("third", p_desc.items.items[0].title);
+    try std.testing.expectEqualStrings("second", p_desc.items.items[1].title);
+
+    // 2. paginatedWithOptions invalid column error
+    try std.testing.expectError(error.InvalidSortColumn, paginatedWithOptions(client.article, .{}, .{ .sort_col = "non_existent" }, 1, 2));
+
+    // 3. latest helper
+    var lat = try latest(client.article, .{}, "created_at");
+    defer if (lat) |*e| deinitEntity(infos, info, e, allocator);
+    try std.testing.expect(lat != null);
+    try std.testing.expectEqualStrings("third", lat.?.title);
+
+    // 4. latest invalid column error
+    try std.testing.expectError(error.InvalidSortColumn, latest(client.article, .{}, "malicious_injection; DROP TABLE--"));
+
+    // 5. withTx commit path
+    try withTx(client, struct {
+        fn run(tx: anytype) !void {
+            var created = try create(tx.client.article, .{ .title = "tx_fourth", .created_at = 400 });
+            deinitEntity(infos, info, &created, allocator);
+        }
+    }.run);
+
+    var lat2 = try latest(client.article, .{}, "created_at");
+    defer if (lat2) |*e| deinitEntity(infos, info, e, allocator);
+    try std.testing.expect(lat2 != null);
+    try std.testing.expectEqualStrings("tx_fourth", lat2.?.title);
+
+    // 6. withTx rollback path
+    const RollbackError = error{IntentionalFailure};
+    const res = withTx(client, struct {
+        fn run(tx: anytype) !void {
+            var created = try create(tx.client.article, .{ .title = "tx_fifth_failed", .created_at = 500 });
+            deinitEntity(infos, info, &created, allocator);
+            return RollbackError.IntentionalFailure;
+        }
+    }.run);
+    try std.testing.expectError(RollbackError.IntentionalFailure, res);
+
+    var lat3 = try latest(client.article, .{}, "created_at");
+    defer if (lat3) |*e| deinitEntity(infos, info, e, allocator);
+    try std.testing.expect(lat3 != null);
+    try std.testing.expectEqualStrings("tx_fourth", lat3.?.title); // 500 was rolled back
 }
