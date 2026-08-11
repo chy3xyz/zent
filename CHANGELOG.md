@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `zent.crud_helpers`: Enhanced business query and mutation helpers:
+  - `paginatedWithOptions`: Sorting (`ASC`/`DESC`) with automatic column whitelist validation against entity schema fields (`error.InvalidSortColumn`).
+  - `latest`: Fetch newest single entity matching predicates with column whitelist validation.
+  - `withTx`: Transaction callback wrapper with automatic commit on success, rollback on error, and guaranteed single `deinit()` cleanup.
+  - `increment`: Atomic field increment / decrement helper.
+  - `scoped` / `scopedBy` / `scopedFirst` / `scopedFirstBy`: Multi-tenant query scope helpers enforcing tenant ID isolation (`error.InvalidTenantColumn`).
+  - `cursorPage`: Keyset cursor-based pagination helper (`CursorResult`) supporting `after`/`before` and `has_more` without `OFFSET` overhead.
+  - `updateWithVersion`: Optimistic concurrency locking update helper returning `error.OptimisticLockConflict` on version mismatches.
+  - `batchSaveOrUpdate`: Batch upsert helper matching on business key fields (`error.InvalidMatchColumn`).
+
 ## [0.29.5] - 2026-08-11
 
 ### Added
