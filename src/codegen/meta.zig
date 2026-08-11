@@ -7,7 +7,7 @@ pub fn Meta(comptime info: TypeInfo) type {
         pub const Label = info.name;
 
         // Field name constants
-        pub const FieldID = "id";
+        pub const FieldID = info.pk_field;
 
         // Column names array
         pub const Columns = blk: {

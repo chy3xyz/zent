@@ -267,6 +267,55 @@ pub fn batchCreate(
     return list;
 }
 
+/// Query a single entity by its primary key integer ID.
+/// Returns owned Entity or null — free non-null result with `deinitEntity`.
+pub fn get(accessor: anytype, id_val: i64) !@typeInfo(FirstResult(@TypeOf(accessor))).error_union.payload {
+    var q = accessor.Query();
+    defer q.deinit();
+    const val_buf = try q.allocator.alloc(Value, 1);
+    defer q.allocator.free(val_buf);
+    val_buf[0] = .{ .int = id_val };
+    _ = try q.WhereIn(@TypeOf(accessor).meta.FieldID, val_buf);
+    return try q.First();
+}
+
+/// Query entities matching a list of integer IDs.
+/// Returns owned Managed list of entities — caller frees with `deinitRows`.
+pub fn findByIds(accessor: anytype, allocator: std.mem.Allocator, ids: []const i64) !@typeInfo(AllResult(@TypeOf(accessor))).error_union.payload {
+    const val_buf = try allocator.alloc(Value, ids.len);
+    defer allocator.free(val_buf);
+    for (ids, 0..) |id, i| {
+        val_buf[i] = .{ .int = id };
+    }
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.WhereIn(@TypeOf(accessor).meta.FieldID, val_buf);
+    return try q.All();
+}
+
+/// Result enum returned by `saveOrUpdate`.
+pub fn SaveOrUpdateResult(comptime Accessor: type) type {
+    const Entity = @typeInfo(CreateResult(Accessor)).error_union.payload;
+    return union(enum) {
+        created: Entity,
+        updated: usize,
+    };
+}
+
+/// Save or update helper:
+/// Checks if records matching `predicates` exist.
+/// If matched, performs `update(accessor, values, predicates)` returning `.updated = rows_affected`.
+/// If no match, performs `create(accessor, values)` returning `.created = entity`.
+pub fn saveOrUpdate(accessor: anytype, values: anytype, predicates: anytype) !SaveOrUpdateResult(@TypeOf(accessor)) {
+    if (try exists(accessor, predicates)) {
+        const n = try update(accessor, values, predicates);
+        return .{ .updated = n };
+    } else {
+        const ent = try create(accessor, values);
+        return .{ .created = ent };
+    }
+}
+
 /// Free every row of an `All()` result plus the list itself. Centralizes the
 /// memory contract so persistence code is terse: map each `rows.items[i]`,
 /// then `deinitRows(infos, info, rows, alloc)` in one call.
@@ -556,4 +605,69 @@ test "crud_helpers: exists, findOrStore, paginated, and batchCreate" {
     try std.testing.expectEqual(@as(i64, 4), p1.total);
     try std.testing.expectEqual(@as(usize, 2), p1.items.items.len);
     try std.testing.expectEqual(@as(usize, 2), p1.total_pages);
+}
+
+test "crud_helpers: get, findByIds, and saveOrUpdate" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+
+    const Account = Schema("Account", .{
+        .table_name = "zigshop_account",
+        .pk = "account_id",
+        .fields = &.{
+            field.Int("account_id"),
+            field.String("username").Unique(),
+            field.Int("balance"),
+        },
+    });
+    const info = comptime fromSchema(Account);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+    const preds = client.account.predicates;
+
+    // 1. saveOrUpdate -> created
+    var res1 = try saveOrUpdate(client.account, .{ .username = "alice", .balance = 100 }, .{preds.usernameEQ(.{ .string = "alice" })});
+    switch (res1) {
+        .created => |*ent| {
+            defer deinitEntity(infos, info, ent, allocator);
+            try std.testing.expect(ent.account_id > 0);
+            try std.testing.expectEqualStrings("alice", ent.username);
+
+            // 2. get by ID
+            var got = try get(client.account, ent.account_id);
+            defer if (got) |*e| deinitEntity(infos, info, e, allocator);
+            try std.testing.expect(got != null);
+            try std.testing.expectEqual(ent.account_id, got.?.account_id);
+        },
+        .updated => @panic("expected created"),
+    }
+
+    // 3. saveOrUpdate -> updated
+    const res2 = try saveOrUpdate(client.account, .{ .balance = 200 }, .{preds.usernameEQ(.{ .string = "alice" })});
+    switch (res2) {
+        .updated => |affected| try std.testing.expectEqual(@as(usize, 1), affected),
+        .created => @panic("expected updated"),
+    }
+
+    // 4. findByIds
+    const batch_res = try batchCreate(client.account, allocator, &[_]struct { username: []const u8, balance: i64 }{
+        .{ .username = "bob", .balance = 50 },
+        .{ .username = "charlie", .balance = 75 },
+    });
+    defer deinitRows(infos, info, batch_res, allocator);
+
+    const ids = &[_]i64{ batch_res.items[0].account_id, batch_res.items[1].account_id };
+    const found_list = try findByIds(client.account, allocator, ids);
+    defer deinitRows(infos, info, found_list, allocator);
+    try std.testing.expectEqual(@as(usize, 2), found_list.items.len);
 }
