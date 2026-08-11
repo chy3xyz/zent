@@ -132,6 +132,23 @@ pub fn main() !void {
 }
 ```
 
+### 业务极简 Helper 与 Schema 工具链
+
+```zig
+// 1. 单行极简 CRUD Helper
+var u = try zent.crud_helpers.get(client.user, 100);
+if (try zent.crud_helpers.exists(client.user, .{ preds.emailEQ("alice@example.com") })) { ... }
+var p1 = try zent.crud_helpers.paginated(client.category, .{ preds.statusEQ(1) }, 1, 20);
+
+// 2. 导出 Mermaid ER 架构图
+const diagram = try zent.graph.mermaid.toMermaid(allocator, graph.types);
+defer allocator.free(diagram);
+
+// 3. 导出 Markdown 数据字典
+const doc = try zent.graph.doc_exporter.toMarkdownDoc(allocator, graph.types, .{ .title = "数据库数据字典" });
+defer allocator.free(doc);
+```
+
 ## 项目结构
 
 ```

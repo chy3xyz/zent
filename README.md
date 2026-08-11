@@ -139,6 +139,23 @@ pub fn main() !void {
 }
 ```
 
+### Ergonomic Helpers & Schema Tooling
+
+```zig
+// 1. One-line CRUD Helpers
+var u = try zent.crud_helpers.get(client.user, 100);
+if (try zent.crud_helpers.exists(client.user, .{ preds.emailEQ("alice@example.com") })) { ... }
+var p1 = try zent.crud_helpers.paginated(client.category, .{ preds.statusEQ(1) }, 1, 20);
+
+// 2. Export Mermaid ER Diagram
+const diagram = try zent.graph.mermaid.toMermaid(allocator, graph.types);
+defer allocator.free(diagram);
+
+// 3. Export Markdown Data Dictionary
+const doc = try zent.graph.doc_exporter.toMarkdownDoc(allocator, graph.types, .{ .title = "DB Schema" });
+defer allocator.free(doc);
+```
+
 ## Project Structure
 
 ```

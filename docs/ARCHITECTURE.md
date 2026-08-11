@@ -28,12 +28,14 @@ sql (src/sql)         Dialect-aware SQL builder + driver interface
    ├── sqlite.zig / postgres.zig / mysql.zig
    ├── scan.zig       row → struct (column-name mapping, arena or owned)
    ├── schema/        migrate (create tables/views, Flyway-style)
-   ├── pool.zig       ConnPool
+   ├── pool.zig       ConnPool (with active ping & idle reaping)
+   ├── diagnostics.zig SqlDiagnostic context for rich error formatting
    └── logger/cache/explain
 
 cross-cutting:
-   graph/    edge traversal steps (neighbors/step)
-   entql/    EntQL expression parser → SQL
+   crud_helpers ergonomic business CRUD sugar (get, findByIds, exists, findOrStore, saveOrUpdate, paginated, batchCreate)
+   graph/    edge traversal steps (neighbors/step), mermaid (ER diagram), doc_exporter (Markdown Data Dictionary)
+   entql/    EntQL expression parser + parseOrder → SQL
    privacy/  policy filter/deny rules
    runtime/  hook chain, errors, privacy context
 ```
