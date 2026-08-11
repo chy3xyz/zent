@@ -47,6 +47,12 @@ zig build benchmark    # micro-benchmarks
 zig build test
 ```
 
+## Documentation
+
+- [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) — best-practice patterns and pitfalls
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — layer map + memory contract
+- [docs/UPGRADING.md](docs/UPGRADING.md) — version upgrades
+
 ## Usage Example
 
 ### Define Schema

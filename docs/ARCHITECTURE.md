@@ -93,6 +93,10 @@ consumer links its own sqlite/libpq/mariadb (see README "Consumer wiring").
 
 ## Docs
 
+- `BEST_PRACTICES.md` — **how to write persistence code**: API decision table,
+  memory contract, raw-driver Postgres dialect rules, transactions,
+  anti-patterns, testing, and the promotion checklist for moving patterns
+  into zent.
 - `RELEASING.md` — release flow + consumer hash-sync
 - `docs/superpowers/specs/` — design specs
 - `CHANGELOG.md` — release history
