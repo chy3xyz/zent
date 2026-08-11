@@ -56,7 +56,7 @@ pub fn CrudService(
         }
 
         fn idPred(self: *Self, id: i64) sql.Predicate {
-            return self.client.predicates.idEQ(.{ .int = id });
+            return @field(self.client.predicates, info.pk_field ++ "EQ")(.{ .int = id });
         }
 
         /// Paged list scoped to the tenant (zent paged(): one count + one
