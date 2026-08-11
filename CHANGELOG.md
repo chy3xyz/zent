@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - `zent.graph.mermaid.toMermaid`: Generate Mermaid.js `erDiagram` markdown strings directly from `comptime` Schema definitions.
 - `zent.sql_diagnostics.SqlDiagnostic`: Rich diagnostic context struct for formatting detailed database execution errors (SQL, bound args, table name, DB native error codes).
 - `zent.graph.doc_exporter.toMarkdownDoc`: Export complete Markdown Data Dictionaries (fields, types, constraints, and edge relations) from `comptime` Schema definitions.
+- `zent.crud_helpers`: High-level business CRUD sugar functions including `exists`, `findOrStore`, `paginated` (with `PageResult`), and `batchCreate`.
 
 ## [0.29.4] - 2026-08-10
 

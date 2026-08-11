@@ -185,6 +185,88 @@ pub fn delete(accessor: anytype, predicates: anytype) !usize {
     return try del.Exec();
 }
 
+/// Check if any row matches the specified `predicates`.
+/// Returns `true` if at least 1 record exists, `false` otherwise.
+pub fn exists(accessor: anytype, predicates: anytype) !bool {
+    return (try count(accessor, predicates)) > 0;
+}
+
+/// Finds the first matching entity. If none matches, creates and returns a new entity with `create_values`.
+/// Returns owned Entity — free with `deinitEntity`.
+pub fn findOrStore(accessor: anytype, create_values: anytype, predicates: anytype) !@typeInfo(CreateResult(@TypeOf(accessor))).error_union.payload {
+    const existing = try first(accessor, predicates);
+    if (existing) |e| {
+        return e;
+    }
+    return try create(accessor, create_values);
+}
+
+/// Pagination result struct containing total row count, page details, and row items.
+pub fn PageResult(comptime Accessor: type) type {
+    const ItemsList = @typeInfo(AllResult(Accessor)).error_union.payload;
+    return struct {
+        const Self = @This();
+        items: ItemsList,
+        total: i64,
+        page: usize,
+        page_size: usize,
+        total_pages: usize,
+
+        pub fn deinit(self: *Self, comptime infos: []const graph_mod.TypeInfo, comptime info: graph_mod.TypeInfo, allocator: std.mem.Allocator) void {
+            deinitRows(infos, info, self.items, allocator);
+        }
+    };
+}
+
+/// Paginated list query on an entity accessor:
+/// Queries total count and limit/offset slice of items for the requested page.
+pub fn paginated(
+    accessor: anytype,
+    predicates: anytype,
+    page: usize,
+    page_size: usize,
+) !PageResult(@TypeOf(accessor)) {
+    const total_rows = try count(accessor, predicates);
+    const safe_page = if (page == 0) 1 else page;
+    const safe_size = if (page_size == 0) 10 else page_size;
+    const offset = (safe_page - 1) * safe_size;
+
+    var q = accessor.Query();
+    defer q.deinit();
+    _ = try q.Where(predicates);
+    _ = q.Limit(safe_size);
+    _ = q.Offset(offset);
+
+    const items = try q.All();
+    const total_pages = if (total_rows == 0) 0 else @as(usize, @intCast(@divFloor(total_rows + @as(i64, @intCast(safe_size)) - 1, @as(i64, @intCast(safe_size)))));
+
+    return .{
+        .items = items,
+        .total = total_rows,
+        .page = safe_page,
+        .page_size = safe_size,
+        .total_pages = total_pages,
+    };
+}
+
+/// Batch create entities from a slice of struct values (`items`).
+/// Returns an owned Managed list of created Entities. Caller frees with `deinitRows`.
+pub fn batchCreate(
+    accessor: anytype,
+    allocator: std.mem.Allocator,
+    items: anytype,
+) !@typeInfo(AllResult(@TypeOf(accessor))).error_union.payload {
+    const Entity = @typeInfo(CreateResult(@TypeOf(accessor))).error_union.payload;
+    var list = std.array_list.Managed(Entity).init(allocator);
+    errdefer list.deinit();
+
+    for (items) |item| {
+        const entity = try create(accessor, item);
+        try list.append(entity);
+    }
+    return list;
+}
+
 /// Free every row of an `All()` result plus the list itself. Centralizes the
 /// memory contract so persistence code is terse: map each `rows.items[i]`,
 /// then `deinitRows(infos, info, rows, alloc)` in one call.
@@ -411,4 +493,67 @@ test "crud_helpers: all + count over predicates" {
     const rows = try all(client.tag, .{preds.is_deleteEQ(.{ .int = 0 })});
     defer deinitRows(infos, info, rows, allocator);
     try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+}
+
+test "crud_helpers: exists, findOrStore, paginated, and batchCreate" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+
+    const Category = Schema("Category", .{
+        .table_name = "zigshop_category",
+        .pk = "category_id",
+        .fields = &.{
+            field.Int("category_id"),
+            field.String("name").Unique(),
+            field.Int("status").Default(1),
+        },
+    });
+    const info = comptime fromSchema(Category);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+    const preds = client.category.predicates;
+
+    // 1. exists before insertion
+    try std.testing.expect(!(try exists(client.category, .{preds.nameEQ(.{ .string = "electronics" })})));
+
+    // 2. findOrStore (stores missing entity)
+    var stored = try findOrStore(client.category, .{ .name = "electronics", .status = 1 }, .{preds.nameEQ(.{ .string = "electronics" })});
+    defer deinitEntity(infos, info, &stored, allocator);
+    try std.testing.expectEqualStrings("electronics", stored.name);
+
+    // 3. exists after insertion
+    try std.testing.expect(try exists(client.category, .{preds.nameEQ(.{ .string = "electronics" })}));
+
+    // 4. findOrStore (finds existing entity)
+    var fetched = try findOrStore(client.category, .{ .name = "electronics", .status = 99 }, .{preds.nameEQ(.{ .string = "electronics" })});
+    defer deinitEntity(infos, info, &fetched, allocator);
+    try std.testing.expectEqual(stored.category_id, fetched.category_id);
+    try std.testing.expectEqual(@as(i64, 1), fetched.status); // original status preserved
+
+    // 5. batchCreate
+    const batch_items = &[_]struct { name: []const u8, status: i64 }{
+        .{ .name = "books", .status = 1 },
+        .{ .name = "clothing", .status = 1 },
+        .{ .name = "sports", .status = 1 },
+    };
+    const created_list = try batchCreate(client.category, allocator, batch_items);
+    defer deinitRows(infos, info, created_list, allocator);
+    try std.testing.expectEqual(@as(usize, 3), created_list.items.len);
+
+    // 6. paginated (total = 4, page 1, size 2)
+    var p1 = try paginated(client.category, .{preds.statusEQ(.{ .int = 1 })}, 1, 2);
+    defer p1.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(i64, 4), p1.total);
+    try std.testing.expectEqual(@as(usize, 2), p1.items.items.len);
+    try std.testing.expectEqual(@as(usize, 2), p1.total_pages);
 }
