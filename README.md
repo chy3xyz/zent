@@ -4,7 +4,7 @@ A Zig language implementation of an Entity Framework, inspired by [ent](https://
 
 [中文版本](README_CN.md)
 
-Current release: **v0.29.4** (package version synced to tags; see `scripts/release.sh`).
+Current release: **v0.29.5** (package version synced to tags; see `scripts/release.sh`).
 
 ## Features
 
@@ -227,7 +227,7 @@ forces C linkage on consumers:
     // Prefer the git dependency: GitHub tarball archives are not stable
     // across fetches on zig 0.17-dev (hash churn), while a pinned commit
     // ref always resolves to the same content.
-    .url = "git+https://github.com/chy3xyz/zent.git#v0.29.4",
+    .url = "git+https://github.com/chy3xyz/zent.git#v0.29.5",
     .hash = "…", // run `zig fetch --save <url>` to fill this in
 },
 
