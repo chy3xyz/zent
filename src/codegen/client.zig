@@ -113,6 +113,11 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
     return struct {
         const Self = @This();
 
+        /// Exposed so generic helpers can free entities on error paths without
+        /// re-deriving the graph (e.g. `crud_helpers.batchCreate` errdefer).
+        pub const entity_infos = infos;
+        pub const entity_info = info;
+
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
         logger: Logger = .{},

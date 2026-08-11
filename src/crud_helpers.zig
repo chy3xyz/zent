@@ -257,8 +257,16 @@ pub fn batchCreate(
     items: anytype,
 ) !@typeInfo(AllResult(@TypeOf(accessor))).error_union.payload {
     const Entity = @typeInfo(CreateResult(@TypeOf(accessor))).error_union.payload;
+    // The accessor's client allocator owns created entities' strings; the list
+    // backing uses the passed allocator. Free both on any mid-loop failure.
+    const client_alloc = accessor.allocator;
+    const client_infos = @TypeOf(accessor).entity_infos;
+    const client_info = @TypeOf(accessor).entity_info;
     var list = std.array_list.Managed(Entity).init(allocator);
-    errdefer list.deinit();
+    errdefer {
+        for (list.items) |*e| deinitEntity(client_infos, client_info, e, client_alloc);
+        list.deinit();
+    }
 
     for (items) |item| {
         const entity = try create(accessor, item);
@@ -542,6 +550,38 @@ test "crud_helpers: all + count over predicates" {
     const rows = try all(client.tag, .{preds.is_deleteEQ(.{ .int = 0 })});
     defer deinitRows(infos, info, rows, allocator);
     try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+}
+
+test "crud_helpers: batchCreate error path frees created entities (no leak)" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+
+    const Category = Schema("Category", .{
+        .table_name = "zigshop_category",
+        .pk = "category_id",
+        .fields = &.{ field.Int("category_id"), field.String("name").Unique(), field.Int("status").Default(1) },
+    });
+    const info = comptime fromSchema(Category);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+
+    // Second item repeats the first's unique name -> create fails mid-loop;
+    // the first entity's owned strings must be freed by the errdefer.
+    const items = [_]struct { name: []const u8, status: i64 }{
+        .{ .name = "dup", .status = 1 },
+        .{ .name = "dup", .status = 1 },
+    };
+    try std.testing.expectError(error.UniqueViolation, batchCreate(client.category, allocator, items));
 }
 
 test "crud_helpers: exists, findOrStore, paginated, and batchCreate" {
