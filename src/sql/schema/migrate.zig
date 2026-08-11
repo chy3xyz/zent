@@ -392,9 +392,9 @@ pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeI
     }
 }
 
-/// Generate CREATE TABLE SQL for a TableDef.
-pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
-    var buf = std.array_list.Managed(u8).initCapacity(std.heap.page_allocator, 256) catch unreachable;
+/// Generate CREATE TABLE SQL for a TableDef using specified allocator.
+pub fn createTableSQLAlloc(allocator: std.mem.Allocator, table: TableDef, dialect: Dialect) ![]const u8 {
+    var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
     defer buf.deinit();
 
     try buf.appendSlice("CREATE TABLE IF NOT EXISTS ");
@@ -483,12 +483,17 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
 
     try buf.appendSlice("\n)");
 
-    return std.heap.page_allocator.dupe(u8, buf.items);
+    return allocator.dupe(u8, buf.items);
 }
 
-/// Generate CREATE INDEX SQL for an IndexDef.
-pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect) ![]const u8 {
-    var buf = std.array_list.Managed(u8).initCapacity(std.heap.page_allocator, 256) catch unreachable;
+/// Generate CREATE TABLE SQL for a TableDef.
+pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
+    return createTableSQLAlloc(std.heap.page_allocator, table, dialect);
+}
+
+/// Generate CREATE INDEX SQL for an IndexDef using specified allocator.
+pub fn createIndexSQLAlloc(allocator: std.mem.Allocator, index: IndexDef, table_name: []const u8, dialect: Dialect) ![]const u8 {
+    var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
     defer buf.deinit();
 
     try buf.appendSlice("CREATE ");
@@ -509,13 +514,18 @@ pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect)
     }
     try buf.appendSlice(")");
 
-    return std.heap.page_allocator.dupe(u8, buf.items);
+    return allocator.dupe(u8, buf.items);
 }
 
-/// Generate CREATE VIEW SQL.
-pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
+/// Generate CREATE INDEX SQL for an IndexDef.
+pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect) ![]const u8 {
+    return createIndexSQLAlloc(std.heap.page_allocator, index, table_name, dialect);
+}
+
+/// Generate CREATE VIEW SQL using specified allocator.
+pub fn createViewSQLAlloc(allocator: std.mem.Allocator, comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
     const view_sql = info.view_sql orelse return error.MissingViewSQL;
-    var buf = std.array_list.Managed(u8).initCapacity(std.heap.page_allocator, 256) catch unreachable;
+    var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
     defer buf.deinit();
 
     try buf.appendSlice("CREATE VIEW IF NOT EXISTS ");
@@ -523,7 +533,12 @@ pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
     try buf.appendSlice(" AS ");
     try buf.appendSlice(view_sql);
 
-    return std.heap.page_allocator.dupe(u8, buf.items);
+    return allocator.dupe(u8, buf.items);
+}
+
+/// Generate CREATE VIEW SQL.
+pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
+    return createViewSQLAlloc(std.heap.page_allocator, info, dialect);
 }
 
 /// Create entity and junction tables without creating indexes.
