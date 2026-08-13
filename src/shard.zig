@@ -220,3 +220,35 @@ test "ShardSet routes writes to the tenant's shard" {
         try testing.expectEqualStrings(case[1], rows.items[0].name);
     }
 }
+
+test "ShardRouter routes negative tenant ids without crashing" {
+    var router = ShardRouter.init(testing.allocator, 4);
+    defer router.deinit();
+    // Negative ids must not panic/UB: route() uses @bitCast (two's-complement)
+    // rather than @intCast so routing stays deterministic for any i64.
+    const a = router.route(-5);
+    const b = router.route(-5);
+    try testing.expectEqual(a, b);
+    try testing.expect(a < 4);
+    try testing.expect(router.route(-1) < 4);
+}
+
+test "ShardSet.init rejects shard count mismatch" {
+    const allocator = testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const buildGraph = @import("codegen/graph.zig").buildGraph;
+
+    const Account = Schema("Account", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+        },
+    });
+    const infos = comptime buildGraph(&.{Account}).types;
+    const Shards = ShardSet(infos);
+
+    var router = ShardRouter.init(allocator, 2);
+    defer router.deinit();
+    const empty: []const Shards.RootClient = &.{};
+    try testing.expectError(error.ShardCountMismatch, Shards.init(allocator, router, empty));
+}

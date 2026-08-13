@@ -1050,3 +1050,26 @@ test "MySQL quote ident" {
     const q = try Dialect.mysql.quoteIdent(&buf, "my_table");
     try std.testing.expectEqualStrings("`my_table`", q);
 }
+
+test "MySQL errnoToError maps common errnos" {
+    try std.testing.expectEqual(driver.Error.UniqueViolation, errnoToError(1062));
+    try std.testing.expectEqual(driver.Error.UniqueViolation, errnoToError(1586));
+    try std.testing.expectEqual(driver.Error.NotNullViolation, errnoToError(1048));
+    try std.testing.expectEqual(driver.Error.ForeignKeyViolation, errnoToError(1451));
+    try std.testing.expectEqual(driver.Error.ForeignKeyViolation, errnoToError(1452));
+    try std.testing.expectEqual(driver.Error.TxFailed, errnoToError(1213));
+    try std.testing.expectEqual(driver.Error.QueryTimeout, errnoToError(1969));
+    try std.testing.expectEqual(driver.Error.QueryTimeout, errnoToError(3024));
+    try std.testing.expectEqual(driver.Error.ConnectionFailed, errnoToError(2006));
+    try std.testing.expectEqual(driver.Error.DriverFailed, errnoToError(999999));
+}
+
+test "MySQL toDriverError maps native errors to the unified set" {
+    try std.testing.expectEqual(driver.Error.ConnectionFailed, toDriverError(error.MySQLConnectFailed));
+    try std.testing.expectEqual(driver.Error.ExecFailed, toDriverError(error.MySQLExecFailed));
+    try std.testing.expectEqual(driver.Error.QueryFailed, toDriverError(error.MySQLStmtFailed));
+    try std.testing.expectEqual(driver.Error.ProtocolError, toDriverError(error.MySQLDataTruncated));
+    try std.testing.expectEqual(driver.Error.QueryTimeout, toDriverError(error.QueryTimeout));
+    try std.testing.expectEqual(driver.Error.UniqueViolation, toDriverError(error.UniqueViolation));
+    try std.testing.expectEqual(driver.Error.DriverFailed, toDriverError(error.Unexpected));
+}

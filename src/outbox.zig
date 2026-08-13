@@ -356,3 +356,84 @@ test "outbox failed rows carry attempts" {
     try testing.expectEqualStrings(Status.failed, found.items[0].status);
     try testing.expectEqual(@as(i64, 2), found.items[0].attempts);
 }
+
+test "outbox dispatch exhausts max_attempts then marks failed" {
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const infos = graph.types;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+    const OutboxOps = Outbox(infos, info);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    _ = try OutboxOps.enqueue(root, 1, .{
+        .aggregate_type = "order",
+        .aggregate_id = 9,
+        .event_type = "order.placed",
+        .payload = "{}",
+    });
+
+    const FailingPublisher = Publisher{
+        .ctx = null,
+        .call = struct {
+            fn call(_: ?*anyopaque, _: Entry) anyerror!void {
+                return error.PublisherDown;
+            }
+        }.call,
+    };
+
+    // max_attempts=2: first dispatch requeues (attempts 0->1), second marks
+    // failed (attempts 1->2). Neither round counts as dispatched.
+    const d1 = try OutboxOps.dispatch(allocator, root, 100, FailingPublisher, 10, 2);
+    try testing.expectEqual(@as(usize, 0), d1);
+    const d2 = try OutboxOps.dispatch(allocator, root, 200, FailingPublisher, 10, 2);
+    try testing.expectEqual(@as(usize, 0), d2);
+
+    // The row is now failed with attempts=2 and no longer pending.
+    const ec = @field(root, "outbox_message");
+    var q = ec.Query();
+    defer q.deinit();
+    var found = try q.All();
+    defer {
+        for (found.items) |*e| deinitEntity(infos, info, e, allocator);
+        found.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), found.items.len);
+    try testing.expectEqualStrings(Status.failed, found.items[0].status);
+    try testing.expectEqual(@as(i64, 2), found.items[0].attempts);
+
+    const remaining = try OutboxOps.pending(allocator, root, 10);
+    defer OutboxOps.freeEntries(allocator, remaining);
+    try testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "outbox pending returns oldest-first and respects limit" {
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const infos = graph.types;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+    const OutboxOps = Outbox(infos, info);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    // Enqueue out of order: created_at 3000, 1000, 2000.
+    _ = try OutboxOps.enqueue(root, 3000, .{ .aggregate_type = "p", .aggregate_id = 1, .event_type = "e3", .payload = "{}" });
+    _ = try OutboxOps.enqueue(root, 1000, .{ .aggregate_type = "p", .aggregate_id = 2, .event_type = "e1", .payload = "{}" });
+    _ = try OutboxOps.enqueue(root, 2000, .{ .aggregate_type = "p", .aggregate_id = 3, .event_type = "e2", .payload = "{}" });
+
+    const pending = try OutboxOps.pending(allocator, root, 2);
+    defer OutboxOps.freeEntries(allocator, pending);
+    try testing.expectEqual(@as(usize, 2), pending.len);
+    try testing.expectEqual(@as(i64, 1000), pending[0].created_at);
+    try testing.expectEqual(@as(i64, 2000), pending[1].created_at);
+}
