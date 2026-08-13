@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.29.4** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.29.7** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (210 tests, 0 leaks; leaks fail the run)
+- `zig build test` — run unit tests (230 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run SQLite integration tests
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool)
 - `zig build run-start` — run the `examples/start` smoke test

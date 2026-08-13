@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Internal
+- CI: add a `benchmark-regression` canary job (`scripts/bench-compare.sh` +
+  `scripts/benchmark-baseline.txt`) that fails on >100% `ns/op` regressions;
+  loosen the threshold locally with `BENCH_REGRESSION_THRESHOLD_PCT`.
+- Docs: add `SECURITY.md`, `CODE_OF_CONDUCT.md`, and issue/PR templates; sync
+  `README_CN` consumer wiring to the git dependency and fix stale
+  `AGENTS.md`/`CONTRIBUTING.md` references (version, repo URL, dev.md).
+- Tests: cover outbox `max_attempts` exhaustion + oldest-first ordering,
+  shard negative-tenant routing + shard-count mismatch, and MySQL
+  `errnoToError`/`toDriverError` mapping.
+
 ## [0.29.7] - 2026-08-11
 
 ### Added

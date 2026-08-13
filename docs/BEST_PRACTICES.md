@@ -24,6 +24,23 @@ exotic.
 | JOIN / GROUP BY / DISTINCT / dynamic SET | `driver.query/exec` raw | §5 |
 | Transaction | `beginTx()` (codegen) | §6 |
 
+### `crud_helpers` vs `CrudService`
+
+zent ships two "CRUD sugar" layers — they do **not** overlap; pick by whether
+you need side effects:
+
+| | `crud_helpers` (`src/crud_helpers.zig`) | `CrudService` (`src/crud.zig`) |
+|---|---|---|
+| Shape | Stateless free functions | Stateful `CrudService(infos, info, tenant_col)` |
+| Derives from | the typed accessor (`client.order`) | `(infos, info)` + an explicit `tenant_col` |
+| Tenant isolation | opt-in via `scoped`/`scopedBy` | enforced on every op (bound at construction) |
+| Events | none | publishes `CrudEvent{created,updated,deleted}` to a listener (the after-hook surface) |
+| Use when | plain CRUD, or when you already filter manually | you need an audit trail / outbox trigger / a uniform tenant boundary |
+
+Rule of thumb: default to `crud_helpers` for terse reads/writes; reach for
+`CrudService` when several entities share the same tenant column and you want
+created/updated/deleted events emitted consistently (e.g. to feed the outbox).
+
 **Rule of thumb**: typed builders cover single-table + aggregates. Anything
 that references two tables, computes a `CASE`, or needs a correlated subquery
 goes to the raw driver. Don't force `Query()` to express a JOIN you could

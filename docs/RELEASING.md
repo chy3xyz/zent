@@ -30,6 +30,19 @@ git push origin main --tags
   version, and the package version must be ≥ the latest tag.
 - CHANGELOG keeps a `[Unreleased]` section at the top (Keep a Changelog flow).
 
+## Zig version pin
+
+zent targets Zig 0.17-dev, whose snapshots are not ABI-stable. CI pins a
+specific snapshot (`0.17.0-dev.1567+f0354179a` in `.github/workflows/ci.yml`);
+the same commit is the supported build toolchain. When bumping the pin:
+
+1. Update **both** the `test` and `integration-db`/`deadcode` jobs in
+   `.github/workflows/ci.yml` (the `version:` field under `setup-zig`).
+2. Update the prerequisites in `README.md` / `README_CN.md` to mention the
+   new commit.
+3. Re-run `zig build test` and `zig build test-integration` locally with the
+   new snapshot before committing.
+
 ## Consumer impact (hash sync)
 
 Zig package consumers lock onto `name + version + file hash` in their

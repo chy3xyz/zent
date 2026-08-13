@@ -29,13 +29,13 @@
 
 ### 环境要求
 
-- Zig 0.16.0 或更高版本
+- Zig 0.17.0 或更高版本
 - SQLite3 开发库
 
 ### 克隆项目
 
 ```bash
-git clone https://github.com/knot3bot/zent.git
+git clone https://github.com/chy3xyz/zent.git
 cd zent
 ```
 
@@ -96,7 +96,7 @@ zig build run-start
 
 如果你有问题或需要帮助，可以：
 - 查看 [README.md](README.md)
-- 查看 [dev.md](dev.md) 了解架构设计
+- 查看 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 了解架构设计
 - 创建 Issue 提问
 
 ## 许可证

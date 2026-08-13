@@ -22,7 +22,9 @@ Current release: **v0.29.7** (package version synced to tags; see `scripts/relea
 
 ### Prerequisites
 
-- Zig 0.17.0 or later
+- Zig 0.17-dev — CI pins `0.17.0-dev.1567+f0354179a`. Dev snapshots are not
+  ABI-stable; if a newer snapshot fails to build, use that exact commit
+  (check yours with `zig env`).
 - SQLite3 development libraries
 
 ### Installation

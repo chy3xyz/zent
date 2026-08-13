@@ -22,7 +22,8 @@ Zig 语言实现的实体框架（Entity Framework），复刻自 [ent](https://
 
 ### 环境要求
 
-- Zig 0.17.0 或更高版本
+- Zig 0.17-dev —— CI 锁定 `0.17.0-dev.1567+f0354179a`。dev 快照之间 ABI 不稳定，
+  若更新快照后编译失败，请使用该精确 commit（用 `zig env` 查看你的版本）。
 - SQLite3 开发库
 
 ### 安装
@@ -216,7 +217,9 @@ zent/
 ```zig
 // build.zig.zon
 .zent = .{
-    .url = "https://github.com/chy3xyz/zent/archive/refs/tags/v0.29.7.tar.gz",
+    // 优先使用 git 依赖：GitHub tarball 归档在 zig 0.17-dev 上跨 fetch 不稳定
+    // （hash 会漂移），而 pin 到某个 commit ref 始终解析到相同内容。
+    .url = "git+https://github.com/chy3xyz/zent.git#v0.29.7",
     .hash = "…", // 用 `zig fetch --save <url>` 自动填充
 },
 
