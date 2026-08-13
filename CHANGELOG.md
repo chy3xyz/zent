@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.29.8] - 2026-08-13
+
 ### Internal
 - CI: add a `benchmark-regression` canary job (`scripts/bench-compare.sh` +
   `scripts/benchmark-baseline.txt`) that fails on >100% `ns/op` regressions;
