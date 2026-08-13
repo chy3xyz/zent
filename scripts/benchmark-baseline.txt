@@ -1,0 +1,7 @@
+builder/simple_select 57
+builder/complex_where 188
+scan/single_entity 4736
+scan/batch_100 440248
+scan/batch_100_no_alloc 22
+pool/borrow_release 684
+pool/borrow_release_no_health 114

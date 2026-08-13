@@ -142,3 +142,25 @@ jobs:
 
       - name: Check dead-code baseline
         run: ZMODU=/tmp/zigmodu/zig-out/bin/zmodu bash scripts/check-deadcode.sh
+
+  benchmark-regression:
+    name: Benchmark regression canary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1567+f0354179a
+
+      - name: Install native database clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      # ns/op has ~±15% variance on shared runners, so the default threshold
+      # (100%) only catches catastrophic regressions. Tighten locally with
+      # BENCH_REGRESSION_THRESHOLD_PCT on a dedicated machine.
+      - name: Check benchmark regression
+        run: bash scripts/bench-compare.sh
