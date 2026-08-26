@@ -84,6 +84,38 @@ pub const Row = struct {
     pub fn isNull(self: Row, index: usize) bool {
         return self.vtable.isNull(self.ptr, index);
     }
+
+    pub const GetError = error{NullColumn};
+
+    /// Error-union variant of `getBool`. Returns `error.NullColumn` when the
+    /// column is NULL.
+    pub fn tryGetBool(self: Row, index: usize) GetError!bool {
+        return self.getBool(index) orelse error.NullColumn;
+    }
+
+    /// Error-union variant of `getInt`. Returns `error.NullColumn` when the
+    /// column is NULL.
+    pub fn tryGetInt(self: Row, index: usize) GetError!i64 {
+        return self.getInt(index) orelse error.NullColumn;
+    }
+
+    /// Error-union variant of `getFloat`. Returns `error.NullColumn` when the
+    /// column is NULL.
+    pub fn tryGetFloat(self: Row, index: usize) GetError!f64 {
+        return self.getFloat(index) orelse error.NullColumn;
+    }
+
+    /// Error-union variant of `getText`. Returns `error.NullColumn` when the
+    /// column is NULL.
+    pub fn tryGetText(self: Row, index: usize) GetError![]const u8 {
+        return self.getText(index) orelse error.NullColumn;
+    }
+
+    /// Error-union variant of `getBlob`. Returns `error.NullColumn` when the
+    /// column is NULL.
+    pub fn tryGetBlob(self: Row, index: usize) GetError![]const u8 {
+        return self.getBlob(index) orelse error.NullColumn;
+    }
 };
 
 /// Iterator over query results.
