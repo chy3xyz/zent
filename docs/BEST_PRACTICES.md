@@ -315,8 +315,23 @@ evaluation becomes a bottleneck, you have two options:
 - If you must split, keep each graph self-contained and use raw `Driver`
   calls for cross-graph queries.
 
+**Driver-first transactions (Z9, v0.31.0):** when several graphs share one
+`pool.asDriver()`, open a typed transaction for any graph without building
+a root `Client`:
+
+```zig
+var tx = try zent.codegen.beginTxFromDriver(order_infos, pool.asDriver(), alloc);
+defer tx.deinit(); // exactly once, regardless of commit/rollback
+var b = try tx.client.order.Create();
+...
+try tx.commit();
+```
+
+Re-entrant calls inside an active transaction degrade to a savepoint,
+same as `beginTx`.
+
 We plan first-class typed subgraphs with bridge edges (Z3). Until then,
-prefer a single graph with raised quotas.
+prefer a single graph — measured limits (UPGRADING §7a) cover ~300+ tables.
 
 ## 9. Promotion checklist (moving a pattern INTO zent)
 

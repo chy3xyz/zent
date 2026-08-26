@@ -93,7 +93,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 |--|--|
 | **Problem** | Multi-graph apps share `pool.asDriver()` but Client types don’t mix; payment/refund loaders need Driver-first APIs. |
 | **Proposal** | `beginTxFromDriver(infos, drv, alloc)`; document Driver-first config loader pattern; optional `beginTx(infos, *Client)`. |
-| **Status** | Open |
+| **Status** | **Fixed** (v0.31.0): `codegen.beginTxFromDriver(infos, drv, alloc)` opens a typed `TxClient` straight from a shared `Driver` (savepoint on re-entry); Driver-first pattern documented in `BEST_PRACTICES.md` §8a. |
 
 ### Z10 — `WithEdge` options (join kind + limit mode)
 
@@ -133,7 +133,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z6 | Row getInt semantics | P1 | **Fixed** v0.30.0 |
 | Z7 | Where `&.{}` | P1 | **Fixed** v0.30.0 |
 | Z8 | deinitEntity ergonomics | P1 | **Fixed** v0.31.0 |
-| Z9 | beginTxFromDriver | P1 | Open |
+| Z9 | beginTxFromDriver | P1 | **Fixed** v0.31.0 |
 | Z10 | WithEdge options | P1 | Open |
 | Z11 | Decimal field | P2 | Open |
 | Z12 | Complex UPDATE expr | P2 | Open |

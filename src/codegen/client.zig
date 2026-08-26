@@ -395,6 +395,22 @@ pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver
     };
 }
 
+/// Begin a transaction directly from a Driver, without a root Client.
+/// Multi-graph apps that share one connection pool (`pool.asDriver()`)
+/// use this to open a typed `TxClient` for any graph without building a
+/// root `Client` first. Like `beginTx`, a re-entrant call inside an
+/// active transaction degrades to a savepoint.
+pub fn beginTxFromDriver(comptime infos: []const TypeInfo, driver: sql_driver.Driver, allocator: std.mem.Allocator) sql_driver.Error!TxClient(infos) {
+    const tx = if (driver.inTransaction())
+        try driver.beginSavepoint("zent_sp")
+    else
+        try driver.beginTx();
+    return TxClient(infos){
+        .client = makeClient(infos, allocator, tx.inner),
+        .tx = tx,
+    };
+}
+
 const CreateTablesError = sql_driver.Error || error{MissingViewSQL};
 
 /// Create all database tables (create-only migration).
@@ -703,6 +719,55 @@ test "beginTx nested savepoint: inner rollback discards only inner writes" {
     try std.testing.expect(names.contains("outer-a"));
     try std.testing.expect(!names.contains("inner-b"));
     try std.testing.expect(names.contains("outer-c"));
+}
+
+test "beginTxFromDriver opens a typed tx straight from a Driver" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Item = Schema("Item", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+    const info = comptime fromSchema(Item);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    // No root Client: the transaction comes straight from the driver.
+    var tx = try beginTxFromDriver(infos, driver.asDriver(), allocator);
+    defer tx.deinit();
+    {
+        var b = try tx.client.item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "driver-first");
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+    // Re-entrant call on the same driver degrades to a savepoint.
+    try std.testing.expect(driver.inTransaction());
+    var nested = try beginTxFromDriver(infos, driver.asDriver(), allocator);
+    defer nested.deinit();
+    try nested.rollback();
+    try tx.commit();
+
+    const root = makeClient(infos, allocator, driver.asDriver());
+    var q = root.item.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expectEqualStrings("driver-first", rows.items[0].name);
 }
 
 test "beginTx nested savepoint: inner commit releases to outer tx" {
