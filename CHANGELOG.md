@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-08-26
+
 ### Added
 - `WithEdgeOptions(path, .{ .join = .inner, ... })` — eager edge loading with
   a schema-aware EXISTS inner-join filter in SQL, so `Limit` applies after

@@ -4,7 +4,7 @@ Zig 语言实现的实体框架（Entity Framework），复刻自 [ent](https://
 
 [English Version](README.md)
 
-当前发布：**v0.29.8**（包内版本与 tag 已同步；发版走 `scripts/release.sh`）。
+当前发布：**v0.31.0**（包内版本与 tag 已同步；发版走 `scripts/release.sh`）。
 
 ## 特性
 
@@ -219,7 +219,7 @@ zent/
 .zent = .{
     // 优先使用 git 依赖：GitHub tarball 归档在 zig 0.17-dev 上跨 fetch 不稳定
     // （hash 会漂移），而 pin 到某个 commit ref 始终解析到相同内容。
-    .url = "git+https://github.com/chy3xyz/zent.git#v0.29.8",
+    .url = "git+https://github.com/chy3xyz/zent.git#v0.31.0",
     .hash = "…", // 用 `zig fetch --save <url>` 自动填充
 },
 
