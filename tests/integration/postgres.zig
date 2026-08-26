@@ -880,3 +880,37 @@ test "Postgres: boolean column scans via getBool (t/f wire format)" {
     }
     try testing.expect(seen_on and seen_off);
 }
+
+test "Postgres: decimal (NUMERIC) field round-trips exact text" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const Money = schema("Money", .{
+        .fields = &.{field.Decimal("amount")},
+    });
+    const graph = comptime buildGraph(&.{Money});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS money", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    {
+        var b = try client.money.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("amount", "0.1000000001");
+        var row = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &row, allocator);
+        try testing.expectEqualStrings("0.1000000001", row.amount);
+    }
+
+    var q = client.money.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), rows.items.len);
+    try testing.expectEqualStrings("0.1000000001", rows.items[0].amount);
+}

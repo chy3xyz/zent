@@ -1990,3 +1990,37 @@ test "SQLite: query with timeout succeeds" {
     }
     try testing.expectEqual(@as(usize, 0), users.items.len);
 }
+
+test "SQLite: decimal field round-trips exact text" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Money = schema("Money", .{
+        .fields = &.{field.Decimal("amount")},
+    });
+    const graph = comptime buildGraph(&.{Money});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    {
+        var b = try client.money.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("amount", "19.99");
+        var row = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &row, allocator);
+        try testing.expectEqualStrings("19.99", row.amount);
+    }
+
+    var q = client.money.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), rows.items.len);
+    // TEXT affinity: the literal bytes come back verbatim (no REAL rewrite).
+    try testing.expectEqualStrings("19.99", rows.items[0].amount);
+}

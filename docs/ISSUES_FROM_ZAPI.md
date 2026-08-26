@@ -111,6 +111,8 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 
 Schema `Int` vs MySQL `DECIMAL` forces text reads (`DATA_ESCAPES` money rows). Scan to owned string or fixed-point; never silent truncate.
 
+**Status — Fixed (v0.31.0):** `field.Decimal("amount")` → PG `NUMERIC`, MySQL `DECIMAL(38,10)` (explicit precision so the `(10,0)` default can't truncate), SQLite `TEXT` (NUMERIC affinity would rewrite `1.10` to REAL `1.1`). Zig type is owned `[]const u8` — exact wire text, never f64. Round-trip integration tests on all three dialects; docs in `BEST_PRACTICES.md` §1.
+
 ### Z12 — Controlled multi-table / GREATEST update expressions
 
 Stock `GREATEST` and dual-table decrements remain raw. Document fluent limits; optional allowlisted `execExpr`.
@@ -135,7 +137,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z8 | deinitEntity ergonomics | P1 | **Fixed** v0.31.0 |
 | Z9 | beginTxFromDriver | P1 | **Fixed** v0.31.0 |
 | Z10 | WithEdge options | P1 | **Fixed** v0.31.0 |
-| Z11 | Decimal field | P2 | Open |
+| Z11 | Decimal field | P2 | **Fixed** v0.31.0 |
 | Z12 | Complex UPDATE expr | P2 | Open |
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
 

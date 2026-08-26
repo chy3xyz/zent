@@ -46,6 +46,13 @@ that references two tables, computes a `CASE`, or needs a correlated subquery
 goes to the raw driver. Don't force `Query()` to express a JOIN you could
 write in one raw line.
 
+**Money: use `field.Decimal`, never `field.Float` (Z11, v0.31.0).** Decimal
+fields map to PG `NUMERIC`, MySQL `DECIMAL(38,10)`, SQLite `TEXT`, and scan
+into an owned `[]const u8` — the exact wire text, no f64 rounding, no silent
+truncation. MySQL pads to the declared scale (`19.99` reads back as
+`19.9900000000`); parse to cents/fixed-point in application code before
+arithmetic.
+
 ## 2. Memory contract (the one thing to get right)
 
 zent results are **owned**; the caller frees exactly once. Three ownership

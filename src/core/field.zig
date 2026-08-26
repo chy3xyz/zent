@@ -12,6 +12,9 @@ pub const FieldType = enum {
     json,
     enum_,
     uuid,
+    /// Exact fixed-point money/decimal values. Scanned as owned text
+    /// (`[]const u8`) — never silently truncated to f64.
+    decimal,
     other,
 };
 
@@ -219,6 +222,14 @@ pub fn UUID(name: []const u8) Field {
     return .{ .name = name, .field_type = .uuid };
 }
 
+/// Exact decimal/money column. The Zig type is `[]const u8` (owned text):
+/// MySQL `DECIMAL` and PG `NUMERIC` both arrive as text on the wire, so the
+/// value is preserved byte-for-byte — no f64 rounding, no silent truncation.
+/// Parse to cents/fixed-point in application code when arithmetic is needed.
+pub fn Decimal(name: []const u8) Field {
+    return .{ .name = name, .field_type = .decimal };
+}
+
 pub fn Version(name: []const u8) Field {
     var f = Int(name);
     f.is_version = true;
@@ -260,6 +271,15 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
             if (std.mem.eql(u8, dialect.name, "postgres")) return "UUID";
             return "TEXT";
         },
+        .decimal => {
+            if (std.mem.eql(u8, dialect.name, "postgres")) return "NUMERIC";
+            // MySQL DECIMAL without precision defaults to (10,0) and would
+            // truncate fractional cents — pin an explicit precision instead.
+            if (std.mem.eql(u8, dialect.name, "mysql")) return "DECIMAL(38,10)";
+            // SQLite TEXT affinity keeps the literal bytes exact; NUMERIC
+            // affinity would silently rewrite "1.10" to the REAL 1.1.
+            return "TEXT";
+        },
         .other => return "TEXT",
     }
 }
@@ -270,7 +290,7 @@ pub fn zigType(comptime field_type: FieldType, comptime custom_type: ?type) type
         .bool => return bool,
         .int => return i64,
         .float => return f64,
-        .string, .text, .enum_, .uuid, .other => return []const u8,
+        .string, .text, .enum_, .uuid, .decimal, .other => return []const u8,
         .bytes => return []const u8,
         .time => return i64, // timestamp as epoch for simplicity
         .json => return custom_type orelse []const u8,
@@ -300,4 +320,10 @@ test "SQL type mapping" {
     try std.testing.expectEqualStrings("UUID", sqlType(.uuid, .{ .name = "postgres" }));
     try std.testing.expectEqualStrings("BLOB", sqlType(.bytes, .{ .name = "sqlite3" }));
     try std.testing.expectEqualStrings("BYTEA", sqlType(.bytes, .{ .name = "postgres" }));
+    // Decimal: exact text everywhere; MySQL pins explicit precision so the
+    // (10,0) default cannot truncate fractional cents.
+    try std.testing.expectEqualStrings("NUMERIC", sqlType(.decimal, .{ .name = "postgres" }));
+    try std.testing.expectEqualStrings("DECIMAL(38,10)", sqlType(.decimal, .{ .name = "mysql" }));
+    try std.testing.expectEqualStrings("TEXT", sqlType(.decimal, .{ .name = "sqlite3" }));
+    try std.testing.expectEqual([]const u8, zigType(.decimal, null));
 }

@@ -876,3 +876,38 @@ test "MySQL: boolean column scans via getBool" {
     }
     try testing.expect(seen_on and seen_off);
 }
+
+test "MySQL: decimal (DECIMAL(38,10)) field round-trips without truncation" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const Money = schema("Money", .{
+        .fields = &.{field.Decimal("amount")},
+    });
+    const graph = comptime buildGraph(&.{Money});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS money", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    {
+        var b = try client.money.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("amount", "19.99");
+        var row = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &row, allocator);
+        // MySQL has no RETURNING: Save echoes the input values back.
+        try testing.expectEqualStrings("19.99", row.amount);
+    }
+
+    var q = client.money.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), rows.items.len);
+    try testing.expectEqualStrings("19.9900000000", rows.items[0].amount);
+}
