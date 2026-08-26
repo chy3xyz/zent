@@ -21,7 +21,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 | **Evidence** | `sql/builder.zig` (ESCAPE render); consumer: `PORTING_RECIPE.md`, `WAVE4_GUIDE.md` |
 | **Proposal** | Dialect branch: MySQL → parameterised `LIKE ?` with bind-side escape, or `ESCAPE '\\\\'`; add MySQL integration test; drop “never use ContainsEscaped” from consumer guides once green. |
 | **Acceptance** | Fuzzy match with literal `%`/`_` works on MySQL/SQLite/PG; CI covers MySQL. |
-| **Status** | Open |
+| **Status** | **Fixed** in v0.30.0 |
 
 ### Z2 — Business-key upsert (usable ODKU / ON CONFLICT)
 
@@ -125,18 +125,18 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 | ID | Title | P | Status |
 |----|-------|---|--------|
-| Z1 | ContainsEscaped MySQL | P0 | Open |
-| Z2 | Business-key upsert | P0 | Open |
+| Z1 | ContainsEscaped MySQL | P0 | **Fixed** v0.30.0 |
+| Z2 | Business-key upsert | P0 | **Fixed** v0.30.0 |
 | Z3 | Large-schema / multi-graph | P0 | Open |
-| Z4 | INSERT IGNORE | P1 | Open |
+| Z4 | INSERT IGNORE | P1 | **Fixed** v0.30.0 |
 | Z5 | SELECT expressions | P1 | Open |
-| Z6 | Row getInt semantics | P1 | Open |
-| Z7 | Where `&.{}` | P1 | Open |
+| Z6 | Row getInt semantics | P1 | **Fixed** v0.30.0 |
+| Z7 | Where `&.{}` | P1 | **Fixed** v0.30.0 |
 | Z8 | deinitEntity ergonomics | P1 | Open |
 | Z9 | beginTxFromDriver | P1 | Open |
 | Z10 | WithEdge options | P1 | Open |
 | Z11 | Decimal field | P2 | Open |
 | Z12 | Complex UPDATE expr | P2 | Open |
-| Z13 | Docs alignment | P2 | Open |
+| Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.
