@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `WithEdgeOptions(path, .{ .join = .inner, ... })` — eager edge loading with
+  a schema-aware EXISTS inner-join filter in SQL, so `Limit` applies after
+  the edge filter (no limit skew). `WithEdgeOpts` / `EdgeJoinKind` /
+  `EdgeLimitMode` exported via `zent.codegen` (Z10).
+- `field.Decimal(name)` — exact money columns: PG `NUMERIC`, MySQL
+  `DECIMAL(38,10)` (explicit precision), SQLite `TEXT`; scans to owned
+  `[]const u8`, never silently truncated to f64 (Z11).
+- Fluent SELECT/ORDER BY expressions: `sql.SelectExpr(expr, alias)` with
+  quoted aliases on all dialects, `sql.OrderExprSql(expr, desc)`,
+  `Selector.addColumn`, `Driver.queryOwned`, and `Row.columnIndex(name)`
+  for alias-based DTO mapping (Z5).
+- `codegen.ManagedEntity` / `managedEntity` bind the owning allocator to an
+  entity so teardown can't pick the wrong allocator; `codegen.dupeEntityTo`
+  deep-copies fields, typed JSON structs and two edge levels into a caller
+  arena for request-scoped HTTP handlers (Z8).
+- `codegen.beginTxFromDriver(infos, driver, alloc)` — open a typed `TxClient`
+  straight from a shared `Driver`/`pool.asDriver()` without a root `Client`;
+  re-entrant calls degrade to a savepoint (Z9).
+- Comptime graph stress tests: a single `buildGraph` compiles 400 minimal,
+  400 realistic 8-field, and 300 hub-and-spoke edged schemas under the
+  default 1M eval-branch quota (Z3).
+
+### Documentation
+- `UPGRADING.md` §7a: measured large-schema limits + safe-split guidance (Z3).
+- `BEST_PRACTICES.md`: §5b SELECT expressions, §5c fluent complex UPDATE
+  expressions (`setExprArgs` with `GREATEST`-style clamps; multi-table UPDATE
+  stays raw), §2 rule 5 allocator-safe teardown helpers, §8a Driver-first
+  transactions (Z5/Z8/Z9/Z12).
+
+## [0.30.0] - 2026-08-26
+
+### Added
+- `SaveOrUpdateOn(conflict_columns)` on `CreateBuilder`/`BulkInsertBuilder` —
+  business-key upserts with explicit conflict targets (PG/SQLite
+  `ON CONFLICT (cols) DO UPDATE`, MySQL ODKU) (Z2).
+- `SaveIgnore()` — conflict-do-nothing inserts: MySQL `INSERT IGNORE`,
+  PG `ON CONFLICT DO NOTHING`, SQLite `INSERT OR IGNORE` (Z4).
+- `Row.tryGetBool/tryGetInt/tryGetFloat/tryGetText/tryGetBlob` —
+  error-union getters returning `error.NullColumn` on NULL (Z6).
+- `crud_helpers.freeOwnedStrings` helper (zapi escape-ledger support).
+
+### Fixed
+- MySQL `ContainsEscaped` now uses `!` as the ESCAPE character (`\` is
+  MySQL's string escape and corrupts LIKE patterns) (Z1).
+
+### Documentation
+- `BEST_PRACTICES.md`: upsert section (§5a), multi-graph strategy (§8a),
+  escape-ledger template with "min zent version" column (Z7/Z13).
+- `docs/ISSUES_FROM_ZAPI.md`: consumer issue tracker from the zapi port.
+
 ## [0.29.8] - 2026-08-13
 
 ### Internal
