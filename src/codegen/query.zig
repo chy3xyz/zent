@@ -200,6 +200,38 @@ fn loadEdgePath(
     return error.InvalidEdge;
 }
 
+/// How `WithEdgeOptions` joins an eager-loaded edge.
+pub const EdgeJoinKind = enum {
+    /// Keep parents with no matching edge targets (edge slice stays null).
+    left,
+    /// Filter the parent query with a schema-aware EXISTS subquery so only
+    /// parents with at least one edge target are returned. SQL LIMIT then
+    /// applies after the filter — no limit skew.
+    inner,
+};
+
+/// Controls when the parent LIMIT applies relative to edge filtering.
+pub const EdgeLimitMode = enum {
+    /// LIMIT in the parent SQL (default).
+    before_edges,
+    /// With `.inner` joins the EXISTS filter runs in SQL, so LIMIT already
+    /// applies after the edge filter — this flag documents that intent.
+    /// With `.left` joins edge loading never changes the parent set, so
+    /// this mode is a no-op.
+    after_edges,
+};
+
+/// Options for `QueryBuilder.WithEdgeOptions`.
+pub const WithEdgeOpts = struct {
+    join: EdgeJoinKind = .left,
+    limit_mode: EdgeLimitMode = .before_edges,
+};
+
+const WithEdgeEntry = struct {
+    path: []const u8,
+    opts: WithEdgeOpts,
+};
+
 /// Generate a Query builder for an entity.
 pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, comptime Entity: type) type {
     return struct {
@@ -221,7 +253,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         cursor_desc: bool = false,
         distinct: bool,
         with_trashed: bool,
-        with_edges: std.ArrayListUnmanaged([]const u8),
+        with_edges: std.ArrayListUnmanaged(WithEdgeEntry),
         group_cols: std.ArrayListUnmanaged([]const u8),
         or_in_chunks: std.ArrayListUnmanaged([]const []const sql.Value),
         having_pred: ?sql.Predicate,
@@ -479,12 +511,27 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// relations, e.g. `WithEdge("posts.comments")` loads each row's
         /// posts and each post's comments (two levels max).
         pub fn WithEdge(self: *Self, comptime edge_path: []const u8) !*Self {
+            return self.WithEdgeOptions(edge_path, .{});
+        }
+
+        /// Eager-load an edge with options. `.join = .inner` adds a
+        /// schema-aware EXISTS filter on the head edge: parents without
+        /// targets are excluded in SQL, so LIMIT applies after the filter
+        /// (no limit skew from post-load filtering). Nested dot paths
+        /// filter on the head edge only.
+        pub fn WithEdgeOptions(self: *Self, comptime edge_path: []const u8, opts: WithEdgeOpts) !*Self {
             const head = comptime blk: {
                 if (std.mem.indexOfScalar(u8, edge_path, '.')) |dot| break :blk edge_path[0..dot];
                 break :blk edge_path;
             };
             _ = comptime findEdgeInfo(info, head);
-            try self.with_edges.append(self.allocator, edge_path);
+            if (opts.join == .inner) {
+                const lowerHasEdge = @import("predicate.zig").lowerHasEdge;
+                var pred = sql.Predicate{ .has_edge = .{ .edge_name = head, .fk_col = "", .pred = null } };
+                try lowerHasEdge(infos, info, self.allocator, &pred);
+                try self.predicates.append(pred);
+            }
+            try self.with_edges.append(self.allocator, .{ .path = edge_path, .opts = opts });
             return self;
         }
 
@@ -648,8 +695,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 });
             }
 
-            for (self.with_edges.items) |edge_name| {
-                try self.loadEdges(edge_name, result.items);
+            for (self.with_edges.items) |we| {
+                try self.loadEdges(we.path, result.items);
             }
             return result;
         }
@@ -720,8 +767,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
 
             var entities_arr = [_]Entity{entity};
-            for (self.with_edges.items) |edge_name| {
-                try self.loadEdges(edge_name, &entities_arr);
+            for (self.with_edges.items) |we| {
+                try self.loadEdges(we.path, &entities_arr);
             }
             return entities_arr[0];
         }
@@ -760,8 +807,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
 
             var entities_arr = [_]Entity{entity};
-            for (self.with_edges.items) |edge_name| {
-                try self.loadEdges(edge_name, &entities_arr);
+            for (self.with_edges.items) |we| {
+                try self.loadEdges(we.path, &entities_arr);
             }
             return entities_arr[0];
         }
@@ -1198,7 +1245,7 @@ test "Query builder WithEdge compiles" {
 
     _ = try q.WithEdge("cars");
     try std.testing.expectEqual(@as(usize, 1), q.with_edges.items.len);
-    try std.testing.expectEqualStrings("cars", q.with_edges.items[0]);
+    try std.testing.expectEqualStrings("cars", q.with_edges.items[0].path);
 }
 
 test "WithEdge nested two-level preload" {
@@ -1840,4 +1887,108 @@ test "Select projects columns and leaves others zero" {
     try std.testing.expectEqualStrings("t1", rows.items[0].title);
     // Unselected string field keeps its zero value (empty, read-only).
     try std.testing.expectEqual(@as(usize, 0), rows.items[0].body.len);
+}
+
+test "WithEdgeOptions inner join filters parents and honors SQL limit" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const migrate = @import("../sql/schema/migrate.zig");
+
+    const User = Schema("InnerUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const Post = Schema("InnerPost", .{
+        .fields = &.{
+            field.Int("inner_user_id"),
+            field.String("title"),
+        },
+        .edges = &.{edge.From("author", User).Field("inner_user_id")},
+    });
+    const UserWithEdge = Schema("InnerUser", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("posts", Post)},
+    });
+
+    const graph = comptime buildGraph(&.{ UserWithEdge, Post });
+    const infos = graph.types;
+    const user_info = comptime fromSchema(UserWithEdge);
+    const post_info = comptime fromSchema(Post);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    // Seed: u1 no posts, u2 two posts, u3 no posts.
+    for (1..4) |i| {
+        var b = try root.inner_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", switch (i) {
+            1 => "u1",
+            2 => "u2",
+            else => "u3",
+        });
+        var row = try b.Save();
+        defer deinitEntity(infos, user_info, &row, allocator);
+        if (i == 2) {
+            for (0..2) |j| {
+                var pb = try root.inner_post.Create();
+                defer pb.deinit();
+                _ = try pb.setFieldValue("inner_user_id", row.id);
+                _ = try pb.setFieldValue("title", if (j == 0) "p1" else "p2");
+                var prow = try pb.Save();
+                defer deinitEntity(infos, post_info, &prow, allocator);
+            }
+        }
+    }
+
+    // Inner join: only u2 survives; its posts are loaded.
+    {
+        var q = root.inner_user.Query();
+        defer q.deinit();
+        _ = try q.WithEdgeOptions("posts", .{ .join = .inner });
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+        try std.testing.expectEqualStrings("u2", users.items[0].name);
+        try std.testing.expectEqual(@as(usize, 2), users.items[0].edges.posts.?.len);
+    }
+
+    // Limit skew fix: LIMIT 1 with the inner filter returns u2, not u1.
+    {
+        var q = root.inner_user.Query();
+        defer q.deinit();
+        _ = try q.OrderBy(&.{sql.OrderAsc("id")});
+        _ = q.Limit(1);
+        _ = try q.WithEdgeOptions("posts", .{ .join = .inner, .limit_mode = .after_edges });
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+        try std.testing.expectEqualStrings("u2", users.items[0].name);
+    }
+
+    // Default (left) join keeps everyone.
+    {
+        var q = root.inner_user.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("posts");
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 3), users.items.len);
+    }
 }

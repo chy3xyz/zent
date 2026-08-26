@@ -129,6 +129,20 @@ stick with it across the codebase.
 
 **`Limit`/`Offset` return `*Self`, not an error union** — don't `try` them.
 
+**Eager edges: `WithEdgeOptions` (Z10, v0.31.0).** Default `WithEdge("posts")`
+is a LEFT join — parents without posts survive with `edges.posts == null`.
+For "only parents that HAVE targets", pass `.join = .inner`:
+
+```zig
+_ = try q.WithEdgeOptions("posts", .{ .join = .inner });
+```
+
+This adds a schema-aware `EXISTS` filter in SQL (not a post-load filter), so
+`Limit(n)` returns exactly n qualifying parents — no limit skew. Nested dot
+paths (`"posts.comments"`) filter on the head edge only. Edges must live in
+the same graph as the parent (see §8a); cross-graph eager loading is a
+compile error by design.
+
 ## 4. Aggregates
 
 ```zig

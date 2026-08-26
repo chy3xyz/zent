@@ -101,7 +101,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 |--|--|
 | **Problem** | LIMIT applied before edge load skews result sets; INNER vs LEFT requires manual filtering; edges must live in one graph. |
 | **Proposal** | `WithEdgeOpts{ .join = .left|.inner, .limit_mode = .after_edges }`; document cross-graph edge rules. |
-| **Status** | Open |
+| **Status** | **Fixed** (v0.31.0): `WithEdgeOptions(path, .{ .join = .inner, .limit_mode = .after_edges })` — inner join lowers to a schema-aware EXISTS filter in SQL, so LIMIT applies after the edge filter (no skew); cross-graph edge rules documented in `BEST_PRACTICES.md` §3/§8a. |
 
 ---
 
@@ -134,7 +134,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z7 | Where `&.{}` | P1 | **Fixed** v0.30.0 |
 | Z8 | deinitEntity ergonomics | P1 | **Fixed** v0.31.0 |
 | Z9 | beginTxFromDriver | P1 | **Fixed** v0.31.0 |
-| Z10 | WithEdge options | P1 | Open |
+| Z10 | WithEdge options | P1 | **Fixed** v0.31.0 |
 | Z11 | Decimal field | P2 | Open |
 | Z12 | Complex UPDATE expr | P2 | Open |
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
