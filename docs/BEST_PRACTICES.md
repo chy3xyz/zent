@@ -104,10 +104,11 @@ defer crud_helpers.deinitRows(ORDER_INFO_accessor_infos, ORDER_INFO, rows, alloc
 for (rows.items) |*e| { /* dupe strings with alloc */ }
 ```
 
-**Predicates go in a tuple `.{ ... }`**, not `&.{ ... }`. The pointer form
-is accepted by `Where`, but the tuple form is what `update`/`delete`
-(`update_delete.zig`) resolve at comptime without tripping "unable to resolve
-comptime value". Be consistent: always `.{ ... }`.
+**Predicates go in a tuple `.{ ... }`**, not `&.{ ... }`. Both forms are
+accepted by `Where` on query, update, and delete builders; the tuple form is
+preferred for consistency. The builders normalize pointer-to-tuple,
+pointer-to-predicate, arrays, and slices at comptime, so pick one style and
+stick with it across the codebase.
 
 **`Limit`/`Offset` return `*Self`, not an error union** — don't `try` them.
 
@@ -167,6 +168,32 @@ while (rows.next()) |row| {
 alloc, mapRow)` — it returns an owned `Rows(T)` that frees strings + slice in
 one `deinit()`.
 
+## 5a. Upserts (INSERT ... ON CONFLICT / ODKU)
+
+zent supports three upsert modes on `CreateBuilder`:
+
+| Mode | MySQL | PostgreSQL | SQLite |
+|------|-------|------------|--------|
+| `Save()` | `INSERT INTO` | `INSERT INTO ... RETURNING` | `INSERT INTO ... RETURNING` |
+| `SaveOrUpdate()` | `INSERT ... ON DUPLICATE KEY UPDATE` | `INSERT ... ON CONFLICT (pk) DO UPDATE SET ...` | `INSERT OR REPLACE` |
+| `SaveIgnore()` | `INSERT IGNORE INTO` | `INSERT ... ON CONFLICT DO NOTHING` | `INSERT OR IGNORE` |
+
+**Business-key upsert** (e.g. `(key, app_id)` settings table):
+
+```zig
+var b = try client.setting.Create();
+defer b.deinit();
+_ = try b.setFieldValue("key", .{ .string = "site_name" });
+_ = try b.setFieldValue("app_id", .{ .int = app_id });
+_ = try b.setFieldValue("value", .{ .string = "zent" });
+_ = try b.SaveOrUpdate();
+```
+
+`SaveOrUpdate` targets the primary key by default. For a business-key
+conflict target (e.g. a `@unique` index on `(key, app_id)`), ensure the
+schema marks the columns unique and the builder generates the correct
+`ON CONFLICT ("key", "app_id")` clause (see Z2).
+
 ## 6. Transactions
 
 ```zig
@@ -192,7 +219,7 @@ try tx.commit();
 |---------|---------|-----|
 | `const e = first(...)` then `\|*e\|` | "deinitEntity requires a mutable entity pointer" | `var e` |
 | `create(...)` freed as value, not `&created` | same compile error | `deinitEntity(..., &created, ...)` |
-| Predicates as `&.{ ... }` to update/delete | "unable to resolve comptime value" (update_delete.zig) | tuple `.{ ... }` |
+| Predicates as `&.{ ... }` to update/delete | historical comptime failure; now normalized | tuple `.{ ... }` for consistency |
 | `comptime_int` for a Float field in `create` values | "Type mismatch for field 'x': expected f64, got comptime_int" | `@floatFromInt` / `0.0` |
 | Unqualified `is_delete` in a JOIN | runtime "column reference is ambiguous" | `p.is_delete = 0` |
 | `{d:0>4}` on a signed int (Zig 0.17) | dates render `+2026-+8-+10` | cast to `usize`/`u32` before formatting |
@@ -213,6 +240,28 @@ try tx.commit();
 - **Verify rollback leaves no trace**: after the tx test, `SELECT` outside the
   tx and assert 0 rows.
 
+## 8a. Multi-graph strategy
+
+zent assumes one graph spans all tables of an application; edges resolve
+across it at comptime. When the schema grows beyond ~80 tables and comptime
+evaluation becomes a bottleneck, you have two options:
+
+**Option A: Raise quotas (recommended)**
+- `@setEvalBranchQuota` is already set to 1M in `src/codegen/graph.zig` and
+  `src/codegen/predicate.zig`.
+- If compilation still fails, raise the quota locally and report the measured
+  limit so we can tune the default.
+
+**Option B: Split graphs (not yet first-class)**
+- Consumer apps (zapi, ~114 tables) have split into three graphs.
+- **Limitation:** cross-graph edges do not resolve; `Client` types are not
+  interchangeable; transactions across graphs need Driver-first APIs (Z9).
+- If you must split, keep each graph self-contained and use raw `Driver`
+  calls for cross-graph queries.
+
+We plan first-class typed subgraphs with bridge edges (Z3). Until then,
+prefer a single graph with raised quotas.
+
 ## 9. Promotion checklist (moving a pattern INTO zent)
 
 Before shipping an app-side pattern up to the library, it must be:
@@ -228,6 +277,24 @@ Before shipping an app-side pattern up to the library, it must be:
 
 Consumer-driven open items from the zapi port:
 [`ISSUES_FROM_ZAPI.md`](ISSUES_FROM_ZAPI.md).
+
+### Escape ledger template
+
+When your app must bypass the typed API with raw SQL, log it in a
+`DATA_ESCAPES.md` (or equivalent) so the library can absorb the pattern
+later. Use this template:
+
+```markdown
+| # | Pattern | Why raw | zent version | min zent version | GitHub issue |
+|---|---------|---------|--------------|------------------|--------------|
+| 1 | `INSERT IGNORE INTO t ...` | idempotent relation insert | v0.29.8 | v0.30.0 (Z4) | #123 |
+| 2 | `UPDATE stock SET num = GREATEST(num - ?, 0)` | no fluent GREATEST | v0.29.8 | v0.30.0 (Z12) | #124 |
+```
+
+- `zent version`: the version you first wrote the escape against.
+- `min zent version`: the release that makes the escape unnecessary.
+- Keep the table sorted by escape count / criticality so the most painful
+  gaps float to the top.
 
 ## 10. Style
 
