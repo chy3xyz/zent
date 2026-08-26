@@ -996,6 +996,7 @@ pub const InsertBuilder = struct {
     col_names: std.array_list.Managed([]const u8),
     rows: std.array_list.Managed(std.array_list.Managed(Value)),
     or_replace: bool,
+    or_ignore: bool,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
         return .{
@@ -1004,6 +1005,7 @@ pub const InsertBuilder = struct {
             .col_names = std.array_list.Managed([]const u8).init(allocator),
             .rows = std.array_list.Managed(std.array_list.Managed(Value)).init(allocator),
             .or_replace = false,
+            .or_ignore = false,
         };
     }
 
@@ -1030,6 +1032,14 @@ pub const InsertBuilder = struct {
     pub fn query(i: *InsertBuilder) !QueryResult {
         if (i.or_replace) {
             try i.b.writeString("INSERT OR REPLACE INTO ");
+        } else if (i.or_ignore) {
+            if (std.mem.eql(u8, i.b.dialect.name, "mysql")) {
+                try i.b.writeString("INSERT IGNORE INTO ");
+            } else if (std.mem.eql(u8, i.b.dialect.name, "sqlite3")) {
+                try i.b.writeString("INSERT OR IGNORE INTO ");
+            } else {
+                try i.b.writeString("INSERT INTO ");
+            }
         } else {
             try i.b.writeString("INSERT INTO ");
         }
@@ -1060,6 +1070,14 @@ pub const InsertBuilder = struct {
     pub fn takeQuery(i: *InsertBuilder) !OwnedQuery {
         if (i.or_replace) {
             try i.b.writeString("INSERT OR REPLACE INTO ");
+        } else if (i.or_ignore) {
+            if (std.mem.eql(u8, i.b.dialect.name, "mysql")) {
+                try i.b.writeString("INSERT IGNORE INTO ");
+            } else if (std.mem.eql(u8, i.b.dialect.name, "sqlite3")) {
+                try i.b.writeString("INSERT OR IGNORE INTO ");
+            } else {
+                try i.b.writeString("INSERT INTO ");
+            }
         } else {
             try i.b.writeString("INSERT INTO ");
         }
@@ -1093,6 +1111,12 @@ pub fn Insert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8)
 pub fn InsertOrReplace(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
     var builder = InsertBuilder.init(allocator, dialect, table);
     builder.or_replace = true;
+    return builder;
+}
+
+pub fn InsertOrIgnore(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
+    var builder = InsertBuilder.init(allocator, dialect, table);
+    builder.or_ignore = true;
     return builder;
 }
 
@@ -1660,6 +1684,31 @@ test "INSERT OR REPLACE" {
     const q = try i.query();
     try std.testing.expectEqualStrings("INSERT OR REPLACE INTO \"users\" (\"id\", \"name\") VALUES (?, ?)", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
+}
+
+test "INSERT OR IGNORE per dialect" {
+    const allocator = std.testing.allocator;
+
+    var sqlite = InsertOrIgnore(allocator, Dialect.sqlite, "users");
+    defer sqlite.deinit();
+    _ = try sqlite.columns(&.{ "id", "name" });
+    _ = try sqlite.values(&.{ .{ .int = 1 }, .{ .string = "alice" } });
+    const sqlite_q = try sqlite.query();
+    try std.testing.expectEqualStrings("INSERT OR IGNORE INTO \"users\" (\"id\", \"name\") VALUES (?, ?)", sqlite_q.sql);
+
+    var mysql = InsertOrIgnore(allocator, Dialect.mysql, "users");
+    defer mysql.deinit();
+    _ = try mysql.columns(&.{ "id", "name" });
+    _ = try mysql.values(&.{ .{ .int = 1 }, .{ .string = "alice" } });
+    const mysql_q = try mysql.query();
+    try std.testing.expectEqualStrings("INSERT IGNORE INTO `users` (`id`, `name`) VALUES (?, ?)", mysql_q.sql);
+
+    var pg = InsertOrIgnore(allocator, Dialect.postgres, "users");
+    defer pg.deinit();
+    _ = try pg.columns(&.{ "id", "name" });
+    _ = try pg.values(&.{ .{ .int = 1 }, .{ .string = "alice" } });
+    const pg_q = try pg.query();
+    try std.testing.expectEqualStrings("INSERT INTO \"users\" (\"id\", \"name\") VALUES ($1, $2)", pg_q.sql);
 }
 
 test "MultiInsert single row" {

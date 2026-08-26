@@ -147,6 +147,43 @@ test "MySQL: SaveOrUpdate updates existing row" {
     try testing.expectEqual(@as(i64, 200), r.getInt(0).?);
 }
 
+test "MySQL: SaveIgnore ignores unique-key conflict" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyIgnoreUser = schema("MyIgnoreUser", .{
+        .fields = &.{
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{MyIgnoreUser});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_ignore_user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b1 = try client.my_ignore_user.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("id", @as(i64, 99));
+    _ = try b1.setFieldValue("score", @as(i64, 100));
+    _ = try b1.SaveIgnore();
+
+    // Second insert with the same PK must not error.
+    var b2 = try client.my_ignore_user.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("id", @as(i64, 99));
+    _ = try b2.setFieldValue("score", @as(i64, 200));
+    _ = try b2.SaveIgnore();
+
+    var rows = try drv.query("SELECT score FROM my_ignore_user WHERE id = ?", &.{.{ .int = 99 }});
+    defer rows.deinit();
+    const r = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 100), r.getInt(0).?);
+}
+
 test "MySQL returns long strings without truncation" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

@@ -160,14 +160,21 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!Entity {
-            return self.saveInternal(false);
+            return self.saveInternal(false, false);
         }
 
         pub fn SaveOrUpdate(self: *Self) SaveError!Entity {
-            return self.saveInternal(true);
+            return self.saveInternal(true, false);
         }
 
-        fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!Entity {
+        /// Insert the row, silently ignoring unique-key conflicts.
+        /// MySQL → INSERT IGNORE, PostgreSQL → ON CONFLICT DO NOTHING,
+        /// SQLite → INSERT OR IGNORE.
+        pub fn SaveIgnore(self: *Self) SaveError!Entity {
+            return self.saveInternal(false, true);
+        }
+
+        fn saveInternal(self: *Self, comptime or_replace: bool, comptime ignore_conflicts: bool) SaveError!Entity {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .create;
@@ -240,6 +247,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, info.pk_field);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
+            const ignore_suffix: []const u8 = if (ignore_conflicts and is_postgres) " ON CONFLICT DO NOTHING" else "";
+
             // std.mem.zeroes(Entity) is not allowed when an entity carries a
             // std.json.Value field (std rejects zeroing Value); zeroInit
             // handles that (Value fields default to .null).
@@ -247,6 +256,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             if (supports_returning) {
                 var builder = if (or_replace and is_sqlite)
                     sql.InsertOrReplace(self.allocator, dialect, info.table_name)
+                else if (ignore_conflicts and is_sqlite)
+                    sql.InsertOrIgnore(self.allocator, dialect, info.table_name)
                 else
                     sql.Insert(self.allocator, dialect, info.table_name);
                 defer builder.deinit();
@@ -255,17 +266,19 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var q = builder.takeQuery() catch |err| return mapBuildError(err);
                 defer q.deinit();
 
-                // Build the full SQL: q.sql + PG/SQLite UPSERT suffix + RETURNING.
+                // Build the full SQL: q.sql + ignore suffix + PG/SQLite UPSERT suffix + RETURNING.
                 // MySQL never reaches this branch because it does not support RETURNING.
                 const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{info.pk_field});
                 defer self.allocator.free(ret_suffix);
 
-                const full_sql_len = q.sql.len + upsert_suffix.len + ret_suffix.len;
+                const full_sql_len = q.sql.len + ignore_suffix.len + upsert_suffix.len + ret_suffix.len;
                 const full_sql = try self.allocator.alloc(u8, full_sql_len);
                 defer self.allocator.free(full_sql);
                 var pos: usize = 0;
                 @memcpy(full_sql[pos..][0..q.sql.len], q.sql);
                 pos += q.sql.len;
+                @memcpy(full_sql[pos..][0..ignore_suffix.len], ignore_suffix);
+                pos += ignore_suffix.len;
                 @memcpy(full_sql[pos..][0..upsert_suffix.len], upsert_suffix);
                 pos += upsert_suffix.len;
                 @memcpy(full_sql[pos..][0..ret_suffix.len], ret_suffix);
@@ -274,18 +287,24 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const start = nowUs();
                 var rows = try self.driver.queryCtx(&self.execution_context, full_sql, q.args);
                 defer rows.deinit();
-                const row = rows.next() orelse {
-                    // Distinguish a driver error (e.g. a UNIQUE/NOT NULL
-                    // constraint on INSERT ... RETURNING) from a genuinely
-                    // missing RETURNING row.
-                    if (rows.nextError()) |e| return e;
-                    return error.NotFound;
-                };
-                if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
-                    @field(entity, info.pk_field) = @intCast(row.getInt(0) orelse return error.TypeMismatch);
+                if (rows.next()) |row| {
+                    if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
+                        @field(entity, info.pk_field) = @intCast(row.getInt(0) orelse return error.TypeMismatch);
+                    } else {
+                        // Textual primary key (uuid): RETURNING gives the value back.
+                        @field(entity, info.pk_field) = try self.allocator.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
+                    }
                 } else {
-                    // Textual primary key (uuid): RETURNING gives the value back.
-                    @field(entity, info.pk_field) = try self.allocator.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
+                    // For ignore mode a missing RETURNING row means the row
+                    // already existed and was ignored. Return the entity with
+                    // ID left at zero; callers can query the existing row.
+                    if (!ignore_conflicts) {
+                        // Distinguish a driver error (e.g. a UNIQUE/NOT NULL
+                        // constraint on INSERT ... RETURNING) from a genuinely
+                        // missing RETURNING row.
+                        if (rows.nextError()) |e| return e;
+                        return error.NotFound;
+                    }
                 }
                 const duration_us: u64 = nowUs() - start;
 
@@ -309,8 +328,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     });
                 }
             } else {
-                // MySQL path: normal INSERT plus ON DUPLICATE KEY UPDATE suffix.
-                var builder = sql.Insert(self.allocator, dialect, info.table_name);
+                // MySQL path: normal INSERT plus ON DUPLICATE KEY UPDATE suffix,
+                // or INSERT IGNORE for conflict-ignore mode.
+                var builder = if (ignore_conflicts)
+                    sql.InsertOrIgnore(self.allocator, dialect, info.table_name)
+                else
+                    sql.Insert(self.allocator, dialect, info.table_name);
                 defer builder.deinit();
                 _ = try builder.columns(columns.items);
                 _ = try builder.values(args.items);
