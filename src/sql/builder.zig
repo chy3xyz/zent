@@ -171,6 +171,7 @@ pub const ColumnRef = struct {
     table: ?[]const u8,
     name: []const u8,
     raw: bool = false,
+    alias: ?[]const u8 = null,
 
     pub fn appendTo(self: ColumnRef, b: *Builder) !void {
         if (self.table) |t| {
@@ -182,8 +183,20 @@ pub const ColumnRef = struct {
         } else {
             try b.ident(self.name);
         }
+        if (self.alias) |a| {
+            try b.writeString(" AS ");
+            try b.ident(a);
+        }
     }
 };
+
+/// A raw SELECT expression with an optional alias, e.g.
+/// `SelectExpr("UNIX_TIMESTAMP(created_at)", "created_ts")` renders
+/// `UNIX_TIMESTAMP(created_at) AS "created_ts"`. The expression is emitted
+/// verbatim — never interpolate user input into it.
+pub fn SelectExpr(expr: []const u8, alias: ?[]const u8) ColumnRef {
+    return .{ .table = null, .name = expr, .raw = true, .alias = alias };
+}
 
 // ------------------------------------------------------------------
 // Predicate
@@ -601,6 +614,9 @@ pub const Order = union(enum) {
         gen: *const fn (*Builder) anyerror!void,
         desc: bool = false,
     },
+    /// Order by a raw SQL snippet, emitted verbatim. Never interpolate
+    /// user input into it.
+    raw: struct { sql: []const u8, desc: bool = false },
 
     pub fn appendTo(self: Order, b: *Builder) !void {
         switch (self) {
@@ -610,6 +626,10 @@ pub const Order = union(enum) {
             },
             .expr => |o| {
                 try o.gen(b);
+                if (o.desc) try b.writeString(" DESC");
+            },
+            .raw => |o| {
+                try b.writeString(o.sql);
                 if (o.desc) try b.writeString(" DESC");
             },
         }
@@ -626,6 +646,13 @@ pub fn OrderDesc(column: []const u8) Order {
 
 pub fn OrderExpr(comptime gen: anytype, desc: bool) Order {
     return .{ .expr = .{ .gen = &gen, .desc = desc } };
+}
+
+/// Order by a raw SQL expression string, e.g.
+/// `OrderExprSql("UNIX_TIMESTAMP(created_at)", true)`. Emitted verbatim —
+/// never interpolate user input into it.
+pub fn OrderExprSql(sql: []const u8, desc: bool) Order {
+    return .{ .raw = .{ .sql = sql, .desc = desc } };
 }
 
 // ------------------------------------------------------------------
@@ -748,6 +775,13 @@ pub const Selector = struct {
 
     pub fn from(s: *Selector, table: TableBuilder) *Selector {
         s.table = table;
+        return s;
+    }
+
+    /// Append an extra column (or raw expression via `SelectExpr`) to the
+    /// SELECT list after construction.
+    pub fn addColumn(s: *Selector, col: ColumnRef) !*Selector {
+        try s.columns.append(col);
         return s;
     }
 
@@ -1662,6 +1696,39 @@ test "SELECT with JOIN, ORDER BY, LIMIT, OFFSET" {
         q.sql,
     );
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
+}
+
+test "SELECT with expression columns and raw order by" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.sqlite, &.{
+        .{ .table = null, .name = "id" },
+        SelectExpr("COUNT(*)", "total"),
+    });
+    defer s.deinit();
+    _ = s.from(Table("users"));
+    _ = try s.addColumn(SelectExpr("strftime('%Y', created_at)", null));
+    _ = try s.orderBy(OrderExprSql("COUNT(*)", true));
+    _ = try s.orderBy(OrderAsc("id"));
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "SELECT \"id\", COUNT(*) AS \"total\", strftime('%Y', created_at) FROM \"users\" ORDER BY COUNT(*) DESC, \"id\"",
+        q.sql,
+    );
+}
+
+test "SelectExpr and OrderExprSql on Postgres quote only the alias" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.postgres, &.{
+        SelectExpr("EXTRACT(EPOCH FROM created_at)", "created_ts"),
+    });
+    defer s.deinit();
+    _ = s.from(Table("users"));
+    _ = try s.orderBy(OrderExprSql("EXTRACT(EPOCH FROM created_at)", false));
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "SELECT EXTRACT(EPOCH FROM created_at) AS \"created_ts\" FROM \"users\" ORDER BY EXTRACT(EPOCH FROM created_at)",
+        q.sql,
+    );
 }
 
 test "INSERT" {

@@ -194,6 +194,45 @@ conflict target (e.g. a `@unique` index on `(key, app_id)`), ensure the
 schema marks the columns unique and the builder generates the correct
 `ON CONFLICT ("key", "app_id")` clause (see Z2).
 
+## 5b. SELECT / ORDER BY expressions (Z5)
+
+`FROM_UNIXTIME`, Haversine distance, `CONCAT`, `UNIX_TIMESTAMP()` and friends
+no longer require hand-written SQL strings. Build the SELECT list with
+`sql.SelectExpr(expr, alias)` and order with `sql.OrderExprSql(expr, desc)`,
+then execute through `driver.queryOwned`:
+
+```zig
+var s = try zent.sql.Select(alloc, dialect, &.{
+    .{ .table = null, .name = "id" },
+    zent.sql.SelectExpr("UNIX_TIMESTAMP(created_at)", "created_ts"),
+});
+defer s.deinit();
+_ = s.from(zent.sql.Table("orders"));
+_ = try s.where(zent.sql.EQ("app_id", .{ .int = app_id }));
+_ = try s.orderBy(zent.sql.OrderExprSql("UNIX_TIMESTAMP(created_at)", true));
+_ = s.limit(50);
+
+const q = try s.takeQuery();
+defer q.deinit();
+var rows = try client.driver.queryOwned(q);
+defer rows.deinit();
+while (rows.next()) |row| {
+    const ts_idx = row.columnIndex("created_ts") orelse continue;
+    const created_ts = row.getInt(ts_idx) orelse 0;
+    _ = created_ts;
+}
+```
+
+- The expression is emitted **verbatim** — never interpolate user input.
+  Bind values with `?` / `$N` placeholders via `where`, never string concat.
+- The alias is quoted as an identifier (`AS "created_ts"`) on all dialects.
+- `Row.columnIndex(name)` maps an alias to its index for DTO mapping; combine
+  with `tryGetInt`/`tryGetText` (error on NULL) or `getInt`/`getText`
+  (`null` on NULL).
+- For one-value queries (scalar aggregates) keep using `Count()` /
+  `CountBy(...)` when they fit; reach for `SelectExpr` when the projection
+  itself is an expression.
+
 ## 6. Transactions
 
 ```zig

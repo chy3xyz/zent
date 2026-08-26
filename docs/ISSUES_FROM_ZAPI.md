@@ -61,7 +61,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 |--|--|
 | **Problem** | `FROM_UNIXTIME`, Haversine, `CONCAT`, `UNIX_TIMESTAMP()` force raw queries across list/export paths. |
 | **Proposal** | `SelectExpr("…", "alias")`, `OrderByExpr`, optional `ScalarExpr` for one-value queries; map into DTO / `sql.Value`. |
-| **Status** | Open |
+| **Status** | **Fixed** (v0.31.0): `sql.SelectExpr(expr, alias)` + `ColumnRef.alias`, `sql.OrderExprSql(expr, desc)`, `Selector.addColumn`, `Driver.queryOwned`, `Row.columnIndex(name)`; docs in `BEST_PRACTICES.md` §5b. |
 
 ### Z6 — Clarify or harden raw `Row.getInt` / `getText`
 
@@ -129,7 +129,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z2 | Business-key upsert | P0 | **Fixed** v0.30.0 |
 | Z3 | Large-schema / multi-graph | P0 | **Documented** v0.31.0 |
 | Z4 | INSERT IGNORE | P1 | **Fixed** v0.30.0 |
-| Z5 | SELECT expressions | P1 | Open |
+| Z5 | SELECT expressions | P1 | **Fixed** v0.31.0 |
 | Z6 | Row getInt semantics | P1 | **Fixed** v0.30.0 |
 | Z7 | Where `&.{}` | P1 | **Fixed** v0.30.0 |
 | Z8 | deinitEntity ergonomics | P1 | Open |

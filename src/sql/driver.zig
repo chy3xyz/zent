@@ -1,5 +1,6 @@
 const std = @import("std");
 const Value = @import("builder.zig").Value;
+const OwnedQuery = @import("builder.zig").OwnedQuery;
 const Dialect = @import("dialect.zig").Dialect;
 
 pub const Result = struct {
@@ -83,6 +84,16 @@ pub const Row = struct {
 
     pub fn isNull(self: Row, index: usize) bool {
         return self.vtable.isNull(self.ptr, index);
+    }
+
+    /// Look up a column's zero-based index by name (e.g. a `SelectExpr`
+    /// alias). Returns null when no column carries that name.
+    pub fn columnIndex(self: Row, name: []const u8) ?usize {
+        var i: usize = 0;
+        while (i < self.columnCount()) : (i += 1) {
+            if (std.mem.eql(u8, self.columnName(i), name)) return i;
+        }
+        return null;
     }
 
     pub const GetError = error{NullColumn};
@@ -265,6 +276,13 @@ pub const Driver = struct {
 
     pub fn query(self: Driver, query_sql: []const u8, args: []const Value) !Rows {
         return self.vtable.query(self.ptr, null, query_sql, args);
+    }
+
+    /// Execute an `OwnedQuery` built by `Builder.takeQuery` /
+    /// `Selector.takeQuery`. The query stays owned by the caller — `deinit`
+    /// it after the returned `Rows` are consumed.
+    pub fn queryOwned(self: Driver, q: OwnedQuery) !Rows {
+        return self.vtable.query(self.ptr, null, q.sql, q.args);
     }
 
     pub fn execCtx(self: Driver, ctx: ?*const ExecutionContext, query_sql: []const u8, args: []const Value) !Result {
