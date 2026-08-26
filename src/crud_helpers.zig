@@ -141,6 +141,20 @@ fn freeStrings(comptime T: type, items: []T, allocator: std.mem.Allocator) void 
     }
 }
 
+/// Free owned `[]const u8` / `?[]const u8` fields on a single DTO.
+/// Drop-in replacement for `sqlx.freeScanned` in zent-only apps.
+pub fn freeOwnedStrings(allocator: std.mem.Allocator, comptime T: type, val: T) void {
+    const info = @typeInfo(T);
+    if (info != .@"struct") return;
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |name, ft| {
+        if (ft == []const u8) {
+            allocator.free(@field(val, name));
+        } else if (ft == ?[]const u8) {
+            if (@field(val, name)) |s| allocator.free(s);
+        }
+    }
+}
+
 /// Run a raw driver query and collect the rows into an owned `Rows(T)` slice.
 /// `mapRow(allocator, row)` returns one `T` per result row and MAY return an
 /// error union (`!T`). Contract: every string field of the returned `T` must

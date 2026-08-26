@@ -226,6 +226,9 @@ Before shipping an app-side pattern up to the library, it must be:
 4. **Consumed** — at least one real caller switched to it, then the app-side
    copy is deleted (the app re-exports via its `zent_layer`).
 
+Consumer-driven open items from the zapi port:
+[`ISSUES_FROM_ZAPI.md`](ISSUES_FROM_ZAPI.md).
+
 ## 10. Style
 
 - Dupe strings with the **method's** allocator param (not a global) so the

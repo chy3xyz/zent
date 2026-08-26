@@ -90,6 +90,9 @@ use `field.JSON(name, T)`; untyped documents use `field.JSONValue(name)`
   graph ever hits a quota error, raise the value in the relevant
   `src/codegen/*.zig` file rather than splitting the graph — the graph is
   meant to span all tables of an application (edges resolve across it).
+- **Consumer pushback:** multi-tenant commerce ports (~100+ tables) have
+  still split graphs in practice. Tracked as **Z3** in
+  [`ISSUES_FROM_ZAPI.md`](ISSUES_FROM_ZAPI.md) (quota vs first-class subgraphs).
 
 ## 8. Build & toolchain
 
