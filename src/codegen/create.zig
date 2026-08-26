@@ -57,6 +57,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         logger: Logger = .{},
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
+        upsert_conflict_columns: ?[]const []const u8 = null,
 
         const EdgeValue = struct {
             edge: []const u8,
@@ -160,21 +161,28 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!Entity {
-            return self.saveInternal(false, false);
+            return self.saveInternal(false, false, null);
         }
 
         pub fn SaveOrUpdate(self: *Self) SaveError!Entity {
-            return self.saveInternal(true, false);
+            return self.saveInternal(true, false, null);
         }
 
         /// Insert the row, silently ignoring unique-key conflicts.
         /// MySQL → INSERT IGNORE, PostgreSQL → ON CONFLICT DO NOTHING,
         /// SQLite → INSERT OR IGNORE.
         pub fn SaveIgnore(self: *Self) SaveError!Entity {
-            return self.saveInternal(false, true);
+            return self.saveInternal(false, true, null);
         }
 
-        fn saveInternal(self: *Self, comptime or_replace: bool, comptime ignore_conflicts: bool) SaveError!Entity {
+        /// Upsert using the given columns as the conflict target instead of
+        /// the primary key. Requires a matching UNIQUE index on those columns.
+        pub fn SaveOrUpdateOn(self: *Self, conflict_columns: []const []const u8) SaveError!Entity {
+            self.upsert_conflict_columns = conflict_columns;
+            return self.saveInternal(true, false, conflict_columns);
+        }
+
+        fn saveInternal(self: *Self, comptime or_replace: bool, comptime ignore_conflicts: bool, conflict_columns: ?[]const []const u8) SaveError!Entity {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .create;
@@ -240,11 +248,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
             // Build the upsert suffix per dialect. For SQLite we use the
             // built-in InsertOrReplace builder. For PG we append ON CONFLICT
-            // (id) DO UPDATE SET col=excluded.col ... For MySQL we generate
+            // (cols) DO UPDATE SET col=excluded.col ... For MySQL we generate
             // ON DUPLICATE KEY UPDATE (the old REPLACE prefix has been removed).
             // For plain Save (or_replace=false) the suffix is empty.
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, info.pk_field);
+            const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, info.pk_field);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             const ignore_suffix: []const u8 = if (ignore_conflicts and is_postgres) " ON CONFLICT DO NOTHING" else "";
@@ -747,6 +756,7 @@ fn buildUpsertSuffix(
     is_sqlite: bool,
     is_mysql: bool,
     columns: []const []const u8,
+    conflict_columns: []const []const u8,
     pk_field: []const u8,
 ) ![]const u8 {
     if (!or_replace or is_sqlite) return "";
@@ -764,18 +774,28 @@ fn buildUpsertSuffix(
         }
         return try buf.toOwnedSlice();
     }
-    // PostgreSQL AND SQLite (bulk path): ON CONFLICT ("id") DO UPDATE SET …
+    // PostgreSQL AND SQLite (bulk path): ON CONFLICT ("cols") DO UPDATE SET …
     // (is_postgres is unused beyond this branch — keep for signature clarity).
     _ = is_postgres;
     var buf = std.array_list.Managed(u8).init(allocator);
     errdefer buf.deinit();
     try buf.appendSlice(" ON CONFLICT (");
-    try buf.appendSlice("\"");
-    try buf.appendSlice(pk_field);
-    try buf.appendSlice("\") DO UPDATE SET ");
+    for (conflict_columns, 0..) |col, i| {
+        if (i > 0) try buf.appendSlice(", ");
+        try buf.print("\"{s}\"", .{col});
+    }
+    try buf.appendSlice(") DO UPDATE SET ");
     var first = true;
     for (columns) |col| {
         if (std.mem.eql(u8, col, pk_field)) continue;
+        var is_conflict_col = false;
+        for (conflict_columns) |cc| {
+            if (std.mem.eql(u8, col, cc)) {
+                is_conflict_col = true;
+                break;
+            }
+        }
+        if (is_conflict_col) continue;
         if (!first) try buf.appendSlice(", ");
         first = false;
         try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
@@ -800,6 +820,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         privacy_ctx: ?privacy.PrivacyContext = null,
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
+        upsert_conflict_columns: ?[]const []const u8 = null,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) !Self {
             var self = Self{
@@ -891,7 +912,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
 
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
-            return self.saveInternal(false);
+            return self.saveInternal(false, null);
         }
 
         /// Bulk upsert: INSERT … ON CONFLICT ("id") DO UPDATE SET … for
@@ -901,10 +922,17 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         /// one id per row (RETURNING where supported; last_insert_id chain on
         /// MySQL).
         pub fn SaveOrUpdate(self: *Self) SaveError!std.array_list.Managed(i64) {
-            return self.saveInternal(true);
+            return self.saveInternal(true, null);
         }
 
-        fn saveInternal(self: *Self, comptime or_replace: bool) SaveError!std.array_list.Managed(i64) {
+        /// Bulk upsert using the given columns as the conflict target instead
+        /// of the primary key. Requires a matching UNIQUE index.
+        pub fn SaveOrUpdateOn(self: *Self, conflict_columns: []const []const u8) SaveError!std.array_list.Managed(i64) {
+            self.upsert_conflict_columns = conflict_columns;
+            return self.saveInternal(true, conflict_columns);
+        }
+
+        fn saveInternal(self: *Self, comptime or_replace: bool, conflict_columns: ?[]const []const u8) SaveError!std.array_list.Managed(i64) {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .create;
@@ -985,7 +1013,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
             const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, info.pk_field);
+            const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, info.pk_field);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
             const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
             defer query.deinit();

@@ -184,6 +184,52 @@ test "MySQL: SaveIgnore ignores unique-key conflict" {
     try testing.expectEqual(@as(i64, 100), r.getInt(0).?);
 }
 
+test "MySQL: SaveOrUpdateOn uses business-key conflict target" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MySetting = schema("MySetting", .{
+        .fields = &.{
+            field.String("key"),
+            field.Int("app_id"),
+            field.String("value"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{MySetting});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_setting", &.{}) catch {};
+
+    // Business-key unique index required by ON CONFLICT / ODKU.
+    // MySQL requires a length prefix on TEXT columns used in indexes.
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_my_setting_key_app ON my_setting(`key`(255), app_id)", &.{});
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b1 = try client.my_setting.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("key", "site_name");
+    _ = try b1.setFieldValue("app_id", @as(i64, 42));
+    _ = try b1.setFieldValue("value", "zent");
+    var e1 = try b1.SaveOrUpdateOn(&.{ "key", "app_id" });
+    defer zent.codegen.deinitEntity(infos, infos[0], &e1, allocator);
+
+    var b2 = try client.my_setting.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("key", "site_name");
+    _ = try b2.setFieldValue("app_id", @as(i64, 42));
+    _ = try b2.setFieldValue("value", "zapi");
+    var e2 = try b2.SaveOrUpdateOn(&.{ "key", "app_id" });
+    defer zent.codegen.deinitEntity(infos, infos[0], &e2, allocator);
+
+    var rows = try drv.query("SELECT value FROM my_setting WHERE `key` = ? AND app_id = ?", &.{ .{ .string = "site_name" }, .{ .int = 42 } });
+    defer rows.deinit();
+    const r = rows.next() orelse return error.NoRow;
+    try testing.expectEqualStrings("zapi", r.getText(0).?);
+}
+
 test "MySQL returns long strings without truncation" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
