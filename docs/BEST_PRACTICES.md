@@ -271,6 +271,28 @@ while (rows.next()) |row| {
   `CountBy(...)` when they fit; reach for `SelectExpr` when the projection
   itself is an expression.
 
+## 5c. Complex UPDATE expressions (Z12)
+
+Single-table column expressions are fluent — no raw SQL needed. Use
+`setExprArgs(field, "expr with ? placeholders", args)` on the update builder,
+e.g. a clamped atomic stock decrement with `GREATEST`:
+
+```zig
+var u = client.stock.Update();
+defer u.deinit();
+_ = try u.setExprArgs("num", "GREATEST(num - ?, 0)", &.{.{ .int = delta }});
+_ = try u.Where(.{preds.sku_idEQ(.{ .int = sku_id })});
+const affected = try u.Save();
+```
+
+- The expression is emitted verbatim inside `SET col = <expr>`; placeholders
+  bind through `args` in order (they come before any WHERE args).
+- Works for `LEAST`, `COALESCE`, string functions — any single-column
+  expression on the updated table.
+- **Still raw** (by design): multi-table UPDATE (`UPDATE a JOIN b ...`),
+  updating from a subquery, and dialect-specific `UPDATE ... FROM`. Keep those
+  in `driver.exec` and log them in your escape ledger.
+
 ## 6. Transactions
 
 ```zig
@@ -380,7 +402,7 @@ later. Use this template:
 | # | Pattern | Why raw | zent version | min zent version | GitHub issue |
 |---|---------|---------|--------------|------------------|--------------|
 | 1 | `INSERT IGNORE INTO t ...` | idempotent relation insert | v0.29.8 | v0.30.0 (Z4) | #123 |
-| 2 | `UPDATE stock SET num = GREATEST(num - ?, 0)` | no fluent GREATEST | v0.29.8 | v0.30.0 (Z12) | #124 |
+| 2 | `UPDATE stock SET num = GREATEST(num - ?, 0)` | no fluent GREATEST | v0.29.8 | v0.31.0 (Z12: `setExprArgs`) | #124 |
 ```
 
 - `zent version`: the version you first wrote the escape against.

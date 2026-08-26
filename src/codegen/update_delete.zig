@@ -1467,6 +1467,60 @@ test "setExprArgs atomic stock decrement prevents oversell" {
     try std.testing.expectEqual(@as(i64, 2), found.items[0].stock);
 }
 
+test "setExprArgs with clamping expression (GREATEST-style floor at zero)" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Sku = Schema("SkuClamp", .{
+        .fields = &.{field.Int("stock")},
+    });
+    const info = comptime fromSchema(Sku);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const EntityClient = client_mod.EntityClient(infos, info);
+    const client = EntityClient.init(allocator, driver.asDriver());
+
+    {
+        var b = try client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("stock", @as(i64, 4));
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+
+    const preds = client.predicates;
+
+    // SQLite spells GREATEST as the multi-arg max() scalar; MySQL/PG use
+    // GREATEST(num - ?, 0) — the fluent shape is identical across dialects.
+    {
+        var u = client.Update();
+        defer u.deinit();
+        _ = try u.setExprArgs("stock", "MAX(stock - ?, 0)", &.{.{ .int = 10 }});
+        _ = try u.Where(.{preds.idEQ(.{ .int = 1 })});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    var q = client.Query();
+    defer q.deinit();
+    var found = try q.All();
+    defer {
+        for (found.items) |*e| deinitEntity(infos, info, e, allocator);
+        found.deinit();
+    }
+    // Decrement of 10 against stock 4 clamps at 0 instead of going negative.
+    try std.testing.expectEqual(@as(i64, 0), found.items[0].stock);
+}
+
 test "maskSensitiveArgs masks sensitive field values in logs" {
     const allocator = std.testing.allocator;
     const field = @import("../core/field.zig");

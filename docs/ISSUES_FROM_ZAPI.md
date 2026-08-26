@@ -117,6 +117,8 @@ Schema `Int` vs MySQL `DECIMAL` forces text reads (`DATA_ESCAPES` money rows). S
 
 Stock `GREATEST` and dual-table decrements remain raw. Document fluent limits; optional allowlisted `execExpr`.
 
+**Status — Fixed (v0.31.0):** single-table expression updates were already fluent via `setExprArgs(field, expr, args)`; added a clamping-expression test (`MAX(stock - ?, 0)`, the SQLite spelling of `GREATEST`) and documented the fluent limits + what stays raw (multi-table UPDATE, UPDATE ... FROM) in `BEST_PRACTICES.md` §5c.
+
 ### Z13 — Docs: multi-graph playbook + escape ledger hygiene
 
 Align official docs with ODKU reality; add “Multi-graph” section; escape template column “min zent version”.
@@ -138,7 +140,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z9 | beginTxFromDriver | P1 | **Fixed** v0.31.0 |
 | Z10 | WithEdge options | P1 | **Fixed** v0.31.0 |
 | Z11 | Decimal field | P2 | **Fixed** v0.31.0 |
-| Z12 | Complex UPDATE expr | P2 | Open |
+| Z12 | Complex UPDATE expr | P2 | **Fixed** v0.31.0 |
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.
