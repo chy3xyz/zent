@@ -85,14 +85,24 @@ use `field.JSON(name, T)`; untyped documents use `field.JSONValue(name)`
 
 ## 7a. Comptime budget (large schemas)
 
-- Codegen runs under `@setEvalBranchQuota` (predicates/migrations: 100000,
-  graph lowering: 100000). 30-table schemas compile fine; if a very large
-  graph ever hits a quota error, raise the value in the relevant
-  `src/codegen/*.zig` file rather than splitting the graph — the graph is
-  meant to span all tables of an application (edges resolve across it).
-- **Consumer pushback:** multi-tenant commerce ports (~100+ tables) have
-  still split graphs in practice. Tracked as **Z3** in
-  [`ISSUES_FROM_ZAPI.md`](ISSUES_FROM_ZAPI.md) (quota vs first-class subgraphs).
+- Codegen runs under `@setEvalBranchQuota(1_000_000)` in
+  `src/codegen/graph.zig` and `src/codegen/predicate.zig`.
+- **Measured limits** (enforced by the "Graph stress" tests in
+  `graph.zig`): a single `buildGraph` compiles with 400 minimal
+  (2-field) tables, 400 realistic 8-field tables with an index each,
+  and 300 hub-and-spoke tables with one edge each. So a ~100–300 table
+  application **fits in one graph**; splitting is unnecessary at that
+  scale and costs you cross-graph edges.
+- If a still-larger graph hits a quota error, raise the value in the
+  relevant `src/codegen/*.zig` file rather than splitting the graph —
+  the graph is meant to span all tables of an application (edges
+  resolve across it).
+- **Consumer note:** multi-tenant commerce ports (~100+ tables) split
+  graphs against older guidance. On current zent a single graph at that
+  size compiles; if you must split, keep each graph self-contained (no
+  cross-graph edges) and pass the matching `infos` to every
+  client/tx/helper. Tracked as **Z3** in
+  [`ISSUES_FROM_ZAPI.md`](ISSUES_FROM_ZAPI.md).
 
 ## 8. Build & toolchain
 

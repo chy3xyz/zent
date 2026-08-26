@@ -41,7 +41,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 | **Evidence** | `UPGRADING.md` §7a; `zapi` `ZENT_BEST_PRACTICES.md` §2; `MIGRATION_PLAN.md` |
 | **Proposal** | (a) Higher default quotas + measured limits, and/or (b) **first-class subgraphs** with explicit bridge edges and compile error on unresolved cross-graph edges; document when split is allowed. |
 | **Acceptance** | Documented path for >80-table apps; either single-graph compiles or multi-graph is typed-safe. |
-| **Status** | Open |
+| **Status** | **Documented** (v0.31.0): stress tests in `graph.zig` prove a single graph compiles at 400 realistic / 300 edged tables under the default 1M quota; `UPGRADING.md` §7a updated with measured limits and safe-split guidance. First-class subgraphs (option b) deferred. |
 
 ---
 
@@ -127,7 +127,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 |----|-------|---|--------|
 | Z1 | ContainsEscaped MySQL | P0 | **Fixed** v0.30.0 |
 | Z2 | Business-key upsert | P0 | **Fixed** v0.30.0 |
-| Z3 | Large-schema / multi-graph | P0 | Open |
+| Z3 | Large-schema / multi-graph | P0 | **Documented** v0.31.0 |
 | Z4 | INSERT IGNORE | P1 | **Fixed** v0.30.0 |
 | Z5 | SELECT expressions | P1 | Open |
 | Z6 | Row getInt semantics | P1 | **Fixed** v0.30.0 |

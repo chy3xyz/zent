@@ -759,3 +759,84 @@ test "From edge with explicit FK field does not duplicate declared columns" {
     try std.testing.expectEqualStrings("file_id", step.to_column);
     try std.testing.expectEqualStrings("photo_id", step.edge_columns[0]);
 }
+
+const StressGen = struct {
+    fn make(comptime n: usize) type {
+        const field = @import("../core/field.zig");
+        const schema = @import("../core/schema.zig").Schema;
+        return schema(std.fmt.comptimePrint("Stress{d}", .{n}), .{
+            .fields = &.{ field.String("value"), field.Int("num") },
+        });
+    }
+
+    /// Realistic shape: ~8 fields of varied types per table.
+    fn makeRich(comptime n: usize) type {
+        const field = @import("../core/field.zig");
+        const schema = @import("../core/schema.zig").Schema;
+        return schema(std.fmt.comptimePrint("Rich{d}", .{n}), .{
+            .fields = &.{
+                field.String("name"),
+                field.String("slug").Unique(),
+                field.Int("count").Default(0),
+                field.Bool("enabled"),
+                field.Float("score"),
+                field.Enum("status", &.{ "active", "inactive", "archived" }),
+                field.Time("created_at"),
+                field.String("note").Optional(),
+            },
+            .indexes = &.{@import("../core/index.zig").Fields(&.{"name"})},
+        });
+    }
+
+    fn list(comptime N: usize, comptime rich: bool) [N]type {
+        @setEvalBranchQuota(1000000);
+        var arr: [N]type = undefined;
+        for (0..N) |i| arr[i] = if (rich) makeRich(i) else make(i);
+        return arr;
+    }
+
+    /// Hub-and-spoke: every node has a To edge to node 0 — stresses
+    /// resolveGraphEdges / addEdgeFieldsToAll at O(edges × types).
+    fn listEdged(comptime N: usize) [N]type {
+        @setEvalBranchQuota(1000000);
+        const edge = @import("../core/edge.zig");
+        const Hub = makeRich(0);
+        var arr: [N]type = undefined;
+        arr[0] = Hub;
+        for (1..N) |i| {
+            const Base = makeRich(i);
+            arr[i] = struct {
+                pub const schema_name = Base.schema_name;
+                pub const fields = Base.fields;
+                pub const edges = &.{edge.To("hub", Hub)};
+                pub const indexes = Base.indexes;
+            };
+        }
+        return arr;
+    }
+};
+
+test "Graph stress: 400 minimal schemas build within the default quota" {
+    const schemas = comptime StressGen.list(400, false);
+    const graph = comptime buildGraph(&schemas);
+    try std.testing.expectEqual(@as(usize, 400), graph.types.len);
+    try std.testing.expectEqualStrings("stress0", graph.types[0].table_name);
+    try std.testing.expectEqualStrings("stress399", graph.types[399].table_name);
+}
+
+test "Graph stress: 400 realistic 8-field schemas build within the default quota" {
+    const schemas = comptime StressGen.list(400, true);
+    const graph = comptime buildGraph(&schemas);
+    try std.testing.expectEqual(@as(usize, 400), graph.types.len);
+    try std.testing.expectEqualStrings("rich0", graph.types[0].table_name);
+    try std.testing.expectEqualStrings("rich399", graph.types[399].table_name);
+}
+
+test "Graph stress: 300 hub-and-spoke edged schemas build within the default quota" {
+    const schemas = comptime StressGen.listEdged(300);
+    const graph = comptime buildGraph(&schemas);
+    try std.testing.expectEqual(@as(usize, 300), graph.types.len);
+    // Every spoke resolves its To edge to the hub.
+    try std.testing.expectEqual(@as(usize, 1), graph.types[100].edges.len);
+    try std.testing.expectEqualStrings("Rich0", graph.types[100].edges[0].target_name);
+}
