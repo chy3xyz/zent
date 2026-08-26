@@ -394,6 +394,123 @@ pub fn toMaskedJson(
 }
 
 // ------------------------------------------------------------------
+// ManagedEntity + arena dupe (HTTP-handler ergonomics)
+// ------------------------------------------------------------------
+
+/// Owning wrapper that bundles an entity with the allocator it was
+/// allocated with, so teardown cannot pick the wrong allocator:
+///
+///   var m = managedEntity(infos, UserInfo, user, client.allocator);
+///   defer m.deinit();
+///   use(m.get().name);
+pub fn ManagedEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
+    return struct {
+        entity: Entity(infos, info),
+        allocator: std.mem.Allocator,
+
+        const Self = @This();
+
+        pub fn get(self: *Self) *Entity(infos, info) {
+            return &self.entity;
+        }
+
+        pub fn deinit(self: *Self) void {
+            deinitEntity(infos, info, &self.entity, self.allocator);
+        }
+    };
+}
+
+/// Wrap an entity with its owning allocator. See `ManagedEntity`.
+pub fn managedEntity(
+    comptime infos: []const TypeInfo,
+    comptime info: TypeInfo,
+    entity: Entity(infos, info),
+    allocator: std.mem.Allocator,
+) ManagedEntity(infos, info) {
+    return .{ .entity = entity, .allocator = allocator };
+}
+
+fn dupeDeep(comptime T: type, v: T, arena: std.mem.Allocator) std.mem.Allocator.Error!T {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .slice) return v;
+            if (p.child == u8) return try arena.dupe(u8, v);
+            const new_slice = try arena.alloc(p.child, v.len);
+            for (v, 0..) |item, i| new_slice[i] = try dupeDeep(p.child, item, arena);
+            return new_slice;
+        },
+        .optional => |opt| {
+            if (v) |inner| return @as(T, try dupeDeep(opt.child, inner, arena));
+            return null;
+        },
+        .@"struct" => |s| {
+            var out = v;
+            inline for (s.field_names, s.field_types) |fname, ftype| {
+                @field(out, fname) = try dupeDeep(ftype, @field(v, fname), arena);
+            }
+            return out;
+        },
+        .array => |a| {
+            var out: T = undefined;
+            for (v, 0..) |item, i| out[i] = try dupeDeep(a.child, item, arena);
+            return out;
+        },
+        // Tagged unions (e.g. untyped std.json.Value documents) are copied
+        // shallowly — their payloads stay in the source entity's json_arena.
+        else => return v,
+    }
+}
+
+fn dupeItem(
+    comptime infos: []const TypeInfo,
+    comptime info: TypeInfo,
+    comptime T: type,
+    item: T,
+    arena: std.mem.Allocator,
+) std.mem.Allocator.Error!T {
+    var out = item;
+    // JSON payloads are re-duped field-by-field below; the arena pointer
+    // itself is bookkeeping and must not survive the copy.
+    if (comptime @hasField(T, "json_arena")) out.json_arena = null;
+    inline for (info.fields) |f| {
+        const field_type = if (f.optional) ?f.zig_type else f.zig_type;
+        @field(out, f.name) = try dupeDeep(field_type, @field(out, f.name), arena);
+    }
+    if (comptime @hasField(T, "edges") and info.edges.len > 0) {
+        inline for (info.edges) |e| {
+            const target_info = comptime findTypeInfo(infos, e.target_name);
+            const EdgeFieldType = @TypeOf(@field(out.edges, e.name));
+            const ArrType = @typeInfo(EdgeFieldType).optional.child;
+            const ItemType = @typeInfo(ArrType).pointer.child;
+            if (@field(out.edges, e.name)) |arr| {
+                const new_arr = try arena.alloc(ItemType, arr.len);
+                for (arr, 0..) |it, i| {
+                    new_arr[i] = try dupeItem(infos, target_info, ItemType, it, arena);
+                }
+                @field(out.edges, e.name) = new_arr;
+            }
+        }
+    }
+    return out;
+}
+
+/// Deep-copy an entity (scalar fields, string/slice fields, typed JSON
+/// structs and up to two levels of eager-loaded edges) into `arena`.
+///
+/// The returned entity borrows everything from the arena: pass it to
+/// request-scoped code and free it all at once with `arena.deinit()`.
+/// Do NOT pass the copy to `deinitEntity` — that would double-free into
+/// the wrong allocator.
+pub fn dupeEntityTo(
+    comptime infos: []const TypeInfo,
+    comptime info: TypeInfo,
+    self: anytype,
+    arena: std.mem.Allocator,
+) std.mem.Allocator.Error!@TypeOf(self.*) {
+    return dupeItem(infos, info, @TypeOf(self.*), self.*, arena);
+}
+
+// ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
 
@@ -419,6 +536,88 @@ test "toMaskedJson masks sensitive fields" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"api_key\":\"***\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"alice\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "sk-secret-123") == null);
+}
+
+test "ManagedEntity deinit frees with the bound allocator" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const User = Schema("ManagedUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+
+    var m = managedEntity(infos, info, .{
+        .id = 1,
+        .name = try allocator.dupe(u8, "alice"),
+    }, allocator);
+    defer m.deinit(); // leak-checker validates the free
+    try std.testing.expectEqualStrings("alice", m.get().name);
+}
+
+test "dupeEntityTo deep-copies strings, JSON payloads and edges into an arena" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Settings = struct { theme: []const u8 };
+    const Post = Schema("DupePost", .{
+        .fields = &.{field.String("title")},
+    });
+    const Blog = Schema("DupeBlog", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("note").Optional(),
+            field.JSON("settings", Settings),
+        },
+        .edges = &.{edge.To("posts", Post)},
+    });
+    const graph = comptime buildGraph(&.{ Blog, Post });
+    const infos = graph.types;
+    const blog_info = infos[0];
+    const post_info = infos[1];
+    const BlogEntity = Entity(infos, blog_info);
+    const PostLight = LightEntity(infos, post_info);
+
+    const posts = try allocator.alloc(PostLight, 1);
+    posts[0] = .{ .id = 7, .dupe_blog_id = 1, .title = try allocator.dupe(u8, "hello"), .json_arena = null, .edges = .{} };
+    // Real entities carry JSON payloads in a per-entity arena.
+    const src_json_arena = try allocator.create(std.heap.ArenaAllocator);
+    src_json_arena.* = std.heap.ArenaAllocator.init(allocator);
+    var src = BlogEntity{
+        .id = 1,
+        .name = try allocator.dupe(u8, "tech"),
+        .note = try allocator.dupe(u8, "draft"),
+        .settings = .{ .theme = try src_json_arena.allocator().dupe(u8, "dark") },
+        .json_arena = src_json_arena,
+        .edges = .{ .posts = posts },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit(); // frees the whole copy at once
+    const arena = arena_state.allocator();
+
+    const copy = try dupeEntityTo(infos, blog_info, &src, arena);
+    // Contents equal, storage independent.
+    try std.testing.expectEqualStrings("tech", copy.name);
+    try std.testing.expect(copy.name.ptr != src.name.ptr);
+    try std.testing.expectEqualStrings("dark", copy.settings.theme);
+    try std.testing.expect(copy.settings.theme.ptr != src.settings.theme.ptr);
+    try std.testing.expectEqualStrings("hello", copy.edges.posts.?[0].title);
+    try std.testing.expect(copy.edges.posts.?.ptr != src.edges.posts.?.ptr);
+    try std.testing.expect(copy.json_arena == null);
+
+    // Freeing the source must not invalidate the arena copy.
+    deinitEntity(infos, blog_info, &src, allocator);
+    try std.testing.expectEqualStrings("tech", copy.name);
+    try std.testing.expectEqualStrings("draft", copy.note.?);
+    try std.testing.expectEqualStrings("hello", copy.edges.posts.?[0].title);
+    // `copy` must NOT be deinitEntity'd — the arena owns it.
 }
 
 test "toMaskedJson on JSON-field entity never emits json_arena" {

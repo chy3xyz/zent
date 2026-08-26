@@ -87,6 +87,23 @@ shapes:
    errdefer { freeStrings(T, list.items, alloc); list.deinit(); }  // crud_helpers.queryRows does this
    ```
 
+5. **HTTP handlers: prefer the request arena over the client allocator.**
+   Two helpers remove the wrong-allocator footgun (Z8):
+   ```zig
+   // (a) bind the allocator to the entity once:
+   var m = zent.codegen.managedEntity(infos, USER_INFO, user, client_alloc);
+   defer m.deinit();                       // always frees with client_alloc
+   use(m.get().name);
+
+   // (b) or deep-copy everything into the request arena and never deinit:
+   const copy = try zent.codegen.dupeEntityTo(infos, USER_INFO, &user, req_arena);
+   // copy borrows from req_arena — do NOT call deinitEntity on it.
+   ```
+   `dupeEntityTo` copies strings, typed JSON structs and up to two levels of
+   eager edges. Untyped `std.json.Value` fields are copied shallowly (their
+   payloads stay in the source's `json_arena`) — dupe those by hand if the
+   source must die first.
+
 ## 3. Typed query builder
 
 ```zig

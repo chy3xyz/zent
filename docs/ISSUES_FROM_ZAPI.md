@@ -85,7 +85,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 |--|--|
 | **Problem** | Must use `var` + `client.<e>.allocator` (not request arena); footgun under HTTP. |
 | **Proposal** | `Entity.deinit(*T)` bound to client allocator; debug assert on wrong allocator; optional `ManagedEntity` / `dupeTo(arena)` helper. |
-| **Status** | Open |
+| **Status** | **Fixed** (v0.31.0): `codegen.ManagedEntity` / `managedEntity` bind the allocator to the entity; `codegen.dupeEntityTo(arena)` deep-copies fields + JSON + 2 edge levels into a request arena. Runtime wrong-allocator assert is not feasible in Zig — the two helpers remove the footgun instead. Docs: `BEST_PRACTICES.md` §2 rule 5. |
 
 ### Z9 — `beginTxFromDriver` + Driver-first loaders
 
@@ -132,7 +132,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z5 | SELECT expressions | P1 | **Fixed** v0.31.0 |
 | Z6 | Row getInt semantics | P1 | **Fixed** v0.30.0 |
 | Z7 | Where `&.{}` | P1 | **Fixed** v0.30.0 |
-| Z8 | deinitEntity ergonomics | P1 | Open |
+| Z8 | deinitEntity ergonomics | P1 | **Fixed** v0.31.0 |
 | Z9 | beginTxFromDriver | P1 | Open |
 | Z10 | WithEdge options | P1 | Open |
 | Z11 | Decimal field | P2 | Open |
