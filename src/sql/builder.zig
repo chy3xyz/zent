@@ -275,14 +275,17 @@ pub const Predicate = union(enum) {
                 // Inline literal with full escaping of the escape char,
                 // LIKE wildcards and quotes — no injection surface, no
                 // pre-escaped allocation needed.
+                // MySQL: use '!' as escape character because '\' would
+                // escape the closing quote in string literals.
+                const escape: u8 = if (std.mem.eql(u8, b.dialect.name, "mysql")) '!' else p.escape;
                 try b.qualifiedIdent(p.column);
                 try b.writeString(" LIKE '");
                 try b.writeByte('%');
-                try writeLikeEscaped(b, p.needle, p.escape);
+                try writeLikeEscaped(b, p.needle, escape);
                 try b.writeByte('%');
                 try b.writeByte('\'');
                 try b.writeString(" ESCAPE '");
-                try b.writeByte(p.escape);
+                try b.writeByte(escape);
                 try b.writeByte('\'');
             },
             .in => |p| {
@@ -485,6 +488,17 @@ test "ContainsEscaped renders LIKE with escaped wildcards and quotes" {
     _ = try s.where(ContainsEscaped("name", "a%b_c\\d'e"));
     const q = try s.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE \"name\" LIKE '%a\\%b\\_c\\\\d''e%' ESCAPE '\\'", q.sql);
+    try std.testing.expectEqual(@as(usize, 0), q.args.len);
+}
+
+test "ContainsEscaped renders MySQL-safe LIKE with ! escape" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("users"));
+    _ = try s.where(ContainsEscaped("name", "a%b_c!d'e"));
+    const q = try s.query();
+    try std.testing.expectEqualStrings("SELECT `id` FROM `users` WHERE `name` LIKE '%a!%b!_c!!d''e%' ESCAPE '!'", q.sql);
     try std.testing.expectEqual(@as(usize, 0), q.args.len);
 }
 
