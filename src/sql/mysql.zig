@@ -330,12 +330,14 @@ pub const MySQLDriver = struct {
             }
         }
 
-        const stmt = if (self.cache) |*cached|
-            try cached.getOrPrepare(sql, self, prepareMySQLStmt, {}, closeStmt)
-        else
-            try prepareMySQLStmt(self, sql);
+        var owns_stmt = true;
+        const stmt = if (self.cache) |*cached| blk: {
+            const p = try cached.getOrPrepare(sql, self, prepareMySQLStmt, {}, closeStmt);
+            owns_stmt = !p.cached;
+            break :blk p.stmt;
+        } else try prepareMySQLStmt(self, sql);
         defer {
-            if (self.cache == null) _ = c.mysql_stmt_close(stmt);
+            if (owns_stmt) _ = c.mysql_stmt_close(stmt);
         }
 
         // Reset before rebinding (needed when stmt came from cache).
@@ -398,10 +400,12 @@ pub const MySQLDriver = struct {
 
     pub fn query(self: *MySQLDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
         try self.ensureAlive();
-        const stmt = if (self.cache) |*cached|
-            try cached.takeOrPrepare(query_sql, self, prepareMySQLStmt)
-        else
-            try prepareMySQLStmt(self, query_sql);
+        var cache_slot: ?usize = null;
+        const stmt = if (self.cache) |*cached| blk: {
+            const t = try cached.takeOrPrepare(query_sql, self, prepareMySQLStmt);
+            cache_slot = t.slot;
+            break :blk t.stmt;
+        } else try prepareMySQLStmt(self, query_sql);
         errdefer _ = c.mysql_stmt_close(stmt);
 
         // Reset before rebinding (needed when stmt came from cache).
@@ -495,9 +499,8 @@ pub const MySQLDriver = struct {
             .allocator = self.allocator,
             .done = false,
             .last_error = null,
-            .cache = if (self.cache) |*cch| cch else null,
-            .cache_sql_hash = std.hash.Wyhash.hash(0, query_sql),
-            .cache_sql_len = query_sql.len,
+            .cache = if (cache_slot != null) &self.cache.? else null,
+            .cache_slot = cache_slot,
         };
 
         return driver.Rows{
@@ -733,8 +736,7 @@ pub const MySQLRows = struct {
     done: bool,
     last_error: ?anyerror = null,
     cache: ?*cache.PreparedCache(16, *c.MYSQL_STMT) = null,
-    cache_sql_hash: u64 = 0,
-    cache_sql_len: usize = 0,
+    cache_slot: ?usize = null,
 
     // Per-row buffer
     row_bind: ?[]c.MYSQL_BIND = null,
@@ -885,9 +887,9 @@ pub const MySQLRows = struct {
         c.mysql_free_result(self.metadata);
         _ = c.mysql_stmt_free_result(self.stmt);
 
-        if (self.cache) |cch| {
+        if (self.cache_slot) |slot| {
             _ = c.mysql_stmt_reset(self.stmt);
-            cch.returnStmtByHash(self.cache_sql_hash, self.cache_sql_len, self.stmt, {}, struct {
+            self.cache.?.returnStmt(slot, self.stmt, {}, struct {
                 fn f(_: anytype, s: *c.MYSQL_STMT) void {
                     _ = c.mysql_stmt_close(s);
                 }

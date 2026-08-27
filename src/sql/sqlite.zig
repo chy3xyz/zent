@@ -90,9 +90,12 @@ pub const SQLiteDriver = struct {
             }
         }
 
-        const stmt = if (self.cache) |*cached|
-            try cached.getOrPrepare(sql, self.db, prepareStmt, {}, finalizeStmt)
-        else blk: {
+        var owns_stmt = true;
+        const stmt = if (self.cache) |*cached| blk: {
+            const p = try cached.getOrPrepare(sql, self.db, prepareStmt, {}, finalizeStmt);
+            owns_stmt = !p.cached;
+            break :blk p.stmt;
+        } else blk: {
             var out: ?*c.sqlite3_stmt = null;
             const rc = c.sqlite3_prepare_v2(self.db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&out), null);
             if (rc != c.SQLITE_OK or out == null) {
@@ -102,7 +105,7 @@ pub const SQLiteDriver = struct {
             break :blk out.?;
         };
         defer {
-            if (self.cache == null) _ = c.sqlite3_finalize(stmt);
+            if (owns_stmt) _ = c.sqlite3_finalize(stmt);
         }
 
         // Reset before rebinding (needed when stmt came from cache).
@@ -123,9 +126,12 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn query(self: *SQLiteDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
-        const stmt = if (self.cache) |*cached|
-            try cached.takeOrPrepare(query_sql, self.db, prepareStmtQuery)
-        else blk: {
+        var cache_slot: ?usize = null;
+        const stmt = if (self.cache) |*cached| blk: {
+            const t = try cached.takeOrPrepare(query_sql, self.db, prepareStmtQuery);
+            cache_slot = t.slot;
+            break :blk t.stmt;
+        } else blk: {
             var out: ?*c.sqlite3_stmt = null;
             const rc = c.sqlite3_prepare_v2(
                 self.db,
@@ -153,9 +159,8 @@ pub const SQLiteDriver = struct {
             .stmt = stmt,
             .allocator = self.allocator,
             .done = false,
-            .cache = if (self.cache) |*cch| cch else null,
-            .cache_sql_hash = std.hash.Wyhash.hash(0, query_sql),
-            .cache_sql_len = query_sql.len,
+            .cache = if (cache_slot != null) &self.cache.? else null,
+            .cache_slot = cache_slot,
         };
 
         return driver.Rows{
@@ -412,8 +417,7 @@ const SQLiteRows = struct {
     done: bool,
     next_error: ?driver.Error = null,
     cache: ?*cache.PreparedCache(16, *c.sqlite3_stmt) = null,
-    cache_sql_hash: u64 = 0,
-    cache_sql_len: usize = 0,
+    cache_slot: ?usize = null,
 
     const vtable = driver.Rows.VTable{
         .next = next,
@@ -453,10 +457,10 @@ const SQLiteRows = struct {
 
     fn deinit(ptr: *anyopaque) void {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
-        if (self.cache) |cch| {
+        if (self.cache_slot) |slot| {
             _ = c.sqlite3_reset(self.stmt);
             _ = c.sqlite3_clear_bindings(self.stmt);
-            cch.returnStmtByHash(self.cache_sql_hash, self.cache_sql_len, self.stmt, {}, struct {
+            self.cache.?.returnStmt(slot, self.stmt, {}, struct {
                 fn f(_: anytype, s: *c.sqlite3_stmt) void {
                     _ = c.sqlite3_finalize(s);
                 }
