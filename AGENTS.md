@@ -13,10 +13,11 @@
 - `zig build` — build the library and example executables
 - `zig build test` — run unit tests (256 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run SQLite integration tests
-- `zig build benchmark` — run performance benchmarks (builder/scan/pool)
+- `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
 - `zig build run-complex` — run the `examples/complex` e-commerce demo
 - `zig build run-pool` — run the `examples/pool` connection-pool demo
+- `zig build run-interceptor` — run the `examples/interceptor` multi-tenant demo
 - `zig fmt --check src examples tests build.zig` — formatting
 - `bash scripts/check-version.sh` — release-consistency gate (CI)
 - `bash scripts/check-deadcode.sh` — dead-code baseline gate (CI; needs
@@ -84,4 +85,5 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `examples/complex/` — e-commerce demo with advanced SQL operations
 - `examples/pool/` — connection-pool usage demo
 - `examples/migrate/` — migration-file runner demo
+- `examples/interceptor/` — multi-tenant query-rewriting demo (`UseInterceptor`)
 - `tests/integration/` — end-to-end tests

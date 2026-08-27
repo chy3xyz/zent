@@ -212,6 +212,27 @@ pub fn build(b: *std.Build) void {
     rollback_step.dependOn(&run_rollback.step);
 
     // -------------------------------------------------------------
+    // Example: interceptor (multi-tenant query rewriting)
+    // -------------------------------------------------------------
+    const interceptor_mod = b.createModule(.{
+        .root_source_file = b.path("examples/interceptor/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    interceptor_mod.addImport("zent", zent_mod);
+    interceptor_mod.addImport("sqlite3_c", sqlite_c_mod);
+    interceptor_mod.linkSystemLibrary("sqlite3", .{});
+    const interceptor_exe = b.addExecutable(.{
+        .name = "interceptor",
+        .root_module = interceptor_mod,
+    });
+    b.installArtifact(interceptor_exe);
+
+    const run_interceptor = b.addRunArtifact(interceptor_exe);
+    const interceptor_step = b.step("run-interceptor", "Run the interceptor (multi-tenant) example");
+    interceptor_step.dependOn(&run_interceptor.step);
+
+    // -------------------------------------------------------------
     // Benchmarks
     // -------------------------------------------------------------
     const bench_mod = b.createModule(.{
