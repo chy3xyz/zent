@@ -44,7 +44,10 @@ pub const PostgresDriver = struct {
         if (c.PQstatus(conn) != c.CONNECTION_OK) {
             defer c.PQfinish(conn);
             const msg = c.PQerrorMessage(conn);
-            std.log.err("postgres connect failed: {s}", .{std.mem.span(msg)});
+            // warn (not err): a refused connection is an expected, recoverable
+            // outcome (server not running / integration-test skip path), and
+            // the test framework fails on err-level logs even in skipped tests.
+            std.log.warn("postgres connect failed: {s}", .{std.mem.span(msg)});
             return error.PostgresConnectFailed;
         }
         // Set client encoding to UTF8 for consistent text handling.

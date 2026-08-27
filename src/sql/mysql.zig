@@ -146,7 +146,10 @@ pub const MySQLDriver = struct {
         if (ret == null) {
             defer c.mysql_close(conn);
             const msg = c.mysql_error(conn);
-            std.log.err("mysql connect failed: {s}", .{std.mem.span(msg)});
+            // warn (not err): a refused connection is an expected, recoverable
+            // outcome (server not running / integration-test skip path), and
+            // the test framework fails on err-level logs even in skipped tests.
+            std.log.warn("mysql connect failed: {s}", .{std.mem.span(msg)});
             return error.MySQLConnectFailed;
         }
 

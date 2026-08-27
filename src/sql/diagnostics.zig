@@ -1,5 +1,4 @@
 const std = @import("std");
-const Value = @import("builder.zig").Value;
 
 /// Diagnostic context captured when SQL statement execution or query encounters a failure.
 pub const SqlDiagnostic = struct {

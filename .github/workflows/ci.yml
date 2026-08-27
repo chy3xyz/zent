@@ -93,7 +93,10 @@ jobs:
 
     env:
       PG_DSN: "host=localhost dbname=zent_test user=postgres password=postgres"
-      MYSQL_HOST: localhost
+      # 127.0.0.1, not localhost: libmariadb treats "localhost" as a unix
+      # socket (/run/mysqld/mysqld.sock), which does not exist in this job's
+      # container — the server lives in the sibling service container.
+      MYSQL_HOST: 127.0.0.1
       MYSQL_PORT: "3306"
       MYSQL_USER: root
       MYSQL_PASS: root
@@ -133,11 +136,11 @@ jobs:
         with:
           version: 0.17.0-dev.1567+f0354179a
 
-      - name: Build zmodu CLI from zigmodu (pinned v0.15.10)
+      - name: Build zmodu CLI from zigmodu (pinned v0.15.31)
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
-          git clone --depth 1 --branch v0.15.10 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
+          git clone --depth 1 --branch v0.15.31 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
           cd /tmp/zigmodu && zig build -Ddb=sqlite
 
       - name: Check dead-code baseline
@@ -148,6 +151,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so we can check out the parent commit for the A/B
+          # baseline without a second network fetch.
+          fetch-depth: 0
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -159,8 +166,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
 
-      # ns/op has ~±15% variance on shared runners, so the default threshold
-      # (100%) only catches catastrophic regressions. Tighten locally with
-      # BENCH_REGRESSION_THRESHOLD_PCT on a dedicated machine.
-      - name: Check benchmark regression
-        run: bash scripts/bench-compare.sh
+      # The committed scripts/benchmark-baseline.txt is machine-relative
+      # (recorded on a fast local Mac), so comparing it against CI runners
+      # (3-6x slower) is meaningless. Instead, do a same-runner A/B: record a
+      # baseline at the parent commit, then measure HEAD on the same runner.
+      # The default threshold (100%) then genuinely catches a 2x regression
+      # in HEAD relative to the commit it was pushed on top of.
+      - name: Record baseline at parent commit
+        env:
+          BASE_SHA: ${{ github.event.before }}
+        run: |
+          if [ -z "${BASE_SHA}" ] || [ "${BASE_SHA}" = "0000000000000000000000000000000000000000" ]; then
+            echo "no parent commit; skipping regression canary"
+            exit 0
+          fi
+          git worktree add --detach /tmp/zent-base "${BASE_SHA}"
+          (cd /tmp/zent-base && bash scripts/bench-compare.sh --save /tmp/bench-base.txt)
+
+      - name: Compare HEAD against parent
+        run: |
+          if [ ! -f /tmp/bench-base.txt ]; then
+            echo "baseline not recorded; skipping regression compare"
+            exit 0
+          fi
+          bash scripts/bench-compare.sh /tmp/bench-base.txt

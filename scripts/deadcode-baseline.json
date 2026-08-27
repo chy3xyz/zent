@@ -2,14 +2,14 @@
   "items": [
     {
       "file": "src/codegen/client.zig",
-      "line": 24,
+      "line": 25,
       "kind": "constant",
       "name": "graph_step",
       "parent": null
     },
     {
       "file": "src/codegen/client.zig",
-      "line": 27,
+      "line": 28,
       "kind": "function",
       "name": "capitalize",
       "parent": null
@@ -58,7 +58,7 @@
     },
     {
       "file": "src/codegen/graph.zig",
-      "line": 139,
+      "line": 154,
       "kind": "function",
       "name": "toFieldInfo",
       "parent": null
@@ -79,21 +79,21 @@
     },
     {
       "file": "src/codegen/query.zig",
-      "line": 42,
+      "line": 44,
       "kind": "constant",
       "name": "LogContext",
       "parent": null
     },
     {
       "file": "src/codegen/query.zig",
-      "line": 45,
+      "line": 47,
       "kind": "constant",
       "name": "EntityGen",
       "parent": null
     },
     {
       "file": "src/codegen/query.zig",
-      "line": 46,
+      "line": 48,
       "kind": "constant",
       "name": "graph_step",
       "parent": null
@@ -107,14 +107,7 @@
     },
     {
       "file": "src/codegen/update_delete.zig",
-      "line": 10,
-      "kind": "constant",
-      "name": "Op",
-      "parent": null
-    },
-    {
-      "file": "src/codegen/update_delete.zig",
-      "line": 14,
+      "line": 15,
       "kind": "constant",
       "name": "LogContext",
       "parent": null
