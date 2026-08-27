@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `examples/interceptor` — multi-tenant query-rewriting demo: a runtime tenant
+  id in the interceptor `ctx` transparently scopes `Query`/`Update`/`Delete`
+  via `view.whereEq("tenant_id", …)`; wired as `zig build run-interceptor`.
+- Eager-loading and upsert benchmarks (`bench/eager.zig`, `bench/upsert.zig`):
+  `eager/with_edge_o2m`, `upsert/save_or_update`, `upsert/save_or_update_on`,
+  each against in-memory SQLite with a one-shot correctness check.
+
+### Fixed
+- CI is green again on every push. Four independent failures (all pre-existing
+  at v0.32.0) are fixed: (1) connect-failure logs are `warn` instead of `err`
+  so the skip path no longer fails Zig's test runner; (2) the `integration-db`
+  job connects to MariaDB over TCP (`127.0.0.1`) instead of the unix socket;
+  (3) the dead-code job pins zigmodu v0.15.32, which builds under the pinned
+  Zig on Linux; (4) the benchmark canary is now a same-runner A/B against the
+  parent commit instead of a machine-relative absolute baseline.
+- Remove an unused `Value` import in `src/sql/diagnostics.zig` that the newer
+  zmodu dead-code pass flags; shrink the dead-code baseline.
+
 ## [0.32.0] - 2026-08-27
 
 ### Added
