@@ -1686,3 +1686,88 @@ test "Postgres: beginTx propagates hooks and privacy_ctx to transaction entity c
 
     try tx.commit();
 }
+
+test "Postgres: interceptor injects tenant filter into query/update/delete" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const TenantDoc = schema("PgTenantDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{TenantDoc});
+    const infos = graph.types;
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_tenant_doc", &.{});
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_tenant_doc", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    // Multi-tenant interceptor: transparently scope every query/update/delete
+    // to the current tenant (see the SQLite twin test for the full matrix).
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("tenant_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    for ([_]struct { n: []const u8, t: i64 }{ .{ .n = "t1-doc", .t = 1 }, .{ .n = "t2-doc", .t = 2 } }) |s| {
+        var b = try client.pg_tenant_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", s.n);
+        _ = try b.setFieldValue("tenant_id", s.t);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+
+    // Query reads only the current tenant's row.
+    {
+        var q = client.pg_tenant_doc.Query();
+        defer q.deinit();
+        const rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("t1-doc", rows.items[0].name);
+    }
+
+    // Update without an explicit Where touches only the current tenant.
+    {
+        var u = client.pg_tenant_doc.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "renamed");
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    // Delete scoped to tenant 2 removes exactly its row.
+    tenant = 2;
+    {
+        var d = client.pg_tenant_doc.Delete();
+        defer d.deinit();
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    // Only tenant 1's renamed row remains.
+    tenant = 1;
+    var q = client.pg_tenant_doc.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), rows.items.len);
+    try testing.expectEqualStrings("renamed", rows.items[0].name);
+}

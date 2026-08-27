@@ -203,7 +203,7 @@ zent/
 - [x] Hooks system framework
 - [x] Privacy Policy framework
 - [x] Cross-dialect mutation parity (RETURNING / UPSERT / savepoints on SQLite + PostgreSQL + MySQL)
-- [ ] Interceptors (query interception / transparent query rewriting)
+- [x] Interceptors (query interception / transparent query rewriting)
 - [ ] CLI tool for SQL→Zig schema generation
 - [ ] More advanced features
 

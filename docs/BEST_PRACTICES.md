@@ -293,6 +293,46 @@ const affected = try u.Save();
   updating from a subquery, and dialect-specific `UPDATE ... FROM`. Keep those
   in `driver.exec` and log them in your escape ledger.
 
+## 5d. Interceptors (runtime query rewriting)
+
+Interceptors observe and transparently rewrite a query *before* it runs —
+the ent `Intercept` counterpart. Register once on the root client; every
+`Query`/`Update`/`Delete` (and `Bulk*` variant) from any entity client runs
+the chain. The canonical use is multi-tenant row scoping:
+
+```zig
+var client = Client.makeClient(infos, allocator, drv.asDriver());
+defer Client.DeinitClient(infos, &client); // frees the owned chain
+
+var tenant: i64 = currentTenantId();
+try Client.UseInterceptor(infos, &client, .{
+    .ctx = &tenant,
+    .intercept = struct {
+        fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+            const id: *i64 = @ptrCast(@alignCast(ctx.?));
+            // Adds `tenant_id = ?` to the WHERE clause of every
+            // query/update/delete on any table that has the field.
+            try view.whereEq("tenant_id", .{ .int = id.* });
+        }
+    }.f,
+});
+```
+
+- Division of labor: **privacy** answers allow/deny plus *static* row
+  filters tied to a policy (`withContext`); **interceptors** rewrite or
+  observe queries at runtime (tenant injection, soft-scope enforcement,
+  query counters) and are registered once per client.
+- `view.whereEq` validates the field against the entity schema —
+  `error.UnknownField` surfaces as `error.InterceptFailed` on the query.
+- Interceptor errors abort the operation: the first error wins, and all
+  errors collapse to `error.InterceptFailed` at the builder boundary
+  (execution methods keep explicit error sets).
+- Create is deliberately not intercepted — hooks own the create path.
+- `beginTx` copies the chain pointer into the TxClient, so registered
+  interceptors also apply inside transactions. Register before `beginTx`.
+- Per-entity registration (without a root client): borrow a caller-owned
+  chain via `entity_client.withInterceptors(&chain)`.
+
 ## 6. Transactions
 
 ```zig

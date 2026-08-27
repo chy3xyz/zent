@@ -65,6 +65,7 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) MUST be `deinit`'d.
 - `driver.Tx` MUST be `deinit`'d exactly once, regardless of `commit`/`rollback`.
 - `sql.QueryResult` (`{ sql, args }`) borrows from the builder; `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) transfers ownership and MUST be `deinit`'d.
+- The root `Client` owns its `InterceptorChain`: register with `client_mod.UseInterceptor(infos, &client, i)` and release with `client_mod.DeinitClient(infos, &client)` (only needed when `UseInterceptor` was called). Register before `beginTx` — the tx client borrows the same chain.
 - Use `std.testing.allocator` in tests so `zig build test` reports leaks with non-zero exit.
 
 ## Layout
@@ -74,7 +75,7 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `src/sql/` — SQL builder, driver interface, SQLite/PostgreSQL/MySQL drivers
   (`builder/dialect/driver/scan/sqlite/postgres/mysql/schema`, plus
   `pool.zig`, `cache.zig`, `explain.zig`, `logger.zig`, `value.zig`)
-- `src/runtime/` — hook and error helpers
+- `src/runtime/` — hook, interceptor (runtime query rewriting), and error helpers
 - `src/privacy/` — privacy policy framework
 - `src/graph/` — graph traversal helpers
 - `src/entql/` — EntQL expression parser

@@ -38,6 +38,8 @@ fn scanEntityNamed(comptime T: type, allocator: std.mem.Allocator, row: sql_driv
 }
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
+const hook = @import("../runtime/hook.zig");
+const intercept = @import("../runtime/intercept.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;
@@ -263,6 +265,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         for_update: bool,
         for_share: bool,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        /// Shared interceptor chain borrowed from the entity client; run
+        /// before every execution method (after privacy filter injection).
+        interceptors: ?*intercept.InterceptorChain = null,
         logger: Logger = .{},
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
@@ -569,7 +574,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
-        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported };
+        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
         const ExplainError = error{ OutOfMemory, BuildFailed, InvalidCursor, UnsupportedDialect };
 
@@ -653,6 +658,35 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
+        /// Run the interceptor chain against this query. Interceptor errors
+        /// collapse to `error.InterceptFailed` so execution methods keep
+        /// their explicit error sets.
+        fn runInterceptors(self: *Self, op: hook.Op) error{InterceptFailed}!void {
+            const chain = self.interceptors orelse return;
+            var view = intercept.QueryView{
+                .op = op,
+                .table_name = info.table_name,
+                .sink = self,
+                .add_eq_fn = addEqPredicate,
+            };
+            chain.run(&view) catch return error.InterceptFailed;
+        }
+
+        /// QueryView sink: append `field_name = value` after validating the
+        /// field against the entity schema (unknown fields are rejected).
+        fn addEqPredicate(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (info.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            try self.predicates.append(sql.EQ(field_name, value));
+        }
+
         /// Fetch every matching row. Returns `std.array_list.Managed(Entity)`:
         /// iterate via `result.items` (a slice) and free each entity with
         /// `deinitEntity(infos, info, &item, allocator)` before `result.deinit()`.
@@ -661,6 +695,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn All(self: *Self) QueryError!std.array_list.Managed(Entity) {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
             self.ensureDeadline();
@@ -710,6 +745,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Iterate(self: *Self) QueryError!QueryIterator {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
             self.ensureDeadline();
@@ -737,6 +773,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn First(self: *Self) QueryError!?Entity {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             self.limit_val = 1;
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
@@ -776,6 +813,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Only(self: *Self) QueryError!Entity {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildQuery(info.fields.len);
             defer q.deinit();
             self.ensureDeadline();
@@ -816,6 +854,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn IDs(self: *Self) QueryError!std.array_list.Managed(i64) {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildQuery(1); // only id column
             defer q.deinit();
             self.ensureDeadline();
@@ -836,6 +875,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Count(self: *Self) QueryError!i64 {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildCountQuery();
             defer q.deinit();
             self.ensureDeadline();
@@ -890,6 +930,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn CountBy(self: *Self, comptime field_name: []const u8) QueryError!std.array_list.Managed(GroupCount) {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildGroupedCountQuery(field_name);
             defer q.deinit();
             self.ensureDeadline();
@@ -932,6 +973,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Exist(self: *Self) QueryError!bool {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             self.limit_val = 1;
             var q = try self.buildQuery(1);
             defer q.deinit();
@@ -949,6 +991,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Sum(self: *Self, comptime field_name: []const u8) QueryError!f64 {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
@@ -965,6 +1008,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Avg(self: *Self, comptime field_name: []const u8) QueryError!f64 {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
@@ -980,6 +1024,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Max(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
@@ -1004,6 +1049,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         pub fn Min(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
             var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
@@ -1468,7 +1514,7 @@ test "Query builder execution methods expose explicit driver error union" {
     const infos = &[_]TypeInfo{info};
     const UserEntity = comptime EntityGenerator(infos, info);
     const UserQuery = QueryBuilder(infos, info, UserEntity);
-    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported };
+    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
 
     comptime {
         const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
@@ -1540,7 +1586,7 @@ test "query contract tests" {
     const infos = &[_]TypeInfo{info};
     const UserEntity = comptime EntityGenerator(infos, info);
     const QB = QueryBuilder(infos, info, UserEntity);
-    const QE = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed, InvalidCursor, UuidEdgesUnsupported };
+    const QE = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed, InvalidCursor, UuidEdgesUnsupported, InterceptFailed };
 
     comptime {
         // Verify all public query method error sets are explicit

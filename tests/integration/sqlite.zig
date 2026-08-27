@@ -2024,3 +2024,142 @@ test "SQLite: decimal field round-trips exact text" {
     // TEXT affinity: the literal bytes come back verbatim (no REAL rewrite).
     try testing.expectEqualStrings("19.99", rows.items[0].amount);
 }
+
+test "SQLite: interceptor injects tenant filter into query/update/delete" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const TenantDoc = schema("TenantDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{TenantDoc});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    // Multi-tenant interceptor: transparently scope every query/update/delete
+    // to the current tenant. `ctx` is read per call, so flipping `tenant`
+    // re-scopes the same registered interceptor.
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("tenant_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    // Seed one row per tenant (create is hook territory, not intercepted).
+    for ([_]struct { n: []const u8, t: i64 }{ .{ .n = "t1-doc", .t = 1 }, .{ .n = "t2-doc", .t = 2 } }) |s| {
+        var b = try client.tenant_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", s.n);
+        _ = try b.setFieldValue("tenant_id", s.t);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+
+    // Query reads only the current tenant's row.
+    {
+        var q = client.tenant_doc.Query();
+        defer q.deinit();
+        const rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("t1-doc", rows.items[0].name);
+    }
+
+    // Update without an explicit Where touches only the current tenant.
+    {
+        var u = client.tenant_doc.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "renamed");
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    // TxClient inherits the interceptor chain pointer.
+    {
+        var tx = try Client.beginTx(infos, client);
+        defer tx.deinit();
+        try testing.expect(tx.client.tenant_doc.interceptors != null);
+        var q = tx.client.tenant_doc.Query();
+        defer q.deinit();
+        try testing.expectEqual(@as(i64, 1), try q.Count());
+        try tx.rollback();
+    }
+
+    // Switch the tenant context: the same interceptor now scopes to tenant 2.
+    tenant = 2;
+    {
+        var q = client.tenant_doc.Query();
+        defer q.deinit();
+        const rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        // Tenant 2's row was untouched by the tenant-1 update above.
+        try testing.expectEqualStrings("t2-doc", rows.items[0].name);
+    }
+
+    // Delete scoped to tenant 2 removes exactly its row.
+    {
+        var d = client.tenant_doc.Delete();
+        defer d.deinit();
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    // Only tenant 1's renamed row remains.
+    tenant = 1;
+    var q = client.tenant_doc.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), rows.items.len);
+    try testing.expectEqualStrings("renamed", rows.items[0].name);
+}
+
+test "SQLite: interceptor with unknown field aborts with InterceptFailed" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const BadScope = schema("BadScope", .{
+        .fields = &.{field.String("name")},
+    });
+
+    const graph = comptime buildGraph(&.{BadScope});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    try Client.UseInterceptor(infos, &client, .{
+        .intercept = struct {
+            fn f(_: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                try view.whereEq("no_such_field", .{ .int = 1 });
+            }
+        }.f,
+    });
+
+    var q = client.bad_scope.Query();
+    defer q.deinit();
+    try testing.expectError(error.InterceptFailed, q.All());
+}

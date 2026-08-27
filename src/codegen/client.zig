@@ -8,6 +8,7 @@ const Logger = @import("../sql/logger.zig").Logger;
 const debugLogger = @import("../sql/logger.zig").debugLogger;
 const migrate = @import("../sql/schema/migrate.zig");
 const Hook = @import("../runtime/hook.zig").Hook;
+const intercept = @import("../runtime/intercept.zig");
 const privacy = @import("../privacy/policy.zig");
 
 const EntityGen = @import("entity.zig").Entity;
@@ -125,6 +126,9 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         orders: @TypeOf(EdgeOrders),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        /// Shared interceptor chain (owned by the root Client or the caller);
+        /// propagated into every builder this client creates.
+        interceptors: ?*intercept.InterceptorChain = null,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver) Self {
             return .{
@@ -135,6 +139,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
                 .orders = EdgeOrders,
                 .hooks = &.{},
                 .privacy_ctx = null,
+                .interceptors = null,
             };
         }
 
@@ -150,9 +155,18 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return copy;
         }
 
+        /// Borrow an interceptor chain (e.g. one owned by the caller rather
+        /// than by a root Client). Mirrors `withContext`.
+        pub fn withInterceptors(self: Self, chain: *intercept.InterceptorChain) Self {
+            var copy = self;
+            copy.interceptors = chain;
+            return copy;
+        }
+
         pub fn Query(self: Self) QueryBuilder {
             var qb = QueryBuilder.init(self.allocator, self.driver, self.privacy_ctx);
             qb.logger = self.logger;
+            qb.interceptors = self.interceptors;
             return qb;
         }
 
@@ -172,6 +186,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             if (info.is_view) @compileError("Update is not supported for view entities");
             var ub = UpdateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
             ub.logger = self.logger;
+            ub.interceptors = self.interceptors;
             return ub;
         }
 
@@ -179,17 +194,22 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             if (info.is_view) @compileError("Delete is not supported for view entities");
             var db = DeleteBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
             db.logger = self.logger;
+            db.interceptors = self.interceptors;
             return db;
         }
 
         pub fn BulkUpdate(self: Self) BulkUpdateBuilder {
             if (info.is_view) @compileError("BulkUpdate is not supported for view entities");
-            return BulkUpdateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            var bub = BulkUpdateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            bub.interceptors = self.interceptors;
+            return bub;
         }
 
         pub fn BulkDelete(self: Self) !BulkDeleteBuilder {
             if (info.is_view) @compileError("BulkDelete is not supported for view entities");
-            return BulkDeleteBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            var bdb = try BulkDeleteBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            bdb.interceptors = self.interceptors;
+            return bdb;
         }
 
         const QueryEdgeError = sql_driver.Error || error{TypeMismatch};
@@ -297,7 +317,7 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
 /// The Client holds entity sub-clients and per-edge query helpers.
 pub fn Client(comptime infos: []const TypeInfo) type {
     comptime {
-        const total_fields = 3 + infos.len; // allocator, driver, logger, + one per entity
+        const total_fields = 4 + infos.len; // allocator, driver, logger, interceptors, + one per entity
         var field_names: [total_fields][:0]const u8 = undefined;
         var field_types: [total_fields]type = undefined;
         var field_attrs: [total_fields]std.builtin.Type.Struct.FieldAttributes = undefined;
@@ -315,8 +335,12 @@ pub fn Client(comptime infos: []const TypeInfo) type {
         field_types[2] = Logger;
         field_attrs[2] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(Logger) };
 
+        field_names[3] = "interceptors";
+        field_types[3] = intercept.InterceptorChain;
+        field_attrs[3] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(intercept.InterceptorChain) };
+
         // Entity sub-clients (user, car, group, ...)
-        for (infos, 3..) |info, i| {
+        for (infos, 4..) |info, i| {
             const ClientType = EntityClient(infos, info);
             const name = structFieldName(info.name);
             field_names[i] = name;
@@ -335,12 +359,32 @@ pub fn makeClient(comptime infos: []const TypeInfo, allocator: std.mem.Allocator
     result.allocator = allocator;
     result.driver = driver;
     result.logger = .{};
+    result.interceptors = intercept.InterceptorChain.init(allocator);
     inline for (infos) |info| {
         const ClientType = EntityClient(infos, info);
         const field_name = comptime toSnakeCase(info.name);
         @field(result, field_name) = ClientType.init(allocator, driver);
     }
     return result;
+}
+
+/// Register an interceptor on the client's owned chain and point every
+/// entity sub-client at it. Call this on the final `Client` value you use
+/// (the entity clients store a pointer into the client's `interceptors`
+/// field); register before starting transactions so `beginTx` copies the
+/// pointer. Pair with `DeinitClient`.
+pub fn UseInterceptor(comptime infos: []const TypeInfo, self: *Client(infos), i: intercept.Interceptor) !void {
+    try self.interceptors.use(i);
+    inline for (infos) |info| {
+        const field_name = comptime structFieldName(info.name);
+        @field(self, field_name).interceptors = &self.interceptors;
+    }
+}
+
+/// Release the client's owned interceptor chain. Only required when
+/// `UseInterceptor` was called — an unused chain never allocates.
+pub fn DeinitClient(comptime infos: []const TypeInfo, self: *Client(infos)) void {
+    self.interceptors.deinit();
 }
 
 /// Set the logger on the root client and propagate to all entity sub-clients.
@@ -371,9 +415,9 @@ pub fn GetMetrics() Metrics {
 }
 
 /// Begin a transaction and return a TxClient backed by the transaction.
-/// Copies logger, hooks, and privacy_ctx from the parent entity clients
-/// so that transactional operations retain hook callbacks, privacy rules,
-/// and logging configuration.
+/// Copies logger, hooks, privacy_ctx, and interceptors from the parent
+/// entity clients so that transactional operations retain hook callbacks,
+/// privacy rules, query interceptors, and logging configuration.
 pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver.Error!TxClient(infos) {
     // Re-entrant beginTx inside an active transaction degrades to a
     // savepoint, so service orchestration can nest transactions safely.
@@ -388,6 +432,7 @@ pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver
         @field(c, field_name).logger = @field(self, field_name).logger;
         @field(c, field_name).hooks = @field(self, field_name).hooks;
         @field(c, field_name).privacy_ctx = @field(self, field_name).privacy_ctx;
+        @field(c, field_name).interceptors = @field(self, field_name).interceptors;
     }
     return TxClient(infos){
         .client = c,

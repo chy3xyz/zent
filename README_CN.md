@@ -195,7 +195,7 @@ zent/
 - [x] Hooks 系统框架
 - [x] 隐私策略框架
 - [x] 跨方言 mutation 对齐（RETURNING / UPSERT / savepoint 三方言全覆盖）
-- [ ] Interceptors（查询拦截 / 透明改写）
+- [x] Interceptors（查询拦截 / 透明改写）
 - [ ] SQL→Zig schema 反向生成 CLI
 - [ ] 更多高级特性
 

@@ -9,6 +9,7 @@ const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const rthook = @import("../runtime/hook.zig");
+const intercept = @import("../runtime/intercept.zig");
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
@@ -151,6 +152,8 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        /// Shared interceptor chain borrowed from the entity client.
+        interceptors: ?*intercept.InterceptorChain = null,
         logger: Logger = .{},
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
@@ -306,7 +309,35 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+        /// Run the interceptor chain (`.update`). Interceptor errors
+        /// collapse to `error.InterceptFailed` to keep explicit error sets.
+        fn runInterceptors(self: *Self, op: Op) error{InterceptFailed}!void {
+            const chain = self.interceptors orelse return;
+            var view = intercept.QueryView{
+                .op = op,
+                .table_name = info.table_name,
+                .sink = self,
+                .add_eq_fn = addEqPredicate,
+            };
+            chain.run(&view) catch return error.InterceptFailed;
+        }
+
+        /// QueryView sink: append `field_name = value` after validating the
+        /// field against the entity schema (unknown fields are rejected).
+        fn addEqPredicate(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (info.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            try self.predicates.append(sql.EQ(field_name, value));
+        }
+
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
         const SaveOneError = SaveError || error{ NotFound, NotSingular };
 
         /// Execute the UPDATE and return rows affected.
@@ -322,6 +353,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                     try self.predicates.append(pred.*);
                 }
             }
+            try self.runInterceptors(.update);
             // Build mutated slice from field values for hook context.
             const mutated = try self.allocator.alloc(sql.Value, self.values.items.len);
             defer self.allocator.free(mutated);
@@ -510,6 +542,8 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         version_value: ?sql.Value,
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        /// Shared interceptor chain borrowed from the entity client.
+        interceptors: ?*intercept.InterceptorChain = null,
         logger: Logger = .{},
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
@@ -606,7 +640,35 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
-        const ExecError = sql_driver.Error || HookError || error{PrivacyDenied};
+        /// Run the interceptor chain (`.delete`). Interceptor errors
+        /// collapse to `error.InterceptFailed` to keep explicit error sets.
+        fn runInterceptors(self: *Self, op: Op) error{InterceptFailed}!void {
+            const chain = self.interceptors orelse return;
+            var view = intercept.QueryView{
+                .op = op,
+                .table_name = info.table_name,
+                .sink = self,
+                .add_eq_fn = addEqPredicate,
+            };
+            chain.run(&view) catch return error.InterceptFailed;
+        }
+
+        /// QueryView sink: append `field_name = value` after validating the
+        /// field against the entity schema (unknown fields are rejected).
+        fn addEqPredicate(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (info.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            try self.predicates.append(sql.EQ(field_name, value));
+        }
+
+        const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
         const ExecOneError = ExecError || error{ NotFound, NotSingular };
 
         /// Execute the DELETE and return rows affected.
@@ -670,6 +732,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     try self.predicates.append(pred.*);
                 }
             }
+            try self.runInterceptors(.delete);
             var hook_ctx = HookContext{
                 .op = .delete,
                 .table_name = info.table_name,
@@ -778,6 +841,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     try self.predicates.append(pred.*);
                 }
             }
+            try self.runInterceptors(.delete);
             var hook_ctx = HookContext{
                 .op = .delete,
                 .table_name = info.table_name,
@@ -877,6 +941,8 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         json_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        /// Shared interceptor chain borrowed from the entity client.
+        interceptors: ?*intercept.InterceptorChain = null,
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
 
@@ -964,7 +1030,35 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             return try self.set(field_name, toSqlValue(value));
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+        /// Run the interceptor chain (`.update`). Interceptor errors
+        /// collapse to `error.InterceptFailed` to keep explicit error sets.
+        fn runInterceptors(self: *Self, op: Op) error{InterceptFailed}!void {
+            const chain = self.interceptors orelse return;
+            var view = intercept.QueryView{
+                .op = op,
+                .table_name = info.table_name,
+                .sink = self,
+                .add_eq_fn = addEqPredicate,
+            };
+            chain.run(&view) catch return error.InterceptFailed;
+        }
+
+        /// QueryView sink: add a global `field_name = value` predicate after
+        /// validating the field against the entity schema.
+        fn addEqPredicate(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (info.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            _ = try self.b.where(sql.EQ(field_name, value));
+        }
+
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
 
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
@@ -979,6 +1073,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                     try self.b.where(pred.*);
                 }
             }
+            try self.runInterceptors(.update);
             var hook_ctx = HookContext{
                 .op = .update,
                 .table_name = info.table_name,
@@ -1047,6 +1142,8 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
         b: sql.BulkDeleteBuilder,
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
+        /// Shared interceptor chain borrowed from the entity client.
+        interceptors: ?*intercept.InterceptorChain = null,
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
 
@@ -1124,7 +1221,39 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
-        const ExecError = sql_driver.Error || HookError || error{PrivacyDenied};
+        /// Run the interceptor chain (`.delete`). Interceptor errors
+        /// collapse to `error.InterceptFailed` to keep explicit error sets.
+        fn runInterceptors(self: *Self, op: Op) error{InterceptFailed}!void {
+            const chain = self.interceptors orelse return;
+            var view = intercept.QueryView{
+                .op = op,
+                .table_name = info.table_name,
+                .sink = self,
+                .add_eq_fn = addEqPredicate,
+            };
+            chain.run(&view) catch return error.InterceptFailed;
+        }
+
+        /// QueryView sink: add `field_name = value` to every WHERE group
+        /// (groups are ORed, so the filter must AND into each one), after
+        /// validating the field against the entity schema.
+        fn addEqPredicate(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (info.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            const pred = sql.EQ(field_name, value);
+            for (self.b.groups.items) |*group| {
+                try group.append(pred);
+            }
+        }
+
+        const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
 
         /// Execute the bulk DELETE and return rows affected.
         pub fn Exec(self: *Self) ExecError!usize {
@@ -1144,6 +1273,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            try self.runInterceptors(.delete);
             if (self.b.groups.items.len == 0) return 0;
 
             // Each WHERE group becomes its own UPDATE (OR semantics across
@@ -1182,6 +1312,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                     }
                 }
             }
+            try self.runInterceptors(.delete);
             var hook_ctx = HookContext{
                 .op = .delete,
                 .table_name = info.table_name,
@@ -1375,9 +1506,9 @@ test "Update and delete execution methods expose explicit driver error unions" {
     const Del = DeleteBuilder(info);
     const BulkUpd = BulkUpdateBuilder(info);
     const BulkDel = BulkDeleteBuilder(info);
-    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
     const SaveOneError = SaveError || error{ NotFound, NotSingular };
-    const ExecError = sql_driver.Error || HookError || error{PrivacyDenied};
+    const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
     const ExecOneError = ExecError || error{ NotFound, NotSingular };
 
     comptime {

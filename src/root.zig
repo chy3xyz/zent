@@ -52,6 +52,7 @@ pub const helpers = @import("helpers.zig");
 
 pub const runtime = struct {
     pub const hook = @import("runtime/hook.zig");
+    pub const intercept = @import("runtime/intercept.zig");
     pub const err = @import("runtime/error.zig");
     pub const privacy = @import("runtime/privacy.zig");
 };
