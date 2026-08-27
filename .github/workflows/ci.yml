@@ -26,7 +26,7 @@ jobs:
         with:
           path: ~/.cache/zig
           key: ${{ runner.os }}-zig-${{ hashFiles('.zig-cache/never_was_here') }}
-          enable-cross-os-cache: true
+          enableCrossOsArchive: true
 
       - name: Install native database clients (Linux)
         if: runner.os == 'Linux'
@@ -115,7 +115,7 @@ jobs:
         with:
           path: ~/.cache/zig
           key: ${{ runner.os }}-zig-${{ hashFiles('.zig-cache/never_was_here') }}
-          enable-cross-os-cache: true
+          enableCrossOsArchive: true
 
       - name: Install native database clients
         run: |
@@ -136,31 +136,12 @@ jobs:
         with:
           version: 0.17.0-dev.1567+f0354179a
 
-      - name: Build zmodu CLI from zigmodu (pinned v0.15.31)
+      - name: Build zmodu CLI from zigmodu (pinned v0.15.32)
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
-          git clone --depth 1 --branch v0.15.31 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
-          cd /tmp/zigmodu
-          # Upstream bug: the zmodu CLI exe is missing `.link_libc = true`
-          # (every other exe in zigmodu/build.zig has it). On macOS this is
-          # masked by auto-linked libSystem; on Linux glibc must be explicit,
-          # so `zig build` fails with "dependency on libc must be explicitly
-          # specified". Patch the clone in place — keep the fix local to this
-          # workflow until it lands in an upstream zigmodu release.
-          python3 - <<'PY'
-          import pathlib, sys
-          p = pathlib.Path("build.zig")
-          s = p.read_text()
-          old = '    const zmodu_cli_mod = b.createModule(.{\n        .root_source_file = b.path("tools/zmodu/src/main.zig"),\n        .target = target,\n        .optimize = optimize,\n    });'
-          new = '    const zmodu_cli_mod = b.createModule(.{\n        .root_source_file = b.path("tools/zmodu/src/main.zig"),\n        .target = target,\n        .optimize = optimize,\n        .link_libc = true,\n    });'
-          if s.count(old) != 1:
-              print("FAIL: zmodu_cli_mod block not found or ambiguous", file=sys.stderr)
-              sys.exit(1)
-          p.write_text(s.replace(old, new))
-          print("patched zmodu_cli_mod -> link_libc = true")
-          PY
-          zig build -Ddb=sqlite
+          git clone --depth 1 --branch v0.15.32 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
+          cd /tmp/zigmodu && zig build -Ddb=sqlite
 
       - name: Check dead-code baseline
         run: ZMODU=/tmp/zigmodu/zig-out/bin/zmodu bash scripts/check-deadcode.sh
