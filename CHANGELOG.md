@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Interceptor framework** (`src/runtime/intercept.zig`) — ent-style runtime
+  query interception. `UseInterceptor(infos, &client, i)` registers an
+  `Interceptor` on the client; every query/update/delete runs the chain after
+  privacy checks and before execution, and each interceptor receives a
+  type-erased `QueryView` whose `whereEq(field, value)` ANDs an equality
+  predicate into the statement (multi-tenant `tenant_id` injection, audit
+  filters). Chain pointer propagates to all five builders and `TxClient`;
+  release with `DeinitClient`. Errors converge to `error.InterceptFailed`.
+  Docs: `BEST_PRACTICES.md` §5d.
+- PreparedCache benchmarks (`bench/cache.zig`): hot hit, cold-tail hit,
+  take+return, evict churn — the byte-compare lookup path costs ~27ns hot /
+  ~160ns cold tail.
+
+### Fixed
+- PreparedCache no longer keys statements by `(Wyhash, length)` alone — a
+  hash collision could have handed back a statement prepared for different
+  SQL. Entries store the SQL text inline (byte-compared on lookup; SQL
+  longer than 2048 bytes bypasses the cache), and take/return is now
+  slot-based: a taken (in-use) statement is invisible to lookups and
+  eviction, and a slot invalidated by DDL `evictAll` releases the handle on
+  return instead of re-caching stale SQL. Also fixes LRU order drift in the
+  old `returnStmtByHash` evict branch.
+
+### Tests
+- Three-dialect integration alignment: optimistic locking (4), migrateSchema
+  drop-column + dry-run, WhereIn chunking, privacy owner_id filter,
+  BulkInsert id derivation (RETURNING on PG, `last_insert_id` fallback on
+  MySQL), file-based migrations, cascade delete, stream iterator, and
+  beginTx hook/privacy propagation now run on PostgreSQL and MySQL too
+  (PG 18→31, MySQL 19→32 tests; suite total 116).
+
+### Docs
+- ISSUES_FROM_ZAPI body statuses synced (Z2/Z4/Z6/Z7 were fixed in v0.30.0);
+  README comparison tables updated: migration is diff-based, PG/MySQL
+  drivers are no longer "basic/placeholder".
+
 ## [0.31.0] - 2026-08-26
 
 ### Added
