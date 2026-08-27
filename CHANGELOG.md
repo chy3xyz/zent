@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-27
+
 ### Added
 - **Interceptor framework** (`src/runtime/intercept.zig`) — ent-style runtime
   query interception. `UseInterceptor(infos, &client, i)` registers an
