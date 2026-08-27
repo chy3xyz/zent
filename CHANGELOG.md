@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-08-27
+
 ### Added
 - `examples/interceptor` — multi-tenant query-rewriting demo: a runtime tenant
   id in the interceptor `ctx` transparently scopes `Query`/`Update`/`Delete`
