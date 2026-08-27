@@ -141,7 +141,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev
           git clone --depth 1 --branch v0.15.31 https://github.com/chy3xyz/zigmodu.git /tmp/zigmodu
-          cd /tmp/zigmodu && zig build -Ddb=sqlite
+          cd /tmp/zigmodu
+          # Upstream bug: the zmodu CLI exe is missing `.link_libc = true`
+          # (every other exe in zigmodu/build.zig has it). On macOS this is
+          # masked by auto-linked libSystem; on Linux glibc must be explicit,
+          # so `zig build` fails with "dependency on libc must be explicitly
+          # specified". Patch the clone in place — keep the fix local to this
+          # workflow until it lands in an upstream zigmodu release.
+          python3 - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("build.zig")
+          s = p.read_text()
+          old = '    const zmodu_cli_exe = b.addExecutable(.{\n        .name = "zmodu",\n        .root_module = zmodu_cli_mod,\n    });'
+          new = '    const zmodu_cli_exe = b.addExecutable(.{\n        .name = "zmodu",\n        .root_module = zmodu_cli_mod,\n        .link_libc = true,\n    });'
+          if s.count(old) != 1:
+              print("FAIL: zmodu_cli_exe block not found or ambiguous", file=sys.stderr)
+              sys.exit(1)
+          p.write_text(s.replace(old, new))
+          print("patched zmodu_cli_exe -> link_libc = true")
+          PY
+          zig build -Ddb=sqlite
 
       - name: Check dead-code baseline
         run: ZMODU=/tmp/zigmodu/zig-out/bin/zmodu bash scripts/check-deadcode.sh
