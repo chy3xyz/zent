@@ -9,3 +9,6 @@ cache/hit 27
 cache/hit_cold_tail 163
 cache/take_return 26
 cache/evict_churn 104
+eager/with_edge_o2m 198870
+upsert/save_or_update 29148
+upsert/save_or_update_on 42394
