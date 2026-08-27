@@ -189,13 +189,14 @@ zent/
 - [x] Phase 1: Comptime Schema 解析
 - [x] Phase 2: 代码生成 - 实体与 Builder
 - [x] Phase 3: SQLGraph 与图遍历
-- [x] Phase 4: 迁移引擎
-- [x] PostgreSQL 支持（占位符）
-- [x] MySQL 支持（占位符）
+- [x] Phase 4: 迁移引擎（差异式：增/删列、可选 ALTER TYPE）
+- [x] PostgreSQL 驱动
+- [x] MySQL 驱动
 - [x] Hooks 系统框架
 - [x] 隐私策略框架
-- [ ] 完整的 PostgreSQL 驱动实现
-- [ ] 完整的 MySQL 驱动实现
+- [x] 跨方言 mutation 对齐（RETURNING / UPSERT / savepoint 三方言全覆盖）
+- [ ] Interceptors（查询拦截 / 透明改写）
+- [ ] SQL→Zig schema 反向生成 CLI
 - [ ] 更多高级特性
 
 ## 与 ent 的对比
@@ -206,9 +207,9 @@ zent/
 | 静态类型 API | ✅ 代码生成 | ✅ comptime 生成 |
 | SQL Builder | ✅ | ✅ |
 | SQLGraph | ✅ | ✅ |
-| 自动迁移 | ✅ (Atlas) | ✅ Create-only |
+| 自动迁移 | ✅ (Atlas) | ✅ 差异式（增/删列、可选 ALTER TYPE、历史表） |
 | SQLite | ✅ | ✅ |
-| PostgreSQL/MySQL | ✅ | ✅ (占位符) |
+| PostgreSQL/MySQL | ✅ | ✅ |
 
 ## 消费者接线
 

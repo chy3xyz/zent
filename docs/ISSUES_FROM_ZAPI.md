@@ -31,7 +31,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 | **Evidence** | `DATA_ESCAPES.md` #36–38, #76, #87–95, …; `CHANGELOG` upsert notes vs consumer escape ledger |
 | **Proposal** | `SaveOrUpdateOn(&.{"key", "app_id"})` or schema `@unique` → generate ODKU / `ON CONFLICT`; partial column update; docs + example for setting-table pattern; refresh escape guidance (“prefer fluent upsert before escape”). |
 | **Acceptance** | One zapi-style setting upsert ports without raw SQL; docs no longer claim “zent has no upsert”. |
-| **Status** | Open |
+| **Status** | **Fixed** in v0.30.0 (`SaveOrUpdateOn`) |
 
 ### Z3 — Large-schema / multi-graph strategy
 
@@ -53,7 +53,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 |--|--|
 | **Problem** | Idempotent relation inserts use raw `INSERT IGNORE` (`DATA_ESCAPES` #4). |
 | **Proposal** | `Create().IgnoreConflict().Save()` / bulk variant → MySQL `INSERT IGNORE`, PG `ON CONFLICT DO NOTHING`, SQLite `INSERT OR IGNORE`. |
-| **Status** | Open |
+| **Status** | **Fixed** in v0.30.0 (`SaveIgnore`) |
 
 ### Z5 — Fluent SELECT / ORDER BY expressions
 
@@ -69,7 +69,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 |--|--|
 | **Problem** | Returns `?T`, not error union; authors repeatedly write `try row.getInt`. |
 | **Proposal** | Prefer `mustGetInt` / `tryGetInt` naming, or breaking `getInt → error{NullColumn}!i64`; examples forbid `try getInt`. |
-| **Status** | Open |
+| **Status** | **Fixed** in v0.30.0 (`tryGet*` error-union variants added alongside `get*`) |
 
 ### Z7 — `Where` accepts `&.{}` or clear `@compileError`
 
@@ -77,7 +77,7 @@ Suggested landing order: **Z1 → Z2 → Z3 → Z4…**.
 |--|--|
 | **Problem** | `&.{ P.xEQ }` vs `.{}` causes opaque comptime failures (`BEST_PRACTICES` anti-pattern). |
 | **Proposal** | Normalize pointer-to-tuple, or emit actionable compile error. |
-| **Status** | Open |
+| **Status** | **Fixed** in v0.30.0 |
 
 ### Z8 — `deinitEntity` ergonomics
 

@@ -197,12 +197,13 @@ zent/
 - [x] Phase 1: Comptime Schema parsing
 - [x] Phase 2: Code generation - entities and builders
 - [x] Phase 3: SQLGraph and graph traversal
-- [x] Phase 4: Migration engine
-- [x] PostgreSQL driver (basic)
-- [x] MySQL driver (basic)
+- [x] Phase 4: Migration engine (diff-based: add/drop column, opt-in alter type)
+- [x] PostgreSQL driver
+- [x] MySQL driver
 - [x] Hooks system framework
 - [x] Privacy Policy framework
-- [ ] Cross-dialect mutation parity (junction inserts, RETURNING, UPSERT)
+- [x] Cross-dialect mutation parity (RETURNING / UPSERT / savepoints on SQLite + PostgreSQL + MySQL)
+- [ ] Interceptors (query interception / transparent query rewriting)
 - [ ] CLI tool for SQL→Zig schema generation
 - [ ] More advanced features
 
@@ -214,9 +215,9 @@ zent/
 | Statically typed API | ✅ code generation | ✅ comptime generation |
 | SQL Builder | ✅ | ✅ |
 | SQLGraph | ✅ | ✅ |
-| Auto migration | ✅ (Atlas) | ✅ Create-only |
+| Auto migration | ✅ (Atlas) | ✅ Diff-based (add/drop column, opt-in alter type, history table) |
 | SQLite | ✅ | ✅ |
-| PostgreSQL/MySQL | ✅ | ✅ (basic; some mutation paths SQLite-only) |
+| PostgreSQL/MySQL | ✅ | ✅ |
 
 ## Consumer wiring
 
