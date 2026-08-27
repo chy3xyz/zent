@@ -5,3 +5,7 @@ scan/batch_100 440248
 scan/batch_100_no_alloc 22
 pool/borrow_release 684
 pool/borrow_release_no_health 114
+cache/hit 27
+cache/hit_cold_tail 163
+cache/take_return 26
+cache/evict_churn 104

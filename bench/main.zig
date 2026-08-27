@@ -46,7 +46,8 @@ pub fn main() !void {
     const builder_benches = @import("builder.zig").benchmarks;
     const scan_benches = @import("scan.zig").benchmarks;
     const pool_benches = @import("pool.zig").benchmarks;
-    const cases = builder_benches ++ scan_benches ++ pool_benches;
+    const cache_benches = @import("cache.zig").benchmarks;
+    const cases = builder_benches ++ scan_benches ++ pool_benches ++ cache_benches;
 
     std.debug.print("{s:40} {s:>12} {s:>12}\n", .{ "Benchmark", "Iterations", "ns/op" });
     std.debug.print("{s}\n", .{"------------------------------------------------------------------"});
