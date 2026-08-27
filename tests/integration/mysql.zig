@@ -911,3 +911,779 @@ test "MySQL: decimal (DECIMAL(38,10)) field round-trips without truncation" {
     try testing.expectEqual(@as(usize, 1), rows.items.len);
     try testing.expectEqualStrings("19.9900000000", rows.items[0].amount);
 }
+
+test "MySQL: optimistic lock conflict" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const User = schema("MyLockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_locked_user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.my_locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    // Simulate stale update: the row exists but the version value is wrong.
+    var stale = created;
+    stale.name = "bob";
+    stale.version = 999;
+
+    var ub = client.my_locked_user.Update();
+    defer ub.deinit();
+    _ = try ub.set("name", .{ .string = "bob" });
+    _ = try ub.setFieldValue("version", stale.version);
+    _ = try ub.Where(.{zent.sql.EQ("id", .{ .int = stale.id })});
+    const result = ub.SaveOne();
+    try testing.expectError(error.OptimisticLockConflict, result);
+}
+
+test "MySQL: optimistic lock update increments version" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const User = schema("MyLockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_locked_user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.my_locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    var update = client.my_locked_user.Update();
+    defer update.deinit();
+    _ = try update.set("name", .{ .string = "bob" });
+    _ = try update.setFieldValue("version", created.version);
+    _ = try update.Where(.{client.my_locked_user.predicates.idEQ(.{ .int = created.id })});
+    const affected = try update.Save();
+    try testing.expectEqual(@as(usize, 1), affected);
+
+    var q = client.my_locked_user.Query();
+    defer q.deinit();
+    _ = try q.Where(.{client.my_locked_user.predicates.idEQ(.{ .int = created.id })});
+    const results = try q.All();
+    defer {
+        for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        results.deinit();
+    }
+    try testing.expectEqual(@as(usize, 1), results.items.len);
+    try testing.expectEqualStrings("bob", results.items[0].name);
+    try testing.expectEqual(@as(i64, 1), results.items[0].version);
+}
+
+test "MySQL: optimistic lock delete conflict" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const User = schema("MyLockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_locked_user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.my_locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    var db = client.my_locked_user.Delete();
+    defer db.deinit();
+    _ = db.setVersion(999);
+    _ = try db.Where(.{client.my_locked_user.predicates.idEQ(.{ .int = created.id })});
+    const result = db.ExecOne();
+    try testing.expectError(error.OptimisticLockConflict, result);
+}
+
+test "MySQL: optimistic lock soft delete conflict and success" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const SoftLockedUser = schema("MySoftLockedUser", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("name"),
+            field.Version("version"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    const graph = comptime buildGraph(&.{SoftLockedUser});
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_soft_locked_user", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.my_soft_locked_user.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+    try testing.expectEqual(@as(i64, 0), created.version);
+
+    // Stale version should fail with optimistic lock conflict.
+    {
+        var db = client.my_soft_locked_user.Delete();
+        defer db.deinit();
+        _ = db.setVersion(999);
+        _ = try db.Where(.{client.my_soft_locked_user.predicates.idEQ(.{ .int = created.id })});
+        const result = db.ExecOne();
+        try testing.expectError(error.OptimisticLockConflict, result);
+    }
+
+    // Correct version should soft-delete the row and bump the version.
+    {
+        var db = client.my_soft_locked_user.Delete();
+        defer db.deinit();
+        _ = db.setVersion(created.version);
+        _ = try db.Where(.{client.my_soft_locked_user.predicates.idEQ(.{ .int = created.id })});
+        const affected = try db.Exec();
+        try testing.expectEqual(@as(usize, 1), affected);
+    }
+
+    // Verify the row is still present but marked deleted and version incremented.
+    var rows = try drv.query("SELECT deleted_at, version FROM my_soft_locked_user WHERE id = ?", &.{
+        .{ .int = created.id },
+    });
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expect(row.getInt(0) != null);
+    try testing.expect(row.getInt(0).? > 0);
+    try testing.expectEqual(@as(i64, 1), row.getInt(1).?);
+}
+
+test "MySQL: migrateSchema drops removed column" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Create legacy table with an extra 'obsolete' column not in the schema.
+    _ = try drv.exec("DROP TABLE IF EXISTS my_drop_test", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_drop_test", &.{}) catch {};
+    _ = try drv.exec(
+        "CREATE TABLE my_drop_test (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), value INT, obsolete VARCHAR(255))",
+        &.{},
+    );
+
+    const DropTest = schema("MyDropTest", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("value"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{DropTest});
+    const infos = graph.types;
+
+    const obsolete_count_sql =
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = ? AND table_schema = DATABASE() AND column_name = 'obsolete'";
+
+    // Run with drop_columns: false (default) → column remains.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    {
+        var rows = try drv.query(obsolete_count_sql, &.{.{ .string = "my_drop_test" }});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+    }
+
+    // Run with drop_columns: true → column gone.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .drop_columns = true,
+    });
+    {
+        var rows = try drv.query(obsolete_count_sql, &.{.{ .string = "my_drop_test" }});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+    }
+}
+
+test "MySQL: migrateSchema dry-run outputs SQL without executing" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const DREntity = schema("MyDrEntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("value"),
+        },
+        .indexes = &.{
+            index.Named("idx_my_drentity_name", &.{"name"}),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{DREntity});
+    const infos = graph.types;
+
+    // The table must not exist beforehand — drop leftovers from a previous run.
+    _ = try drv.exec("DROP TABLE IF EXISTS my_dr_entity", &.{});
+
+    // Run with dry_run: true — should NOT create any tables.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .dry_run = true,
+    });
+
+    // Verify the table was not created (the DB is shared, so check the
+    // specific table rather than counting all tables like the SQLite test).
+    var rows = try drv.query(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ? AND table_schema = DATABASE()",
+        &.{.{ .string = "my_dr_entity" }},
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+}
+
+test "MySQL: WhereIn chunks OR-joins IN predicates" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CodeBase = schema("MyWhereInCode", .{
+        .fields = &.{field.Int("code")},
+    });
+    const Code = struct {
+        pub const schema_name = CodeBase.schema_name;
+        pub const fields = CodeBase.fields;
+        pub const edges = CodeBase.edges;
+        pub const indexes = CodeBase.indexes;
+        pub const policy = CodeBase.policy;
+        pub const is_view = CodeBase.is_view;
+        pub const view_sql = CodeBase.view_sql;
+        pub const soft_delete = CodeBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{Code});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_where_in_code", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Seed rows with codes 0..4 plus one row in the second chunk (500).
+    for (0..5) |i| {
+        var b = try client.my_where_in_code.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", @as(i64, @intCast(i)));
+        var e = try b.Save();
+        zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+    {
+        var b = try client.my_where_in_code.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", @as(i64, 500));
+        var e = try b.Save();
+        zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+
+    // Empty values -> error.EmptyInValues (no SQL is built).
+    {
+        var q = client.my_where_in_code.Query();
+        defer q.deinit();
+        try testing.expectError(error.EmptyInValues, q.WhereIn("code", &.{}));
+    }
+
+    // Single value.
+    {
+        const one = [_]zent.sql.Value{.{ .int = 3 }};
+        var q = client.my_where_in_code.Query();
+        defer q.deinit();
+        _ = try q.WhereIn("code", &one);
+        var items = try q.All();
+        defer {
+            for (items.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            items.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), items.items.len);
+        try testing.expectEqual(@as(i64, 3), items.items[0].code);
+    }
+
+    // Multiple values.
+    {
+        const few = [_]zent.sql.Value{ .{ .int = 1 }, .{ .int = 3 } };
+        var q = client.my_where_in_code.Query();
+        defer q.deinit();
+        _ = try q.WhereIn("code", &few);
+        var items = try q.All();
+        defer {
+            for (items.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            items.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), items.items.len);
+        var found_one = false;
+        var found_three = false;
+        for (items.items) |e| {
+            if (e.code == 1) found_one = true;
+            if (e.code == 3) found_three = true;
+        }
+        try testing.expect(found_one and found_three);
+    }
+
+    // >500 values force two IN chunks joined by OR (chunk_size = 500);
+    // values 0..500 cover the seeded rows across both chunk boundaries,
+    // so the second chunk must return the code-500 row.
+    {
+        var many: [501]zent.sql.Value = undefined;
+        for (0..501) |i| many[i] = .{ .int = @intCast(i) };
+        var q = client.my_where_in_code.Query();
+        defer q.deinit();
+        _ = try q.WhereIn("code", &many);
+        var items = try q.All();
+        defer {
+            for (items.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            items.deinit();
+        }
+        try testing.expectEqual(@as(usize, 6), items.items.len);
+        var found_500 = false;
+        for (items.items) |e| {
+            if (e.code == 500) found_500 = true;
+        }
+        try testing.expect(found_500);
+    }
+}
+
+// Module-level storage for the filter predicate so the opaque pointer
+// returned by the Filter rule remains valid through injectPrivacyFilters.
+var my_filter_pred: zent.sql.Predicate = undefined;
+
+fn myOwnerFilter(ctx: zent.privacy.PrivacyContext) ?*const anyopaque {
+    if (ctx.user_id) |uid| {
+        my_filter_pred = zent.sql.EQ("owner_id", .{ .int = uid });
+        return @ptrCast(&my_filter_pred);
+    }
+    return null;
+}
+
+test "MySQL: privacy filter restricts rows by owner_id" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Schema with owner_id field and a Filter-based privacy policy.
+    const FilteredEntity = schema("MyFilteredEntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("owner_id"),
+        },
+        .policy = zent.privacy.Policy{
+            .rules = &.{
+                zent.privacy.Allow,
+                zent.privacy.Filter(myOwnerFilter),
+            },
+        },
+    });
+
+    const graph = comptime buildGraph(&.{FilteredEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_filtered_entity", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Insert two rows: one owned by user 1, one owned by user 2.
+    {
+        var c1 = client.my_filtered_entity.withContext(.{ .user_id = 1 });
+        var b1 = try c1.Create();
+        defer b1.deinit();
+        _ = try b1.setFieldValue("name", "alice-item");
+        _ = try b1.setFieldValue("owner_id", @as(i64, 1));
+        var e1 = try b1.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e1, allocator);
+        try testing.expect(e1.id > 0);
+    }
+    {
+        var c2 = client.my_filtered_entity.withContext(.{ .user_id = 2 });
+        var b2 = try c2.Create();
+        defer b2.deinit();
+        _ = try b2.setFieldValue("name", "bob-item");
+        _ = try b2.setFieldValue("owner_id", @as(i64, 2));
+        var e2 = try b2.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e2, allocator);
+        try testing.expect(e2.id > 0);
+    }
+
+    // User 1 can only see their own row.
+    {
+        var c1 = client.my_filtered_entity.withContext(.{ .user_id = 1 });
+        var q = c1.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), results.items.len);
+        try testing.expectEqualStrings("alice-item", results.items[0].name);
+        try testing.expectEqual(@as(i64, 1), results.items[0].owner_id);
+    }
+
+    // User 2 can only see their own row.
+    {
+        var c2 = client.my_filtered_entity.withContext(.{ .user_id = 2 });
+        var q = c2.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), results.items.len);
+        try testing.expectEqualStrings("bob-item", results.items[0].name);
+        try testing.expectEqual(@as(i64, 2), results.items[0].owner_id);
+    }
+
+    // User 3 sees nothing (filter doesn't match any row).
+    {
+        var c3 = client.my_filtered_entity.withContext(.{ .user_id = 999 });
+        var q = c3.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 0), results.items.len);
+    }
+
+    // Anonymous user (no user_id) gets null from filter → no filter applied, sees all.
+    {
+        var c_anon = client.my_filtered_entity.withContext(.{});
+        var q = c_anon.Query();
+        defer q.deinit();
+        const results = try q.All();
+        defer {
+            for (results.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            results.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), results.items.len);
+    }
+}
+
+test "MySQL: BulkInsert multi-row derives ids from last_insert_id" {
+    // Oracle MySQL 8.0 has no INSERT ... RETURNING: the codegen falls back to
+    // driver.exec and derives one id per row from last_insert_id (see
+    // src/codegen/create.zig, BulkInsert Save). This test pins that fallback.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const BulkEntity = schema("MyBulkEntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{BulkEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_bulk_entity", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Insert 3 rows in a single round-trip.
+    var b = try client.my_bulk_entity.BulkInsert();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alpha");
+    _ = try b.setFieldValue("score", @as(i64, 100));
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "beta");
+    _ = try b.setFieldValue("score", @as(i64, 200));
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "gamma");
+    _ = try b.setFieldValue("score", @as(i64, 300));
+
+    const ids = try b.Save();
+    defer ids.deinit();
+
+    try testing.expectEqual(@as(usize, 3), ids.items.len);
+    // AUTO_INCREMENT ids from a single multi-row INSERT are consecutive.
+    try testing.expect(ids.items[0] > 0);
+    try testing.expectEqual(ids.items[0] + 1, ids.items[1]);
+    try testing.expectEqual(ids.items[0] + 2, ids.items[2]);
+
+    // Verify rows actually exist in the DB.
+    var rows = try drv.query("SELECT id, name, score FROM my_bulk_entity ORDER BY id", &.{});
+    defer rows.deinit();
+
+    const r1 = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(ids.items[0], r1.getInt(0).?);
+    try testing.expectEqualStrings("alpha", r1.getText(1).?);
+    try testing.expectEqual(@as(i64, 100), r1.getInt(2).?);
+
+    const r2 = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(ids.items[1], r2.getInt(0).?);
+    try testing.expectEqualStrings("beta", r2.getText(1).?);
+    try testing.expectEqual(@as(i64, 200), r2.getInt(2).?);
+
+    const r3 = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(ids.items[2], r3.getInt(0).?);
+    try testing.expectEqualStrings("gamma", r3.getText(1).?);
+    try testing.expectEqual(@as(i64, 300), r3.getInt(2).?);
+
+    try testing.expect(rows.next() == null);
+}
+
+test "MySQL: file-based migrations" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    const dir_name = "test_migrations_file_mysql";
+    try std.Io.Dir.cwd().createDirPath(io, dir_name);
+    defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{
+            .sub_path = "900201_create_my_file_items.up.sql",
+            .data =
+            \\CREATE TABLE my_file_items (id INTEGER PRIMARY KEY, name VARCHAR(255));
+            \\INSERT INTO my_file_items (id, name) VALUES (1, 'first');
+            ,
+        });
+        try dir.writeFile(io, .{
+            .sub_path = "900201_create_my_file_items.down.sql",
+            .data = "DELETE FROM my_file_items;",
+        });
+        try dir.writeFile(io, .{
+            .sub_path = "900202_add_second_item.up.sql",
+            .data = "INSERT INTO my_file_items (id, name) VALUES (2, 'second');",
+        });
+    }
+
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Clean leftovers from a previous run: the shared zent_schema_migrations
+    // history would otherwise mark these versions as already applied.
+    _ = try drv.exec("DROP TABLE IF EXISTS my_file_items", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_file_items", &.{}) catch {};
+    _ = try drv.exec("DELETE FROM zent_schema_migrations WHERE version IN (?, ?)", &.{ .{ .int = 900201 }, .{ .int = 900202 } });
+    defer _ = drv.exec("DELETE FROM zent_schema_migrations WHERE version IN (?, ?)", &.{ .{ .int = 900201 }, .{ .int = 900202 } }) catch {};
+
+    try migrate.migrateFromFiles(io, allocator, drv.asDriver(), dir_name);
+
+    var rows = try drv.query("SELECT COUNT(*) FROM my_file_items", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 2), row.getInt(0).?);
+
+    try migrate.rollbackFiles(io, allocator, drv.asDriver(), dir_name, 1);
+
+    var rows2 = try drv.query("SELECT COUNT(*) FROM my_file_items", &.{});
+    defer rows2.deinit();
+    const row2 = rows2.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row2.getInt(0).?);
+}
+
+test "MySQL: database-level cascade delete" {
+    const allocator = testing.allocator;
+
+    const User = schema("MyCascadeUser", .{
+        .fields = &.{ field.Int("id"), field.String("name") },
+    });
+    const Order = schema("MyCascadeOrder", .{
+        .fields = &.{
+            field.Int("id"),
+        },
+        .edges = &.{
+            // O2M From edge: order.user -> user
+            edge.From("user", User).Required(),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{ User, Order });
+    const infos = graph.types;
+
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_cascade_order", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_cascade_user", &.{});
+    // Drop the child first at cleanup: defers run LIFO, and my_cascade_order
+    // holds the FK referencing my_cascade_user.
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_cascade_user", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_cascade_order", &.{}) catch {};
+
+    // Requires InnoDB (default engine on MySQL 8 / MariaDB 10) for FK
+    // enforcement; createTableSQL emits FOREIGN KEY ... ON DELETE CASCADE.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    _ = try drv.exec("INSERT INTO my_cascade_user (id, name) VALUES (1, 'alice')", &.{});
+    _ = try drv.exec("INSERT INTO my_cascade_order (id, user_id) VALUES (10, 1)", &.{});
+    _ = try drv.exec("INSERT INTO my_cascade_order (id, user_id) VALUES (11, 1)", &.{});
+
+    _ = try drv.exec("DELETE FROM my_cascade_user WHERE id = 1", &.{});
+
+    var rows = try drv.query("SELECT COUNT(*) FROM my_cascade_order", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+}
+
+test "MySQL: stream iterator avoids loading all rows" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const StreamEntity = schema("MyStreamEntity", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("idx"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{StreamEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_stream_entity", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Create 50 entities.
+    for (0..50) |i| {
+        var b = try client.my_stream_entity.Create();
+        defer b.deinit();
+        const name = try std.fmt.allocPrint(allocator, "entity_{d}", .{i});
+        defer allocator.free(name);
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("idx", @as(i64, @intCast(i)));
+        var entity = try b.Save();
+        zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+    }
+
+    // Stream all rows via iterator.
+    {
+        var q = client.my_stream_entity.Query();
+        defer q.deinit();
+        _ = try q.OrderBy(&.{zent.sql.OrderAsc("idx")});
+        var iter = try q.Iterate();
+        defer iter.deinit();
+
+        var count: usize = 0;
+        while (try iter.next()) |entity| {
+            const expected_name = try std.fmt.allocPrint(allocator, "entity_{d}", .{count});
+            defer allocator.free(expected_name);
+            try testing.expectEqualStrings(expected_name, entity.name);
+            try testing.expectEqual(@as(i64, @intCast(count)), entity.idx);
+            count += 1;
+        }
+        try testing.expectEqual(@as(usize, 50), count);
+    }
+}
+
+test "MySQL: beginTx propagates hooks and privacy_ctx to transaction entity clients" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Entity with AlwaysAllow policy (requires privacy context to be set)
+    // and hooks to verify propagation.
+    const TxPropEntity = schema("MyTxPropEntity", .{
+        .fields = &.{field.String("name")},
+        .policy = zent.privacy.AlwaysAllow,
+    });
+
+    const graph = comptime buildGraph(&.{TxPropEntity});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_tx_prop_entity", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Container for verifying hook fired.
+    const H = struct {
+        var before_called: bool = false;
+        fn beforeFn(ctx: *HookContext) HookError!void {
+            _ = ctx;
+            before_called = true;
+        }
+    };
+    H.before_called = false;
+
+    const hooks = &[_]Hook{
+        Hook.initBefore(.create, H.beforeFn),
+    };
+
+    // Set hooks and privacy context on the entity client.
+    client.my_tx_prop_entity = client.my_tx_prop_entity.withHooks(hooks);
+    client.my_tx_prop_entity = client.my_tx_prop_entity.withContext(zent.privacy.PrivacyContext{ .user_id = 42 });
+
+    // Verify hooks slice is non-empty on the parent client (precondition).
+    try testing.expectEqual(@as(usize, 1), client.my_tx_prop_entity.hooks.len);
+
+    // Begin a transaction.
+    var tx = try Client.beginTx(infos, client);
+    defer tx.deinit();
+
+    // Verify hooks propagated to tx client.
+    try testing.expectEqual(@as(usize, 1), tx.client.my_tx_prop_entity.hooks.len);
+
+    // Verify privacy_ctx propagated to tx client.
+    try testing.expect(tx.client.my_tx_prop_entity.privacy_ctx != null);
+    try testing.expectEqual(@as(i64, 42), tx.client.my_tx_prop_entity.privacy_ctx.?.user_id);
+
+    // Perform a create inside the transaction — should succeed (privacy allows)
+    // and the before hook should fire.
+    var b = try tx.client.my_tx_prop_entity.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "tx-hook-test");
+    var entity = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &entity, allocator);
+
+    try testing.expect(entity.id > 0);
+    try testing.expect(H.before_called);
+    try testing.expectEqualStrings("tx-hook-test", entity.name);
+
+    try tx.commit();
+}
