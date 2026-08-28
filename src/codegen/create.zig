@@ -253,7 +253,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // For plain Save (or_replace=false) the suffix is empty.
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
             const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, info.pk_field);
+            const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             const ignore_suffix: []const u8 = if (ignore_conflicts and is_postgres) " ON CONFLICT DO NOTHING" else "";
@@ -758,6 +759,7 @@ fn buildUpsertSuffix(
     columns: []const []const u8,
     conflict_columns: []const []const u8,
     pk_field: []const u8,
+    pk_is_integer: bool,
 ) ![]const u8 {
     if (!or_replace or is_sqlite) return "";
     if (is_mysql) {
@@ -765,8 +767,17 @@ fn buildUpsertSuffix(
         errdefer buf.deinit();
         try buf.appendSlice(" ON DUPLICATE KEY UPDATE ");
         // Preserve the row id through LAST_INSERT_ID so callers receive the
-        // existing auto-increment value on UPDATE as well as on INSERT.
-        try buf.print("`{s}`=LAST_INSERT_ID(`{s}`)", .{ pk_field, pk_field });
+        // existing auto-increment value on UPDATE as well as on INSERT. This is
+        // only valid when the PK is an integer column: for a varchar/string PK
+        // (e.g. xdaofood_setting.key) LAST_INSERT_ID(string) coerces the value
+        // to an int and fails with "Truncated incorrect INTEGER value" (errno
+        // 1292). In that case fall back to VALUES(`pk`) which carries the real
+        // string unchanged.
+        if (pk_is_integer) {
+            try buf.print("`{s}`=LAST_INSERT_ID(`{s}`)", .{ pk_field, pk_field });
+        } else {
+            try buf.print("`{s}`=VALUES(`{s}`)", .{ pk_field, pk_field });
+        }
         for (columns) |col| {
             if (std.mem.eql(u8, col, pk_field)) continue;
             try buf.appendSlice(", ");
@@ -1014,7 +1025,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
             const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, info.pk_field);
+            const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
             const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
             defer query.deinit();
