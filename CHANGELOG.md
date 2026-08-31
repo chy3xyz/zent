@@ -19,6 +19,15 @@ All notable changes to this project will be documented in this file.
   duplicate-key UPDATE path. Integer PKs keep the id-preserving
   `LAST_INSERT_ID` form; string/UUID PKs now fall back to `VALUES(pk)`.
 
+### Tests
+- Multi-threaded pool tests use a thread-safe allocator
+  (`std.heap.page_allocator`); sharing the single-threaded
+  `std.testing.allocator` across spawned threads was UB and the source of
+  intermittent `failed command` crashes in CI.
+- Benchmark regression canary compares against `HEAD~1` instead of
+  `github.event.before`, which can point at a dangling SHA after a
+  force-push/amend.
+
 ## [0.32.1] - 2026-08-27
 
 ### Added
