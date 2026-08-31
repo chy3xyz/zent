@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.32.2] - 2026-08-31
+
 ### Fixed
 - **Connection pool use-after-free.** `ConnPool` stored entries by value in
   `all` and kept raw pointers into that array in `available`; `closeConnection`
