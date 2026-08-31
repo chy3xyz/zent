@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Connection pool use-after-free.** `ConnPool` stored entries by value in
+  `all` and kept raw pointers into that array in `available`; `closeConnection`
+  used `swapRemove`, which moved the tail entry into the removed slot. A
+  still-borrowed entry at the tail could then be aliased when a later
+  `addOne` reused that slot, so a borrowed `*D` could point at a recycled or
+  freed connection and a health-check `ping()` would dereference poisoned
+  memory (segfault after idle eviction). Entries are now individually
+  heap-allocated (`*PooledEntry`) with stable addresses; removal is by pointer
+  identity from both lists. Regression test added.
+- **MySQL upsert for non-integer primary keys.** `LAST_INSERT_ID(pk)` coerces
+  a string/varchar PK to an integer, raising MySQL errno 1292 on the
+  duplicate-key UPDATE path. Integer PKs keep the id-preserving
+  `LAST_INSERT_ID` form; string/UUID PKs now fall back to `VALUES(pk)`.
+
 ## [0.32.1] - 2026-08-27
 
 ### Added
