@@ -84,7 +84,9 @@ test "Pool: transaction holds connection until deinit" {
 }
 
 test "Pool: concurrent borrows respect max_connections" {
-    const allocator = testing.allocator;
+    // std.testing.allocator is single-threaded; the spawned threads below
+    // share it via the pooled SQLite connections, so use a thread-safe one.
+    const allocator = std.heap.page_allocator;
     const path = "tests/integration/.pool_concurrent.db";
     cleanup(path);
     defer cleanup(path);

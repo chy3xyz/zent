@@ -1348,7 +1348,10 @@ test "ConnPool never aliases a borrowed entry when another is closed" {
 
 test "ConnPool supports concurrent borrow and release across threads" {
     const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
-    const allocator = std.testing.allocator;
+    // std.testing.allocator (SafeAllocator) is single-threaded; sharing it
+    // across the spawned threads is UB and intermittently corrupts its
+    // bookkeeping. Use a thread-safe allocator for the concurrency exercise.
+    const allocator = std.heap.page_allocator;
 
     var pool = try ConnPool(SQLiteDriver).init(allocator, .{
         .connect = struct {
