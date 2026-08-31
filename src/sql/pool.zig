@@ -128,7 +128,7 @@ pub fn ConnPool(comptime D: type) type {
         io: std.Io,
         mutex: std.Io.Mutex = .init,
         cond: std.Io.Condition = .init,
-        all: std.ArrayListUnmanaged(PooledEntry) = .empty,
+        all: std.ArrayListUnmanaged(*PooledEntry) = .empty,
         available: std.ArrayListUnmanaged(*PooledEntry) = .empty,
         closed: bool = false,
         owned_io: ?*std.Io.Threaded = null,
@@ -188,8 +188,9 @@ pub fn ConnPool(comptime D: type) type {
             self.closed = true;
             // Wake any waiters so they observe the closed state.
             self.cond.broadcast(io);
-            for (self.all.items) |*entry| {
+            for (self.all.items) |entry| {
                 entry.conn.close();
+                self.allocator.destroy(entry);
             }
             self.all.deinit(self.allocator);
             self.available.deinit(self.allocator);
@@ -203,21 +204,26 @@ pub fn ConnPool(comptime D: type) type {
 
         fn addConnection(self: *Self) !void {
             var conn = try self.openConnection();
-            const ptr = blk: {
-                errdefer conn.close(); // only runs if all.addOne fails
-                const p = try self.all.addOne(self.allocator);
-                break :blk p;
-            };
-            ptr.* = .{
+            errdefer conn.close();
+
+            // Each entry lives in its own heap allocation so its address is
+            // stable for the connection's lifetime. `available` holds raw
+            // pointers into `all`; if entries were stored by value in `all`,
+            // a `swapRemove` would move a still-borrowed entry and leave a
+            // borrowed pointer aliasing a recycled slot (use-after-free).
+            const entry = try self.allocator.create(PooledEntry);
+            errdefer self.allocator.destroy(entry);
+
+            entry.* = .{
                 .conn = conn,
                 .created_at = unixTimestamp(),
                 .idle_since = unixTimestamp(),
             };
-            errdefer {
-                _ = self.all.pop(); // remove dangling pointer
-                conn.close();
-            }
-            try self.available.append(self.allocator, ptr);
+
+            try self.all.append(self.allocator, entry);
+            errdefer _ = self.all.pop();
+
+            try self.available.append(self.allocator, entry);
         }
 
         /// Open a new connection honoring either factory (connectCtx wins).
@@ -229,23 +235,27 @@ pub fn ConnPool(comptime D: type) type {
 
         /// Close a connection and remove it from the pool.
         /// The caller must hold `self.mutex`.
+        ///
+        /// Entries are heap-allocated and never move, so removal is by pointer
+        /// identity from both lists — no `swapRemove` and no pointer-patching.
+        /// The entry being closed is never currently borrowed (callers only
+        /// close idle or freshly-opened-but-failed entries), so it can appear
+        /// in `available` at most once.
         fn closeConnection(self: *Self, entry: *PooledEntry) void {
-            entry.conn.close();
-            const idx = for (self.all.items, 0..) |*item, i| {
+            const all_idx = for (self.all.items, 0..) |item, i| {
                 if (item == entry) break i;
             } else unreachable;
+            _ = self.all.orderedRemove(all_idx);
 
-            const last = &self.all.items[self.all.items.len - 1];
-            if (last != entry) {
-                // `swapRemove` moves `last` to `idx`. Fix any available pointer
-                // that still references `last`.
-                for (self.available.items) |*avail| {
-                    if (avail.* == last) {
-                        avail.* = entry;
-                    }
+            for (self.available.items, 0..) |item, i| {
+                if (item == entry) {
+                    _ = self.available.orderedRemove(i);
+                    break;
                 }
             }
-            _ = self.all.swapRemove(idx);
+
+            entry.conn.close();
+            self.allocator.destroy(entry);
         }
 
         /// Non-blocking borrow attempt. Returns a pooled entry or null when
@@ -256,18 +266,19 @@ pub fn ConnPool(comptime D: type) type {
                     if (self.all.items.len < self.options.max_connections) {
                         // Open a new connection.
                         var new_conn = self.openConnection() catch return null;
-                        const ptr = blk: {
-                            errdefer new_conn.close();
-                            const p = self.all.addOne(self.allocator) catch {
-                                new_conn.close();
-                                return null;
-                            };
-                            break :blk p;
+                        const entry = self.allocator.create(PooledEntry) catch {
+                            new_conn.close();
+                            return null;
                         };
-                        ptr.* = .{
+                        entry.* = .{
                             .conn = new_conn,
                             .created_at = unixTimestamp(),
                             .idle_since = null,
+                        };
+                        self.all.append(self.allocator, entry) catch {
+                            entry.conn.close();
+                            self.allocator.destroy(entry);
+                            return null;
                         };
                         // Newly created connections must also pass the health
                         // check before being handed out. If they fail, close the
@@ -275,12 +286,12 @@ pub fn ConnPool(comptime D: type) type {
                         // attempt again; otherwise we could spin forever creating
                         // and discarding dead connections.
                         if (self.options.health_check_on_borrow) {
-                            ptr.conn.asDriver().ping() catch {
-                                self.closeConnection(ptr);
+                            entry.conn.asDriver().ping() catch {
+                                self.closeConnection(entry);
                                 return null;
                             };
                         }
-                        return ptr;
+                        return entry;
                     }
                     return null;
                 };
@@ -349,7 +360,7 @@ pub fn ConnPool(comptime D: type) type {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             if (self.closed) return;
-            const found = for (self.all.items) |*item| {
+            const found = for (self.all.items) |item| {
                 if (item == entry) break true;
             } else false;
             if (!found) return;
@@ -411,7 +422,8 @@ pub fn ConnPool(comptime D: type) type {
                 const entry = self.available.items[i];
                 if (entry.idle_since) |idle_since| {
                     if (now - idle_since >= max_idle_secs) {
-                        _ = self.available.swapRemove(i);
+                        // closeConnection removes the entry from both lists;
+                        // iterating in reverse makes the orderedRemove safe.
                         self.closeConnection(entry);
                         reaped += 1;
                     }
@@ -434,7 +446,8 @@ pub fn ConnPool(comptime D: type) type {
                 i -= 1;
                 const entry = self.available.items[i];
                 entry.conn.asDriver().ping() catch {
-                    _ = self.available.swapRemove(i);
+                    // closeConnection removes the entry from both lists;
+                    // iterating in reverse makes the orderedRemove safe.
                     self.closeConnection(entry);
                     continue;
                 };
@@ -921,14 +934,7 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
     MockDriver.opens = 0;
     MockDriver.closes = 0;
 
-    // fail_index = 3: init performs one Io allocation plus two capacity
-    // allocations (all, available), then the next allocation inside
-    // addConnection's all.addOne must fail.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 3,
-    });
-    const allocator = failing.allocator();
-
+    const allocator = std.testing.allocator;
     var pool = try ConnPool(MockDriver).init(allocator, .{
         .connect = struct {
             fn f(a: std.mem.Allocator) !MockDriver {
@@ -943,21 +949,19 @@ test "ConnPool closes connection when bookkeeping allocation fails" {
     });
     defer pool.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), MockDriver.opens);
-    try std.testing.expectEqual(@as(usize, 0), MockDriver.closes);
+    // Make the next entry allocation fail: the freshly-opened connection must
+    // be closed exactly once and no entry added to `all`.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    pool.allocator = failing.allocator();
 
-    // Fill the pre-allocated capacity so the next addConnection is forced to
-    // grow self.all, which triggers the FailingAllocator.
-    pool.options.max_connections = 100;
-    while (pool.all.items.len < pool.all.capacity) {
-        try pool.addConnection();
-    }
-
+    const all_len_before = pool.all.items.len;
     try std.testing.expectError(error.OutOfMemory, pool.addConnection());
 
-    // The connection opened for the failed bookkeeping allocation must be closed.
-    try std.testing.expectEqual(@as(usize, pool.all.items.len + 1), MockDriver.opens);
+    try std.testing.expectEqual(@as(usize, all_len_before), pool.all.items.len);
     try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.opens);
+
+    pool.allocator = allocator;
 }
 
 test "ConnPool closes connection once when available.append fails" {
@@ -1032,11 +1036,11 @@ test "ConnPool closes connection once when available.append fails" {
     defer pool.deinit();
 
     // Force the next available.append to allocate by freeing the available
-    // buffer. all.addOne will still succeed because capacity was reserved
-    // during init.
+    // buffer. Entry allocation (#0) and all.append succeed (capacity was
+    // reserved during init), so the failure lands on available.append (#1).
     pool.available.shrinkAndFree(allocator, 0);
 
-    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
     pool.allocator = failing.allocator();
 
     const all_len_before = pool.all.items.len;
@@ -1240,6 +1244,106 @@ test "ConnPool evicts connection exceeding max lifetime on release" {
 
     try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
     try std.testing.expectEqual(@as(usize, 0), pool.available.items.len);
+}
+
+test "ConnPool never aliases a borrowed entry when another is closed" {
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {}
+        fn mockInTransaction(_: *anyopaque) bool {
+            return false;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
+        };
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+
+    const allocator = std.testing.allocator;
+    var pool = try ConnPool(MockDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return .{ .id = MockDriver.opens };
+            }
+        }.f,
+        .min_connections = 2,
+        .max_connections = 2,
+        .health_check_on_borrow = false,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    // available = [e0, e1]; borrow pops the last entry (e1).
+    const borrowed = try pool.borrow();
+    const borrowed_id = borrowed.id;
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.opens);
+
+    // Close the *other* entry (e0) while e1 is still borrowed. The old
+    // value-array + swapRemove design moved e1 into e0's slot and left a
+    // stale copy that a subsequent append overwrote, aliasing the borrowed
+    // pointer (use-after-free).
+    const other = pool.available.items[0];
+    {
+        const io = pool.io;
+        pool.mutex.lockUncancelable(io);
+        pool.closeConnection(other);
+        pool.mutex.unlock(io);
+    }
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
+
+    // Force a new connection to fill the (previously recycled) slot.
+    const extra = try pool.borrow();
+    try std.testing.expectEqual(@as(usize, 3), MockDriver.opens);
+    try std.testing.expect(extra.id != borrowed_id);
+
+    // Releasing the original borrow must not be confused by the new entry.
+    pool.release(borrowed);
+    try std.testing.expectEqual(@as(usize, 1), pool.available.items.len);
+    pool.release(extra);
+    try std.testing.expectEqual(@as(usize, 2), pool.available.items.len);
 }
 
 test "ConnPool supports concurrent borrow and release across threads" {
