@@ -172,15 +172,14 @@ jobs:
       # baseline at the parent commit, then measure HEAD on the same runner.
       # The default threshold (100%) then genuinely catches a 2x regression
       # in HEAD relative to the commit it was pushed on top of.
+      #
+      # Use HEAD~1 rather than github.event.before: the latter can point at a
+      # dangling SHA after a force-push (amend/rewrite), which is unreachable
+      # from the freshly-fetched refs and makes `worktree add` fail. HEAD~1 is
+      # always the immediately-preceding commit in the fetched history.
       - name: Record baseline at parent commit
-        env:
-          BASE_SHA: ${{ github.event.before }}
         run: |
-          if [ -z "${BASE_SHA}" ] || [ "${BASE_SHA}" = "0000000000000000000000000000000000000000" ]; then
-            echo "no parent commit; skipping regression canary"
-            exit 0
-          fi
-          git worktree add --detach /tmp/zent-base "${BASE_SHA}"
+          git worktree add --detach /tmp/zent-base "HEAD~1"
           (cd /tmp/zent-base && bash scripts/bench-compare.sh --save /tmp/bench-base.txt)
 
       - name: Compare HEAD against parent
