@@ -819,7 +819,6 @@ fn buildUpsertSuffix(
 /// that support RETURNING (SQLite 3.35+, PostgreSQL, MySQL 8.0.19+).
 pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, comptime Entity: type) type {
     _ = infos;
-    _ = Entity;
     return struct {
         const Self = @This();
 
