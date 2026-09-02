@@ -13,6 +13,13 @@ pub const SQLiteDriver = struct {
     /// Optional prepared-statement cache. Set this field after `open()` to
     /// enable caching; null (the default) disables it.
     cache: ?cache.PreparedCache(16, *c.sqlite3_stmt) = null,
+    /// Serializes all access to the connection. Servers (e.g. zigmodu) run
+    /// handlers on multiple worker threads while sqlite (and the stmt cache,
+    /// and the allocator) behind a single connection is not safe for
+    /// concurrent use — observed as SEGV inside sqlite3_prepare_v2 when two
+    /// requests race. Recursive so a tx body / eager-load recursion can issue
+    /// nested statements on the same thread while holding the lock.
+    mutex: RecursiveMutex = .{},
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SQLiteDriver {
         const path_z = try allocator.dupeSentinel(u8, path, 0);
@@ -34,6 +41,8 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn close(self: *SQLiteDriver) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.cache) |*cached| {
             cached.evictAll({}, finalizeStmt);
         }
@@ -83,6 +92,25 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn exec(self: *SQLiteDriver, sql: []const u8, args: []const Value) !driver.Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.execInner(null, sql, args);
+    }
+
+    /// Body of exec; assumes `self.mutex` is already held by this thread.
+    fn execInner(self: *SQLiteDriver, ctx: ?*const driver.ExecutionContext, sql: []const u8, args: []const Value) !driver.Result {
+        var saved_busy: c_int = undefined;
+        self.applyDeadline(ctx, &saved_busy);
+        if (ctx) |cx| {
+            c.sqlite3_progress_handler(self.db, 100, progressCallback, @ptrCast(@constCast(cx)));
+        }
+        defer {
+            if (ctx != null) {
+                c.sqlite3_progress_handler(self.db, 0, null, null);
+            }
+            self.restoreDeadline(saved_busy);
+        }
+
         // DDL invalidates cached prepared statements.
         if (self.cache) |*cached| {
             if (cache.isDDL(sql)) {
@@ -126,6 +154,27 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn query(self: *SQLiteDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
+        self.mutex.lock();
+        errdefer self.mutex.unlock();
+        return self.queryInner(null, query_sql, args);
+    }
+
+    /// Body of query; assumes `self.mutex` is already held by this thread.
+    /// On success the lock ownership transfers to the returned Rows, whose
+    /// deinit() restores the deadline/progress handler and unlocks.
+    fn queryInner(self: *SQLiteDriver, ctx: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const Value) !driver.Rows {
+        var saved_busy: c_int = undefined;
+        self.applyDeadline(ctx, &saved_busy);
+        if (ctx) |cx| {
+            c.sqlite3_progress_handler(self.db, 100, progressCallback, @ptrCast(@constCast(cx)));
+        }
+        errdefer {
+            if (ctx != null) {
+                c.sqlite3_progress_handler(self.db, 0, null, null);
+            }
+            self.restoreDeadline(saved_busy);
+        }
+
         var cache_slot: ?usize = null;
         const stmt = if (self.cache) |*cached| blk: {
             const t = try cached.takeOrPrepare(query_sql, self.db, prepareStmtQuery);
@@ -161,6 +210,9 @@ pub const SQLiteDriver = struct {
             .done = false,
             .cache = if (cache_slot != null) &self.cache.? else null,
             .cache_slot = cache_slot,
+            .driver = self,
+            .saved_busy = saved_busy,
+            .clear_progress = ctx != null,
         };
 
         return driver.Rows{
@@ -170,7 +222,9 @@ pub const SQLiteDriver = struct {
     }
 
     pub fn beginTx(self: *SQLiteDriver) !driver.Tx {
-        _ = try self.exec("BEGIN", &.{});
+        self.mutex.lock();
+        errdefer self.mutex.unlock();
+        _ = try self.execInner(null, "BEGIN", &.{});
         const tx_ptr = try self.allocator.create(SQLiteTx);
         errdefer self.allocator.destroy(tx_ptr);
         tx_ptr.* = SQLiteTx{
@@ -260,6 +314,8 @@ pub const SQLiteDriver = struct {
     /// Returns true if a transaction is currently active on this connection.
     /// SQLite is in autocommit mode when not inside an explicit transaction.
     pub fn inTransaction(self: *SQLiteDriver) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return c.sqlite3_get_autocommit(self.db) == 0;
     }
 
@@ -274,35 +330,18 @@ pub const SQLiteDriver = struct {
         .exec = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
-                var saved_busy: c_int = undefined;
-                self_ptr.applyDeadline(ctx, &saved_busy);
-                if (ctx) |cx| {
-                    c.sqlite3_progress_handler(self_ptr.db, 100, progressCallback, @ptrCast(@constCast(cx)));
-                }
-                defer {
-                    if (ctx != null) {
-                        c.sqlite3_progress_handler(self_ptr.db, 0, null, null);
-                    }
-                    self_ptr.restoreDeadline(saved_busy);
-                }
-                return self_ptr.exec(q, a) catch |err| return toDriverError(err);
+                self_ptr.mutex.lock();
+                defer self_ptr.mutex.unlock();
+                return self_ptr.execInner(ctx, q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
                 const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
-                var saved_busy: c_int = undefined;
-                self_ptr.applyDeadline(ctx, &saved_busy);
-                if (ctx) |cx| {
-                    c.sqlite3_progress_handler(self_ptr.db, 100, progressCallback, @ptrCast(@constCast(cx)));
-                }
-                defer {
-                    if (ctx != null) {
-                        c.sqlite3_progress_handler(self_ptr.db, 0, null, null);
-                    }
-                    self_ptr.restoreDeadline(saved_busy);
-                }
-                return self_ptr.query(q, a) catch |err| return toDriverError(err);
+                self_ptr.mutex.lock();
+                errdefer self_ptr.mutex.unlock();
+                // 成功路径锁所有权随 Rows 转移（deinit 时释放）。
+                return self_ptr.queryInner(ctx, q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .beginTx = struct {
@@ -391,21 +430,24 @@ const SQLiteTx = struct {
 
     fn commit(self: *SQLiteTx) !void {
         if (self.state != .active) return error.TxNotActive;
-        _ = try self.driver.exec("COMMIT", &.{});
+        _ = try self.driver.execInner(null, "COMMIT", &.{});
         self.state = .committed;
+        self.driver.mutex.unlock();
     }
 
     fn rollback(self: *SQLiteTx) !void {
         if (self.state != .active) return;
         // Best-effort; ignore failure (driver may have already closed).
-        _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+        _ = self.driver.execInner(null, "ROLLBACK", &.{}) catch {};
         self.state = .rolled_back;
+        self.driver.mutex.unlock();
     }
 
     fn deinit(self: *SQLiteTx) void {
         if (self.state == .active) {
             std.log.warn("sqlite tx deinit without commit/rollback; rolling back", .{});
-            _ = self.driver.exec("ROLLBACK", &.{}) catch {};
+            _ = self.driver.execInner(null, "ROLLBACK", &.{}) catch {};
+            self.driver.mutex.unlock();
         }
         self.driver.allocator.destroy(self);
     }
@@ -418,6 +460,11 @@ const SQLiteRows = struct {
     next_error: ?driver.Error = null,
     cache: ?*cache.PreparedCache(16, *c.sqlite3_stmt) = null,
     cache_slot: ?usize = null,
+    /// Lock ownership transferred from queryInner; deinit restores the
+    /// deadline/progress handler and releases the driver mutex.
+    driver: *SQLiteDriver,
+    saved_busy: c_int,
+    clear_progress: bool,
 
     const vtable = driver.Rows.VTable{
         .next = next,
@@ -468,6 +515,11 @@ const SQLiteRows = struct {
         } else {
             _ = c.sqlite3_finalize(self.stmt);
         }
+        if (self.clear_progress) {
+            c.sqlite3_progress_handler(self.driver.db, 0, null, null);
+        }
+        self.driver.restoreDeadline(self.saved_busy);
+        self.driver.mutex.unlock();
         const alloc = self.allocator;
         alloc.destroy(self);
     }
@@ -540,6 +592,36 @@ const SQLiteRows = struct {
 fn finalizeStmt(_: void, stmt: *c.sqlite3_stmt) void {
     _ = c.sqlite3_finalize(stmt);
 }
+
+/// Same-thread recursive mutex, so a transaction (or eager-load recursion)
+/// can run nested statements while holding the driver lock. Blocking wait via
+/// pthread mutex (std.Io.Mutex would need an Io this layer doesn't have, and
+/// std.Thread.Futex no longer exists in this Zig).
+const RecursiveMutex = struct {
+    inner: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    owner: std.atomic.Value(std.Thread.Id) = .init(0),
+    recursion: usize = 0,
+
+    fn lock(self: *RecursiveMutex) void {
+        const tid = std.Thread.getCurrentId();
+        // Only the owner thread ever mutates `recursion`; a live holder always
+        // has a unique thread id, so a same-id hit means we are the holder.
+        if (self.owner.load(.acquire) == tid) {
+            self.recursion += 1;
+            return;
+        }
+        _ = std.c.pthread_mutex_lock(&self.inner);
+        self.owner.store(tid, .release);
+        self.recursion = 1;
+    }
+
+    fn unlock(self: *RecursiveMutex) void {
+        self.recursion -= 1;
+        if (self.recursion != 0) return;
+        self.owner.store(0, .release);
+        _ = std.c.pthread_mutex_unlock(&self.inner);
+    }
+};
 
 fn prepareStmt(db: *c.sqlite3, sql: []const u8) !*c.sqlite3_stmt {
     var out: ?*c.sqlite3_stmt = null;
@@ -644,4 +726,49 @@ test "SQLite uncached exec finalizes statements after success" {
     _ = try drv.exec("CREATE TABLE t (id INTEGER)", &.{});
 
     try std.testing.expect(c.sqlite3_next_stmt(drv.db, null) == null);
+}
+
+test "SQLite concurrent access from multiple threads is serialized" {
+    // Regression: a shared connection used from several threads raced inside
+    // sqlite3_prepare_v2 / the stmt cache and segfaulted. The driver mutex
+    // must serialize exec / query(→Rows lifetime) / tx across threads.
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", &.{});
+
+    const Worker = struct {
+        fn run(d: *SQLiteDriver, base: i64) void {
+            var i: i64 = 0;
+            while (i < 200) : (i += 1) {
+                // tx path (holds the lock across nested execs)
+                var tx = d.beginTx() catch return;
+                _ = tx.exec("INSERT INTO t (v) VALUES (?)", &.{.{ .int = base + i }}) catch {
+                    tx.deinit();
+                    return;
+                };
+                tx.commit() catch {
+                    tx.deinit();
+                    return;
+                };
+                tx.deinit();
+                // query path (lock held until rows.deinit)
+                var rows = d.query("SELECT COUNT(*) FROM t WHERE v >= ?", &.{.{ .int = base }}) catch return;
+                defer rows.deinit();
+                _ = rows.next() orelse return;
+            }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*th, k| {
+        th.* = try std.Thread.spawn(.{}, Worker.run, .{ &drv, @as(i64, @intCast(k)) * 1000 });
+    }
+    for (&threads) |*th| th.join();
+
+    var rows = try drv.query("SELECT COUNT(*) FROM t", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try std.testing.expectEqual(@as(i64, 4 * 200), row.getInt(0).?);
 }
