@@ -14,6 +14,7 @@ const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;
+const intercept = @import("../runtime/intercept.zig");
 
 fn mapBuildError(err: anyerror) sql_driver.Error {
     return switch (err) {
@@ -58,6 +59,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
         upsert_conflict_columns: ?[]const []const u8 = null,
+        interceptors: ?*intercept.InterceptorChain = null,
 
         const EdgeValue = struct {
             edge: []const u8,
@@ -158,7 +160,39 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self;
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed, InterceptFailed };
+
+        /// Run the interceptor chain (`.create`). `whereEq` fills omitted
+        /// columns; already-set fields are left alone. Errors collapse to
+        /// `error.InterceptFailed` so Save keeps an explicit error set.
+        fn runInterceptors(self: *Self) error{InterceptFailed}!void {
+            const chain = self.interceptors orelse return;
+            var view = intercept.QueryView{
+                .op = .create,
+                .table_name = info.table_name,
+                .sink = self,
+                .add_eq_fn = addEqField,
+            };
+            chain.run(&view) catch return error.InterceptFailed;
+        }
+
+        /// QueryView sink: set `field_name = value` when the caller omitted
+        /// it. Unknown fields are rejected; a duplicate name is a no-op.
+        fn addEqField(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (info.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            for (self.values.items) |fv| {
+                if (std.mem.eql(u8, fv.name, field_name)) return;
+            }
+            try self.values.append(.{ .name = field_name, .value = value });
+        }
 
         pub fn Save(self: *Self) SaveError!Entity {
             return self.saveInternal(false, false, null);
@@ -190,6 +224,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
             fillAuditUser(info, self.privacy_ctx, &self.values, false);
+            try self.runInterceptors();
             // Build mutated slice from field values for hook context.
             const mutated = try self.allocator.alloc(sql.Value, self.values.items.len);
             defer self.allocator.free(mutated);
@@ -831,6 +866,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
         upsert_conflict_columns: ?[]const []const u8 = null,
+        interceptors: ?*intercept.InterceptorChain = null,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) !Self {
             var self = Self{
@@ -919,7 +955,41 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             return try self.setValue(field_name, toSqlValue(value));
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed, InterceptFailed };
+
+        fn runInterceptors(self: *Self) error{InterceptFailed}!void {
+            const chain = self.interceptors orelse return;
+            var view = intercept.QueryView{
+                .op = .create,
+                .table_name = info.table_name,
+                .sink = self,
+                .add_eq_fn = addEqField,
+            };
+            chain.run(&view) catch return error.InterceptFailed;
+        }
+
+        /// Fill omitted columns on every row already in the batch.
+        fn addEqField(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (info.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            for (self.rows.items) |*row| {
+                var already = false;
+                for (row.items) |fv| {
+                    if (std.mem.eql(u8, fv.name, field_name)) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) try row.append(.{ .name = field_name, .value = value });
+            }
+        }
 
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
             return self.saveInternal(false, null);
@@ -949,6 +1019,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
+            try self.runInterceptors();
             var hook_ctx = HookContext{
                 .op = .create,
                 .table_name = info.table_name,
@@ -1251,8 +1322,8 @@ test "Create builders expose explicit driver error unions" {
     const UserEntity = comptime EntityGen(infos, info);
     const Builder = CreateBuilder(infos, info, UserEntity);
     const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
-    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed };
-    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed, InterceptFailed };
+    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed, InterceptFailed };
 
     comptime {
         const save_return = @typeInfo(@TypeOf(Builder.Save)).@"fn".return_type.?;

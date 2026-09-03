@@ -174,12 +174,15 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             if (info.is_view) @compileError("Create is not supported for view entities");
             var cb = CreateBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
             cb.logger = self.logger;
+            cb.interceptors = self.interceptors;
             return cb;
         }
 
         pub fn BulkInsert(self: Self) !BulkInsertBuilder {
             if (info.is_view) @compileError("BulkInsert is not supported for view entities");
-            return try BulkInsertBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            var bb = try BulkInsertBuilder.init(self.allocator, self.driver, self.hooks, self.privacy_ctx);
+            bb.interceptors = self.interceptors;
+            return bb;
         }
 
         pub fn Update(self: Self) UpdateBuilder {

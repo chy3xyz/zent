@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Create / BulkInsert interceptors.** `UseInterceptor` now runs on
+  `Create` and `BulkInsert` as well as Query/Update/Delete. `whereEq` on
+  create fills an omitted column (if-missing); an explicit value is kept.
+  Tables without the field still return `UnknownField`. Hooks still fire
+  after injection so they see the filled values.
+
 ## [0.32.2] - 2026-08-31
 
 ### Fixed

@@ -297,8 +297,8 @@ const affected = try u.Save();
 
 Interceptors observe and transparently rewrite a query *before* it runs —
 the ent `Intercept` counterpart. Register once on the root client; every
-`Query`/`Update`/`Delete` (and `Bulk*` variant) from any entity client runs
-the chain. The canonical use is multi-tenant row scoping:
+`Query`/`Update`/`Delete`/`Create` (and `Bulk*` variant) from any entity
+client runs the chain. The canonical use is multi-tenant row scoping:
 
 ```zig
 var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -310,8 +310,8 @@ try Client.UseInterceptor(infos, &client, .{
     .intercept = struct {
         fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
             const id: *i64 = @ptrCast(@alignCast(ctx.?));
-            // Adds `tenant_id = ?` to the WHERE clause of every
-            // query/update/delete on any table that has the field.
+            // Query/Update/Delete: WHERE tenant_id = ?.
+            // Create: set tenant_id when the caller omitted it.
             try view.whereEq("tenant_id", .{ .int = id.* });
         }
     }.f,
@@ -327,7 +327,10 @@ try Client.UseInterceptor(infos, &client, .{
 - Interceptor errors abort the operation: the first error wins, and all
   errors collapse to `error.InterceptFailed` at the builder boundary
   (execution methods keep explicit error sets).
-- Create is deliberately not intercepted — hooks own the create path.
+- Create / BulkInsert are intercepted: `whereEq` fills an omitted column
+  (if-missing). An explicit value on the builder is kept. Tables without
+  the field still return `UnknownField` (swallow it in the interceptor
+  when the column is optional across the graph).
 - `beginTx` copies the chain pointer into the TxClient, so registered
   interceptors also apply inside transactions. Register before `beginTx`.
 - Per-entity registration (without a root client): borrow a caller-owned

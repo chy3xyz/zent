@@ -8,7 +8,9 @@
 //! or observe the query at runtime (multi-tenant injection, soft-scope
 //! enforcement, query logging/counters, ...).
 //!
-//! Create is intentionally not intercepted — hooks own the create path.
+//! Create / BulkInsert are intercepted too: `whereEq` fills an omitted
+//! column (if-missing). Callers that already set the field keep their
+//! value. Query/Update/Delete still append a WHERE predicate.
 
 const std = @import("std");
 
@@ -18,7 +20,7 @@ const sql = @import("../sql/builder.zig");
 /// A view of the query being intercepted. Passed to every interceptor in
 /// the chain; mutations go through `whereEq`.
 pub const QueryView = struct {
-    /// Operation being executed (create is never intercepted).
+    /// Operation being executed (create uses `whereEq` as set-if-missing).
     op: hook.Op,
     /// Physical table name the operation targets.
     table_name: []const u8,
@@ -28,9 +30,9 @@ pub const QueryView = struct {
     /// Builder-provided callback backing `whereEq`.
     add_eq_fn: *const fn (sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void,
 
-    /// Add an equality predicate `field_name = value` to the intercepted
-    /// query. Returns `error.UnknownField` when the entity has no such
-    /// field; other errors come from the builder (e.g. OutOfMemory).
+    /// Add `field_name = value`. On query/update/delete this is a WHERE
+    /// predicate; on create it sets the column when the caller omitted it.
+    /// Returns `error.UnknownField` when the entity has no such field.
     pub fn whereEq(self: *QueryView, field_name: []const u8, value: sql.Value) !void {
         try self.add_eq_fn(self.sink, field_name, value);
     }
@@ -230,4 +232,27 @@ test "QueryView whereEq surfaces sink errors (unknown field)" {
     var v = sink.view(.update);
     try std.testing.expectError(error.UnknownField, chain.run(&v));
     try std.testing.expectEqual(@as(usize, 0), sink.fields.items.len);
+}
+
+test "QueryView whereEq on create reaches the sink" {
+    const allocator = std.testing.allocator;
+    var chain = InterceptorChain.init(allocator);
+    defer chain.deinit();
+
+    const inject = struct {
+        fn f(_: ?*anyopaque, v: *QueryView) anyerror!void {
+            try v.whereEq("tenant_id", .{ .int = 3 });
+        }
+    }.f;
+    try chain.use(.{ .intercept = inject });
+
+    var sink = TestSink.init();
+    defer sink.deinit(allocator);
+    var v = sink.view(.create);
+    try chain.run(&v);
+
+    try std.testing.expectEqual(hook.Op.create, v.op);
+    try std.testing.expectEqual(@as(usize, 1), sink.fields.items.len);
+    try std.testing.expectEqualStrings("tenant_id", sink.fields.items[0]);
+    try std.testing.expectEqual(@as(i64, 3), sink.values.items[0].int);
 }

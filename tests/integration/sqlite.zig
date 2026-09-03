@@ -2058,7 +2058,8 @@ test "SQLite: interceptor injects tenant filter into query/update/delete" {
         }.f,
     });
 
-    // Seed one row per tenant (create is hook territory, not intercepted).
+    // Seed one row per tenant with an explicit tenant_id (kept as-is:
+    // create injection is if-missing, so this still writes tenant 2).
     for ([_]struct { n: []const u8, t: i64 }{ .{ .n = "t1-doc", .t = 1 }, .{ .n = "t2-doc", .t = 2 } }) |s| {
         var b = try client.tenant_doc.Create();
         defer b.deinit();
@@ -2133,6 +2134,61 @@ test "SQLite: interceptor injects tenant filter into query/update/delete" {
     }
     try testing.expectEqual(@as(usize, 1), rows.items.len);
     try testing.expectEqualStrings("renamed", rows.items[0].name);
+}
+
+test "SQLite: interceptor fills omitted tenant_id on create" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const TenantDoc = schema("TenantDocInject", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{TenantDoc});
+    const infos = graph.types;
+    try Client.createAllTables(infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 7;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("tenant_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    {
+        var b = try client.tenant_doc_inject.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "omitted");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+        try testing.expectEqual(@as(i64, 7), e.tenant_id);
+    }
+
+    // Explicit value is kept (if-missing).
+    {
+        var b = try client.tenant_doc_inject.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "explicit");
+        _ = try b.setFieldValue("tenant_id", @as(i64, 9));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+        try testing.expectEqual(@as(i64, 9), e.tenant_id);
+    }
+
+    var q = client.tenant_doc_inject.Query();
+    defer q.deinit();
+    try testing.expectEqual(@as(i64, 1), try q.Count());
 }
 
 test "SQLite: interceptor with unknown field aborts with InterceptFailed" {

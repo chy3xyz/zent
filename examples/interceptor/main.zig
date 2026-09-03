@@ -38,8 +38,9 @@ pub fn main() !void {
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     defer Client.DeinitClient(infos, &client);
 
-    // Seed two tenants without the interceptor: create is not intercepted by
-    // design (hooks own the create path), so tenant_id is set explicitly here.
+    // Seed two tenants before the interceptor is registered so we can
+    // insert both tenant_id values. After UseInterceptor, omitted
+    // tenant_id on Create is filled from ctx (if-missing).
     try insertDoc(&client, 1, "tenant-1 doc A", "alpha");
     try insertDoc(&client, 1, "tenant-1 doc B", "beta");
     try insertDoc(&client, 2, "tenant-2 doc C", "gamma");
