@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-03
+
 ### Added
 - **Create / BulkInsert interceptors.** `UseInterceptor` now runs on
   `Create` and `BulkInsert` as well as Query/Update/Delete. `whereEq` on
