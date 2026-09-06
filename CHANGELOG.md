@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-09-07
+
 ### Added
 - **Parameterized raw predicates.** `sql.RawArgs(sql_text, args)` renders a
   raw SQL fragment whose `?` markers are rebound to dialect placeholders in
