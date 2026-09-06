@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Parameterized raw predicates.** `sql.RawArgs(sql_text, args)` renders a
+  raw SQL fragment whose `?` markers are rebound to dialect placeholders in
+  order (`$N` on PostgreSQL), composing with typed predicates via
+  `sql.And`/`sql.Or`. A marker/argument count mismatch fails with
+  `error.RawArgCountMismatch` instead of emitting malformed SQL. Covers
+  fragments typed predicates cannot express (`BETWEEN`, `IN (…)`, function
+  calls) without string-concatenating values.
+- **Aggregate query helpers** on `QueryBuilder`:
+  - `SumOrZero("col")` — `COALESCE(SUM("col"), 0)`, returns `0` on empty
+    sets instead of `NULL`.
+  - `AggregateOne("COUNT(DISTINCT name)")` — single-value aggregates as a
+    typed `sql.Value` (`null`/`int`/`float`/owned `string`).
+  - `AggregateText("SUM(\"amount\")")` — aggregate read back as exact
+    decimal text (`?[]u8`, caller frees) for money columns where `f64`
+    rounding is unacceptable.
+  - `AggregateBy("SUM(\"amount\")", "status")` — raw aggregate grouped by a
+    schema field, honoring `Where` predicates, soft-delete filtering and
+    `Having`; returns `Managed(GroupMetric)` released with
+    `freeGroupMetrics`. Appends to an existing `GroupBy` column list.
+- **Upsert custom update expressions.** `SaveOrUpdateOnWith(conflict_cols, exprs)`
+  takes per-column `UpsertSetExpr{ .column, .expr }` templates rendered on the
+  duplicate-key path, e.g. `{t:receive_num} + 1` for counter increments
+  (`{t:col}` = table-qualified column, `{x:col}` = `EXCLUDED."col"` on
+  PostgreSQL/SQLite, `VALUES(\`col\`)` on MySQL). Placeholder columns are
+  validated to `[A-Za-z0-9_]`; other columns keep the default
+  `EXCLUDED`/`VALUES()` assignment. On SQLite, supplying expressions switches
+  from `INSERT OR REPLACE` (delete+insert, breaks FK/ROWID invariants) to
+  `INSERT … ON CONFLICT … DO UPDATE`.
+- **Raw-query DTO scanning.** `sql_scan.queryAll(T, allocator, driver, sql, args)`
+  / `sql_scan.queryOne(...)` run a raw driver query and scan rows into any
+  DTO struct by column name (`scanRowNamed` semantics — unselected fields
+  keep zero values); `sql_scan.freeDto(T, allocator, &item)` releases the
+  string fields duplicated at scan time. Failed mid-scan calls free the
+  already-collected items (errdefer), keeping `zig build test` leak-clean.
+  This replaces hand-written `rows.next()` + per-column `getInt`/`getText`
+  loops in consumer persistence code.
+- **Row-lock variants.** `Selector.forUpdateWith` / `QueryBuilder.ForUpdateWith`
+  accept `LockOpts{ .of, .skip_locked, .nowait }`: `FOR UPDATE OF "table"`
+  scopes the lock to one table on PostgreSQL; `SKIP LOCKED` / `NOWAIT`
+  (PostgreSQL 9.5+, MySQL 8+) skip or fail on locked rows instead of
+  blocking — the queue-drain pattern for worker pools. Unsupported clauses
+  degrade per dialect: `OF` is PostgreSQL-only, lock modifiers are omitted on
+  SQLite (no row locks).
+
 ## [0.33.0] - 2026-09-03
 
 ### Added

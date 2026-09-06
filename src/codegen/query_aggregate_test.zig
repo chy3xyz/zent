@@ -5,8 +5,11 @@ const Dialect = @import("../sql/dialect.zig").Dialect;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const fromSchema = @import("graph.zig").fromSchema;
 const EntityGen = @import("entity.zig").Entity;
+const deinitEntity = @import("entity.zig").deinitEntity;
 const QueryBuilder = @import("query.zig").QueryBuilder;
 const BulkInsertBuilder = @import("create.zig").BulkInsertBuilder;
+const CreateBuilder = @import("create.zig").CreateBuilder;
+const UpsertSetExpr = @import("create.zig").UpsertSetExpr;
 const field = @import("../core/field.zig");
 const schema = @import("../core/schema.zig").Schema;
 
@@ -332,4 +335,221 @@ test "paged rejects zero page size and short-circuits empty tables" {
     defer page.deinit();
     try std.testing.expectEqual(@as(i64, 0), page.total);
     try std.testing.expectEqual(@as(usize, 0), page.items.items.len);
+}
+
+test "SumOrZero wraps SUM with COALESCE and returns the value" {
+    const allocator = std.testing.allocator;
+
+    const Order = schema("Order", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.Float("amount"),
+        },
+    });
+    const info = comptime fromSchema(Order);
+    const infos = &[_]TypeInfo{info};
+    const OrderEntity = comptime EntityGen(infos, info);
+    const OrderQuery = QueryBuilder(infos, info, OrderEntity);
+
+    var mock = MockDriver{ .value = .{ .float = 0 }, .capture_sql = true };
+    var q = OrderQuery.init(allocator, mock.asDriver(), null);
+    defer q.deinit();
+    _ = try q.Where(&.{sql.EQ("tenant_id", .{ .int = 7 })});
+    const total = try q.SumOrZero("amount");
+    try std.testing.expectEqual(@as(f64, 0), total);
+
+    const s = mock.last_sql orelse return error.NoSqlCaptured;
+    defer if (mock.last_sql_owned) |o| allocator.free(o);
+    try std.testing.expect(std.mem.indexOf(u8, s, "COALESCE(SUM(\"amount\"), 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "tenant_id") != null);
+}
+
+test "AggregateOne returns typed values across null/int/float/text" {
+    const allocator = std.testing.allocator;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const UserQuery = QueryBuilder(infos, info, UserEntity);
+
+    const cases = &[_]sql.Value{
+        .null,
+        .{ .int = 42 },
+        .{ .float = 3.14 },
+        .{ .string = "99.95" },
+    };
+    for (cases) |value| {
+        var mock = MockDriver{ .value = value };
+        var q = UserQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        const v = try q.AggregateOne("COUNT(DISTINCT name)");
+        defer if (v == .string) allocator.free(v.string);
+        try expectValueEqual(value, v);
+    }
+}
+
+test "AggregateText returns exact decimal text and null" {
+    const allocator = std.testing.allocator;
+
+    const Order = schema("Order", .{
+        .fields = &.{field.String("amount")},
+    });
+    const info = comptime fromSchema(Order);
+    const infos = &[_]TypeInfo{info};
+    const OrderEntity = comptime EntityGen(infos, info);
+    const OrderQuery = QueryBuilder(infos, info, OrderEntity);
+
+    var mock = MockDriver{ .value = .{ .string = "123.45" } };
+    var q = OrderQuery.init(allocator, mock.asDriver(), null);
+    defer q.deinit();
+    const text = (try q.AggregateText("SUM(\"amount\")")) orelse return error.ExpectedValue;
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("123.45", text);
+
+    var mock_null = MockDriver{ .value = .null };
+    var q_null = OrderQuery.init(allocator, mock_null.asDriver(), null);
+    defer q_null.deinit();
+    try std.testing.expect((try q_null.AggregateText("SUM(\"amount\")")) == null);
+}
+
+test "AggregateBy groups with raw aggregate expr and frees cleanly" {
+    const allocator = std.testing.allocator;
+
+    const Order = schema("Order", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.String("status"),
+            field.Int("amount"),
+        },
+    });
+    const info = comptime fromSchema(Order);
+    const infos = &[_]TypeInfo{info};
+    const OrderEntity = comptime EntityGen(infos, info);
+    const OrderQuery = QueryBuilder(infos, info, OrderEntity);
+
+    var mock = MockDriver{ .value = .{ .int = 7 }, .capture_sql = true };
+    var q = OrderQuery.init(allocator, mock.asDriver(), null);
+    defer q.deinit();
+    _ = try q.Where(&.{sql.EQ("tenant_id", .{ .int = 1 })});
+    var metrics = try q.AggregateBy("SUM(\"amount\")", "status");
+    defer OrderQuery.freeGroupMetrics(&metrics);
+    try std.testing.expectEqual(@as(usize, 1), metrics.items.len);
+    try expectValueEqual(.{ .int = 7 }, metrics.items[0].key);
+    try expectValueEqual(.{ .int = 7 }, metrics.items[0].value);
+
+    const s = mock.last_sql orelse return error.NoSqlCaptured;
+    defer if (mock.last_sql_owned) |o| allocator.free(o);
+    try std.testing.expect(std.mem.indexOf(u8, s, "SUM(\"amount\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "GROUP BY \"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "tenant_id") != null);
+}
+
+test "SaveOrUpdateOnWith emits custom DO UPDATE expressions per dialect" {
+    const allocator = std.testing.allocator;
+
+    const Coupon = schema("Coupon", .{
+        .table_name = "zigshop_coupon",
+        .pk = "coupon_id",
+        .fields = &.{
+            field.Int("coupon_id"),
+            field.Int("receive_num"),
+            field.String("title"),
+        },
+    });
+    const info = comptime fromSchema(Coupon);
+    const infos = &[_]TypeInfo{info};
+    const CouponEntity = comptime EntityGen(infos, info);
+    const Create = CreateBuilder(infos, info, CouponEntity);
+
+    const exprs = &[_]UpsertSetExpr{
+        .{ .column = "receive_num", .expr = "{t:receive_num} + 1" },
+    };
+
+    // PostgreSQL: custom expr for receive_num, EXCLUDED for the rest.
+    var mock_pg = MockDriver{ .value = .{ .int = 1 }, .capture_sql = true, .dialect_override = .postgres };
+    var b_pg = Create.init(allocator, mock_pg.asDriver(), &.{}, null);
+    defer b_pg.deinit();
+    _ = try b_pg.setFieldValue("coupon_id", 9);
+    _ = try b_pg.setFieldValue("receive_num", 1);
+    _ = try b_pg.setFieldValue("title", "t");
+    var e_pg = try b_pg.SaveOrUpdateOnWith(&.{"coupon_id"}, exprs);
+    deinitEntity(infos, info, &e_pg, allocator);
+    const pg_sql = mock_pg.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "ON CONFLICT (\"coupon_id\") DO UPDATE SET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"receive_num\"=\"zigshop_coupon\".\"receive_num\" + 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"title\"=EXCLUDED.\"title\"") != null);
+
+    // MySQL: backtick idents, {t:col} → `table`.`col`, default VALUES().
+    var mock_my = MockDriver{ .value = .{ .int = 1 }, .capture_sql = true, .dialect_override = .mysql };
+    var b_my = Create.init(allocator, mock_my.asDriver(), &.{}, null);
+    defer b_my.deinit();
+    _ = try b_my.setFieldValue("coupon_id", 9);
+    _ = try b_my.setFieldValue("receive_num", 1);
+    _ = try b_my.setFieldValue("title", "t");
+    var e_my = try b_my.SaveOrUpdateOnWith(&.{"coupon_id"}, exprs);
+    deinitEntity(infos, info, &e_my, allocator);
+    const my_sql = mock_my.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(my_sql);
+    try std.testing.expect(std.mem.indexOf(u8, my_sql, "ON DUPLICATE KEY UPDATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my_sql, "`receive_num`=`zigshop_coupon`.`receive_num` + 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, my_sql, "`title`=VALUES(`title`)") != null);
+
+    // SQLite with custom exprs: ON CONFLICT form (not INSERT OR REPLACE).
+    var mock_sq = MockDriver{ .value = .{ .int = 1 }, .capture_sql = true, .dialect_override = .sqlite };
+    var b_sq = Create.init(allocator, mock_sq.asDriver(), &.{}, null);
+    defer b_sq.deinit();
+    _ = try b_sq.setFieldValue("coupon_id", 9);
+    _ = try b_sq.setFieldValue("receive_num", 1);
+    var e_sq = try b_sq.SaveOrUpdateOnWith(&.{"coupon_id"}, exprs);
+    deinitEntity(infos, info, &e_sq, allocator);
+    const sq_sql = mock_sq.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(sq_sql);
+    try std.testing.expect(std.mem.indexOf(u8, sq_sql, "ON CONFLICT (\"coupon_id\") DO UPDATE SET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sq_sql, "\"receive_num\"=\"zigshop_coupon\".\"receive_num\" + 1") != null);
+}
+
+test "ForUpdateWith flows lock options into the generated SELECT" {
+    const allocator = std.testing.allocator;
+
+    const Order = schema("Order", .{
+        .table_name = "orders",
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.Int("amount"),
+        },
+    });
+    const info = comptime fromSchema(Order);
+    const infos = &[_]TypeInfo{info};
+    const OrderEntity = comptime EntityGen(infos, info);
+    const OrderQuery = QueryBuilder(infos, info, OrderEntity);
+
+    // PostgreSQL: OF + SKIP LOCKED reach the SELECT suffix.
+    var mock_pg = MockDriver{ .value = .null, .no_rows = true, .capture_sql = true, .dialect_override = .postgres };
+    var q_pg = OrderQuery.init(allocator, mock_pg.asDriver(), null);
+    defer q_pg.deinit();
+    _ = try q_pg.Where(&.{sql.EQ("tenant_id", .{ .int = 1 })});
+    _ = q_pg.ForUpdateWith(.{ .of = "orders", .skip_locked = true });
+    var rows_pg = try q_pg.All();
+    defer rows_pg.deinit();
+    try std.testing.expectEqual(@as(usize, 0), rows_pg.items.len);
+    const pg_sql = mock_pg.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "FOR UPDATE OF \"orders\" SKIP LOCKED") != null);
+
+    // Plain ForUpdate still renders the bare suffix (backwards compatible).
+    var mock_plain = MockDriver{ .value = .null, .no_rows = true, .capture_sql = true, .dialect_override = .postgres };
+    var q_plain = OrderQuery.init(allocator, mock_plain.asDriver(), null);
+    defer q_plain.deinit();
+    _ = q_plain.ForUpdate();
+    var rows_plain = try q_plain.All();
+    defer rows_plain.deinit();
+    const plain_sql = mock_plain.last_sql_owned orelse return error.MissingCapture;
+    defer allocator.free(plain_sql);
+    try std.testing.expect(std.mem.indexOf(u8, plain_sql, "FOR UPDATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_sql, "SKIP LOCKED") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain_sql, "NOWAIT") == null);
 }

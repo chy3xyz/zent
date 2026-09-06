@@ -219,6 +219,8 @@ pub const Predicate = union(enum) {
     is_null: []const u8,
     is_not_null: []const u8,
     raw: []const u8,
+    /// Raw SQL fragment with bound args spliced at each `?` marker, in order.
+    raw_args: RawArgsOp,
     in_subquery: struct { column: []const u8, sql: []const u8 },
     exists_subquery: []const u8,
     /// EXISTS subquery generated lazily via a function pointer.
@@ -246,6 +248,7 @@ pub const Predicate = union(enum) {
         needle: []const u8,
         escape: u8 = '\\',
     };
+    pub const RawArgsOp = struct { sql: []const u8, args: []const Value };
 
     pub fn appendTo(self: Predicate, b: *Builder) !void {
         switch (self) {
@@ -350,6 +353,19 @@ pub const Predicate = union(enum) {
             },
             .raw => |sql_text| {
                 try b.writeString(sql_text);
+            },
+            .raw_args => |p| {
+                var rest = p.sql;
+                var n: usize = 0;
+                while (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+                    if (n >= p.args.len) return error.RawArgCountMismatch;
+                    try b.writeString(rest[0..q]);
+                    try b.arg(p.args[n]);
+                    n += 1;
+                    rest = rest[q + 1 ..];
+                }
+                if (n != p.args.len) return error.RawArgCountMismatch;
+                try b.writeString(rest);
             },
             .in_subquery => |p| {
                 try b.qualifiedIdent(p.column);
@@ -571,6 +587,14 @@ pub fn Raw(sql_text: []const u8) Predicate {
     return .{ .raw = sql_text };
 }
 
+/// Raw SQL fragment with bound parameters: each `?` marker is replaced by a
+/// bound arg (dialect placeholder), in order. Prefer this over interpolating
+/// values into `Raw` text. The `?` marker must not appear inside string
+/// literals or operators within the fragment.
+pub fn RawArgs(sql_text: []const u8, args: []const Value) Predicate {
+    return .{ .raw_args = .{ .sql = sql_text, .args = args } };
+}
+
 pub fn InSubquery(column: []const u8, sql_text: []const u8) Predicate {
     return .{ .in_subquery = .{ .column = column, .sql = sql_text } };
 }
@@ -737,6 +761,9 @@ pub const Selector = struct {
     distinct: bool,
     for_update: bool,
     for_share: bool,
+    for_update_of: ?[]const u8 = null,
+    skip_locked: bool = false,
+    nowait: bool = false,
     ctes: std.array_list.Managed(CTE),
     cte_dialect: ?Dialect = null,
 
@@ -835,6 +862,44 @@ pub const Selector = struct {
         return s;
     }
 
+    /// Row-lock options: `of` limits the lock to one table (PostgreSQL only),
+    /// `skip_locked` / `nowait` avoid blocking (PostgreSQL 9.5+, MySQL 8+).
+    /// Ignored on SQLite, which has no row locks.
+    pub const LockOpts = struct {
+        of: ?[]const u8 = null,
+        skip_locked: bool = false,
+        nowait: bool = false,
+    };
+
+    pub fn forUpdateWith(s: *Selector, opts: LockOpts) *Selector {
+        s.for_update = true;
+        s.for_update_of = opts.of;
+        s.skip_locked = opts.skip_locked;
+        s.nowait = opts.nowait;
+        return s;
+    }
+
+    fn writeLockSuffix(s: *Selector) !void {
+        if (s.for_update) {
+            try s.b.writeString(" FOR UPDATE");
+        } else if (s.for_share) {
+            try s.b.writeString(" FOR SHARE");
+        } else {
+            return;
+        }
+        const dname = s.b.dialect.name;
+        if (s.for_update_of) |of| {
+            if (std.mem.eql(u8, dname, "postgres")) {
+                try s.b.writeString(" OF ");
+                try s.b.ident(of);
+            }
+        }
+        if (!std.mem.eql(u8, dname, "sqlite3")) {
+            if (s.skip_locked) try s.b.writeString(" SKIP LOCKED");
+            if (s.nowait) try s.b.writeString(" NOWAIT");
+        }
+    }
+
     /// Add a Common Table Expression (CTE) to the SELECT.
     /// The subquery is an OwnedQuery; its SQL and args will be merged into
     /// the main query at build time. Caller transfers ownership of the subquery.
@@ -914,11 +979,7 @@ pub const Selector = struct {
             const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{n});
             try s.b.writeString(num_str);
         }
-        if (s.for_update) {
-            try s.b.writeString(" FOR UPDATE");
-        } else if (s.for_share) {
-            try s.b.writeString(" FOR SHARE");
-        }
+        try s.writeLockSuffix();
         const bq = s.b.query();
         return .{ .sql = bq.sql, .args = bq.args };
     }
@@ -993,11 +1054,7 @@ pub const Selector = struct {
             const num_str = try std.fmt.bufPrint(&num_buf, "{d}", .{n});
             try s.b.writeString(num_str);
         }
-        if (s.for_update) {
-            try s.b.writeString(" FOR UPDATE");
-        } else if (s.for_share) {
-            try s.b.writeString(" FOR SHARE");
-        }
+        try s.writeLockSuffix();
         const result = try s.b.takeQuery();
         s.columns.deinit();
         s.columns = std.array_list.Managed(ColumnRef).init(s.b.allocator);
@@ -1913,6 +1970,29 @@ test "Raw predicate" {
     try std.testing.expectEqual(@as(usize, 0), q.args.len);
 }
 
+test "RawArgs predicate splices bound args" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("coupon"));
+    _ = try s.where(RawArgs("(total_num <= 0 OR receive_num < ?)", &.{.{ .int = 5 }}));
+    _ = try s.where(EQ("app_id", .{ .int = 9 }));
+    const q = try s.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"coupon\" WHERE (total_num <= 0 OR receive_num < $1) AND \"app_id\" = $2", q.sql);
+    try std.testing.expectEqual(@as(usize, 2), q.args.len);
+    try std.testing.expectEqual(@as(i64, 5), q.args[0].int);
+    try std.testing.expectEqual(@as(i64, 9), q.args[1].int);
+}
+
+test "RawArgs predicate rejects marker/arg count mismatch" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("users"));
+    _ = try s.where(RawArgs("age > ? AND score < ?", &.{.{ .int = 1 }}));
+    try std.testing.expectError(error.RawArgCountMismatch, s.query());
+}
+
 test "Subquery predicates" {
     const allocator = std.testing.allocator;
 
@@ -1947,6 +2027,31 @@ test "FOR UPDATE and FOR SHARE" {
     _ = s2.from(Table("users")).forShare();
     const q2 = try s2.query();
     try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" FOR SHARE", q2.sql);
+}
+
+test "forUpdateWith row-lock variants" {
+    const allocator = std.testing.allocator;
+
+    // PostgreSQL: OF table + SKIP LOCKED.
+    var s1 = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+    defer s1.deinit();
+    _ = s1.from(Table("users")).forUpdateWith(.{ .of = "users", .skip_locked = true });
+    const q1 = try s1.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" FOR UPDATE OF \"users\" SKIP LOCKED", q1.sql);
+
+    // MySQL 8+: NOWAIT, OF ignored (not supported by MySQL).
+    var s2 = try Select(allocator, Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+    defer s2.deinit();
+    _ = s2.from(Table("users")).forUpdateWith(.{ .of = "users", .nowait = true });
+    const q2 = try s2.query();
+    try std.testing.expectEqualStrings("SELECT `id` FROM `users` FOR UPDATE NOWAIT", q2.sql);
+
+    // SQLite: no row locks — suffix collapses to plain FOR UPDATE.
+    var s3 = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    defer s3.deinit();
+    _ = s3.from(Table("users")).forUpdateWith(.{ .of = "users", .skip_locked = true });
+    const q3 = try s3.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" FOR UPDATE", q3.sql);
 }
 
 test "BulkUpdate SQL generation" {

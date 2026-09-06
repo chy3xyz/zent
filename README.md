@@ -17,6 +17,7 @@ Current release: **v0.33.0** (package version synced to tags; see `scripts/relea
 - **Hooks System**: Runtime hooks for before/after operations
 - **Privacy Policy**: Flexible policy framework for access control
 - **Connection Pool**: Mutex-backed pool with warmup and on-borrow health checks
+- **Advanced SQL Toolkit**: Parameterized raw predicates (`sql.RawArgs`), aggregate helpers (`SumOrZero`/`AggregateOne`/`AggregateText`/`AggregateBy`), upsert update expressions (`SaveOrUpdateOnWith`), row-lock variants (`ForUpdateWith`), and raw-query DTO scanning (`sql_scan.queryAll`/`queryOne`)
 
 ## Quick Start
 

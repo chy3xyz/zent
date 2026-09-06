@@ -264,6 +264,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         select_cols: ?[]const []const u8 = null,
         for_update: bool,
         for_share: bool,
+        for_update_of: ?[]const u8 = null,
+        skip_locked: bool = false,
+        nowait: bool = false,
         privacy_ctx: ?privacy.PrivacyContext = null,
         /// Shared interceptor chain borrowed from the entity client; run
         /// before every execution method (after privacy filter injection).
@@ -559,6 +562,16 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn ForShare(self: *Self) *Self {
             self.for_share = true;
+            return self;
+        }
+
+        /// Row-lock variants: `of` scopes the lock (PostgreSQL only),
+        /// `skip_locked`/`nowait` avoid blocking (PostgreSQL 9.5+, MySQL 8+).
+        pub fn ForUpdateWith(self: *Self, opts: sql.Selector.LockOpts) *Self {
+            self.for_update = true;
+            self.for_update_of = opts.of;
+            self.skip_locked = opts.skip_locked;
+            self.nowait = opts.nowait;
             return self;
         }
 
@@ -927,6 +940,32 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// Replaces N separate Count() calls with a single round trip.
         pub const GroupCount = struct { key: i64, count: i64 };
 
+        /// One group row from `AggregateBy`: the group key and the aggregate
+        /// result. String/bytes payloads are duped — free with
+        /// `freeGroupMetrics`.
+        pub const GroupMetric = struct { key: sql.Value, value: sql.Value };
+
+        /// Free duped string/bytes payloads in each entry, then the list.
+        pub fn freeGroupMetrics(list: *std.array_list.Managed(GroupMetric)) void {
+            for (list.items) |*m| {
+                if (m.key == .string) list.allocator.free(m.key.string);
+                if (m.key == .bytes) list.allocator.free(m.key.bytes);
+                if (m.value == .string) list.allocator.free(m.value.string);
+                if (m.value == .bytes) list.allocator.free(m.value.bytes);
+            }
+            list.deinit();
+        }
+
+        fn readAggValue(row: sql_driver.Row, col: usize, allocator: std.mem.Allocator) QueryError!sql.Value {
+            if (row.isNull(col)) return .null;
+            if (row.getInt(col)) |v| return .{ .int = v };
+            if (row.getFloat(col)) |v| return .{ .float = v };
+            // Dup text/blob while rows is alive: getters borrow driver buffers.
+            if (row.getText(col)) |v| return .{ .string = try allocator.dupe(u8, v) };
+            if (row.getBlob(col)) |v| return .{ .bytes = try allocator.dupe(u8, v) };
+            return error.TypeMismatch;
+        }
+
         pub fn CountBy(self: *Self, comptime field_name: []const u8) QueryError!std.array_list.Managed(GroupCount) {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
@@ -1069,6 +1108,116 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return error.TypeMismatch;
         }
 
+        /// COALESCE(SUM(field), 0): an empty set yields 0 instead of the
+        /// `error.TypeMismatch` a bare `Sum` returns on SQL NULL.
+        pub fn SumOrZero(self: *Self, comptime field_name: []const u8) QueryError!f64 {
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
+            var q = try self.buildAggregateQuery("COALESCE(SUM(\"" ++ field_name ++ "\"), 0)");
+            defer q.deinit();
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
+            defer rows.deinit();
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
+            return row.getFloat(0) orelse return error.TypeMismatch;
+        }
+
+        /// Generic single-expression aggregate, e.g. `AggregateOne("COUNT(DISTINCT user_id)")`.
+        /// The expression is emitted verbatim — never interpolate user input.
+        /// String results are duped; free with the query allocator when
+        /// the returned value is `.string`/`.bytes`.
+        pub fn AggregateOne(self: *Self, comptime agg_expr: []const u8) QueryError!sql.Value {
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
+            var q = try self.buildAggregateQuery(agg_expr);
+            defer q.deinit();
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
+            defer rows.deinit();
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
+            return readAggValue(row, 0, self.allocator);
+        }
+
+        /// Exact text form of an aggregate (e.g. DECIMAL `SUM`), avoiding
+        /// float rounding for money columns. Returns null on SQL NULL.
+        /// Caller owns the returned slice (free with the query allocator).
+        pub fn AggregateText(self: *Self, comptime agg_expr: []const u8) QueryError!?[]u8 {
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
+            var q = try self.buildAggregateQuery(agg_expr);
+            defer q.deinit();
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
+            defer rows.deinit();
+            const row = rows.next() orelse {
+                if (rows.nextError()) |e| return e;
+                return error.NotFound;
+            };
+            if (row.isNull(0)) return null;
+            const text = row.getText(0) orelse return error.TypeMismatch;
+            return try self.allocator.dupe(u8, text);
+        }
+
+        /// Grouped aggregate: `SELECT group_field, <agg_expr> ... GROUP BY
+        /// group_field`. When `GroupBy` was already called with extra columns
+        /// they are appended after `group_field`. Honors Where/Having and
+        /// soft-delete filtering like `CountBy`. `agg_expr` is emitted
+        /// verbatim — never interpolate user input.
+        /// Caller frees the result with `freeGroupMetrics`.
+        pub fn AggregateBy(self: *Self, comptime agg_expr: []const u8, comptime group_field: []const u8) QueryError!std.array_list.Managed(GroupMetric) {
+            const pol = try self.checkPolicy();
+            try self.injectPrivacyFilters(pol);
+            try self.runInterceptors(.query);
+            const t = sql.Table(info.table_name);
+            const key_col = sql.ColumnRef{ .table = null, .name = group_field, .raw = false };
+            const val_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
+            var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{ key_col, val_col });
+            _ = selector.from(t);
+            if (self.predicates.items.len > 0) {
+                for (self.predicates.items) |pred| {
+                    _ = try selector.where(pred);
+                }
+            }
+            if (info.soft_delete and !self.with_trashed) {
+                _ = try selector.where(sql.IsNull("deleted_at"));
+            }
+            if (self.group_cols.items.len > 0) {
+                _ = try selector.groupBy(self.group_cols.items);
+            } else {
+                _ = try selector.groupBy(&.{group_field});
+            }
+            if (self.having_pred) |pred| {
+                _ = selector.having(pred);
+            }
+            var q = selector.takeQuery() catch |err| return mapBuildError(err);
+            defer q.deinit();
+            self.ensureDeadline();
+            var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
+            defer rows.deinit();
+            var result = std.array_list.Managed(GroupMetric).init(self.allocator);
+            errdefer freeGroupMetrics(&result);
+            while (rows.next()) |row| {
+                const key = try readAggValue(row, 0, self.allocator);
+                errdefer {
+                    if (key == .string) self.allocator.free(key.string);
+                    if (key == .bytes) self.allocator.free(key.bytes);
+                }
+                const value = try readAggValue(row, 1, self.allocator);
+                try result.append(.{ .key = key, .value = value });
+            }
+            if (rows.nextError()) |e| return e;
+            return result;
+        }
+
         fn loadEdges(self: *Self, edge_path: []const u8, entities: []Entity) !void {
             return loadEdgePath(infos, info, Entity, self.allocator, self.driver, self.execution_context, entities, edge_path);
         }
@@ -1174,7 +1323,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 _ = selector.offset(n);
             }
             if (self.for_update) {
-                _ = selector.forUpdate();
+                _ = selector.forUpdateWith(.{
+                    .of = self.for_update_of,
+                    .skip_locked = self.skip_locked,
+                    .nowait = self.nowait,
+                });
             } else if (self.for_share) {
                 _ = selector.forShare();
             }

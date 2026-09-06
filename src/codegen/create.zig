@@ -59,6 +59,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         timeout_ms: ?u32 = null,
         execution_context: sql_driver.ExecutionContext = .{},
         upsert_conflict_columns: ?[]const []const u8 = null,
+        upsert_set_exprs: ?[]const UpsertSetExpr = null,
         interceptors: ?*intercept.InterceptorChain = null,
 
         const EdgeValue = struct {
@@ -216,6 +217,16 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self.saveInternal(true, false, conflict_columns);
         }
 
+        /// Upsert with a custom conflict target AND per-column SET
+        /// expressions. Columns without an entry keep the default
+        /// `col = EXCLUDED.col` assignment. Requires a matching UNIQUE index
+        /// on `conflict_columns`.
+        pub fn SaveOrUpdateOnWith(self: *Self, conflict_columns: []const []const u8, update_exprs: []const UpsertSetExpr) SaveError!Entity {
+            self.upsert_conflict_columns = conflict_columns;
+            self.upsert_set_exprs = update_exprs;
+            return self.saveInternal(true, false, conflict_columns);
+        }
+
         fn saveInternal(self: *Self, comptime or_replace: bool, comptime ignore_conflicts: bool, conflict_columns: ?[]const []const u8) SaveError!Entity {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
@@ -289,7 +300,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
             const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
             const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer);
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer, self.upsert_set_exprs, info.table_name);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             const ignore_suffix: []const u8 = if (ignore_conflicts and is_postgres) " ON CONFLICT DO NOTHING" else "";
@@ -299,7 +310,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // handles that (Value fields default to .null).
             var entity: Entity = @import("../sql/scan.zig").zeroInit(Entity);
             if (supports_returning) {
-                var builder = if (or_replace and is_sqlite)
+                var builder = if (or_replace and is_sqlite and self.upsert_set_exprs == null)
                     sql.InsertOrReplace(self.allocator, dialect, info.table_name)
                 else if (ignore_conflicts and is_sqlite)
                     sql.InsertOrIgnore(self.allocator, dialect, info.table_name)
@@ -785,6 +796,73 @@ fn toSqlValue(v: anytype) sql.Value {
 /// (it uses INSERT OR REPLACE instead); the bulk path passes
 /// `is_sqlite=false` and falls into the ON CONFLICT branch — SQLite supports
 /// ON CONFLICT for multi-row INSERTs. Returns "" when `or_replace` is false.
+/// Custom SET expression for one column on the upsert DO UPDATE path.
+/// Tokens in `expr`: `{t:col}` → qualified target-table column,
+/// `{x:col}` → the proposed row's column (`EXCLUDED."col"` on
+/// PG/SQLite, `VALUES(col)` on MySQL). Anything else is emitted
+/// verbatim — never interpolate user input.
+/// Example increment: `.{ .column = "receive_num", .expr = "{t:receive_num} + 1" }`.
+pub const UpsertSetExpr = struct { column: []const u8, expr: []const u8 };
+
+/// Expand `{t:col}` / `{x:col}` tokens in an upsert SET expression for the
+/// target dialect. Column names must be bare identifiers (letters, digits,
+/// underscore) — anything else is `error.ValidationFailed`.
+fn findUpsertExpr(update_exprs: ?[]const UpsertSetExpr, column: []const u8) ?[]const u8 {
+    const exprs = update_exprs orelse return null;
+    for (exprs) |e| {
+        if (std.mem.eql(u8, e.column, column)) return e.expr;
+    }
+    return null;
+}
+
+fn expandUpsertExpr(allocator: std.mem.Allocator, is_mysql: bool, table_name: []const u8, expr: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var rest = expr;
+    while (std.mem.indexOfScalar(u8, rest, '{')) |open| {
+        try out.appendSlice(rest[0..open]);
+        const close = std.mem.indexOfScalarPos(u8, rest, open, '}') orelse return error.ValidationFailed;
+        const tok = rest[open + 1 .. close];
+        if (tok.len < 3 or tok[1] != ':') return error.ValidationFailed;
+        const col = tok[2..];
+        for (col) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return error.ValidationFailed;
+        }
+        switch (tok[0]) {
+            't' => {
+                if (is_mysql) {
+                    try out.append('`');
+                    try out.appendSlice(table_name);
+                    try out.appendSlice("`.`");
+                    try out.appendSlice(col);
+                    try out.append('`');
+                } else {
+                    try out.append('"');
+                    try out.appendSlice(table_name);
+                    try out.appendSlice("\".\"");
+                    try out.appendSlice(col);
+                    try out.append('"');
+                }
+            },
+            'x' => {
+                if (is_mysql) {
+                    try out.appendSlice("VALUES(`");
+                    try out.appendSlice(col);
+                    try out.appendSlice("`)");
+                } else {
+                    try out.appendSlice("EXCLUDED.\"");
+                    try out.appendSlice(col);
+                    try out.append('"');
+                }
+            },
+            else => return error.ValidationFailed,
+        }
+        rest = rest[close + 1 ..];
+    }
+    try out.appendSlice(rest);
+    return try out.toOwnedSlice();
+}
+
 fn buildUpsertSuffix(
     allocator: std.mem.Allocator,
     or_replace: bool,
@@ -795,8 +873,14 @@ fn buildUpsertSuffix(
     conflict_columns: []const []const u8,
     pk_field: []const u8,
     pk_is_integer: bool,
+    update_exprs: ?[]const UpsertSetExpr,
+    table_name: []const u8,
 ) ![]const u8 {
-    if (!or_replace or is_sqlite) return "";
+    // SQLite single-row upsert normally goes through INSERT OR REPLACE, but
+    // a custom SET expr needs the ON CONFLICT form (SQLite ≥3.24 supports
+    // the PG spelling) — REPLACE cannot express per-column update math.
+    const sqlite_expr_path = is_sqlite and update_exprs != null;
+    if (!or_replace or (is_sqlite and !sqlite_expr_path)) return "";
     if (is_mysql) {
         var buf = std.array_list.Managed(u8).init(allocator);
         errdefer buf.deinit();
@@ -816,7 +900,13 @@ fn buildUpsertSuffix(
         for (columns) |col| {
             if (std.mem.eql(u8, col, pk_field)) continue;
             try buf.appendSlice(", ");
-            try buf.print("`{s}`=VALUES(`{s}`)", .{ col, col });
+            if (findUpsertExpr(update_exprs, col)) |expr| {
+                const expanded = try expandUpsertExpr(allocator, true, table_name, expr);
+                defer allocator.free(expanded);
+                try buf.print("`{s}`={s}", .{ col, expanded });
+            } else {
+                try buf.print("`{s}`=VALUES(`{s}`)", .{ col, col });
+            }
         }
         return try buf.toOwnedSlice();
     }
@@ -844,7 +934,13 @@ fn buildUpsertSuffix(
         if (is_conflict_col) continue;
         if (!first) try buf.appendSlice(", ");
         first = false;
-        try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
+        if (findUpsertExpr(update_exprs, col)) |expr| {
+            const expanded = try expandUpsertExpr(allocator, false, table_name, expr);
+            defer allocator.free(expanded);
+            try buf.print("\"{s}\"={s}", .{ col, expanded });
+        } else {
+            try buf.print("\"{s}\"=EXCLUDED.\"{s}\"", .{ col, col });
+        }
     }
     return try buf.toOwnedSlice();
 }
@@ -1096,7 +1192,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
             const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
             const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer);
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer, null, info.table_name);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
             const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
             defer query.deinit();

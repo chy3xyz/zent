@@ -17,6 +17,7 @@ Zig 语言实现的实体框架（Entity Framework），复刻自 [ent](https://
 - **Hooks 系统**：用于操作前后的运行时钩子
 - **隐私策略**：用于访问控制的灵活策略框架
 - **连接池**：基于 Mutex 的预热连接池，支持借出时健康检查
+- **高级 SQL 工具集**：带参原始谓词（`sql.RawArgs`）、聚合助手（`SumOrZero`/`AggregateOne`/`AggregateText`/`AggregateBy`）、Upsert 更新表达式（`SaveOrUpdateOnWith`）、行锁变体（`ForUpdateWith`）、原始查询 DTO 扫描（`sql_scan.queryAll`/`queryOne`）
 
 ## 快速开始
 

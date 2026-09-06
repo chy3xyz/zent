@@ -1,5 +1,9 @@
 const std = @import("std");
-const Row = @import("driver.zig").Row;
+const driver_mod = @import("driver.zig");
+const Row = driver_mod.Row;
+const Rows = driver_mod.Rows;
+const Driver = driver_mod.Driver;
+const Value = @import("value.zig").Value;
 
 /// Scan a database row into a value of type T.
 /// Supports primitives, optional primitives, and structs.
@@ -309,6 +313,77 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
     }
 }
 
+/// Run `sql_text` on `driver` and scan every row into the DTO type `T`,
+/// mapping result columns to struct fields by name (`scanRowNamed`
+/// semantics: unselected fields keep zero values).
+///
+/// Ownership: string fields are duplicated with `allocator`. Release each
+/// item with `freeDto(T, allocator, &item)`, then `list.deinit()`. DTOs
+/// carrying JSON-struct / `std.json.Value` fields are parsed leaky into
+/// `allocator` — scan those under an arena instead of freeing per item.
+pub fn queryAll(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    driver: Driver,
+    sql_text: []const u8,
+    args: []const Value,
+) !std.array_list.Managed(T) {
+    var rows = try driver.query(sql_text, args);
+    defer rows.deinit();
+    var list = std.array_list.Managed(T).init(allocator);
+    errdefer {
+        for (list.items) |*item| freeDto(T, allocator, item);
+        list.deinit();
+    }
+    while (rows.next()) |row| {
+        try list.append(try scanRowNamed(T, allocator, row));
+    }
+    if (rows.nextError()) |err| return err;
+    return list;
+}
+
+/// Like `queryAll`, but scans at most the first row; `null` when the
+/// result set is empty. Release with `freeDto(T, allocator, &item)`.
+pub fn queryOne(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    driver: Driver,
+    sql_text: []const u8,
+    args: []const Value,
+) !?T {
+    var rows = try driver.query(sql_text, args);
+    defer rows.deinit();
+    const row = rows.next() orelse {
+        if (rows.nextError()) |err| return err;
+        return null;
+    };
+    return try scanRowNamed(T, allocator, row);
+}
+
+/// Free the memory owned by a DTO scanned with `scanRowNamed`, `queryAll`,
+/// or `queryOne`: every `[]u8` / `[]const u8` field (including optionals)
+/// duplicated at scan time. Unselected fields are zero-initialized empty
+/// slices, which free as no-ops. JSON-struct / `std.json.Value` fields are
+/// skipped — those are parsed leaky; use an arena for such DTOs.
+pub fn freeDto(comptime T: type, allocator: std.mem.Allocator, dto: *const T) void {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        freeDtoValue(field_type, allocator, @field(dto, field_name));
+    }
+}
+
+fn freeDtoValue(comptime T: type, allocator: std.mem.Allocator, value: T) void {
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) allocator.free(value);
+        },
+        .optional => |opt| {
+            if (value) |v| freeDtoValue(opt.child, allocator, v);
+        },
+        else => {},
+    }
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
@@ -449,4 +524,226 @@ test "scan enum from int and string" {
         const st = try scanRow(Status, std.testing.allocator, row);
         try std.testing.expectEqual(Status.deleted, st);
     }
+}
+
+// ------------------------------------------------------------------
+// queryAll / queryOne / freeDto tests
+// ------------------------------------------------------------------
+
+const NamedRowData = struct {
+    names: []const []const u8,
+    ints: []const ?i64,
+    texts: []const ?[]const u8,
+    nulls: []const bool,
+
+    fn columnCountFn(ptr: *anyopaque) usize {
+        const self: *const NamedRowData = @ptrCast(@alignCast(ptr));
+        return self.names.len;
+    }
+
+    fn columnNameFn(ptr: *anyopaque, index: usize) []const u8 {
+        const self: *const NamedRowData = @ptrCast(@alignCast(ptr));
+        return self.names[index];
+    }
+
+    fn getIntFn(ptr: *anyopaque, index: usize) ?i64 {
+        const self: *const NamedRowData = @ptrCast(@alignCast(ptr));
+        return self.ints[index];
+    }
+
+    fn getTextFn(ptr: *anyopaque, index: usize) ?[]const u8 {
+        const self: *const NamedRowData = @ptrCast(@alignCast(ptr));
+        return self.texts[index];
+    }
+
+    fn nullFn(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+
+    fn nullBoolFn(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+
+    fn nullBlobFn(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+
+    fn isNullFn(ptr: *anyopaque, index: usize) bool {
+        const self: *const NamedRowData = @ptrCast(@alignCast(ptr));
+        return self.nulls[index];
+    }
+};
+
+const named_row_vtable = Row.VTable{
+    .columnCount = NamedRowData.columnCountFn,
+    .columnName = NamedRowData.columnNameFn,
+    .getBool = NamedRowData.nullBoolFn,
+    .getInt = NamedRowData.getIntFn,
+    .getFloat = NamedRowData.nullFn,
+    .getText = NamedRowData.getTextFn,
+    .getBlob = NamedRowData.nullBlobFn,
+    .isNull = NamedRowData.isNullFn,
+};
+
+const ListRows = struct {
+    data: []const NamedRowData,
+    cursor: usize = 0,
+
+    const rows_vtable = Rows.VTable{
+        .next = nextFn,
+        .deinit = deinitFn,
+        .nextError = null,
+    };
+
+    fn nextFn(ptr: *anyopaque) ?Row {
+        const self: *ListRows = @ptrCast(@alignCast(ptr));
+        if (self.cursor >= self.data.len) return null;
+        defer self.cursor += 1;
+        return Row{ .ptr = @ptrCast(@constCast(&self.data[self.cursor])), .vtable = &named_row_vtable };
+    }
+
+    fn deinitFn(ptr: *anyopaque) void {
+        std.testing.allocator.destroy(@as(*ListRows, @ptrCast(@alignCast(ptr))));
+    }
+};
+
+const ListDriver = struct {
+    rows_data: []const NamedRowData,
+    last_sql: ?[]const u8 = null,
+
+    const driver_vtable = Driver.VTable{
+        .exec = execFn,
+        .query = queryFn,
+        .beginTx = txFailFn,
+        .close = closeFn,
+        .dialect = dialectFn,
+        .ping = pingFn,
+        .inTransaction = inTxFn,
+        .beginSavepoint = savepointFailFn,
+    };
+
+    fn asDriver(self: *ListDriver) Driver {
+        return Driver{ .ptr = self, .vtable = &driver_vtable };
+    }
+
+    fn execFn(_: *anyopaque, _: ?*const driver_mod.ExecutionContext, _: []const u8, _: []const Value) driver_mod.Error!driver_mod.Result {
+        return .{ .rows_affected = 0, .last_insert_id = null };
+    }
+
+    fn queryFn(ptr: *anyopaque, _: ?*const driver_mod.ExecutionContext, sql_text: []const u8, _: []const Value) driver_mod.Error!Rows {
+        const self: *ListDriver = @ptrCast(@alignCast(ptr));
+        self.last_sql = sql_text;
+        const rows = try std.testing.allocator.create(ListRows);
+        rows.* = .{ .data = self.rows_data };
+        return Rows{ .ptr = rows, .vtable = &ListRows.rows_vtable };
+    }
+
+    fn txFailFn(_: *anyopaque) driver_mod.Error!driver_mod.Tx {
+        return error.TxFailed;
+    }
+
+    fn savepointFailFn(_: *anyopaque, _: []const u8) driver_mod.Error!driver_mod.Tx {
+        return error.TxFailed;
+    }
+
+    fn closeFn(_: *anyopaque) void {}
+
+    fn dialectFn(_: *anyopaque) @import("dialect.zig").Dialect {
+        return .sqlite;
+    }
+
+    fn pingFn(_: *anyopaque) driver_mod.Error!void {}
+
+    fn inTxFn(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+test "queryAll scans all rows into DTOs by column name and frees cleanly" {
+    const allocator = std.testing.allocator;
+    const Item = struct {
+        sku_id: i64,
+        title: []const u8,
+        memo: ?[]const u8,
+        unselected: i64,
+    };
+    const rows_data = &[_]NamedRowData{
+        .{
+            .names = &.{ "sku_id", "title", "memo" },
+            .ints = &.{ 1, null, null },
+            .texts = &.{ null, "apple", "fresh" },
+            .nulls = &.{ false, false, false },
+        },
+        .{
+            .names = &.{ "sku_id", "title", "memo" },
+            .ints = &.{ 2, null, null },
+            .texts = &.{ null, "banana", null },
+            .nulls = &.{ false, false, true },
+        },
+    };
+    var drv = ListDriver{ .rows_data = rows_data };
+    var list = try queryAll(Item, allocator, drv.asDriver(), "SELECT sku_id, title, memo FROM sku", &.{});
+    defer {
+        for (list.items) |*item| freeDto(Item, allocator, item);
+        list.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqual(@as(i64, 1), list.items[0].sku_id);
+    try std.testing.expectEqualStrings("apple", list.items[0].title);
+    try std.testing.expectEqualStrings("fresh", list.items[0].memo.?);
+    try std.testing.expectEqual(@as(i64, 0), list.items[0].unselected);
+    try std.testing.expectEqual(@as(i64, 2), list.items[1].sku_id);
+    try std.testing.expectEqual(@as(?[]const u8, null), list.items[1].memo);
+    try std.testing.expectEqualStrings("SELECT sku_id, title, memo FROM sku", drv.last_sql.?);
+}
+
+test "queryOne scans the first row and returns null when empty" {
+    const allocator = std.testing.allocator;
+    const Item = struct {
+        sku_id: i64,
+        title: []const u8,
+    };
+    const rows_data = &[_]NamedRowData{
+        .{
+            .names = &.{ "sku_id", "title" },
+            .ints = &.{ 7, null },
+            .texts = &.{ null, "pear" },
+            .nulls = &.{ false, false },
+        },
+    };
+    var drv = ListDriver{ .rows_data = rows_data };
+    const one = (try queryOne(Item, allocator, drv.asDriver(), "SELECT ...", &.{})) orelse return error.ExpectedRow;
+    defer freeDto(Item, allocator, &one);
+    try std.testing.expectEqual(@as(i64, 7), one.sku_id);
+    try std.testing.expectEqualStrings("pear", one.title);
+
+    var drv_empty = ListDriver{ .rows_data = &.{} };
+    try std.testing.expect((try queryOne(Item, allocator, drv_empty.asDriver(), "SELECT ...", &.{})) == null);
+}
+
+test "queryAll frees scanned items when a later row fails" {
+    const allocator = std.testing.allocator;
+    const Item = struct {
+        sku_id: i64,
+        title: []const u8,
+    };
+    // Second row has sku_id NULL → scanRowNamed raises TypeMismatch after the
+    // first item (with an owned string) was already appended; errdefer must
+    // free it. std.testing.allocator turns any leak into a test failure.
+    const rows_data = &[_]NamedRowData{
+        .{
+            .names = &.{ "sku_id", "title" },
+            .ints = &.{ 1, null },
+            .texts = &.{ null, "apple" },
+            .nulls = &.{ false, false },
+        },
+        .{
+            .names = &.{ "sku_id", "title" },
+            .ints = &.{ null, null },
+            .texts = &.{ null, "bad" },
+            .nulls = &.{ true, false },
+        },
+    };
+    var drv = ListDriver{ .rows_data = rows_data };
+    try std.testing.expectError(error.TypeMismatch, queryAll(Item, allocator, drv.asDriver(), "SELECT ...", &.{}));
 }
