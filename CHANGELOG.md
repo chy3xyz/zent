@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-09-11
+
 ### Added
 - **Typed predicates for IN / NULL / prefix / suffix / case-insensitive.**
   Every field gains `In`, `NotIn`, `IsNull`, `NotNil`; `string`/`text` fields
