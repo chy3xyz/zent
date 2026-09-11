@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Outbox stale-claim recovery.** The claim-based dispatcher added in 0.35.0
+  could strand a row in `processing` forever if a dispatcher died after
+  claiming it. `OutboxMessage` now has a nullable `claimed_at` column (epoch
+  ms) that `claim` writes in the same statement that flips the row to
+  `processing`, and the new `OutboxOps.requeueStale(allocator, client,
+  older_than_secs)` returns `processing` rows whose claim is older than the
+  threshold — a NULL `claimed_at` counts as stale, and `older_than_secs <= 0`
+  reclaims every `processing` row — to `pending` with `claimed_at` cleared.
+  `markPublished` / `markFailed` / `requeue` also clear `claimed_at`. Call
+  `requeueStale` from a periodic sweeper (a threshold several times the
+  longest publish). **This adds a column, so existing deployments need one
+  schema migration** (`migrateSchema` adds it automatically; downgrades must
+  drop it manually).
 - **Migration locking and checksum verification.** `MigrateOptions.lock_timeout_ms`
   (default 10 s, `0` disables) takes an advisory lock for the whole migration:
   `pg_advisory_lock` on PostgreSQL and `GET_LOCK`/`RELEASE_LOCK` on MySQL, so

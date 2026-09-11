@@ -2467,6 +2467,14 @@ test "MySQL: outbox claim is exclusive and requeue re-enables a row" {
     defer OutboxOps.freeEntries(allocator, second);
     try testing.expectEqual(@as(usize, 0), second.len);
 
+    // Fresh claims carry a non-NULL claimed_at, so a generous stale threshold
+    // reclaims nothing; threshold 0 reclaims every processing row.
+    try testing.expectEqual(@as(usize, 0), try OutboxOps.requeueStale(allocator, client, 3600));
+    try testing.expectEqual(@as(usize, 2), try OutboxOps.requeueStale(allocator, client, 0));
+    const reclaimed = try OutboxOps.claim(allocator, client, 10);
+    defer OutboxOps.freeEntries(allocator, reclaimed);
+    try testing.expectEqual(@as(usize, 2), reclaimed.len);
+
     // requeue returns a row to pending so it can be claimed again.
     try OutboxOps.requeue(allocator, client, id1, 1);
     const third = try OutboxOps.claim(allocator, client, 10);
