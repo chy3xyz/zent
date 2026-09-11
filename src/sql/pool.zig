@@ -396,11 +396,14 @@ pub fn ConnPool(comptime D: type) type {
                 }
             }
 
-            self.available.append(self.allocator, entry) catch {
-                // If bookkeeping fails, drop the connection.
+            // Bookkeeping failure is fatal for this entry: close it rather than
+            // leaving a borrowed connection unreachable. `closeConnection`
+            // frees the entry, so it must not be touched afterwards.
+            if (self.available.append(self.allocator, entry)) |_| {
+                entry.idle_since = unixTimestamp();
+            } else |_| {
                 self.closeConnection(entry);
-            };
-            entry.idle_since = unixTimestamp();
+            }
             self.cond.signal(io);
 
             if (self.options.metrics.onRelease) |cb| cb(self.options.metrics.context);
