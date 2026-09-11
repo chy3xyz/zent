@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-09-11
+
 ### Added
 - **BulkInsert chunks rows around the bound-parameter limit.** `BulkInsert.Save`
   emitted a single multi-row INSERT, so a batch large enough to exceed the
