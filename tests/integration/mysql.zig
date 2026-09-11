@@ -22,25 +22,37 @@ const HookContext = zent.runtime.hook.HookContext;
 const HookError = zent.runtime.hook.HookError;
 const Op = zent.runtime.hook.Op;
 
-fn connect(allocator: std.mem.Allocator) !MySQLDriver {
-    // Symmetric with SKIP_PG in postgres.zig: setting SKIP_MYSQL skips every
-    // MySQL integration test without needing a server. connect() is the
-    // shared entry point, so one check covers all tests.
-    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_MYSQL") != null) return error.SkipZigTest;
-    const host = std.process.Environ.getPosix(std.testing.environ, "MYSQL_HOST") orelse "localhost";
-    const port_s = std.process.Environ.getPosix(std.testing.environ, "MYSQL_PORT") orelse "3306";
-    const user = std.process.Environ.getPosix(std.testing.environ, "MYSQL_USER") orelse "root";
-    const pass = std.process.Environ.getPosix(std.testing.environ, "MYSQL_PASS") orelse "";
-    const db = std.process.Environ.getPosix(std.testing.environ, "MYSQL_DB") orelse "zent_test";
+const Dsn = struct {
+    host: [:0]const u8,
+    port: u32,
+    user: [:0]const u8,
+    pass: [:0]const u8,
+    db: [:0]const u8,
+};
 
-    return MySQLDriver.connect(
-        allocator,
-        host,
-        try std.fmt.parseInt(u32, port_s, 10),
-        user,
-        pass,
-        db,
-    );
+fn dsn() !Dsn {
+    // Symmetric with SKIP_PG in postgres.zig: setting SKIP_MYSQL skips every
+    // MySQL integration test without needing a server. dsn() is the shared
+    // entry point, so one check covers all tests.
+    if (std.process.Environ.getPosix(std.testing.environ, "SKIP_MYSQL") != null) return error.SkipZigTest;
+    const port_s = std.process.Environ.getPosix(std.testing.environ, "MYSQL_PORT") orelse "3306";
+    return .{
+        .host = std.process.Environ.getPosix(std.testing.environ, "MYSQL_HOST") orelse "localhost",
+        .port = try std.fmt.parseInt(u32, port_s, 10),
+        .user = std.process.Environ.getPosix(std.testing.environ, "MYSQL_USER") orelse "root",
+        .pass = std.process.Environ.getPosix(std.testing.environ, "MYSQL_PASS") orelse "",
+        .db = std.process.Environ.getPosix(std.testing.environ, "MYSQL_DB") orelse "zent_test",
+    };
+}
+
+fn connect(allocator: std.mem.Allocator) !MySQLDriver {
+    const d = try dsn();
+    return MySQLDriver.connect(allocator, d.host, d.port, d.user, d.pass, d.db);
+}
+
+fn connectSsl(allocator: std.mem.Allocator, cfg: MySQLDriver.SslConfig) !MySQLDriver {
+    const d = try dsn();
+    return MySQLDriver.connectOptsSsl(allocator, d.host, d.port, d.user, d.pass, d.db, cfg);
 }
 
 fn skipIfNoServer(e: anyerror) anyerror!void {
@@ -2508,4 +2520,134 @@ test "MySQL: migration lock times out while another session holds it" {
         .lock_timeout_ms = 1000,
     });
     try testing.expectError(error.MigrationLockTimeout, res);
+}
+
+// ---------------------------------------------------------------------------
+// TLS / mTLS
+//
+// These tests need a server whose SSL is enabled and a CA PEM on disk, taken
+// from the environment (see sslEnv). Every one of them skips when MYSQL_SSL_CA
+// is unset or unreadable, so TLS-less environments (CI containers) stay green.
+// ---------------------------------------------------------------------------
+
+fn pathExists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(testing.io, path, .{}) catch return false;
+    return true;
+}
+
+const SslEnv = struct {
+    ca: [:0]const u8,
+    cert: ?[:0]const u8,
+    key: ?[:0]const u8,
+};
+
+fn sslEnv() !SslEnv {
+    const ca = std.process.Environ.getPosix(std.testing.environ, "MYSQL_SSL_CA") orelse return error.SkipZigTest;
+    if (!pathExists(ca)) return error.SkipZigTest;
+    const cert = std.process.Environ.getPosix(std.testing.environ, "MYSQL_SSL_CERT");
+    const key = std.process.Environ.getPosix(std.testing.environ, "MYSQL_SSL_KEY");
+    if (cert) |p| if (!pathExists(p)) return error.SkipZigTest;
+    if (key) |p| if (!pathExists(p)) return error.SkipZigTest;
+    return .{ .ca = ca, .cert = cert, .key = key };
+}
+
+/// A self-signed CA that did not issue the test server's certificate. Used as
+/// a deliberately wrong trust anchor; kept inline so the negative test needs
+/// nothing but MYSQL_SSL_CA.
+const wrong_ca_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIDGzCCAgOgAwIBAgIUV0rVu7QiQnWdTLQuFfiBf6koMd0wDQYJKoZIhvcNAQEL
+    \\BQAwHTEbMBkGA1UEAwwSemVudC10ZXN0LXdyb25nLWNhMB4XDTI2MDkxMTEzNTkw
+    \\M1oXDTM2MDkwODEzNTkwM1owHTEbMBkGA1UEAwwSemVudC10ZXN0LXdyb25nLWNh
+    \\MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1d29PJP3y2AwUEscDYkp
+    \\gUrYfVWwoPJCzKqu7BBi9jnQmWUSL0Ubq50P9USAntoP8JHxk3bWoY1Azdkbm9N6
+    \\JH/p/GcFdH6Ph3OA8Iz6HPasKN6/Q5PmWs2H97+NDFPIeqo4/51H7A8H5bIrzIRP
+    \\F3EAYNGe4c1MiUkigewU1O1x9X0vsDYOad8G3KJ/Tn4ZoXK7NAC263dUI14MhfHH
+    \\FeHDJ9kNiDZlXz/JIGYOUda3yrrFtFfXOL6OPjoZikfWguXeBFYXMWOswiou1zLN
+    \\Ezd8NS5LAU75DjF1q8CMHvE+2b0j6KQKTU7pCtCd+KrMnqKaV4iGJI5ywVUs8oqt
+    \\JQIDAQABo1MwUTAdBgNVHQ4EFgQUnShwnCfO1sB47tqqJi2zTMS6QPcwHwYDVR0j
+    \\BBgwFoAUnShwnCfO1sB47tqqJi2zTMS6QPcwDwYDVR0TAQH/BAUwAwEB/zANBgkq
+    \\hkiG9w0BAQsFAAOCAQEAkiCWoPzYOj7u4fxdbY6mcKy/v3MefvvJBYFCNe2cJPCA
+    \\hd4V4Hh7/+z3+eUTZMwzx3/kq6W6j5x+tRkU+GbovMleM7qbWCBjexXlX9TdLDNO
+    \\tQCeD19VCF1eRspSqVjOlolZFNNSXFp8HGrho6nEIha2/Kg3W/XeZs/Hma0vrWoK
+    \\Cxu5+Po1NDJbABsaEtwWq+3XZjSGEMlVE9DzIKtjdjRDAnMcm93sJ2dv5DiOiko8
+    \\2H6N6sq512XlU77pG8e/BTS5sDY2NC7zLVpKu6leEy8lQjo11cWnM+UK89sJp7py
+    \\SO4T0DO3GTRAMs7C80/UIFvSoJ4BY6EzNIq4co0J4A==
+    \\-----END CERTIFICATE-----
+;
+
+test "MySQL: required SSL mode negotiates an encrypted session" {
+    const allocator = testing.allocator;
+    const ssl = try sslEnv();
+
+    var drv = connectSsl(allocator, .{ .mode = .required, .ca = ssl.ca }) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // A plaintext session reports an empty Ssl_cipher; a non-empty value can
+    // only come from a completed TLS handshake.
+    var rows = try drv.query("SHOW SESSION STATUS LIKE 'Ssl_cipher'", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    const cipher = row.getText(1) orelse return error.NoRow;
+    try testing.expect(cipher.len > 0);
+}
+
+test "MySQL: verify_ca accepts the configured CA and rejects a foreign one" {
+    const allocator = testing.allocator;
+    const ssl = try sslEnv();
+
+    // The server's real CA must validate the server certificate.
+    {
+        var drv = connectSsl(allocator, .{ .mode = .verify_ca, .ca = ssl.ca }) catch |err| return skipIfNoServer(err);
+        drv.close();
+    }
+
+    // An unrelated self-signed CA must make the connect fail. This is what
+    // proves `ca` actually reaches mysql_ssl_set and is used for
+    // verification: drop it (or skip verification) and this connect succeeds.
+    const wrong_ca = "zent_test_wrong_ca.pem";
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(testing.io, .{ .sub_path = wrong_ca, .data = wrong_ca_pem });
+    defer cwd.deleteFile(testing.io, wrong_ca) catch {};
+
+    const res = connectSsl(allocator, .{ .mode = .verify_ca, .ca = wrong_ca });
+    try testing.expectError(error.MySQLConnectFailed, res);
+}
+
+test "MySQL: client certificate satisfies REQUIRE X509 and its absence is rejected" {
+    const allocator = testing.allocator;
+    const ssl = try sslEnv();
+    const cert = ssl.cert orelse return error.SkipZigTest;
+    const key = ssl.key orelse return error.SkipZigTest;
+
+    var admin = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer admin.close();
+
+    // 'localhost' covers both the socket and the TCP path this test uses.
+    // REQUIRE X509 makes the server refuse any client without a certificate.
+    _ = try admin.exec("DROP USER IF EXISTS 'zent_mtls'@'localhost'", &.{});
+    defer _ = admin.exec("DROP USER IF EXISTS 'zent_mtls'@'localhost'", &.{}) catch {};
+    _ = try admin.exec("CREATE USER 'zent_mtls'@'localhost' REQUIRE X509", &.{});
+    _ = try admin.exec("GRANT SELECT ON *.* TO 'zent_mtls'@'localhost'", &.{});
+
+    const d = try dsn();
+
+    // Presenting cert + key satisfies the server's certificate requirement.
+    {
+        var with_cert = MySQLDriver.connectOptsSsl(allocator, d.host, d.port, "zent_mtls", "", d.db, .{
+            .mode = .required,
+            .ca = ssl.ca,
+            .cert = cert,
+            .key = key,
+        }) catch |err| return err;
+        defer with_cert.close();
+        try with_cert.ping();
+    }
+
+    // Without a client certificate the same credentials must be refused.
+    const res = MySQLDriver.connectOptsSsl(allocator, d.host, d.port, "zent_mtls", "", d.db, .{
+        .mode = .required,
+        .ca = ssl.ca,
+    });
+    try testing.expectError(error.MySQLConnectFailed, res);
 }

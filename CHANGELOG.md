@@ -31,6 +31,19 @@ All notable changes to this project will be documented in this file.
   instead of silently skipped. The history table's `checksum` column may be
   NULL (schema-diff migrations and rows predating verification), which is
   treated as "not recorded" rather than a mismatch.
+- **MySQL TLS material (CA, client certificate/key, cipher).** The MySQL
+  driver previously called `mysql_ssl_set` with every argument NULL, so
+  `verify_ca` enabled certificate verification with no CA to verify against
+  and mutual TLS was impossible. `MySQLDriver.SslConfig` (`mode` plus `ca`,
+  `capath`, `cert`, `key`, `cipher` PEM paths) is now threaded through the new
+  `connectOptsSsl` / `connectOptsSslSocket` entry points; the existing
+  `connect` / `connectOpts` / `connectOptsSocket` keep their signatures and
+  delegate with `SslConfig{ .mode = ... }`. `verify_ca` only verifies when a
+  `ca` (or `capath`) is supplied, and `REQUIRE X509` needs both `cert` and
+  `key`. Integration coverage (skipped unless `MYSQL_SSL_CA` is set, with
+  `MYSQL_SSL_CERT` / `MYSQL_SSL_KEY` for mTLS) asserts an actual TLS session
+  via `Ssl_cipher`, that a wrong CA is rejected, and that a client
+  certificate satisfies `REQUIRE X509` while its absence does not.
 
 ### Fixed
 - **Interceptor chains survive a `Client` move.** `Client` held its interceptor

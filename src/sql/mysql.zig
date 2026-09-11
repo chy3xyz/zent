@@ -116,15 +116,54 @@ pub const MySQLDriver = struct {
         verify_ca = 4,
     };
 
+    /// TLS material for the `connectOptsSsl*` entry points. Paths are PEM
+    /// files, all null-terminated, and are borrowed only for the duration of
+    /// the connect call.
+    ///
+    /// The mode on its own is not enough to verify anything: `verify_ca`
+    /// needs `ca` (or `capath`) to have something to validate the server
+    /// certificate against — with neither, the connector can still complete
+    /// the handshake, so the mode alone is only a policy hint. Mutual TLS
+    /// (e.g. a server-side `REQUIRE X509`) needs both `cert` and `key`;
+    /// supplying only one leaves the server unsatisfied.
+    ///
+    /// Supplying any path also makes the handshake mandatory in this
+    /// connector build (`mysql_ssl_set` implies enforcement), so `preferred`
+    /// falls back to plaintext only when no material is given.
+    pub const SslConfig = struct {
+        mode: SslMode = .preferred,
+        /// PEM bundle of trusted CAs (mysql_ssl_set's `ca`).
+        ca: ?[:0]const u8 = null,
+        /// Directory of hashed CA certificates (mysql_ssl_set's `capath`).
+        capath: ?[:0]const u8 = null,
+        /// Client certificate for mutual TLS (mysql_ssl_set's `cert`).
+        cert: ?[:0]const u8 = null,
+        /// Client private key for mutual TLS (mysql_ssl_set's `key`).
+        key: ?[:0]const u8 = null,
+        /// Cipher list (mysql_ssl_set's `cipher`).
+        cipher: ?[:0]const u8 = null,
+    };
+
     pub fn connect(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8) !MySQLDriver {
         return connectOpts(allocator, host, port, user, passwd, dbname, .preferred);
     }
 
     pub fn connectOpts(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, ssl_mode: SslMode) !MySQLDriver {
-        return connectOptsSocket(allocator, host, port, user, passwd, dbname, ssl_mode, null);
+        return connectOptsSsl(allocator, host, port, user, passwd, dbname, .{ .mode = ssl_mode });
     }
 
+    /// Connect with a unix socket instead of TCP. `unix_socket == null`
+    /// means TCP.
     pub fn connectOptsSocket(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, ssl_mode: SslMode, unix_socket: ?[:0]const u8) !MySQLDriver {
+        return connectOptsSslSocket(allocator, host, port, user, passwd, dbname, .{ .mode = ssl_mode }, unix_socket);
+    }
+
+    /// Like `connectOpts`, but carries CA/client-certificate/key/cipher.
+    pub fn connectOptsSsl(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, cfg: SslConfig) !MySQLDriver {
+        return connectOptsSslSocket(allocator, host, port, user, passwd, dbname, cfg, null);
+    }
+
+    pub fn connectOptsSslSocket(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, cfg: SslConfig, unix_socket: ?[:0]const u8) !MySQLDriver {
         const conn = c.mysql_init(null);
         if (conn == null) return error.MySQLInitFailed;
 
@@ -138,26 +177,40 @@ pub const MySQLDriver = struct {
             checkOpt("write_timeout", c.mysql_options(conn, c.MYSQL_OPT_WRITE_TIMEOUT, &default_write_timeout));
         }
 
+        // mysql_ssl_set's parameter order is (key, cert, ca, capath, cipher).
+        const key_ptr: ?[*:0]const u8 = if (cfg.key) |v| v.ptr else null;
+        const cert_ptr: ?[*:0]const u8 = if (cfg.cert) |v| v.ptr else null;
+        const ca_ptr: ?[*:0]const u8 = if (cfg.ca) |v| v.ptr else null;
+        const capath_ptr: ?[*:0]const u8 = if (cfg.capath) |v| v.ptr else null;
+        const cipher_ptr: ?[*:0]const u8 = if (cfg.cipher) |v| v.ptr else null;
+        const has_material = cfg.ca != null or cfg.capath != null or
+            cfg.cert != null or cfg.key != null or cfg.cipher != null;
+
         // SSL mode. Note: this mariadb-connector-c build exposes
         // MYSQL_OPT_SSL_ENFORCE but not MYSQL_OPT_SSL_MODE; calling
         // mysql_ssl_set implicitly enforces SSL (that combination broke
-        // plain servers like the CI mariadb container), so PREFERRED only
-        // sets ENFORCE=0 and lets the client fall back to plaintext.
-        switch (ssl_mode) {
+        // plain servers like the CI mariadb container), so PREFERRED does not
+        // touch SSL at all unless the caller explicitly supplied material —
+        // those files would otherwise be silently ignored, and a caller that
+        // names a CA/cert wants TLS regardless of the fallback hint.
+        switch (cfg.mode) {
             .required => {
-                _ = c.mysql_ssl_set(conn, null, null, null, null, null);
+                _ = c.mysql_ssl_set(conn, key_ptr, cert_ptr, ca_ptr, capath_ptr, cipher_ptr);
                 const enforce: c_uint = 1;
                 try requireOpt("ssl_enforce(required)", c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce));
             },
             .preferred => {
+                if (has_material) {
+                    _ = c.mysql_ssl_set(conn, key_ptr, cert_ptr, ca_ptr, capath_ptr, cipher_ptr);
+                }
                 const enforce: c_uint = 0;
                 checkOpt("ssl_enforce(preferred)", c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce));
             },
             .disabled => {
-                // No SSL at all.
+                // No SSL at all; any TLS material is intentionally ignored.
             },
             .verify_ca => {
-                _ = c.mysql_ssl_set(conn, null, null, null, null, null);
+                _ = c.mysql_ssl_set(conn, key_ptr, cert_ptr, ca_ptr, capath_ptr, cipher_ptr);
                 const enforce: c_uint = 1;
                 try requireOpt("ssl_enforce(verify_ca)", c.mysql_options(conn, c.MYSQL_OPT_SSL_ENFORCE, &enforce));
                 const verify: c_uint = 1;
