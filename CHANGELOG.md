@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Typed predicates for IN / NULL / prefix / suffix / case-insensitive.**
+  Every field gains `In`, `NotIn`, `IsNull`, `NotNil`; `string`/`text` fields
+  gain `HasPrefix`, `HasSuffix`, `ContainsFold`, `EQFold`; every edge gains
+  `NotHas<Edge>`. The LIKE variants reuse the escaped-literal renderer, so
+  user input stays literal (wildcards escaped) with no injection surface and
+  no pre-escaped allocation. `Has<Edge>With` already accepted the target
+  entity's typed predicates; that is now covered by a test. Catalogue in
+  `BEST_PRACTICES` §3a.
 - **Edge writes on `UpdateBuilder`.** Association maintenance no longer needs
   hand-written junction SQL: `AddEdgeIDs(edge, ids)` (idempotent),
   `RemoveEdgeIDs(edge, ids)`, `SetEdgeIDs(edge, ids)` (replace, detaching the
@@ -27,6 +35,59 @@ All notable changes to this project will be documented in this file.
   `pending` remains as a non-claiming read path.
 
 ### Fixed
+- **Eager loading generated invalid SQL past the parameter limit.**
+  `writeInClauseChunked` emitted `col IN (a, b) OR (c, d)` — a bare row value
+  as an OR operand, which PostgreSQL rejects and SQLite reports as
+  "row value misused". Any `WithEdge` load over 500 parents failed. Each chunk
+  now repeats `col IN (...)`.
+- **Eager-loaded targets bypassed the read contract of a normal query.** They
+  were fetched with no soft-delete filter, no privacy policy/row filters and
+  no interceptor chain — a cross-tenant leak wherever interceptors inject the
+  tenant, plus soft-deleted children appearing in results. The target contract
+  (soft-delete → privacy → interceptors) is now applied inside the neighbour
+  `WHERE`, before any per-parent window ranking, so a filtered row cannot
+  consume a per-parent `LIMIT` slot.
+- **`QueryEdge` traversal emitted dialect-invalid SQL.** `queryTargets`
+  hand-concatenated `?` placeholders, double-quoted identifiers and literal
+  `"id"` / `{table}_id` key and junction columns — wrong on PostgreSQL and
+  MySQL, and wrong on SQLite whenever the primary key or junction column was
+  named differently. It now renders through the same generator as eager
+  loading (`buildEdgeStep` + `appendSetNeighborsFiltered`) and applies the
+  target's soft-delete scope. The helper still takes no
+  privacy_ctx/interceptors — documented on the function; use `WithEdge` when
+  you need tenant scoping.
+- **PostgreSQL and MySQL issued an extra `SET` per statement.** Both drivers
+  ran the timeout reset unconditionally in a `defer`, even when the statement
+  carried no deadline (MySQL performed no SET at all in that case, so the
+  reset was pure overhead). They now track the timeout in effect per
+  connection and only send `SET` when the desired value differs:
+  deadline-free statements cost zero extra round-trips, and statements with a
+  deadline lose the trailing reset.
+- **Concurrency failures could not be told apart.** PostgreSQL 40001/40P01,
+  MySQL 1205/1213 and SQLite BUSY/LOCKED all collapsed into generic failure
+  errors, so callers could not know what was worth retrying. They now map to
+  `SerializationFailure` / `DeadlockDetected` / `LockTimeout`,
+  `driver.isRetryable` classifies transient errors, and `driver.retryTx`
+  replays a whole transaction with exponential backoff (`Tx.deinit` exactly
+  once per attempt).
+- **MySQL no-arg `exec` left its result set pending.** A `SELECT` issued
+  through exec made the NEXT command fail with errno 2014 "Commands out of
+  sync". The result set is now consumed and freed (a no-op for
+  INSERT/UPDATE/DDL).
+- **Quoted identifiers did not escape their own quote character.** A name
+  containing `"` (or a backtick on MySQL) closed the identifier early —
+  reachable from request input via ORDER BY column names. `Builder.ident`,
+  `Dialect.quoteIdent` and `quoteIdentToBuffer` now double embedded quotes per
+  the SQL standard.
+- **Migrations hardcoded `std.heap.page_allocator`.** `createTables`,
+  `createAllTables` and `Client.createAllTables` now take an allocator and
+  thread it through the `*Alloc` SQL builders, so allocate/free always pair on
+  the same allocator and those paths are leak-checked under
+  `std.testing.allocator`.
+- **Connection-pool release wrote to a freed entry on the OOM path.**
+  `release` closed the entry in a `catch` and then still assigned
+  `entry.idle_since`; closing destroys the entry, so that was a
+  use-after-free write.
 - **Connection-pool metrics callbacks run outside the mutex.** `borrow` and
   `release` now invoke `Metrics.onBorrow` / `Metrics.onRelease` after
   unlocking, so a callback that re-enters the pool (reads pool state, borrows
