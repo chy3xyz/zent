@@ -14,6 +14,35 @@ All notable changes to this project will be documented in this file.
   rejected for detach operations. The statements are scoped by a subquery over
   the same predicate set as the parent UPDATE, so they inherit its privacy /
   interceptor scoping — wrap the update in `beginTx` for atomicity.
+- **Outbox claim-based dispatch.** New `Outbox.claim(allocator, client, limit)`
+  atomically moves a batch of rows from `pending` to the new `processing`
+  status and returns them, and `dispatch` now goes through it. PostgreSQL and
+  SQLite claim in a single `UPDATE … RETURNING` (PostgreSQL adds
+  `FOR UPDATE SKIP LOCKED`); MySQL runs `SELECT … FOR UPDATE SKIP LOCKED` plus
+  the `UPDATE` inside one transaction. Because the rows are reserved before
+  publishing, concurrent dispatchers no longer fetch and publish the same
+  rows. `processing` is a plain string value, so no migration/DDL change is
+  needed. Rows left in `processing` by a crash are **not** reaped
+  automatically (no recovery API is provided); requeue stale rows out of band.
+  `pending` remains as a non-claiming read path.
+
+### Fixed
+- **Connection-pool metrics callbacks run outside the mutex.** `borrow` and
+  `release` now invoke `Metrics.onBorrow` / `Metrics.onRelease` after
+  unlocking, so a callback that re-enters the pool (reads pool state, borrows
+  a connection, logs through the pool) no longer self-deadlocks. The borrow
+  path's health check still runs inside the mutex, so
+  `health_check_on_borrow` serializes concurrent borrows — a known limitation,
+  now documented on `Options.Metrics`.
+- **Privacy policies fail closed past their filter capacity.** A policy whose
+  rules produced more than the inline limit (8) row-level filters hit a
+  `std.debug.assert` — a process abort under ReleaseSafe, and a silently
+  dropped filter (widened result set for a security policy) in builds without
+  assertions. The overflow now denies the operation and logs why.
+- **`monotonicNs` no longer traps.** A failing `clock_gettime(CLOCK_MONOTONIC)`
+  hit `unreachable`, which is undefined behaviour in ReleaseFast and an abort
+  under ReleaseSafe. It now degrades to the wall clock with a warning and
+  reports 0 only if both clocks fail.
 
 ### Docs
 - Documented the predicate catalogue (`BEST_PRACTICES` §3a) and the new edge

@@ -2,8 +2,9 @@
 //! `zigmodu.OutboxPublisher/Poller`. Domain events are written in the SAME
 //! transaction as the business write (pass `tx.client`), so a commit makes
 //! the events visible atomically with the change; a background dispatcher
-//! polls pending rows and publishes them with at-least-once semantics
-//! (status + attempts drive retries).
+//! claims pending rows (pending -> processing) and publishes them with
+//! at-least-once semantics (status + attempts drive retries). Claiming is
+//! atomic, so concurrent dispatchers never publish the same row twice.
 //!
 //! Wiring:
 //!   const infos = zent.codegen.graph.buildGraph(&.{
@@ -24,6 +25,7 @@ const Schema = @import("core/schema.zig").Schema;
 const fromSchema = @import("codegen/graph.zig").fromSchema;
 const TypeInfo = @import("codegen/graph.zig").TypeInfo;
 const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+const sql_driver = @import("sql/driver.zig");
 const sql = @import("sql/builder.zig");
 
 /// Outbox table schema - include this type in your schema list so the
@@ -45,6 +47,9 @@ pub const info: TypeInfo = fromSchema(OutboxMessage);
 
 pub const Status = struct {
     pub const pending = "pending";
+    /// Rows claimed by a dispatcher and awaiting publish/requeue. `status` is
+    /// a plain string column, so adding this value needs no DDL change.
+    pub const processing = "processing";
     pub const published = "published";
     pub const failed = "failed";
 };
@@ -100,8 +105,11 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             return enqueue(tx.client, now_ms, msg);
         }
 
-        /// Fetch up to `limit` pending rows, oldest first. Caller frees the
-        /// returned slice + strings via `freeEntries`.
+        /// Fetch up to `limit` pending rows, oldest first, WITHOUT claiming
+        /// them. Intended for inspection/backfill; to drive a dispatcher when
+        /// more than one may run, use `claim` instead so two dispatchers do
+        /// not pick the same rows.
+        /// Caller frees the returned slice + strings via `freeEntries`.
         pub fn pending(allocator: std.mem.Allocator, client: anytype, limit: usize) ![]Entry {
             const ec = @field(client, "outbox_message");
             var q = ec.Query();
@@ -174,10 +182,155 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             _ = try b.Save();
         }
 
-        /// At-least-once dispatch: publish each pending row, marking it
-        /// published on success; on error the row is requeued (pending,
-        /// attempts+1) until `max_attempts` is reached, then marked failed.
-        /// Returns the number of successfully dispatched rows.
+        /// Atomically claim up to `limit` pending rows for this dispatcher by
+        /// flipping them to `processing` in the same statement (SQLite /
+        /// PostgreSQL) or transaction (MySQL) that selects them. A concurrent
+        /// claimer therefore never gets the same rows: PostgreSQL/MySQL use
+        /// `FOR UPDATE SKIP LOCKED` so a second dispatcher skips locked rows
+        /// instead of blocking on them; SQLite's single-writer `UPDATE` is
+        /// atomic on its own.
+        ///
+        /// The returned entries are owned by the caller; free them with
+        /// `freeEntries`. Claimed rows stay `processing` until
+        /// `markPublished` / `markFailed` / `requeue` moves them on.
+        ///
+        /// Crash recovery: if the process dies after a claim the row is left
+        /// in `processing` and no dispatcher will pick it up again. This
+        /// module does NOT provide a reaper — operators must requeue stale
+        /// rows out of band. The schema has no `updated_at` column, so
+        /// age-based recovery has to key off `created_at` (or add an
+        /// updated-at column).
+        pub fn claim(allocator: std.mem.Allocator, client: anytype, limit: usize) ![]Entry {
+            const d = @field(client, "driver");
+            const dialect = d.dialect();
+            const table = outbox_info.table_name;
+
+            // SQLite and PostgreSQL select and flip the rows in one statement,
+            // so the claim is atomic without an explicit transaction.
+            // PostgreSQL adds FOR UPDATE SKIP LOCKED so a concurrent claimer
+            // skips locked rows instead of blocking.
+            if (std.mem.eql(u8, dialect.name, "postgres")) {
+                const q = comptime std.fmt.comptimePrint(
+                    "UPDATE \"{s}\" SET \"status\" = $1 WHERE \"id\" IN (" ++
+                        "SELECT \"id\" FROM \"{s}\" WHERE \"status\" = $2 " ++
+                        "ORDER BY \"created_at\" ASC LIMIT $3 FOR UPDATE SKIP LOCKED" ++
+                        ") RETURNING \"id\", \"aggregate_type\", \"aggregate_id\", " ++
+                        "\"event_type\", \"payload\", \"attempts\", \"created_at\"",
+                    .{ table, table },
+                );
+                var rows = try d.query(q, &.{
+                    .{ .string = Status.processing },
+                    .{ .string = Status.pending },
+                    .{ .int = @intCast(limit) },
+                });
+                defer rows.deinit();
+                return try collectRows(allocator, rows);
+            }
+
+            if (std.mem.eql(u8, dialect.name, "sqlite3")) {
+                const q = comptime std.fmt.comptimePrint(
+                    "UPDATE \"{s}\" SET \"status\" = ? WHERE \"id\" IN (" ++
+                        "SELECT \"id\" FROM \"{s}\" WHERE \"status\" = ? " ++
+                        "ORDER BY \"created_at\" ASC LIMIT ?" ++
+                        ") RETURNING \"id\", \"aggregate_type\", \"aggregate_id\", " ++
+                        "\"event_type\", \"payload\", \"attempts\", \"created_at\"",
+                    .{ table, table },
+                );
+                var rows = try d.query(q, &.{
+                    .{ .string = Status.processing },
+                    .{ .string = Status.pending },
+                    .{ .int = @intCast(limit) },
+                });
+                defer rows.deinit();
+                return try collectRows(allocator, rows);
+            }
+
+            // MySQL has no UPDATE ... RETURNING, so reserve the rows inside a
+            // transaction: SELECT ... FOR UPDATE SKIP LOCKED locks them (a
+            // concurrent claimer skips them), the UPDATE flips them to
+            // processing, and the commit releases the locks with the rows
+            // already claimed.
+            const select_sql = comptime std.fmt.comptimePrint(
+                "SELECT `id`, `aggregate_type`, `aggregate_id`, `event_type`, " ++
+                    "`payload`, `attempts`, `created_at` FROM `{s}` " ++
+                    "WHERE `status` = ? ORDER BY `created_at` ASC LIMIT ? FOR UPDATE SKIP LOCKED",
+                .{table},
+            );
+            const update_sql = comptime std.fmt.comptimePrint(
+                "UPDATE `{s}` SET `status` = ? WHERE `id` = ?",
+                .{table},
+            );
+
+            const tx = if (d.inTransaction())
+                try d.beginSavepoint("zent_outbox_claim")
+            else
+                try d.beginTx();
+            defer tx.deinit();
+            errdefer tx.rollback() catch {};
+
+            var rows = try tx.query(select_sql, &.{
+                .{ .string = Status.pending },
+                .{ .int = @intCast(limit) },
+            });
+            defer rows.deinit();
+            const claimed = try collectRows(allocator, rows);
+            errdefer freeEntries(allocator, claimed);
+
+            for (claimed) |e| {
+                _ = try tx.exec(update_sql, &.{
+                    .{ .string = Status.processing },
+                    .{ .int = e.id },
+                });
+            }
+            try tx.commit();
+            return claimed;
+        }
+
+        /// Duplicate every row of `rows` into an owned `[]Entry`. The caller
+        /// still owns `rows` (it must call `deinit`).
+        fn collectRows(allocator: std.mem.Allocator, rows: sql_driver.Rows) ![]Entry {
+            var list: std.ArrayListUnmanaged(Entry) = .empty;
+            errdefer {
+                for (list.items) |e| {
+                    allocator.free(e.aggregate_type);
+                    allocator.free(e.event_type);
+                    allocator.free(e.payload);
+                }
+                list.deinit(allocator);
+            }
+            while (rows.next()) |row| {
+                const id = row.getInt(0) orelse return error.OutboxRowMissingColumn;
+                const aggregate_type = try allocator.dupe(u8, row.getText(1) orelse return error.OutboxRowMissingColumn);
+                errdefer allocator.free(aggregate_type);
+                const aggregate_id = row.getInt(2) orelse return error.OutboxRowMissingColumn;
+                const event_type = try allocator.dupe(u8, row.getText(3) orelse return error.OutboxRowMissingColumn);
+                errdefer allocator.free(event_type);
+                const payload = try allocator.dupe(u8, row.getText(4) orelse return error.OutboxRowMissingColumn);
+                errdefer allocator.free(payload);
+                const attempts = row.getInt(5) orelse return error.OutboxRowMissingColumn;
+                const created_at = row.getInt(6) orelse return error.OutboxRowMissingColumn;
+                try list.append(allocator, .{
+                    .id = id,
+                    .aggregate_type = aggregate_type,
+                    .aggregate_id = aggregate_id,
+                    .event_type = event_type,
+                    .payload = payload,
+                    .attempts = attempts,
+                    .created_at = created_at,
+                });
+            }
+            return try list.toOwnedSlice(allocator);
+        }
+
+        /// At-least-once dispatch: claim a batch of pending rows, publish each
+        /// one, marking it published on success; on error the row is requeued
+        /// (pending, attempts+1) until `max_attempts` is reached, then marked
+        /// failed. Returns the number of successfully dispatched rows.
+        ///
+        /// Rows are claimed (pending -> processing) before publishing, so
+        /// concurrent dispatchers never publish the same row. A crash after
+        /// the claim leaves the row in `processing`; see `claim` for the
+        /// recovery note (no reaper is provided).
         pub fn dispatch(
             allocator: std.mem.Allocator,
             client: anytype,
@@ -186,7 +339,7 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             batch_size: usize,
             max_attempts: usize,
         ) !usize {
-            const entries = try pending(allocator, client, batch_size);
+            const entries = try claim(allocator, client, batch_size);
             defer freeEntries(allocator, entries);
             var dispatched: usize = 0;
             for (entries) |e| {
@@ -436,4 +589,122 @@ test "outbox pending returns oldest-first and respects limit" {
     try testing.expectEqual(@as(usize, 2), pending.len);
     try testing.expectEqual(@as(i64, 1000), pending[0].created_at);
     try testing.expectEqual(@as(i64, 2000), pending[1].created_at);
+}
+
+test "outbox claim is exclusive and requeue re-enables a row" {
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const infos = graph.types;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+    const OutboxOps = Outbox(infos, info);
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, drv.asDriver());
+
+    const id1 = try OutboxOps.enqueue(root, 1000, .{
+        .aggregate_type = "p",
+        .aggregate_id = 1,
+        .event_type = "a",
+        .payload = "{}",
+    });
+    _ = try OutboxOps.enqueue(root, 2000, .{
+        .aggregate_type = "p",
+        .aggregate_id = 2,
+        .event_type = "b",
+        .payload = "{}",
+    });
+
+    // The first claim flips both rows to processing and returns them.
+    const first = try OutboxOps.claim(allocator, root, 10);
+    defer OutboxOps.freeEntries(allocator, first);
+    try testing.expectEqual(@as(usize, 2), first.len);
+
+    // A second claimer sees none of the rows the first one claimed.
+    const second = try OutboxOps.claim(allocator, root, 10);
+    defer OutboxOps.freeEntries(allocator, second);
+    try testing.expectEqual(@as(usize, 0), second.len);
+
+    // The unclaimed `pending` read path agrees: nothing is pending.
+    const pend = try OutboxOps.pending(allocator, root, 10);
+    defer OutboxOps.freeEntries(allocator, pend);
+    try testing.expectEqual(@as(usize, 0), pend.len);
+
+    // The claimed row really carries the processing status.
+    {
+        const ec = @field(root, "outbox_message");
+        var q = ec.Query();
+        defer q.deinit();
+        _ = try q.Where(.{ec.predicates.idEQ(.{ .int = id1 })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| deinitEntity(infos, info, e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings(Status.processing, found.items[0].status);
+    }
+
+    // requeue puts a claimed row back to pending, so it can be claimed again.
+    try OutboxOps.requeue(allocator, root, id1, 1);
+    const third = try OutboxOps.claim(allocator, root, 10);
+    defer OutboxOps.freeEntries(allocator, third);
+    try testing.expectEqual(@as(usize, 1), third.len);
+    try testing.expectEqual(id1, third[0].id);
+
+    // Publishing removes it from the claimable set for good.
+    try OutboxOps.markPublished(allocator, root, third[0].id, 5000);
+    const fourth = try OutboxOps.claim(allocator, root, 10);
+    defer OutboxOps.freeEntries(allocator, fourth);
+    try testing.expectEqual(@as(usize, 0), fourth.len);
+}
+
+test "outbox dispatch claims before publish so a nested dispatcher cannot double-publish" {
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const infos = graph.types;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+    const OutboxOps = Outbox(infos, info);
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, drv.asDriver());
+
+    _ = try OutboxOps.enqueue(root, 1000, .{
+        .aggregate_type = "p",
+        .aggregate_id = 1,
+        .event_type = "a",
+        .payload = "{}",
+    });
+
+    const Ctx = struct {
+        client: *const @TypeOf(root),
+        published: usize = 0,
+        nested_claimed: usize = 0,
+
+        fn publish(ctx: ?*anyopaque, _: Entry) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ctx.?));
+            c.published += 1;
+            // The row being published is `processing`, so a second dispatcher
+            // running at this instant must claim nothing.
+            const nested = try OutboxOps.claim(std.testing.allocator, c.client.*, 10);
+            defer OutboxOps.freeEntries(std.testing.allocator, nested);
+            c.nested_claimed += nested.len;
+        }
+    };
+
+    var ctx = Ctx{ .client = &root };
+    const dispatched = try OutboxOps.dispatch(allocator, root, 3000, .{
+        .ctx = &ctx,
+        .call = Ctx.publish,
+    }, 10, 3);
+    try testing.expectEqual(@as(usize, 1), dispatched);
+    try testing.expectEqual(@as(usize, 1), ctx.published);
+    try testing.expectEqual(@as(usize, 0), ctx.nested_claimed);
 }

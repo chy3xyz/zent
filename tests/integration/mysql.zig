@@ -2428,3 +2428,49 @@ fn expectMyCarOwner(
     defer zent.codegen.deinitEntity(infos, car_info, &car, std.testing.allocator);
     try std.testing.expectEqual(expected, car.owner_id);
 }
+
+test "MySQL: outbox claim is exclusive and requeue re-enables a row" {
+    const allocator = testing.allocator;
+    const outbox = zent.outbox;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const graph = comptime buildGraph(&.{outbox.OutboxMessage});
+    const infos = graph.types;
+    const OutboxOps = outbox.Outbox(infos, outbox.info);
+
+    _ = try drv.exec("DROP TABLE IF EXISTS outbox_message", &.{});
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    defer _ = drv.exec("DROP TABLE IF EXISTS outbox_message", &.{}) catch {};
+
+    const client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    const id1 = try OutboxOps.enqueue(client, 1000, .{
+        .aggregate_type = "p",
+        .aggregate_id = 1,
+        .event_type = "a",
+        .payload = "{}",
+    });
+    _ = try OutboxOps.enqueue(client, 2000, .{
+        .aggregate_type = "p",
+        .aggregate_id = 2,
+        .event_type = "b",
+        .payload = "{}",
+    });
+
+    // First claim flips both rows to processing; a second claim gets none.
+    const first = try OutboxOps.claim(allocator, client, 10);
+    defer OutboxOps.freeEntries(allocator, first);
+    try testing.expectEqual(@as(usize, 2), first.len);
+
+    const second = try OutboxOps.claim(allocator, client, 10);
+    defer OutboxOps.freeEntries(allocator, second);
+    try testing.expectEqual(@as(usize, 0), second.len);
+
+    // requeue returns a row to pending so it can be claimed again.
+    try OutboxOps.requeue(allocator, client, id1, 1);
+    const third = try OutboxOps.claim(allocator, client, 10);
+    defer OutboxOps.freeEntries(allocator, third);
+    try testing.expectEqual(@as(usize, 1), third.len);
+    try testing.expectEqual(id1, third[0].id);
+}

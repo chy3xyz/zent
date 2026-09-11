@@ -48,9 +48,15 @@ pub fn ConnPool(comptime D: type) type {
         /// Factory used to create a new `D` instance.
         pub const ConnectFn = *const fn (allocator: std.mem.Allocator) anyerror!D;
 
-        /// Optional metrics callbacks. Borrow/release callbacks run while the
-        /// pool mutex is held; slow-query callbacks run after the driver call.
-        /// All callbacks should be fast and non-blocking.
+        /// Optional metrics callbacks. Borrow/release/error callbacks run after
+        /// the pool mutex is released, so they may safely re-enter the pool
+        /// (e.g. read pool state) without deadlocking; slow-query callbacks run
+        /// after the driver call. Callbacks should still be fast and
+        /// non-blocking to avoid delaying the caller.
+        ///
+        /// Known limitation: the borrow-path health check runs inside the
+        /// mutex, so `health_check_on_borrow` serializes concurrent borrows
+        /// while the ping is in flight.
         pub const Metrics = struct {
             /// Called when a connection is successfully borrowed.
             /// `wait_ms` is the total time spent waiting for a connection.
@@ -332,17 +338,27 @@ pub fn ConnPool(comptime D: type) type {
             const io = self.io;
             var attempt: u32 = 0;
             while (true) : (attempt += 1) {
+                // The locked section only records the outcome; the metrics
+                // callback fires after the mutex is released so it can safely
+                // re-enter the pool.
+                var borrowed: ?*PooledEntry = null;
+                var was_closed = false;
                 {
                     self.mutex.lockUncancelable(io);
                     defer self.mutex.unlock(io);
 
-                    if (self.closed) return error.PoolClosed;
-
-                    if (self.tryBorrowNoLock()) |entry| {
-                        if (self.options.metrics.onBorrow) |cb| cb(self.options.metrics.context, 0);
-                        return &entry.conn;
+                    if (self.closed) {
+                        was_closed = true;
+                    } else if (self.tryBorrowNoLock()) |entry| {
+                        borrowed = entry;
                     }
                 }
+
+                if (borrowed) |entry| {
+                    if (self.options.metrics.onBorrow) |cb| cb(self.options.metrics.context, 0);
+                    return &entry.conn;
+                }
+                if (was_closed) return error.PoolClosed;
 
                 if (attempt >= self.options.max_retries) break;
                 const backoff_ms: i64 = @as(i64, self.options.retry_backoff_ms) * (@as(i64, attempt) + 1);
@@ -357,56 +373,68 @@ pub fn ConnPool(comptime D: type) type {
         pub fn release(self: *Self, conn: *D) void {
             const entry: *PooledEntry = @fieldParentPtr("conn", conn);
             const io = self.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            if (self.closed) return;
-            const found = for (self.all.items) |item| {
-                if (item == entry) break true;
-            } else false;
-            if (!found) return;
+            // Only the outcomes that currently report `onRelease` (normal
+            // return and max-lifetime eviction) set this; the dead-connection
+            // path stays silent. The callback fires after the mutex is
+            // released so it can safely re-enter the pool.
+            var notify_release = false;
+            {
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                if (self.closed) return;
+                const found = for (self.all.items) |item| {
+                    if (item == entry) break true;
+                } else false;
+                if (!found) return;
 
-            // 连接已死（Lost connection）→ 直接关闭丢弃，不再回池复用；
-            // 否则后续操作触碰 libmysql 已释放句柄会段错误。
-            if (@hasField(D, "dead") and conn.dead) {
-                self.closeConnection(entry);
-                self.cond.signal(io);
-                return;
-            }
-
-            // Transaction leak protection: if the connection was returned with
-            // an active transaction, roll it back before returning it to the
-            // pool. Ignore errors because the transaction may already be aborted.
-            if (conn.asDriver().inTransaction()) {
-                _ = conn.asDriver().exec("ROLLBACK", &.{}) catch {};
-                // MySQL tracks transaction state client-side; clear the stale
-                // flag after a successful rollback attempt.
-                if (@hasField(D, "in_tx")) {
-                    conn.in_tx = false;
-                }
-            }
-
-            // Max lifetime eviction: close connections that have lived too long.
-            if (self.options.max_lifetime_secs > 0) {
-                const age_secs = unixTimestamp() - entry.created_at;
-                if (age_secs > self.options.max_lifetime_secs) {
+                // 连接已死（Lost connection）→ 直接关闭丢弃，不再回池复用；
+                // 否则后续操作触碰 libmysql 已释放句柄会段错误。
+                if (@hasField(D, "dead") and conn.dead) {
                     self.closeConnection(entry);
                     self.cond.signal(io);
-                    if (self.options.metrics.onRelease) |cb| cb(self.options.metrics.context);
                     return;
                 }
+
+                // Transaction leak protection: if the connection was returned with
+                // an active transaction, roll it back before returning it to the
+                // pool. Ignore errors because the transaction may already be aborted.
+                if (conn.asDriver().inTransaction()) {
+                    _ = conn.asDriver().exec("ROLLBACK", &.{}) catch {};
+                    // MySQL tracks transaction state client-side; clear the stale
+                    // flag after a successful rollback attempt.
+                    if (@hasField(D, "in_tx")) {
+                        conn.in_tx = false;
+                    }
+                }
+
+                // Max lifetime eviction: close connections that have lived too long.
+                var evicted = false;
+                if (self.options.max_lifetime_secs > 0) {
+                    const age_secs = unixTimestamp() - entry.created_at;
+                    if (age_secs > self.options.max_lifetime_secs) {
+                        self.closeConnection(entry);
+                        self.cond.signal(io);
+                        evicted = true;
+                    }
+                }
+
+                // Bookkeeping failure is fatal for this entry: close it rather than
+                // leaving a borrowed connection unreachable. `closeConnection`
+                // frees the entry, so it must not be touched afterwards.
+                if (!evicted) {
+                    if (self.available.append(self.allocator, entry)) |_| {
+                        entry.idle_since = unixTimestamp();
+                    } else |_| {
+                        self.closeConnection(entry);
+                    }
+                    self.cond.signal(io);
+                }
+                notify_release = true;
             }
 
-            // Bookkeeping failure is fatal for this entry: close it rather than
-            // leaving a borrowed connection unreachable. `closeConnection`
-            // frees the entry, so it must not be touched afterwards.
-            if (self.available.append(self.allocator, entry)) |_| {
-                entry.idle_since = unixTimestamp();
-            } else |_| {
-                self.closeConnection(entry);
+            if (notify_release) {
+                if (self.options.metrics.onRelease) |cb| cb(self.options.metrics.context);
             }
-            self.cond.signal(io);
-
-            if (self.options.metrics.onRelease) |cb| cb(self.options.metrics.context);
         }
 
         /// Proactively scan idle connections in the pool and close those that have been
@@ -1433,4 +1461,74 @@ test "ConnPool explicit io is not owned or destroyed by the pool" {
     // A borrow/release cycle should still work with the explicit Io.
     const conn = try pool.borrow();
     pool.release(conn);
+}
+
+test "ConnPool metrics callbacks run outside the mutex and may re-enter" {
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+    const P = ConnPool(SQLiteDriver);
+
+    const Ctx = struct {
+        pool: *P = undefined,
+        borrow_calls: usize = 0,
+        release_calls: usize = 0,
+        reentered_borrow: bool = false,
+        reentered_release: bool = false,
+
+        fn onBorrow(ctx: ?*anyopaque, _: u32) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.borrow_calls += 1;
+            // Re-enter exactly once: the nested borrow runs this callback
+            // again, so gate it on a flag (bounded recursion).
+            if (!c.reentered_borrow) {
+                c.reentered_borrow = true;
+                const inner = c.pool.borrow() catch return;
+                c.pool.release(inner);
+            }
+        }
+
+        fn onRelease(ctx: ?*anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.release_calls += 1;
+            if (!c.reentered_release) {
+                c.reentered_release = true;
+                const inner = c.pool.borrow() catch return;
+                c.pool.release(inner);
+            }
+        }
+    };
+
+    var ctx = Ctx{};
+    var pool = try P.init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, ":memory:");
+            }
+        }.f,
+        .min_connections = 2,
+        .max_connections = 2,
+        .health_check_on_borrow = false,
+        .metrics = .{
+            .onBorrow = Ctx.onBorrow,
+            .onRelease = Ctx.onRelease,
+            .context = &ctx,
+        },
+    });
+    defer pool.deinit();
+    ctx.pool = &pool;
+
+    // If the callbacks ran while the mutex was held, these re-entrant
+    // borrows would deadlock on the non-recursive pool mutex.
+    const c1 = try pool.borrow();
+    pool.release(c1);
+
+    try std.testing.expect(ctx.reentered_borrow);
+    try std.testing.expect(ctx.reentered_release);
+    try std.testing.expect(ctx.borrow_calls >= 2);
+    try std.testing.expect(ctx.release_calls >= 2);
+
+    // State is intact: the pool still hands out and takes back connections.
+    const c2 = try pool.borrow();
+    pool.release(c2);
+    try std.testing.expectEqual(@as(usize, 2), pool.available.items.len);
 }
