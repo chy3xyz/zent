@@ -63,6 +63,30 @@ fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
     @compileError("Edge not found: " ++ name ++ " on " ++ info.name);
 }
 
+/// QueryView sink for an eager-loaded target: validates the field against the
+/// target schema and collects `field = value` predicates to AND into the
+/// neighbor WHERE. `tinfo` is comptime so the field list can be scanned with
+/// `inline for` (FieldInfo carries a `type` and cannot be read at runtime).
+fn EdgeInterceptorSink(comptime tinfo: TypeInfo) type {
+    return struct {
+        preds: *std.ArrayListUnmanaged(sql.Predicate),
+        allocator: std.mem.Allocator,
+
+        fn addEq(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(sink));
+            var found = false;
+            inline for (tinfo.fields) |f| {
+                if (std.mem.eql(u8, f.name, field_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnknownField;
+            try self.preds.append(self.allocator, sql.EQ(field_name, value));
+        }
+    };
+}
+
 fn splitEdgePath(path: []const u8) struct { head: []const u8, rest: []const u8 } {
     if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
         return .{ .head = path[0..dot], .rest = path[dot + 1 ..] };
@@ -95,6 +119,9 @@ fn loadEdgePath(
     execution_context: sql_driver.ExecutionContext,
     entities: []ParentEntity,
     path: []const u8,
+    privacy_ctx: ?privacy.PrivacyContext,
+    interceptors: ?*intercept.InterceptorChain,
+    with_trashed: bool,
 ) !void {
     if (entities.len == 0 or path.len == 0) return;
     const split = splitEdgePath(path);
@@ -127,7 +154,43 @@ fn loadEdgePath(
 
             var b = sql.Builder.init(allocator, driver.dialect());
             defer b.deinit();
-            graph_neighbors.appendSetNeighbors(&b, step, parent_id_values) catch |err| {
+
+            // Eager-loaded neighbors honor the same read contract as the
+            // parent query: soft-delete scope, privacy policy filters, and
+            // registered interceptors (e.g. multi-tenant rewriting). They are
+            // ANDed into the neighbor WHERE before any per-parent limit, so a
+            // trashed or foreign-tenant row cannot consume a limit slot.
+            var extra_preds = std.ArrayListUnmanaged(sql.Predicate).empty;
+            defer extra_preds.deinit(allocator);
+
+            if (target_info.soft_delete and !with_trashed) {
+                try extra_preds.append(allocator, sql.IsNull("deleted_at"));
+            }
+
+            if (target_info.policy) |policy| {
+                var ctx = privacy_ctx orelse return error.PrivacyDenied;
+                ctx.op = .query;
+                const decision_set = policy.eval(ctx);
+                if (decision_set.decision == .deny) return error.PrivacyDenied;
+                for (decision_set.getFilters()) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    try extra_preds.append(allocator, pred.*);
+                }
+            }
+
+            if (interceptors) |chain| {
+                const Sink = EdgeInterceptorSink(target_info);
+                var sink = Sink{ .preds = &extra_preds, .allocator = allocator };
+                var view = intercept.QueryView{
+                    .op = .query,
+                    .table_name = target_info.table_name,
+                    .sink = &sink,
+                    .add_eq_fn = Sink.addEq,
+                };
+                chain.run(&view) catch return error.InterceptFailed;
+            }
+
+            graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_id_values, extra_preds.items) catch |err| {
                 return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
             };
             const qr = b.query();
@@ -191,7 +254,7 @@ fn loadEdgePath(
                     for (entities) |*e| {
                         const arr = @field(e.edges, edge.name);
                         if (arr) |items| {
-                            try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest);
+                            try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest, privacy_ctx, interceptors, with_trashed);
                         }
                     }
                 }
@@ -1219,7 +1282,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         fn loadEdges(self: *Self, edge_path: []const u8, entities: []Entity) !void {
-            return loadEdgePath(infos, info, Entity, self.allocator, self.driver, self.execution_context, entities, edge_path);
+            return loadEdgePath(infos, info, Entity, self.allocator, self.driver, self.execution_context, entities, edge_path, self.privacy_ctx, self.interceptors, self.with_trashed);
         }
 
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {

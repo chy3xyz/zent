@@ -488,7 +488,7 @@ test "stress: 30 tables compile and basic CRUD works" {
 
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     // CRUD smoke on T01 (O2M origin; no cross-referenced FK column).

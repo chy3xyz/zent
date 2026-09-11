@@ -542,7 +542,11 @@ pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
 }
 
 /// Create entity and junction tables without creating indexes.
-fn createTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+///
+/// Generated SQL is allocated from `allocator` and freed with the same
+/// allocator, so callers must pass the allocator they track (e.g. a testing
+/// allocator or an arena).
+fn createTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver_drv.dialect();
 
     // Create main entity tables (skip views)
@@ -552,16 +556,16 @@ fn createTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo)
     // own From edges AND from cross-referenced To edges.
     inline for (infos) |info| {
         if (info.is_view) {
-            const sql = try createViewSQL(info, dialect);
-            defer std.heap.page_allocator.free(sql);
+            const sql = try createViewSQLAlloc(allocator, info, dialect);
+            defer allocator.free(sql);
             _ = try driver_drv.exec(
                 sql,
                 &.{},
             );
         } else {
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
-            const sql = try createTableSQL(table, dialect);
-            defer std.heap.page_allocator.free(sql);
+            const sql = try createTableSQLAlloc(allocator, table, dialect);
+            defer allocator.free(sql);
             _ = try driver_drv.exec(sql, &.{});
         }
     }
@@ -574,8 +578,8 @@ fn createTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo)
         inline for (info.edges) |e| {
             if (e.relation == .m2m and e.through == null) {
                 const jtable = comptime junctionTableForEdge(e, info);
-                const sql = try createTableSQL(jtable, dialect);
-                defer std.heap.page_allocator.free(sql);
+                const sql = try createTableSQLAlloc(allocator, jtable, dialect);
+                defer allocator.free(sql);
                 _ = try driver_drv.exec(
                     sql,
                     &.{},
@@ -592,16 +596,16 @@ fn createTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo)
 /// `migrateSchema` for production use — it provides transactional atomicity
 /// (SQLite, PostgreSQL), idempotency via `zent_schema_migrations`, and
 /// automatic column/index additions on re-run.
-pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver_drv.dialect();
-    try createTables(driver_drv, infos);
+    try createTables(allocator, driver_drv, infos);
 
     inline for (infos) |info| {
         if (info.is_view or info.indexes.len == 0) continue;
 
         var existing_mysql_indexes: ?std.array_list.Managed(ExistingIndex) = null;
         if (std.mem.eql(u8, dialect.name, "mysql")) {
-            existing_mysql_indexes = getExistingIndexes(std.heap.page_allocator, driver_drv, info.table_name) catch |err| switch (err) {
+            existing_mysql_indexes = getExistingIndexes(allocator, driver_drv, info.table_name) catch |err| switch (err) {
                 error.UnsupportedDialect => unreachable, // The dialect was checked immediately above.
                 error.OutOfMemory => return error.OutOfMemory,
                 error.PoolExhausted => return error.PoolExhausted,
@@ -621,7 +625,7 @@ pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const Ty
             };
         }
         defer if (existing_mysql_indexes) |*indexes| {
-            freeExistingIndexes(std.heap.page_allocator, indexes);
+            freeExistingIndexes(allocator, indexes);
         };
 
         inline for (info.indexes) |idx| {
@@ -635,8 +639,8 @@ pub fn createAllTables(driver_drv: sql_driver.Driver, comptime infos: []const Ty
             else
                 false;
             if (!already_exists) {
-                const sql = try createIndexSQL(idx_def, info.table_name, dialect);
-                defer std.heap.page_allocator.free(sql);
+                const sql = try createIndexSQLAlloc(allocator, idx_def, info.table_name, dialect);
+                defer allocator.free(sql);
                 _ = try driver_drv.exec(sql, &.{});
             }
         }
@@ -772,11 +776,15 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
 }
 
 fn quoteIdentToBuffer(dialect: Dialect, buf: *std.array_list.Managed(u8), name: []const u8) !void {
-    if (std.mem.eql(u8, dialect.name, "mysql")) {
-        try buf.print("`{s}`", .{name});
-    } else {
-        try buf.print("\"{s}\"", .{name});
+    const quote: u8 = if (std.mem.eql(u8, dialect.name, "mysql")) '`' else '"';
+    try buf.append(quote);
+    for (name) |c| {
+        try buf.append(c);
+        // SQL-92 escapes an embedded quote by doubling it, so the identifier
+        // cannot be terminated early by a quote inside the name.
+        if (c == quote) try buf.append(c);
     }
+    try buf.append(quote);
 }
 
 fn isSQLiteDialect(dialect: Dialect) bool {
@@ -1098,22 +1106,20 @@ pub fn migrateSchemaWithOptions(
             sqls.deinit();
         }
 
+        // Each SQL string is owned by `sqls` and freed with `allocator` above;
+        // the `*Alloc` helpers allocate from the same allocator.
         // CREATE TABLE for non-view entities.
         inline for (infos) |info| {
             if (!info.is_view) {
                 const table = comptime tableFromTypeInfoCrossRef(info, infos);
-                const sql = try createTableSQL(table, dialect);
-                try sqls.append(try allocator.dupe(u8, sql));
-                std.heap.page_allocator.free(sql);
+                try sqls.append(try createTableSQLAlloc(allocator, table, dialect));
             }
         }
 
         // CREATE VIEW.
         inline for (infos) |info| {
             if (info.is_view) {
-                const sql = try createViewSQL(info, dialect);
-                try sqls.append(try allocator.dupe(u8, sql));
-                std.heap.page_allocator.free(sql);
+                try sqls.append(try createViewSQLAlloc(allocator, info, dialect));
             }
         }
 
@@ -1123,9 +1129,7 @@ pub fn migrateSchemaWithOptions(
             inline for (info.edges) |e| {
                 if (e.relation == .m2m and e.through == null) {
                     const jtable = comptime junctionTableForEdge(e, info);
-                    const sql = try createTableSQL(jtable, dialect);
-                    try sqls.append(try allocator.dupe(u8, sql));
-                    std.heap.page_allocator.free(sql);
+                    try sqls.append(try createTableSQLAlloc(allocator, jtable, dialect));
                 }
             }
         }
@@ -1139,9 +1143,7 @@ pub fn migrateSchemaWithOptions(
                     .columns = idx.columns,
                     .unique = idx.unique,
                 };
-                const sql = try createIndexSQL(idx_def, info.table_name, dialect);
-                try sqls.append(try allocator.dupe(u8, sql));
-                std.heap.page_allocator.free(sql);
+                try sqls.append(try createIndexSQLAlloc(allocator, idx_def, info.table_name, dialect));
             }
         }
 
@@ -1185,8 +1187,8 @@ pub fn migrateSchemaWithOptions(
         if (info.is_view) {
             const version = computeMigrationVersion(info.table_name, "create_view", "");
             if (!versionContains(applied, version)) {
-                const sql = try createViewSQL(info, dialect);
-                defer std.heap.page_allocator.free(sql);
+                const sql = try createViewSQLAlloc(allocator, info, dialect);
+                defer allocator.free(sql);
                 _ = try tx_drv.exec(sql, &.{});
                 try recordMigration(tx_drv, version, null);
             } else {
@@ -1195,8 +1197,8 @@ pub fn migrateSchemaWithOptions(
                 var existing = try getExistingColumns(allocator, tx_drv, info.table_name);
                 if (existing.items.len == 0) {
                     existing.deinit();
-                    const sql = try createViewSQL(info, dialect);
-                    defer std.heap.page_allocator.free(sql);
+                    const sql = try createViewSQLAlloc(allocator, info, dialect);
+                    defer allocator.free(sql);
                     _ = try tx_drv.exec(sql, &.{});
                     try recordMigration(tx_drv, version, null);
                 } else {
@@ -1207,8 +1209,8 @@ pub fn migrateSchemaWithOptions(
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
             const version = computeMigrationVersion(info.table_name, "create_table", "");
             if (!versionContains(applied, version)) {
-                const sql = try createTableSQL(table, dialect);
-                defer std.heap.page_allocator.free(sql);
+                const sql = try createTableSQLAlloc(allocator, table, dialect);
+                defer allocator.free(sql);
                 _ = try tx_drv.exec(sql, &.{});
                 try recordMigration(tx_drv, version, null);
             } else {
@@ -1218,8 +1220,8 @@ pub fn migrateSchemaWithOptions(
                 if (existing.items.len == 0) {
                     // Table does not exist — re-create it.
                     existing.deinit();
-                    const sql = try createTableSQL(table, dialect);
-                    defer std.heap.page_allocator.free(sql);
+                    const sql = try createTableSQLAlloc(allocator, table, dialect);
+                    defer allocator.free(sql);
                     _ = try tx_drv.exec(sql, &.{});
                     try recordMigration(tx_drv, version, null);
                 } else {
@@ -1238,8 +1240,8 @@ pub fn migrateSchemaWithOptions(
                 const jtable = comptime junctionTableForEdge(e, info);
                 const version = computeMigrationVersion(jtable.name, "create_junction", "");
                 if (!versionContains(applied, version)) {
-                    const sql = try createTableSQL(jtable, dialect);
-                    defer std.heap.page_allocator.free(sql);
+                    const sql = try createTableSQLAlloc(allocator, jtable, dialect);
+                    defer allocator.free(sql);
                     _ = try tx_drv.exec(sql, &.{});
                     try recordMigration(tx_drv, version, null);
                 } else {
@@ -1248,8 +1250,8 @@ pub fn migrateSchemaWithOptions(
                     var existing = try getExistingColumns(allocator, tx_drv, jtable.name);
                     if (existing.items.len == 0) {
                         existing.deinit();
-                        const sql = try createTableSQL(jtable, dialect);
-                        defer std.heap.page_allocator.free(sql);
+                        const sql = try createTableSQLAlloc(allocator, jtable, dialect);
+                        defer allocator.free(sql);
                         _ = try tx_drv.exec(sql, &.{});
                         try recordMigration(tx_drv, version, null);
                     } else {
@@ -1344,8 +1346,8 @@ pub fn migrateSchemaWithOptions(
             };
             if (!indexExists(existing_idxs.items, idx_def.name)) {
                 const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
-                const sql = try createIndexSQL(idx_def, table.name, dialect);
-                defer std.heap.page_allocator.free(sql);
+                const sql = try createIndexSQLAlloc(allocator, idx_def, table.name, dialect);
+                defer allocator.free(sql);
                 _ = try tx_drv.exec(sql, &.{});
                 try recordMigration(tx_drv, version, null);
             }
@@ -1741,6 +1743,32 @@ test "Create table SQL" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "AUTOINCREMENT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"name\" TEXT") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "\"age\" INTEGER") != null);
+}
+
+test "createTableSQL escapes embedded quotes in identifiers" {
+    const quoted = TableDef{
+        .name = "we\"ird",
+        .columns = &.{
+            ColumnDef{ .name = "co\"l", .sql_type = "INTEGER" },
+        },
+        .primary_keys = &.{},
+    };
+    const sql = try createTableSQL(quoted, Dialect.sqlite);
+    defer std.heap.page_allocator.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"we\"\"ird\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "\"co\"\"l\"") != null);
+
+    const backticked = TableDef{
+        .name = "we`ird",
+        .columns = &.{
+            ColumnDef{ .name = "co`l", .sql_type = "INTEGER" },
+        },
+        .primary_keys = &.{},
+    };
+    const mysql_sql = try createTableSQL(backticked, Dialect.mysql);
+    defer std.heap.page_allocator.free(mysql_sql);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`we``ird`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`co``l`") != null);
 }
 
 test "CREATE TABLE SQL includes ON DELETE/UPDATE cascade" {

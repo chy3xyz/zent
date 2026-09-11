@@ -124,7 +124,7 @@ test "MySQL: SaveOrUpdate updates existing row" {
 
     const graph = comptime buildGraph(&.{MyUpsertUser});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_upsert_user", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -160,7 +160,7 @@ test "MySQL: SaveIgnore ignores unique-key conflict" {
 
     const graph = comptime buildGraph(&.{MyIgnoreUser});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_ignore_user", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -199,7 +199,7 @@ test "MySQL: SaveOrUpdateOn uses business-key conflict target" {
 
     const graph = comptime buildGraph(&.{MySetting});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_setting", &.{}) catch {};
 
     // Business-key unique index required by ON CONFLICT / ODKU.
@@ -292,8 +292,8 @@ test "MySQL: migrateSchema is idempotent with existing table" {
     try testing.expectEqual(@as(i64, 1), index_row.getInt(0).?);
 
     // The create-only API must also tolerate an existing MySQL index.
-    try Client.createAllTables(graph.types, drv.asDriver());
-    try Client.createAllTables(graph.types, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, graph.types, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, graph.types, drv.asDriver());
 }
 
 test "MySQL: prepared statement cache" {
@@ -371,7 +371,7 @@ test "MySQL: privacy deny blocks query" {
 
     const graph = comptime buildGraph(&.{PrivateEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS private_entity", &.{}) catch {};
 
     // Insert a row via raw SQL so there is data to deny.
@@ -401,7 +401,7 @@ test "MySQL: hooks fire on create/update" {
 
     const graph = comptime buildGraph(&.{HookedUser});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS hooked_user", &.{}) catch {};
 
     // Flag to verify before-create hook fired.
@@ -471,7 +471,7 @@ test "MySQL: multi-insert and count" {
 
     const graph = comptime buildGraph(&.{BulkItem});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS bulk_item", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -520,7 +520,7 @@ test "MySQL: ForUpdate in transaction" {
 
     const graph = comptime buildGraph(&.{LockItem});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS lock_item", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -571,7 +571,7 @@ test "MySQL: MySQL-specific types (VARCHAR length, TEXT, BOOL round-trip)" {
 
     const graph = comptime buildGraph(&.{TypeTest});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS type_test", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -634,7 +634,7 @@ test "MySQL: SaveOrUpdate preserves auto-increment id and child rows" {
 
     const graph = comptime buildGraph(&.{ MyUpsertParent, MyUpsertChild });
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_upsert_parent", &.{}) catch {};
     defer _ = drv.exec("DROP TABLE IF EXISTS my_upsert_child", &.{}) catch {};
 
@@ -715,7 +715,7 @@ test "MySQL: JSONValue + WhereEntQL has(edge) work" {
     };
     const graph = comptime buildGraph(&.{ User, Car });
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_j_user", &.{}) catch {};
     defer _ = drv.exec("DROP TABLE IF EXISTS my_j_car", &.{}) catch {};
 
@@ -776,7 +776,7 @@ test "MySQL: slow query times out" {
 
     const graph = comptime buildGraph(&.{User});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS user", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -836,7 +836,7 @@ test "MySQL: boolean column scans via getBool" {
     };
     const graph = comptime buildGraph(&.{Flag});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_flag", &.{}) catch {};
 
     var c = Client.makeClient(infos, allocator, drv.asDriver());
@@ -887,7 +887,7 @@ test "MySQL: decimal (DECIMAL(38,10)) field round-trips without truncation" {
     });
     const graph = comptime buildGraph(&.{Money});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS money", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -1204,7 +1204,7 @@ test "MySQL: WhereIn chunks OR-joins IN predicates" {
     };
     const graph = comptime buildGraph(&.{Code});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_where_in_code", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -1324,7 +1324,7 @@ test "MySQL: privacy filter restricts rows by owner_id" {
 
     const graph = comptime buildGraph(&.{FilteredEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_filtered_entity", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -1425,7 +1425,7 @@ test "MySQL: BulkInsert multi-row derives ids from last_insert_id" {
 
     const graph = comptime buildGraph(&.{BulkEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_bulk_entity", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -1585,7 +1585,7 @@ test "MySQL: stream iterator avoids loading all rows" {
 
     const graph = comptime buildGraph(&.{StreamEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_stream_entity", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -1636,7 +1636,7 @@ test "MySQL: beginTx propagates hooks and privacy_ctx to transaction entity clie
 
     const graph = comptime buildGraph(&.{TxPropEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_tx_prop_entity", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -1703,7 +1703,7 @@ test "MySQL: interceptor injects tenant filter into query/update/delete" {
     const graph = comptime buildGraph(&.{TenantDoc});
     const infos = graph.types;
     _ = try drv.exec("DROP TABLE IF EXISTS my_tenant_doc", &.{});
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_tenant_doc", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
@@ -1771,4 +1771,98 @@ test "MySQL: interceptor injects tenant filter into query/update/delete" {
     }
     try testing.expectEqual(@as(usize, 1), rows.items.len);
     try testing.expectEqualStrings("renamed", rows.items[0].name);
+}
+
+test "MySQL: eager-loaded children respect interceptor tenant scope" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const ChildBase = schema("MyEagerTenantChild", .{
+        .fields = &.{
+            field.Int("parent_id"),
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+    });
+    const ParentBase = schema("MyEagerTenantParent", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+        .edges = &.{edge.To("children", ChildBase).Field("parent_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ ParentBase, ChildBase });
+    const infos = graph.types;
+    _ = try drv.exec("DROP TABLE IF EXISTS my_eager_tenant_child", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_eager_tenant_parent", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    // Child first at cleanup (defer LIFO): it holds the FK to the parent.
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_eager_tenant_parent", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_eager_tenant_child", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("tenant_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    var p1: i64 = 0;
+    {
+        var b = try client.my_eager_tenant_parent.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "p1");
+        _ = try b.setFieldValue("tenant_id", @as(i64, 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+        p1 = e.id;
+    }
+    var p2: i64 = 0;
+    {
+        var b = try client.my_eager_tenant_parent.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "p2");
+        _ = try b.setFieldValue("tenant_id", @as(i64, 2));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+        p2 = e.id;
+    }
+    for ([_]struct { parent: i64, name: []const u8, t: i64 }{
+        .{ .parent = p1, .name = "p1-t1", .t = 1 },
+        .{ .parent = p1, .name = "p1-t2", .t = 2 },
+        .{ .parent = p2, .name = "p2-t2", .t = 2 },
+    }) |s| {
+        var b = try client.my_eager_tenant_child.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", s.parent);
+        _ = try b.setFieldValue("name", s.name);
+        _ = try b.setFieldValue("tenant_id", s.t);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[1], &e, allocator);
+    }
+
+    // Tenant 1 must not see parent 1's tenant-2 child through the eager load.
+    {
+        var q = client.my_eager_tenant_parent.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("children");
+        const parents = try q.All();
+        defer {
+            for (parents.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            parents.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), parents.items.len);
+        const children = parents.items[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 1), children.len);
+        try testing.expectEqualStrings("p1-t1", children[0].name);
+    }
 }

@@ -82,11 +82,28 @@ pub const Builder = struct {
 
     pub fn ident(b: *Builder, name: []const u8) !void {
         const quote: u8 = if (std.mem.eql(u8, b.dialect.name, "mysql")) '`' else '"';
-        // Pre-allocate once for quote+name+quote to avoid three separate
-        // capacity checks per identifier call.
-        try b.buffer.ensureUnusedCapacity(name.len + 2);
+
+        if (std.mem.indexOfScalar(u8, name, quote) == null) {
+            // Pre-allocate once for quote+name+quote to avoid three separate
+            // capacity checks per identifier call.
+            try b.buffer.ensureUnusedCapacity(name.len + 2);
+            b.buffer.appendAssumeCapacity(quote);
+            b.buffer.appendSliceAssumeCapacity(name);
+            b.buffer.appendAssumeCapacity(quote);
+            return;
+        }
+
+        // The SQL standard escapes a quote embedded in a quoted identifier by
+        // doubling it (`"we""ird"`, `` `we``ird` ``). Without this, a name
+        // carrying the quote would close the identifier early and let the
+        // remainder parse as SQL — an injection vector when the name comes
+        // from request input (e.g. an ORDER BY column).
+        try b.buffer.ensureUnusedCapacity(2 * name.len + 2);
         b.buffer.appendAssumeCapacity(quote);
-        b.buffer.appendSliceAssumeCapacity(name);
+        for (name) |c| {
+            b.buffer.appendAssumeCapacity(c);
+            if (c == quote) b.buffer.appendAssumeCapacity(c);
+        }
         b.buffer.appendAssumeCapacity(quote);
     }
 
@@ -1957,6 +1974,45 @@ test "MySQL identifiers" {
     _ = s.from(Table("users"));
     const q = try s.query();
     try std.testing.expectEqualStrings("SELECT `id` FROM `users`", q.sql);
+}
+
+test "ident doubles embedded quote character" {
+    const allocator = std.testing.allocator;
+
+    // SQLite and PostgreSQL both use `"` quoting.
+    inline for (.{ Dialect.sqlite, Dialect.postgres }) |dialect| {
+        var b = Builder.init(allocator, dialect);
+        defer b.deinit();
+        try b.ident("we\"ird");
+        try std.testing.expectEqualStrings("\"we\"\"ird\"", b.buffer.items);
+    }
+
+    // MySQL quotes with a backtick, so a backtick in the name is doubled.
+    var b_mysql = Builder.init(allocator, Dialect.mysql);
+    defer b_mysql.deinit();
+    try b_mysql.ident("we`ird");
+    try std.testing.expectEqualStrings("`we``ird`", b_mysql.buffer.items);
+}
+
+test "plain identifiers are unchanged" {
+    const allocator = std.testing.allocator;
+    var b = Builder.init(allocator, Dialect.sqlite);
+    defer b.deinit();
+    try b.ident("users");
+    try std.testing.expectEqualStrings("\"users\"", b.buffer.items);
+}
+
+test "OrderBy column escapes an injected quote" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("users"));
+    _ = try s.orderBy(OrderAsc("name\"; DROP TABLE users; --"));
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "SELECT \"id\" FROM \"users\" ORDER BY \"name\"\"; DROP TABLE users; --\"",
+        q.sql,
+    );
 }
 
 test "Raw predicate" {

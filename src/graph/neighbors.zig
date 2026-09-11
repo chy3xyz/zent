@@ -6,16 +6,33 @@ const Step = @import("step.zig").Step;
 // Internal helpers
 // ------------------------------------------------------------------
 
-/// Write `(?,?,…) [OR (?,?,…)]` — parent id lists are chunked so eager loads
-/// never exceed the driver parameter limit (e.g. SQLite 999).
-fn writeInClauseChunked(b: *sql.Builder, parent_ids: []const sql.Value) !void {
+/// Write `<qualifier.>column IN (?,?,…) [OR <qualifier.>column IN (?,?,…)]` —
+/// parent id lists are chunked so eager loads never exceed the driver
+/// parameter limit (e.g. SQLite 999).
+///
+/// The column predicate is repeated for every chunk: `col IN (a, b) OR (c, d)`
+/// is not valid SQL (PostgreSQL rejects a record as an OR operand, SQLite
+/// reports "row value misused"), so a two-chunk eager load would fail.
+fn writeInClauseChunked(
+    b: *sql.Builder,
+    qualifier: ?[]const u8,
+    column: []const u8,
+    parent_ids: []const sql.Value,
+) !void {
     const chunk_size: usize = 500;
     var start: usize = 0;
     var first = true;
     while (start < parent_ids.len) {
         const end = @min(start + chunk_size, parent_ids.len);
         if (!first) try b.writeString(" OR ");
-        try b.writeByte('(');
+        if (qualifier) |q| {
+            // Aliases are introduced unquoted by the JOINs above; keep the
+            // emitted form byte-compatible with the pre-chunking SQL.
+            try b.writeString(q);
+            try b.writeByte('.');
+        }
+        try b.ident(column);
+        try b.writeString(" IN (");
         for (parent_ids[start..end], 0..) |id, i| {
             if (i > 0) try b.writeString(", ");
             try b.arg(id);
@@ -65,6 +82,22 @@ fn writeEagerLoadColumns(b: *sql.Builder, step: Step, include_select: bool) !voi
 /// The caller owns `b` and is responsible for calling `b.query()` and
 /// `b.deinit()`.
 pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.Value) !void {
+    return appendSetNeighborsFiltered(b, step, parent_ids, &.{});
+}
+
+/// Like `appendSetNeighbors`, but ANDs `extra_preds` into the neighbor
+/// WHERE clause. They are emitted before any per-parent window ranking or
+/// ORDER BY, so a per-parent `Limit` ranks only rows that pass the filters
+/// (soft-delete / privacy / interceptor scopes) instead of a trashed or
+/// foreign-tenant row consuming a limit slot. Predicates are rendered
+/// through the caller's builder, so dialect placeholders and bound args
+/// stay in text order.
+pub fn appendSetNeighborsFiltered(
+    b: *sql.Builder,
+    step: Step,
+    parent_ids: []const sql.Value,
+    extra_preds: []const sql.Predicate,
+) !void {
     const use_window = step.limit != null;
     if (use_window and step.edge_rel != .o2m and step.edge_rel != .o2o) {
         return error.UnsupportedEdgeLimit;
@@ -94,9 +127,7 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
             // ToEdgeOwner: FK is in target table.
             //   SELECT t.*, t.fk AS __fk FROM target t WHERE t.fk IN (...)
             try b.writeString(" WHERE ");
-            try b.ident(step.edge_columns[0]);
-            try b.writeString(" IN ");
-            try writeInClauseChunked(b, parent_ids);
+            try writeInClauseChunked(b, null, step.edge_columns[0], parent_ids);
         },
         .m2o => {
             // FromEdgeOwner: FK is in source table.
@@ -111,10 +142,8 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
             try b.ident(step.to_column);
             try b.writeString(" = s.");
             try b.ident(step.edge_columns[0]);
-            try b.writeString(" WHERE s.");
-            try b.ident(step.from_column);
-            try b.writeString(" IN ");
-            try writeInClauseChunked(b, parent_ids);
+            try b.writeString(" WHERE ");
+            try writeInClauseChunked(b, "s", step.from_column, parent_ids);
         },
         .m2m => {
             // ThroughEdgeTable: M2M via junction table.
@@ -129,10 +158,8 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
             try b.ident(step.to_column);
             try b.writeString(" = j.");
             try b.ident(step.targetPK());
-            try b.writeString(" WHERE j.");
-            try b.ident(step.sourcePK());
-            try b.writeString(" IN ");
-            try writeInClauseChunked(b, parent_ids);
+            try b.writeString(" WHERE ");
+            try writeInClauseChunked(b, "j", step.sourcePK(), parent_ids);
         },
     }
 
@@ -140,6 +167,11 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
         // Inner WHERE (before any window/order), so limits rank filtered rows.
         try b.writeString(" AND ");
         try sql.appendExprWithArgs(b, pred.sql, pred.args);
+    }
+
+    for (extra_preds) |pred| {
+        try b.writeString(" AND ");
+        try pred.appendTo(b);
     }
 
     if (use_window) {
@@ -415,6 +447,71 @@ test "appendSetNeighbors order + per-parent limit uses window function" {
     try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT * FROM (SELECT") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, "ROW_NUMBER() OVER (PARTITION BY \"author_id\" ORDER BY \"post\".\"created_at\" DESC) AS __rn") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, ") WHERE __rn <= 2") != null);
+}
+
+test "appendSetNeighborsFiltered applies extra predicates before the window rank" {
+    const step = Step{
+        .from_table = "user",
+        .from_column = "id",
+        .to_table = "post",
+        .to_column = "id",
+        .edge_rel = .o2m,
+        .edge_table = "post",
+        .edge_columns = &[_][]const u8{"author_id"},
+        .inverse = false,
+        .order_by = "created_at",
+        .desc = true,
+        .limit = 2,
+    };
+    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+    const extra = [_]sql.Predicate{sql.IsNull("deleted_at")};
+    try appendSetNeighborsFiltered(&b, step, &[_]sql.Value{.{ .int = 1 }}, &extra);
+    const result = b.query();
+
+    const filter_idx = std.mem.indexOf(u8, result.sql, "AND \"deleted_at\" IS NULL");
+    const rank_idx = std.mem.indexOf(u8, result.sql, ") WHERE __rn <=");
+    try testing.expect(filter_idx != null);
+    try testing.expect(rank_idx != null);
+    // The filter must run inside the derived table, before the per-parent
+    // rank, so a filtered row cannot consume a limit slot.
+    try testing.expect(filter_idx.? < rank_idx.?);
+}
+
+test "appendSetNeighbors chunks parent ids and repeats the column predicate" {
+    const step = Step{
+        .from_table = "user",
+        .from_column = "id",
+        .to_table = "post",
+        .to_column = "id",
+        .edge_rel = .o2m,
+        .edge_table = "post",
+        .edge_columns = &[_][]const u8{"author_id"},
+        .inverse = false,
+    };
+
+    const allocator = testing.allocator;
+    // 501 ids → two chunks (chunk_size = 500).
+    const ids = try allocator.alloc(sql.Value, 501);
+    defer allocator.free(ids);
+    for (ids, 0..) |*v, i| v.* = .{ .int = @intCast(i + 1) };
+
+    var b = sql.Builder.init(allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+    try appendSetNeighbors(&b, step, ids);
+    const result = b.query();
+
+    // Each chunk must repeat the column: `col IN (…) OR (…)` is not valid SQL
+    // (PostgreSQL rejects a record as an OR operand; SQLite reports
+    // "row value misused"), so the predicate is emitted once per chunk.
+    const in_count = std.mem.count(u8, result.sql, "\"author_id\" IN (");
+    try testing.expectEqual(@as(usize, 2), in_count);
+    try testing.expect(std.mem.indexOf(u8, result.sql, ") OR \"author_id\" IN (") != null);
+    try testing.expectEqual(@as(usize, 501), result.args.len);
+
+    // The second chunk must still be a plain parenthesised list, never a
+    // bare row-value constructor.
+    try testing.expect(std.mem.indexOf(u8, result.sql, " OR (") == null);
 }
 
 test "appendSetNeighbors rejects limit on m2m" {

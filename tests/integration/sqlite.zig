@@ -259,7 +259,7 @@ test "SQLite: SaveOrUpdate updates existing row" {
 
     const graph = comptime buildGraph(&.{UpsertUser});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -303,7 +303,7 @@ test "SQLite: Max/Min Rows deinit on numeric and empty paths" {
 
     const graph = comptime buildGraph(&.{ Product, EmptyProduct });
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -375,7 +375,7 @@ test "SQLite: JSON struct field arena is freed by deinitEntity" {
 
     const graph = comptime buildGraph(&.{JsonUser});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -427,7 +427,7 @@ test "SQLite: eager-loaded edge JSON is arena-owned and freed" {
     };
     const graph = comptime buildGraph(&.{ User, Car });
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     var ub = try client.user_eager.Create();
@@ -477,7 +477,7 @@ test "SQLite: scan-path JSON is arena-owned and freed by deinitEntity" {
     });
     const graph = comptime buildGraph(&.{JsonUser});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     // Create path (arena) is a prerequisite for the scan path below.
@@ -711,7 +711,7 @@ test "SQLite: Deny policy blocks query and create" {
 
     const graph = comptime buildGraph(&.{DenyEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -773,7 +773,7 @@ test "SQLite: constraint violations map to specific errors (not NotFound)" {
     });
     const graph = comptime buildGraph(&.{U});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     var b1 = try client.err_user.Create();
@@ -807,7 +807,7 @@ test "SQLite: JSONValue untyped document field round-trips" {
     });
     const graph = comptime buildGraph(&.{Doc});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     // Create with an untyped document (nested object + array).
@@ -853,7 +853,7 @@ test "SQLite: WhereIn chunks OR-joins IN predicates" {
     };
     const graph = comptime buildGraph(&.{Code});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     // Seed rows with codes 0..4 plus one row in the second chunk (500).
@@ -971,7 +971,7 @@ test "SQLite: WhereEntQL has(edge) lowers to EXISTS subquery" {
     };
     const graph = comptime buildGraph(&.{ User, Car });
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
     // Two users; only alice gets a car.
@@ -1046,7 +1046,7 @@ test "SQLite: OnCreate denies create but allows query (per-op)" {
     });
     const graph = comptime buildGraph(&.{User});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     const ctx = zent.privacy.PrivacyContext{ .user_id = 1 };
@@ -1095,7 +1095,7 @@ test "SQLite: privacy WithContext propagates context to allow/deny decisions" {
 
     const graph = comptime buildGraph(&.{ AllowEntity, DenyEntity });
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1178,7 +1178,7 @@ test "SQLite: privacy denies all operations without WithContext" {
 
     const graph = comptime buildGraph(&.{SecureEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1241,7 +1241,7 @@ test "SQLite: before hook abort prevents creation" {
 
     const graph = comptime buildGraph(&.{HookEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1285,7 +1285,7 @@ test "SQLite: after hook sees created entity" {
 
     const graph = comptime buildGraph(&.{HookEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1433,7 +1433,7 @@ test "SQLite: privacy filter restricts rows by owner_id" {
 
     const graph = comptime buildGraph(&.{FilteredEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1530,7 +1530,7 @@ test "SQLite: beginTx propagates hooks and privacy_ctx to transaction entity cli
 
     const graph = comptime buildGraph(&.{TxPropEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1595,7 +1595,7 @@ test "SQLite: stream iterator avoids loading all rows" {
 
     const graph = comptime buildGraph(&.{StreamEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1645,7 +1645,7 @@ test "SQLite: BulkInsert multi-row RETURNING" {
 
     const graph = comptime buildGraph(&.{BulkEntity});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -1976,7 +1976,7 @@ test "SQLite: query with timeout succeeds" {
 
     const graph = comptime buildGraph(&.{User});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -2001,7 +2001,7 @@ test "SQLite: decimal field round-trips exact text" {
     });
     const graph = comptime buildGraph(&.{Money});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     {
@@ -2039,7 +2039,7 @@ test "SQLite: interceptor injects tenant filter into query/update/delete" {
 
     const graph = comptime buildGraph(&.{TenantDoc});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     defer Client.DeinitClient(infos, &client);
@@ -2150,7 +2150,7 @@ test "SQLite: interceptor fills omitted tenant_id on create" {
 
     const graph = comptime buildGraph(&.{TenantDoc});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     defer Client.DeinitClient(infos, &client);
@@ -2202,7 +2202,7 @@ test "SQLite: interceptor with unknown field aborts with InterceptFailed" {
 
     const graph = comptime buildGraph(&.{BadScope});
     const infos = graph.types;
-    try Client.createAllTables(infos, drv.asDriver());
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     defer Client.DeinitClient(infos, &client);
@@ -2218,4 +2218,274 @@ test "SQLite: interceptor with unknown field aborts with InterceptFailed" {
     var q = client.bad_scope.Query();
     defer q.deinit();
     try testing.expectError(error.InterceptFailed, q.All());
+}
+
+test "SQLite: eager-loaded children respect soft delete" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ChildBase = schema("SoftEagerChild", .{
+        .fields = &.{
+            field.Int("parent_id"),
+            field.String("name"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const ParentBase = schema("SoftEagerParent", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("children", ChildBase).Field("parent_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ ParentBase, ChildBase });
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var pb = try client.soft_eager_parent.Create();
+    defer pb.deinit();
+    _ = try pb.setFieldValue("name", "p");
+    var parent = try pb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &parent, allocator);
+
+    var live_id: i64 = 0;
+    {
+        var cb = try client.soft_eager_child.Create();
+        defer cb.deinit();
+        _ = try cb.setFieldValue("parent_id", parent.id);
+        _ = try cb.setFieldValue("name", "live");
+        var c = try cb.Save();
+        defer zent.codegen.deinitEntity(infos, infos[1], &c, allocator);
+        live_id = c.id;
+    }
+    var trashed_id: i64 = 0;
+    {
+        var cb = try client.soft_eager_child.Create();
+        defer cb.deinit();
+        _ = try cb.setFieldValue("parent_id", parent.id);
+        _ = try cb.setFieldValue("name", "trashed");
+        var c = try cb.Save();
+        defer zent.codegen.deinitEntity(infos, infos[1], &c, allocator);
+        trashed_id = c.id;
+    }
+
+    // Soft-delete one child; the row stays in the table with deleted_at set.
+    {
+        var d = client.soft_eager_child.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{client.soft_eager_child.predicates.idEQ(.{ .int = trashed_id })});
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    // Without WithTrashed the eager load must not surface the soft-deleted row.
+    {
+        var q = client.soft_eager_parent.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("children");
+        const parents = try q.All();
+        defer {
+            for (parents.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            parents.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), parents.items.len);
+        const children = parents.items[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 1), children.len);
+        try testing.expectEqualStrings("live", children[0].name);
+        try testing.expectEqual(live_id, children[0].id);
+    }
+
+    // WithTrashed lifts the scope for eager-loaded targets too.
+    {
+        var q = client.soft_eager_parent.Query();
+        defer q.deinit();
+        _ = q.WithTrashed();
+        _ = try q.WithEdge("children");
+        const parents = try q.All();
+        defer {
+            for (parents.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            parents.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), parents.items.len);
+        const children = parents.items[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 2), children.len);
+    }
+}
+
+test "SQLite: eager-loaded children respect interceptor tenant scope" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ChildBase = schema("TenantEagerChild", .{
+        .fields = &.{
+            field.Int("parent_id"),
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+    });
+    const ParentBase = schema("TenantEagerParent", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+        .edges = &.{edge.To("children", ChildBase).Field("parent_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ ParentBase, ChildBase });
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    // Multi-tenant interceptor: scopes every query (including eager loads)
+    // to the current tenant.
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("tenant_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    // Seed two parents and, under parent 1, one child per tenant.
+    var p1: i64 = 0;
+    {
+        var b = try client.tenant_eager_parent.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "p1");
+        _ = try b.setFieldValue("tenant_id", @as(i64, 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+        p1 = e.id;
+    }
+    var p2: i64 = 0;
+    {
+        var b = try client.tenant_eager_parent.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "p2");
+        _ = try b.setFieldValue("tenant_id", @as(i64, 2));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+        p2 = e.id;
+    }
+    const seeds = [_]struct { parent: i64, name: []const u8, t: i64 }{
+        .{ .parent = p1, .name = "p1-t1", .t = 1 },
+        .{ .parent = p1, .name = "p1-t2", .t = 2 },
+        .{ .parent = p2, .name = "p2-t2", .t = 2 },
+    };
+    for (seeds) |s| {
+        var b = try client.tenant_eager_child.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", s.parent);
+        _ = try b.setFieldValue("name", s.name);
+        _ = try b.setFieldValue("tenant_id", s.t);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[1], &e, allocator);
+    }
+
+    // Tenant 1: only parent 1 and only its tenant-1 child (pre-fix the eager
+    // load returned p1-t2 as well — the cross-tenant leak).
+    {
+        var q = client.tenant_eager_parent.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("children");
+        const parents = try q.All();
+        defer {
+            for (parents.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            parents.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), parents.items.len);
+        try testing.expectEqualStrings("p1", parents.items[0].name);
+        const children = parents.items[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 1), children.len);
+        try testing.expectEqualStrings("p1-t1", children[0].name);
+    }
+
+    // Tenant 2: parent 2 and its tenant-2 child.
+    tenant = 2;
+    {
+        var q = client.tenant_eager_parent.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("children");
+        const parents = try q.All();
+        defer {
+            for (parents.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            parents.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), parents.items.len);
+        try testing.expectEqualStrings("p2", parents.items[0].name);
+        const children = parents.items[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 1), children.len);
+        try testing.expectEqualStrings("p2-t2", children[0].name);
+    }
+}
+
+test "SQLite: eager-loaded children respect privacy filters" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ChildBase = schema("PrivacyEagerChild", .{
+        .fields = &.{
+            field.Int("parent_id"),
+            field.String("name"),
+            field.Int("owner_id"),
+        },
+        .policy = zent.privacy.Policy{
+            .rules = &.{
+                zent.privacy.Allow,
+                zent.privacy.Filter(ownerFilter),
+            },
+        },
+    });
+    const ParentBase = schema("PrivacyEagerParent", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("children", ChildBase).Field("parent_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ ParentBase, ChildBase });
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var parent = blk: {
+        var b = try client.privacy_eager_parent.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "p");
+        break :blk try b.Save();
+    };
+    defer zent.codegen.deinitEntity(infos, infos[0], &parent, allocator);
+    for ([_]struct { name: []const u8, owner: i64 }{
+        .{ .name = "mine", .owner = 1 },
+        .{ .name = "theirs", .owner = 2 },
+    }) |s| {
+        var cc = client.privacy_eager_child.withContext(.{ .user_id = s.owner });
+        var b = try cc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", parent.id);
+        _ = try b.setFieldValue("name", s.name);
+        _ = try b.setFieldValue("owner_id", s.owner);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[1], &e, allocator);
+    }
+
+    // The target's Filter policy must scope the eager load to the caller.
+    {
+        var c = client.privacy_eager_parent.withContext(.{ .user_id = 1 });
+        var q = c.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("children");
+        const parents = try q.All();
+        defer {
+            for (parents.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            parents.deinit();
+        }
+        const children = parents.items[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 1), children.len);
+        try testing.expectEqualStrings("mine", children[0].name);
+    }
 }

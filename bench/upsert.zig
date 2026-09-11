@@ -48,7 +48,7 @@ const OnCtx = struct {
 fn benchUpsertPk(allocator: std.mem.Allocator, io: std.Io) !Result {
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
-    try client_mod.createAllTables(pk_infos, drv.asDriver());
+    try client_mod.createAllTables(allocator, pk_infos, drv.asDriver());
     var client = client_mod.makeClient(pk_infos, allocator, drv.asDriver());
 
     // Seed one row.
@@ -107,7 +107,7 @@ fn benchUpsertPk(allocator: std.mem.Allocator, io: std.Io) !Result {
 fn benchUpsertOn(allocator: std.mem.Allocator, io: std.Io) !Result {
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
-    try client_mod.createAllTables(on_infos, drv.asDriver());
+    try client_mod.createAllTables(allocator, on_infos, drv.asDriver());
     var client = client_mod.makeClient(on_infos, allocator, drv.asDriver());
 
     // Seed one row.

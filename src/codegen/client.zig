@@ -463,8 +463,10 @@ const CreateTablesError = sql_driver.Error || error{MissingViewSQL};
 
 /// Create all database tables (create-only migration).
 /// Creates entity tables and junction tables for M2M edges.
-pub fn createAllTables(comptime infos: []const TypeInfo, driver: sql_driver.Driver) CreateTablesError!void {
-    return migrate.createAllTables(driver, infos);
+/// Generated SQL is allocated from `allocator` and freed with the same
+/// allocator before returning.
+pub fn createAllTables(allocator: std.mem.Allocator, comptime infos: []const TypeInfo, driver: sql_driver.Driver) CreateTablesError!void {
+    return migrate.createAllTables(allocator, driver, infos);
 }
 
 fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {

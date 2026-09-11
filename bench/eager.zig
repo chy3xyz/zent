@@ -63,7 +63,7 @@ const EagerCtx = struct {
 fn benchEagerLoad(allocator: std.mem.Allocator, io: std.Io) !Result {
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
-    try client_mod.createAllTables(infos, drv.asDriver());
+    try client_mod.createAllTables(allocator, infos, drv.asDriver());
     var client = client_mod.makeClient(infos, allocator, drv.asDriver());
 
     // Seed N users with K pets each (raw SQL — setup is not timed).
