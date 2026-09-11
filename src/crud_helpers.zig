@@ -374,6 +374,7 @@ pub fn latest(
 fn getInfos(comptime T: type) []const graph_mod.TypeInfo {
     if (@hasDecl(T, "entity_infos")) return T.entity_infos;
     inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |_, FieldT| {
+        if (@typeInfo(FieldT) != .@"struct") continue;
         if (@hasDecl(FieldT, "entity_infos")) {
             return FieldT.entity_infos;
         }

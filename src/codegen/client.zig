@@ -318,9 +318,16 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
 
 /// Generate a root Client type from multiple TypeInfos.
 /// The Client holds entity sub-clients and per-edge query helpers.
+///
+/// The interceptor chain, when present, is a **heap allocation** so its
+/// address survives the many by-value moves of the root Client (returns
+/// from `makeClient`, `StoreEnv`/`PooledEnv`/`ShardedEnv` fields,
+/// `withContext`, transaction clients). `owns_interceptors` records
+/// whether this value is the one that allocated the chain: only that root
+/// value may be passed to `DeinitClient`. Copies made afterwards borrow.
 pub fn Client(comptime infos: []const TypeInfo) type {
     comptime {
-        const total_fields = 4 + infos.len; // allocator, driver, logger, interceptors, + one per entity
+        const total_fields = 5 + infos.len; // allocator, driver, logger, interceptors, owns_interceptors, + one per entity
         var field_names: [total_fields][:0]const u8 = undefined;
         var field_types: [total_fields]type = undefined;
         var field_attrs: [total_fields]std.builtin.Type.Struct.FieldAttributes = undefined;
@@ -339,11 +346,15 @@ pub fn Client(comptime infos: []const TypeInfo) type {
         field_attrs[2] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(Logger) };
 
         field_names[3] = "interceptors";
-        field_types[3] = intercept.InterceptorChain;
-        field_attrs[3] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(intercept.InterceptorChain) };
+        field_types[3] = ?*intercept.InterceptorChain;
+        field_attrs[3] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(?*intercept.InterceptorChain) };
+
+        field_names[4] = "owns_interceptors";
+        field_types[4] = bool;
+        field_attrs[4] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(bool) };
 
         // Entity sub-clients (user, car, group, ...)
-        for (infos, 4..) |info, i| {
+        for (infos, 5..) |info, i| {
             const ClientType = EntityClient(infos, info);
             const name = structFieldName(info.name);
             field_names[i] = name;
@@ -356,13 +367,15 @@ pub fn Client(comptime infos: []const TypeInfo) type {
     }
 }
 
-/// Instantiate a Client.
+/// Instantiate a Client. The interceptor chain is allocated lazily by
+/// `UseInterceptor`, so an interceptor-free client allocates nothing.
 pub fn makeClient(comptime infos: []const TypeInfo, allocator: std.mem.Allocator, driver: sql_driver.Driver) Client(infos) {
     var result: Client(infos) = undefined;
     result.allocator = allocator;
     result.driver = driver;
     result.logger = .{};
-    result.interceptors = intercept.InterceptorChain.init(allocator);
+    result.interceptors = null;
+    result.owns_interceptors = false;
     inline for (infos) |info| {
         const ClientType = EntityClient(infos, info);
         const field_name = comptime toSnakeCase(info.name);
@@ -371,23 +384,58 @@ pub fn makeClient(comptime infos: []const TypeInfo, allocator: std.mem.Allocator
     return result;
 }
 
-/// Register an interceptor on the client's owned chain and point every
-/// entity sub-client at it. Call this on the final `Client` value you use
-/// (the entity clients store a pointer into the client's `interceptors`
-/// field); register before starting transactions so `beginTx` copies the
-/// pointer. Pair with `DeinitClient`.
+/// Register an interceptor and point every entity sub-client at the chain.
+/// The chain lives on the heap and is allocated on first use; its address
+/// therefore stays valid across by-value copies of the root Client (moves
+/// out of `makeClient`, helper structs, `withContext`, tx clients). The
+/// root value that allocates it owns it; pair that value with
+/// `DeinitClient`. Copies only borrow. Register before starting
+/// transactions so `beginTx` copies the pointer.
 pub fn UseInterceptor(comptime infos: []const TypeInfo, self: *Client(infos), i: intercept.Interceptor) !void {
-    try self.interceptors.use(i);
+    if (self.interceptors == null) {
+        const chain = try self.allocator.create(intercept.InterceptorChain);
+        chain.* = intercept.InterceptorChain.init(self.allocator);
+        self.interceptors = chain;
+        self.owns_interceptors = true;
+    }
+    try self.interceptors.?.use(i);
     inline for (infos) |info| {
         const field_name = comptime structFieldName(info.name);
-        @field(self, field_name).interceptors = &self.interceptors;
+        @field(self, field_name).interceptors = self.interceptors;
     }
 }
 
-/// Release the client's owned interceptor chain. Only required when
-/// `UseInterceptor` was called — an unused chain never allocates.
+/// Release the interceptor chain. Call this exactly once, on the root
+/// Client value that called `UseInterceptor` — value copies made
+/// afterwards (helpers, `withContext`, tx clients) borrow the same chain
+/// and must not be deinit'd. A client whose chain was supplied via
+/// `withInterceptors` borrows it from the caller and is left untouched.
+/// An unused (never registered) client allocated nothing.
 pub fn DeinitClient(comptime infos: []const TypeInfo, self: *Client(infos)) void {
-    self.interceptors.deinit();
+    if (self.owns_interceptors) {
+        if (self.interceptors) |chain| {
+            chain.deinit();
+            self.allocator.destroy(chain);
+        }
+        self.interceptors = null;
+        self.owns_interceptors = false;
+    }
+}
+
+/// Return a copy of `self` whose interceptor chain is the caller-owned
+/// `chain` (borrowed, never freed by `DeinitClient`). The caller stays
+/// responsible for deinit'ing the chain. Mirrors the entity-client
+/// `withInterceptors` for code paths that supply their own chain instead
+/// of registering one via `UseInterceptor`.
+pub fn withInterceptors(comptime infos: []const TypeInfo, self: Client(infos), chain: *intercept.InterceptorChain) Client(infos) {
+    var copy = self;
+    copy.interceptors = chain;
+    copy.owns_interceptors = false;
+    inline for (infos) |info| {
+        const field_name = comptime structFieldName(info.name);
+        @field(copy, field_name).interceptors = chain;
+    }
+    return copy;
 }
 
 /// Set the logger on the root client and propagate to all entity sub-clients.
@@ -904,4 +952,135 @@ test "TxClient enqueueEvent collects transaction-scoped events" {
     for (Ctx.handled) |p| allocator.free(p);
     allocator.free(Ctx.handled);
     Ctx.handled = &.{};
+}
+
+test "interceptor stays effective after a by-value Client copy" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Item = Schema("CopyItem", .{
+        .fields = &.{ field.Int("tenant_id"), field.String("name") },
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+    const info = comptime fromSchema(Item);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    var root = makeClient(infos, allocator, driver.asDriver());
+    inline for (.{ .{ 1, "keep" }, .{ 2, "other" } }) |row_data| {
+        var b = try root.copy_item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("tenant_id", @as(i64, row_data[0]));
+        _ = try b.setFieldValue("name", row_data[1]);
+        var row = try b.Save();
+        deinitEntity(infos, info, &row, allocator);
+    }
+
+    const Ctx = struct {
+        var seen: usize = 0;
+    };
+    try UseInterceptor(infos, &root, .{
+        .ctx = null,
+        .intercept = struct {
+            fn f(_: ?*anyopaque, view: *intercept.QueryView) anyerror!void {
+                Ctx.seen += 1;
+                try view.whereEq("tenant_id", .{ .int = 1 });
+            }
+        }.f,
+    });
+    defer DeinitClient(infos, &root);
+
+    // Simulate a move out of a helper/environment: the entity sub-client's
+    // pointer must still reference the heap chain, not the moved root value.
+    const moved = root;
+    try std.testing.expect(moved.interceptors != null);
+    try std.testing.expect(moved.interceptors == root.interceptors);
+    try std.testing.expect(moved.copy_item.interceptors == root.interceptors);
+
+    var q = moved.copy_item.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expectEqualStrings("keep", rows.items[0].name);
+    try std.testing.expect(Ctx.seen > 0);
+}
+
+test "UseInterceptor heap-allocates once and DeinitClient frees it" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Item = Schema("OwnItem", .{ .fields = &.{field.String("name")} });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    const noop = struct {
+        fn f(_: ?*anyopaque, _: *intercept.QueryView) anyerror!void {}
+    }.f;
+
+    var client = makeClient(infos, allocator, undefined);
+    try std.testing.expect(client.interceptors == null);
+    try std.testing.expect(!client.owns_interceptors);
+
+    try UseInterceptor(infos, &client, .{ .intercept = noop });
+    const chain_ptr = client.interceptors.?;
+    try std.testing.expect(client.owns_interceptors);
+    try std.testing.expect(client.own_item.interceptors == chain_ptr);
+
+    // Registering again reuses the same heap chain instead of reallocating.
+    try UseInterceptor(infos, &client, .{ .intercept = noop });
+    try std.testing.expect(client.interceptors.? == chain_ptr);
+
+    // A by-value copy shares the stable heap pointer; it only borrows.
+    const copy = client;
+    try std.testing.expect(copy.interceptors == chain_ptr);
+    try std.testing.expect(copy.own_item.interceptors == chain_ptr);
+
+    DeinitClient(infos, &client);
+    try std.testing.expect(client.interceptors == null);
+    try std.testing.expect(!client.owns_interceptors);
+}
+
+test "withInterceptors borrows: DeinitClient leaves the external chain alive" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Item = Schema("BorrowItem", .{ .fields = &.{field.String("name")} });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    const noop = struct {
+        fn f(_: ?*anyopaque, _: *intercept.QueryView) anyerror!void {}
+    }.f;
+
+    var chain = intercept.InterceptorChain.init(allocator);
+    defer chain.deinit();
+    try chain.use(.{ .intercept = noop });
+
+    var client = withInterceptors(infos, makeClient(infos, allocator, undefined), &chain);
+    try std.testing.expect(!client.owns_interceptors);
+    try std.testing.expect(client.interceptors == &chain);
+    try std.testing.expect(client.borrow_item.interceptors == &chain);
+
+    // DeinitClient must not free a chain it does not own.
+    DeinitClient(infos, &client);
+
+    // The external chain is still alive and usable afterwards.
+    try chain.use(.{ .intercept = noop });
+    try std.testing.expectEqual(@as(usize, 2), chain.interceptors.items.len);
 }

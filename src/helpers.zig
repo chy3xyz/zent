@@ -70,6 +70,9 @@ pub fn StoreEnv(comptime Driver: type, comptime Infos: anytype) type {
 
         pub fn deinit(self: *Self) void {
             if (self.owns_driver) {
+                // Release a chain registered via `Client.UseInterceptor` on
+                // `env.client`; a no-op when no interceptor was registered.
+                codegen.DeinitClient(Infos, &self.client);
                 self.driver_ptr.close();
                 self.allocator.destroy(self.driver_ptr);
                 self.owns_driver = false;
@@ -185,6 +188,9 @@ pub fn PooledEnv(comptime Driver: type, comptime Infos: anytype) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Release a chain registered via `Client.UseInterceptor` on
+            // `env.client`; a no-op when no interceptor was registered.
+            codegen.DeinitClient(Infos, &self.client);
             self.pool.deinit();
             self.allocator.destroy(self.pool);
             self.allocator.free(self.connect_ctx.path);
@@ -237,6 +243,11 @@ pub fn ShardedEnv(comptime Driver: type, comptime Infos: anytype) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // `clientForTenant` hands out pointers into `shards.clients` (a
+            // copy made by ShardSet.init), so release interceptor chains
+            // registered there before shards.deinit frees that slice. No-op
+            // for shards that never registered an interceptor.
+            for (self.shards.clients) |*c| codegen.DeinitClient(Infos, c);
             self.shards.deinit();
             self.allocator.free(self.clients);
             for (self.drivers) |dp| {

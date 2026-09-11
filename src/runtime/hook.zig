@@ -132,8 +132,28 @@ var global_registry: std.atomic.Value(?*HookChain) = std.atomic.Value(?*HookChai
 /// Register a global hook chain that fires for every table/operation.
 /// Safe to call at any time (atomic store); the typical pattern is a single
 /// registration during startup.
+///
+/// Lifetime contract: the registry borrows `chain`, so the caller must keep
+/// it alive while registered and call `unregisterGlobal` before releasing it —
+/// otherwise `globalBefore`/`globalAfter` would run hooks out of freed memory.
 pub fn registerGlobal(chain: *HookChain) void {
     global_registry.store(chain, .monotonic);
+}
+
+/// Clear the global chain, but only when `chain` is the one currently
+/// registered (a no-op otherwise, so a chain that has already been replaced
+/// cannot accidentally clear its successor). Pair this with `registerGlobal`
+/// before the chain is deinit'd. Thread-safe.
+pub fn unregisterGlobal(chain: *HookChain) void {
+    var expected: ?*HookChain = chain;
+    while (true) {
+        // cmpxchgWeak returns `?T` where T is already `?*HookChain`, so the
+        // unwrapped payload is the value that was actually stored.
+        if (global_registry.cmpxchgWeak(expected, null, .monotonic, .monotonic)) |actual| {
+            if (actual != chain) return; // a different chain is registered now
+            expected = actual;
+        } else return; // swapped out
+    }
 }
 
 /// Execute all global before-hooks. Called by codegen before per-table hooks.
@@ -316,4 +336,30 @@ test "LoggingHook callbacks match new signature" {
         try LoggingHook.beforeQuery(&ctx);
         try LoggingHook.afterQuery(&ctx);
     }
+}
+
+test "unregisterGlobal clears only the registered chain" {
+    const allocator = std.testing.allocator;
+    var chain = HookChain.init(allocator);
+    defer chain.deinit();
+    var other = HookChain.init(allocator);
+    defer other.deinit();
+
+    registerGlobal(&chain);
+    defer global_registry.store(null, .monotonic);
+
+    // A chain that is not the registered one must not clear the registry.
+    unregisterGlobal(&other);
+    try std.testing.expect(global_registry.load(.monotonic) == &chain);
+
+    // The registered chain clears it, and a second call is a harmless no-op.
+    unregisterGlobal(&chain);
+    try std.testing.expect(global_registry.load(.monotonic) == null);
+    unregisterGlobal(&chain);
+    try std.testing.expect(global_registry.load(.monotonic) == null);
+
+    // Re-registering and unregistering another chain leaves it intact.
+    registerGlobal(&chain);
+    unregisterGlobal(&other);
+    try std.testing.expect(global_registry.load(.monotonic) == &chain);
 }
