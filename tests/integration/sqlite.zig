@@ -3388,3 +3388,49 @@ test "SQLite: createAllTables keeps a UUID primary key typed as UUID" {
     defer zent.codegen.deinitEntity(infos, doc_info, &saved, allocator);
     try testing.expectEqualStrings("01920000-0000-7000-8000-0000000000f3", saved.id);
 }
+
+test "SQLite: BulkInsert honours an explicit chunk size across boundaries" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Chunked = schema("ChunkedRow", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{Chunked});
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Five rows in chunks of two means three statements (2 + 2 + 1): the test
+    // pins the boundary behaviour deterministically instead of relying on the
+    // server's bound-parameter limit, which varies by SQLite build. Each chunk
+    // reports its own ids, so the caller must still see one id per row and the
+    // ids must keep accumulating across statements.
+    const row_count: usize = 5;
+    var b = try client.chunked_row.BulkInsert();
+    defer b.deinit();
+    _ = b.chunkRows(2);
+    for (0..row_count) |i| {
+        if (i > 0) _ = try b.Next();
+        _ = try b.setFieldValue("name", "row");
+        _ = try b.setFieldValue("score", @as(i64, @intCast(i)));
+    }
+
+    const ids = try b.Save();
+    defer ids.deinit();
+    try testing.expectEqual(row_count, ids.items.len);
+    for (ids.items, 0..) |id, i| {
+        try testing.expectEqual(@as(i64, @intCast(i + 1)), id);
+    }
+
+    var rows = try drv.query("SELECT COUNT(*) FROM chunked_row", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, @intCast(row_count)), row.getInt(0).?);
+}

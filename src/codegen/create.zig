@@ -956,6 +956,16 @@ fn buildUpsertSuffix(
     return try buf.toOwnedSlice();
 }
 
+/// Maximum number of bound parameters one statement may carry. SQLite's
+/// SQLITE_MAX_VARIABLE_NUMBER is 999 on builds older than 3.32, which is the
+/// binding constraint here; PostgreSQL and MySQL cap placeholders at 65535.
+/// Callers chunk rows so a large batch degrades into several statements
+/// instead of failing on the driver's limit.
+fn maxBindParams(dialect: Dialect) usize {
+    if (std.mem.eql(u8, dialect.name, "sqlite")) return 999;
+    return 65535;
+}
+
 /// Generate a Bulk Insert builder for an entity.
 /// Supports INSERT ... VALUES (...), (...) RETURNING "id" for backends
 /// that support RETURNING (SQLite 3.35+, PostgreSQL, MySQL 8.0.19+).
@@ -974,6 +984,10 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         execution_context: sql_driver.ExecutionContext = .{},
         upsert_conflict_columns: ?[]const []const u8 = null,
         interceptors: ?*intercept.InterceptorChain = null,
+        /// Explicit per-statement row budget; 0 derives it from the dialect's
+        /// bound-parameter limit. Set it to bound statement size (e.g. for
+        /// MySQL max_allowed_packet) or to exercise chunk boundaries.
+        chunk_rows_override: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) !Self {
             var self = Self{
@@ -999,6 +1013,15 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         /// immediately before execution and passed to the driver.
         pub fn withTimeout(self: *Self, ms: u32) *Self {
             self.timeout_ms = ms;
+            return self;
+        }
+
+        /// Override the derived per-statement row budget (0 = derive from the
+        /// dialect's bound-parameter limit). Rows are inserted in chunks of at
+        /// most this many rows; every chunk reports its own ids, so the caller
+        /// still receives one id per row.
+        pub fn chunkRows(self: *Self, rows: usize) *Self {
+            self.chunk_rows_override = rows;
             return self;
         }
 
@@ -1181,20 +1204,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 try columns.append(columnName(info, fv.name));
             }
 
-            // Collect all values into a flat array for MultiInsert.
             const cols_per_row = columns.items.len;
-            const total_vals = cols_per_row * self.rows.items.len;
-            var flat_values = try self.allocator.alloc(sql.Value, total_vals);
-            defer self.allocator.free(flat_values);
-            {
-                var vi: usize = 0;
-                for (self.rows.items) |row| {
-                    for (row.items) |fv| {
-                        flat_values[vi] = fv.value;
-                        vi += 1;
-                    }
-                }
-            }
 
             // Build multi-row INSERT SQL.
             const dialect = self.driver.dialect();
@@ -1203,7 +1213,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
             const mapped_conflict: ?[]const []const u8 = if (conflict_columns) |cc| blk: {
                 const buf = try self.allocator.alloc([]const u8, cc.len);
-                for (cc, 0..) |c, i| buf[i] = columnName(info, c);
+                for (cc, 0..) |c, ci| buf[ci] = columnName(info, c);
                 break :blk buf;
             } else null;
             defer if (mapped_conflict) |m| self.allocator.free(m);
@@ -1212,46 +1222,76 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
             const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, pk_col, pk_is_integer, null, info.table_name);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
-            const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
-            defer query.deinit();
 
             var ids = std.array_list.Managed(i64).init(self.allocator);
             errdefer ids.deinit();
 
-            if (supports_returning) {
-                // SQLite / PostgreSQL: append RETURNING clause and query.
-                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{pk_col});
-                defer self.allocator.free(ret_suffix);
-                const full_sql = try self.allocator.alloc(u8, query.sql.len + upsert_suffix.len + ret_suffix.len);
-                defer self.allocator.free(full_sql);
-                var pos: usize = 0;
-                @memcpy(full_sql[pos..][0..query.sql.len], query.sql);
-                pos += query.sql.len;
-                @memcpy(full_sql[pos..][0..upsert_suffix.len], upsert_suffix);
-                pos += upsert_suffix.len;
-                @memcpy(full_sql[pos..][0..ret_suffix.len], ret_suffix);
+            // A single INSERT cannot carry more bound parameters than the
+            // driver allows (SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999 on
+            // older builds), so the rows are inserted in chunks that stay
+            // inside the budget instead of failing outright on a large batch.
+            const chunk_rows = if (self.chunk_rows_override > 0)
+                self.chunk_rows_override
+            else
+                @max(@as(usize, 1), maxBindParams(dialect) / cols_per_row);
 
-                self.ensureDeadline();
-                var rows = try self.driver.queryCtx(&self.execution_context, full_sql, query.args);
-                defer rows.deinit();
-                while (rows.next()) |row| {
-                    const id = row.getInt(0) orelse return error.TypeMismatch;
-                    try ids.append(id);
+            var start_row: usize = 0;
+            while (start_row < self.rows.items.len) {
+                const end_row = @min(start_row + chunk_rows, self.rows.items.len);
+                const rows_in_chunk = end_row - start_row;
+
+                const chunk_values = try self.allocator.alloc(sql.Value, cols_per_row * rows_in_chunk);
+                defer self.allocator.free(chunk_values);
+                {
+                    var vi: usize = 0;
+                    for (self.rows.items[start_row..end_row]) |row| {
+                        for (row.items) |fv| {
+                            chunk_values[vi] = fv.value;
+                            vi += 1;
+                        }
+                    }
                 }
-            } else {
-                // MySQL: no RETURNING. Execute then compute IDs from
-                // last_insert_id and rows_affected.
-                const full_sql_len = query.sql.len + upsert_suffix.len;
-                const full_sql = try self.allocator.alloc(u8, full_sql_len);
-                defer self.allocator.free(full_sql);
-                @memcpy(full_sql[0..query.sql.len], query.sql);
-                @memcpy(full_sql[query.sql.len..], upsert_suffix);
-                self.ensureDeadline();
-                const res = try self.driver.execCtx(&self.execution_context, full_sql, query.args);
-                const base_id = res.last_insert_id orelse 0;
-                for (0..self.rows.items.len) |i| {
-                    try ids.append(base_id + @as(i64, @intCast(i)));
+
+                const query = sql.MultiInsert(self.allocator, dialect, info.table_name, columns.items, rows_in_chunk, chunk_values) catch |err| return mapBuildError(err);
+                defer query.deinit();
+
+                if (supports_returning) {
+                    // SQLite / PostgreSQL: append RETURNING clause and query.
+                    const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{pk_col});
+                    defer self.allocator.free(ret_suffix);
+                    const full_sql = try self.allocator.alloc(u8, query.sql.len + upsert_suffix.len + ret_suffix.len);
+                    defer self.allocator.free(full_sql);
+                    var pos: usize = 0;
+                    @memcpy(full_sql[pos..][0..query.sql.len], query.sql);
+                    pos += query.sql.len;
+                    @memcpy(full_sql[pos..][0..upsert_suffix.len], upsert_suffix);
+                    pos += upsert_suffix.len;
+                    @memcpy(full_sql[pos..][0..ret_suffix.len], ret_suffix);
+
+                    self.ensureDeadline();
+                    var rows = try self.driver.queryCtx(&self.execution_context, full_sql, query.args);
+                    defer rows.deinit();
+                    while (rows.next()) |row| {
+                        const id = row.getInt(0) orelse return error.TypeMismatch;
+                        try ids.append(id);
+                    }
+                } else {
+                    // MySQL: no RETURNING. Execute then compute IDs from
+                    // last_insert_id and rows_affected.
+                    const full_sql_len = query.sql.len + upsert_suffix.len;
+                    const full_sql = try self.allocator.alloc(u8, full_sql_len);
+                    defer self.allocator.free(full_sql);
+                    @memcpy(full_sql[0..query.sql.len], query.sql);
+                    @memcpy(full_sql[query.sql.len..], upsert_suffix);
+                    self.ensureDeadline();
+                    const res = try self.driver.execCtx(&self.execution_context, full_sql, query.args);
+                    const base_id = res.last_insert_id orelse 0;
+                    for (0..rows_in_chunk) |ci| {
+                        try ids.append(base_id + @as(i64, @intCast(ci)));
+                    }
                 }
+
+                start_row = end_row;
             }
 
             // After hooks on success.

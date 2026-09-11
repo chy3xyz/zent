@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **BulkInsert chunks rows around the bound-parameter limit.** `BulkInsert.Save`
+  emitted a single multi-row INSERT, so a batch large enough to exceed the
+  driver's parameter budget (SQLite's `SQLITE_MAX_VARIABLE_NUMBER` is 999 on
+  builds older than 3.32) failed outright. Rows are now inserted in chunks
+  sized from the dialect limit, and each chunk's ids are accumulated so the
+  caller still receives one id per row. `chunkRows(n)` overrides the derived
+  budget when a caller wants to bound statement size (e.g. MySQL
+  `max_allowed_packet`) or to pin chunk boundaries.
 - **`queryTargetsByValue` for UUID/textual primary keys.** `QueryEdge`'s
   traversal helper only accepted `[]const i64` parents, so entities keyed by
   a `field.UUID("id")` string PK could not traverse edges at all. The new
