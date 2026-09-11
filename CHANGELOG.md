@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Nested eager loading issues one query per level instead of one per
+  parent.** `WithEdge("posts.comments")` recursed once per parent entity, so
+  the second level cost N queries (N+1). Every level-1 target now goes into a
+  single pointer list and the next level runs as one query. The parents are
+  addressed by pointer, not copied, because the loaded slices are written back
+  into those very elements. Measured, not assumed: a driver decorator counts
+  statements, and a three-owner two-level load asserts exactly 3 queries —
+  restoring the per-parent recursion makes it 5.
 ## [0.36.0] - 2026-09-11
 
 ### Added

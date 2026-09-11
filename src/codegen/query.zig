@@ -126,7 +126,9 @@ fn loadEdgePath(
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
     execution_context: sql_driver.ExecutionContext,
-    entities: []ParentEntity,
+    /// Parents addressed by pointer: the loaded edge slices are written back
+    /// into these elements, so a copy would silently lose them.
+    entities: []const *ParentEntity,
     path: []const u8,
     privacy_ctx: ?privacy.PrivacyContext,
     interceptors: ?*intercept.InterceptorChain,
@@ -158,7 +160,7 @@ fn loadEdgePath(
             var parent_id_values = try allocator.alloc(sql.Value, entities.len);
             defer allocator.free(parent_id_values);
             for (entities, 0..) |e, i| {
-                parent_id_values[i] = idValue(@field(e, ParentInfo.pk_field));
+                parent_id_values[i] = idValue(@field(e.*, ParentInfo.pk_field));
             }
 
             var b = sql.Builder.init(allocator, driver.dialect());
@@ -247,8 +249,8 @@ fn loadEdgePath(
             }
             if (rows.nextError()) |e| return e;
 
-            for (entities) |*e| {
-                if (map.get(@field(e, ParentInfo.pk_field))) |list| {
+            for (entities) |e| {
+                if (map.get(@field(e.*, ParentInfo.pk_field))) |list| {
                     const slice = try allocator.dupe(TargetEntity, list.items);
                     @field(e.edges, edge.name) = slice;
                 }
@@ -258,13 +260,21 @@ fn loadEdgePath(
             // eager-load target (PlainFields) carries no edges container;
             // the comptime guard stops its instantiation from being
             // analyzed (a third nesting level stays a compile error).
+            // Recurse one level into the loaded targets. Every level-1 target
+            // goes into one pointer list so the next level is a single query;
+            // recursing per parent issued one query per parent (N+1).
             if (comptime @hasField(TargetEntity, "edges")) {
                 if (split.rest.len > 0) {
-                    for (entities) |*e| {
-                        const arr = @field(e.edges, edge.name);
-                        if (arr) |items| {
-                            try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, @constCast(items), split.rest, privacy_ctx, interceptors, with_trashed);
+                    var next: std.ArrayListUnmanaged(*TargetEntity) = .empty;
+                    defer next.deinit(allocator);
+                    for (entities) |e| {
+                        if (@field(e.edges, edge.name)) |items| {
+                            try next.ensureUnusedCapacity(allocator, items.len);
+                            for (items) |*t| next.appendAssumeCapacity(t);
                         }
+                    }
+                    if (next.items.len > 0) {
+                        try loadEdgePath(infos, target_info, TargetEntity, allocator, driver, execution_context, next.items, split.rest, privacy_ctx, interceptors, with_trashed);
                     }
                 }
             }
@@ -1307,7 +1317,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         fn loadEdges(self: *Self, edge_path: []const u8, entities: []Entity) !void {
-            return loadEdgePath(infos, info, Entity, self.allocator, self.driver, self.execution_context, entities, edge_path, self.privacy_ctx, self.interceptors, self.with_trashed);
+            if (entities.len == 0) return;
+            const ptrs = try self.allocator.alloc(*Entity, entities.len);
+            defer self.allocator.free(ptrs);
+            for (entities, 0..) |*e, i| ptrs[i] = e;
+            return loadEdgePath(infos, info, Entity, self.allocator, self.driver, self.execution_context, ptrs, edge_path, self.privacy_ctx, self.interceptors, self.with_trashed);
         }
 
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {

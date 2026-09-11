@@ -3434,3 +3434,142 @@ test "SQLite: BulkInsert honours an explicit chunk size across boundaries" {
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, @intCast(row_count)), row.getInt(0).?);
 }
+
+/// Counts statements reaching the driver so a test can assert how many queries
+/// an eager load issues. Every vtable entry delegates to the wrapped driver.
+const CountingDriver = struct {
+    inner: zent.sql_driver.Driver,
+    queries: usize = 0,
+    execs: usize = 0,
+
+    fn borrowed(self: *@This()) zent.sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn execFn(ptr: *anyopaque, ctx: ?*const zent.sql_driver.ExecutionContext, q: []const u8, a: []const zent.sql.Value) zent.sql_driver.Error!zent.sql_driver.Result {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.execs += 1;
+        return self.inner.execCtx(ctx, q, a);
+    }
+    fn queryFn(ptr: *anyopaque, ctx: ?*const zent.sql_driver.ExecutionContext, q: []const u8, a: []const zent.sql.Value) zent.sql_driver.Error!zent.sql_driver.Rows {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.queries += 1;
+        return self.inner.queryCtx(ctx, q, a);
+    }
+    fn beginTxFn(ptr: *anyopaque) zent.sql_driver.Error!zent.sql_driver.Tx {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.beginTx();
+    }
+    fn beginSavepointFn(ptr: *anyopaque, name: []const u8) zent.sql_driver.Error!zent.sql_driver.Tx {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.beginSavepoint(name);
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.inner.close();
+    }
+    fn dialectFn(ptr: *anyopaque) zent.sql_dialect.Dialect {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.dialect();
+    }
+    fn pingFn(ptr: *anyopaque) zent.sql_driver.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.ping();
+    }
+    fn inTxFn(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.inTransaction();
+    }
+
+    const vtable = zent.sql_driver.Driver.VTable{
+        .exec = execFn,
+        .query = queryFn,
+        .beginTx = beginTxFn,
+        .beginSavepoint = beginSavepointFn,
+        .close = closeFn,
+        .dialect = dialectFn,
+        .ping = pingFn,
+        .inTransaction = inTxFn,
+    };
+};
+
+test "SQLite: nested eager loading batches each level into one query" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // The FK columns are declared fields named after the parent table, which is
+    // what the edge inference expects (same shape as the query.zig nested test).
+    const NoteBase = schema("NitNote", .{
+        .fields = &.{ field.Int("nit_item_id"), field.String("body") },
+    });
+    const ItemBase = schema("NitItem", .{
+        .fields = &.{ field.Int("nit_owner_id"), field.String("label") },
+        .edges = &.{edge.To("notes", NoteBase)},
+    });
+    const OwnerBase = schema("NitOwner", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("items", ItemBase)},
+    });
+
+    const infos = comptime buildGraph(&.{ OwnerBase, ItemBase, NoteBase }).types;
+    const owner_info = infos[0];
+    const item_info = infos[1];
+    const note_info = infos[2];
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+
+    var counting = CountingDriver{ .inner = drv.asDriver() };
+    var client = Client.makeClient(infos, allocator, counting.borrowed());
+
+    // Three owners, each with one item carrying one note.
+    const names = [_][]const u8{ "o1", "o2", "o3" };
+    for (names, 0..) |name, i| {
+        var ob = try client.nit_owner.Create();
+        defer ob.deinit();
+        _ = try ob.setFieldValue("name", name);
+        var owner = try ob.Save();
+        defer zent.codegen.deinitEntity(infos, owner_info, &owner, allocator);
+
+        var ib = try client.nit_item.Create();
+        defer ib.deinit();
+        _ = try ib.setFieldValue("nit_owner_id", owner.id);
+        _ = try ib.setFieldValue("label", name);
+        var item = try ib.Save();
+        defer zent.codegen.deinitEntity(infos, item_info, &item, allocator);
+
+        var nb = try client.nit_note.Create();
+        defer nb.deinit();
+        _ = try nb.setFieldValue("nit_item_id", item.id);
+        _ = try nb.setFieldValue("body", name);
+        var note = try nb.Save();
+        defer zent.codegen.deinitEntity(infos, note_info, &note, allocator);
+        _ = i;
+    }
+
+    counting.queries = 0;
+    counting.execs = 0;
+
+    var q = client.nit_owner.Query();
+    defer q.deinit();
+    _ = try q.WithEdge("items.notes");
+    var result = try q.All();
+    defer {
+        for (result.items) |*e| zent.codegen.deinitEntity(infos, owner_info, e, allocator);
+        result.deinit();
+    }
+
+    // One query for the owners, one for the items, one for the notes —
+    // independent of how many owners there are. Recursing per parent issued
+    // one query per owner for the second level.
+    try testing.expectEqual(@as(usize, 3), counting.queries);
+    try testing.expectEqual(@as(usize, 3), result.items.len);
+    // The nested level really did load (a batching bug that dropped it would
+    // still show 3 queries).
+    for (result.items) |owner| {
+        const items = owner.edges.items.?;
+        try testing.expectEqual(@as(usize, 1), items.len);
+        const notes = items[0].edges.notes.?;
+        try testing.expectEqual(@as(usize, 1), notes.len);
+        try testing.expectEqualStrings(owner.name, notes[0].body);
+    }
+}
