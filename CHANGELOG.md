@@ -39,6 +39,16 @@ All notable changes to this project will be documented in this file.
   into those very elements. Measured, not assumed: a driver decorator counts
   statements, and a three-owner two-level load asserts exactly 3 queries —
   restoring the per-parent recursion makes it 5.
+
+### Docs
+- `BEST_PRACTICES` §5f (connection pool: `max_wait_ms`, health-check and
+  callback locking, the quiescence `deinit` requires) and §5g (eager loading:
+  one query per level, parent chunking, the target read contract, and that
+  `queryTargets` is soft-delete-only and not tenant-scoped). `ARCHITECTURE`
+  now states the interceptor-chain ownership rule and the parked-borrower
+  requirement, and `UPGRADING` §10 lists the concrete steps for adopting
+  v0.36 (outbox `claimed_at` migration, `createAllTables` allocator argument,
+  migrations locking by default, `max_wait_ms` meaning).
 ## [0.36.0] - 2026-09-11
 
 ### Added
