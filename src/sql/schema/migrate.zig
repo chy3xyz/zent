@@ -622,6 +622,9 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
                 error.QueryTimeout => return error.QueryTimeout,
                 error.UniqueViolation, error.NotNullViolation, error.ForeignKeyViolation => return error.ExecFailed,
                 error.OptimisticLockConflict => return error.OptimisticLockConflict,
+                error.DeadlockDetected => return error.DeadlockDetected,
+                error.SerializationFailure => return error.SerializationFailure,
+                error.LockTimeout => return error.LockTimeout,
             };
         }
         defer if (existing_mysql_indexes) |*indexes| {

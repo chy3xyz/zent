@@ -32,6 +32,11 @@ pub const PostgresDriver = struct {
     cache: ?PreparedCache(16, *c.PGresult) = null,
     /// SSL/TLS mode for connections.
     ssl_mode: SslMode = .prefer,
+    /// Statement timeout currently set on this connection, in milliseconds.
+    /// `null` means the server DEFAULT (no timeout). Tracked so a statement
+    /// only pays a `SET statement_timeout` round trip when the desired value
+    /// actually differs from what the connection already has.
+    current_statement_timeout_ms: ?u32 = null,
 
     pub const SslMode = enum { disable, require, prefer, verify_full };
 
@@ -104,14 +109,31 @@ pub const PostgresDriver = struct {
         logPgError(conn, context);
     }
 
-    fn setStatementTimeout(self: *PostgresDriver, ctx: ?*const driver.ExecutionContext) driver.Error!void {
-        const ms_opt = if (ctx) |exec_ctx| exec_ctx.remainingMs() else null;
-        const sql = if (ms_opt) |ms| blk: {
+    /// Apply the statement timeout requested by `ctx`, sending a `SET` only
+    /// when the connection's current value differs from `desired`.
+    ///
+    /// This removes the per-statement round-trip tax the old implementation
+    /// paid: a statement with no deadline previously issued both a leading
+    /// `SET ... = DEFAULT`-or-timeout and an unconditional trailing
+    /// `SET statement_timeout = DEFAULT`. Now a statement with no deadline
+    /// costs zero extra round trips, and a statement with a deadline only pays
+    /// when the deadline differs from the last value applied.
+    ///
+    /// Leaving a non-default value on a pooled connection is safe: the next
+    /// statement either sets its own deadline or restores DEFAULT here,
+    /// because `current_statement_timeout_ms` travels with the connection.
+    fn applyStatementTimeout(self: *PostgresDriver, ctx: ?*const driver.ExecutionContext) driver.Error!void {
+        const desired: ?u32 = if (ctx) |exec_ctx| exec_ctx.remainingMs() else null;
+        if (desired) |ms| {
+            // An already-expired deadline must fail before touching the wire.
             if (ms == 0) return error.QueryTimeout;
-            break :blk try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{ms});
-        } else blk: {
-            break :blk try self.allocator.dupe(u8, "SET statement_timeout = DEFAULT");
-        };
+        }
+        if (self.current_statement_timeout_ms == desired) return;
+
+        const sql = if (desired) |ms|
+            try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{ms})
+        else
+            try self.allocator.dupe(u8, "SET statement_timeout = DEFAULT");
         defer self.allocator.free(sql);
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
@@ -121,11 +143,7 @@ pub const PostgresDriver = struct {
         defer c.PQclear(res);
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_COMMAND_OK) return sqlstateToError(res.?);
-    }
-
-    fn resetStatementTimeout(self: *PostgresDriver) void {
-        const res = c.PQexec(self.conn, "SET statement_timeout = DEFAULT");
-        if (res) |r| c.PQclear(r);
+        self.current_statement_timeout_ms = desired;
     }
 
     /// Free all parameters that were allocated (int, float, string, bytes).
@@ -214,7 +232,15 @@ pub const PostgresDriver = struct {
         const field = c.PQresultErrorField(result, c.PG_DIAG_SQLSTATE) orelse return error.DriverFailed;
         const sqlstate: []const u8 = std.mem.span(field);
         if (sqlstate.len < 2) return error.DriverFailed;
-        if (sqlstate.len >= 5 and std.mem.eql(u8, sqlstate[0..5], "57014")) return error.QueryTimeout;
+        if (sqlstate.len >= 5) {
+            if (std.mem.eql(u8, sqlstate[0..5], "57014")) return error.QueryTimeout;
+            // Retryable transaction-abort conditions (see driver.isRetryable):
+            // 40P01 deadlock_detected, 40001 serialization_failure,
+            // 55P03 lock_not_available.
+            if (std.mem.eql(u8, sqlstate[0..5], "40P01")) return error.DeadlockDetected;
+            if (std.mem.eql(u8, sqlstate[0..5], "40001")) return error.SerializationFailure;
+            if (std.mem.eql(u8, sqlstate[0..5], "55P03")) return error.LockTimeout;
+        }
         return switch (sqlstate[0]) {
             '0' => if (sqlstate[1] == '8') error.ConnectionFailed else error.DriverFailed,
             '2' => switch (sqlstate[1]) {
@@ -566,26 +592,18 @@ pub const PostgresDriver = struct {
         .exec = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
-                // NOTE: the `defer` must live at function scope. Zig runs a
-                // defer when its enclosing block ends, so putting it inside
-                // the `if` would reset statement_timeout BEFORE the query
-                // runs, silently disabling withTimeout.
-                if (ctx != null) {
-                    try self_ptr.setStatementTimeout(ctx);
-                }
-                defer self_ptr.resetStatementTimeout();
+                // applyStatementTimeout only sends SET when the desired value
+                // differs from the connection's current one, so there is no
+                // trailing reset to defer (and no defer-before-query hazard).
+                try self_ptr.applyStatementTimeout(ctx);
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
         .query = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Rows {
                 const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
-                // See note in .exec above: defer at function scope so the
-                // timeout stays active while the query runs.
-                if (ctx != null) {
-                    try self_ptr.setStatementTimeout(ctx);
-                }
-                defer self_ptr.resetStatementTimeout();
+                // See note in .exec above.
+                try self_ptr.applyStatementTimeout(ctx);
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,

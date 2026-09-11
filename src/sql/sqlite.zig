@@ -63,6 +63,7 @@ pub const SQLiteDriver = struct {
             error.SqliteInterrupt => error.QueryTimeout,
             error.TxNotActive => error.TxFailed,
             error.QueryTimeout => error.QueryTimeout,
+            error.LockTimeout => error.LockTimeout,
             error.UniqueViolation => error.UniqueViolation,
             error.NotNullViolation => error.NotNullViolation,
             error.ForeignKeyViolation => error.ForeignKeyViolation,
@@ -144,6 +145,11 @@ pub const SQLiteDriver = struct {
         if (step_rc != c.SQLITE_DONE and step_rc != c.SQLITE_ROW) {
             logSqliteError(self.db, "exec");
             if (step_rc == c.SQLITE_INTERRUPT) return error.SqliteInterrupt;
+            // SQLITE_BUSY/LOCKED surface only after sqlite3_busy_timeout gives
+            // up, so map them to the retryable lock-timeout classification.
+            // Extended codes share the low byte; mask it off.
+            const primary_rc = step_rc & 0xff;
+            if (primary_rc == c.SQLITE_BUSY or primary_rc == c.SQLITE_LOCKED) return error.LockTimeout;
             if (step_rc == c.SQLITE_CONSTRAINT) return toDriverError(sqliteErrnoToDriver(self.db, error.ExecFailed));
             return error.SqliteExecFailed;
         }
@@ -490,7 +496,10 @@ const SQLiteRows = struct {
             // ... RETURNING) must be surfaced via nextError, not swallowed as
             // "no more rows" (which used to surface as error.NotFound).
             self.done = true;
-            if (rc == c.SQLITE_CONSTRAINT) {
+            const primary_rc = rc & 0xff;
+            if (primary_rc == c.SQLITE_BUSY or primary_rc == c.SQLITE_LOCKED) {
+                self.next_error = error.LockTimeout;
+            } else if (rc == c.SQLITE_CONSTRAINT) {
                 const db = c.sqlite3_db_handle(self.stmt) orelse return null;
                 self.next_error = sqliteErrnoToDriver(db, error.ExecFailed);
             }
@@ -717,6 +726,11 @@ test "SQLite transaction" {
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try std.testing.expectEqual(@as(i64, 42), row.getInt(0).?);
+}
+
+test "SQLite busy/locked errors classify as retryable LockTimeout" {
+    try std.testing.expectEqual(driver.Error.LockTimeout, SQLiteDriver.toDriverError(error.LockTimeout));
+    try std.testing.expect(driver.isRetryable(SQLiteDriver.toDriverError(error.LockTimeout)));
 }
 
 test "SQLite uncached exec finalizes statements after success" {

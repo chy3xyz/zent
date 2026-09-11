@@ -816,6 +816,49 @@ test "MySQL: slow query times out" {
     try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
 }
 
+/// Read whichever server-side statement-timeout variable this server exposes
+/// (MySQL: max_execution_time; MariaDB: max_statement_time) as text.
+fn readServerTimeout(allocator: std.mem.Allocator, d: zent.sql_driver.Driver) ![]u8 {
+    var rows = try d.query("SHOW VARIABLES LIKE 'max_execution_time'", &.{});
+    defer rows.deinit();
+    if (rows.next()) |row| return allocator.dupe(u8, row.getText(1).?);
+
+    var rows2 = try d.query("SHOW VARIABLES LIKE 'max_statement_time'", &.{});
+    defer rows2.deinit();
+    if (rows2.next()) |row| return allocator.dupe(u8, row.getText(1).?);
+    return allocator.dupe(u8, "");
+}
+
+test "MySQL: deadline-free statements after a deadline keep server timeout consistent" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+    const d = drv.asDriver();
+
+    const baseline = try readServerTimeout(allocator, d);
+    defer allocator.free(baseline);
+
+    // A deadline applies a non-default server timeout. `DO 1` produces no
+    // result set, which exec() does not consume on the parameterless path.
+    var ctx = zent.sql_driver.ExecutionContext{
+        .deadline_ns = zent.sql_driver.monotonicNs() + 2 * std.time.ns_per_s,
+    };
+    _ = try d.execCtx(&ctx, "DO 1", &.{});
+
+    // Two statements with no deadline: the first must restore DEFAULT, the
+    // second is a no-op for the timeout state. Neither may error.
+    _ = try d.exec("DO 1", &.{});
+    var rows = try d.query("SELECT 1 AS one", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+
+    // The connection must be back to the server default.
+    const after = try readServerTimeout(allocator, d);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(baseline, after);
+}
+
 test "MySQL: boolean column scans via getBool" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
@@ -1865,4 +1908,26 @@ test "MySQL: eager-loaded children respect interceptor tenant scope" {
         try testing.expectEqual(@as(usize, 1), children.len);
         try testing.expectEqualStrings("p1-t1", children[0].name);
     }
+}
+
+test "MySQL: no-arg exec consumes a SELECT result set" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // A no-arg SELECT through exec returns rows; if that result set is left
+    // pending, libmysql rejects the NEXT command with errno 2014
+    // ("Commands out of sync"). Exercise select-then-select and
+    // select-then-parameterized-exec to cover both follow-up paths.
+    _ = try drv.exec("SELECT 1", &.{});
+    _ = try drv.exec("SELECT 2", &.{});
+    _ = try drv.exec("DO 1", &.{});
+
+    var rows = try drv.query("SELECT 7 AS seven", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 7), row.getInt(0).?);
+
+    // Parameterized exec still works right after the no-arg ones.
+    _ = try drv.exec("DO ?", &.{.{ .int = 1 }});
 }

@@ -819,6 +819,41 @@ test "Postgres: slow query times out" {
     try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
 }
 
+test "Postgres: deadline-free statements after a deadline keep statement_timeout consistent" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+    const d = drv.asDriver();
+
+    // Capture the server default (usually "0") so we can prove it is restored.
+    var base_rows = try d.query("SHOW statement_timeout", &.{});
+    defer base_rows.deinit();
+    const base_row = base_rows.next() orelse return error.NoRow;
+    const baseline = try allocator.dupe(u8, base_row.getText(0).?);
+    defer allocator.free(baseline);
+
+    // A deadline applies a non-default timeout to the connection.
+    var ctx = zent.sql_driver.ExecutionContext{
+        .deadline_ns = zent.sql_driver.monotonicNs() + 2 * std.time.ns_per_s,
+    };
+    _ = try d.execCtx(&ctx, "SELECT 1", &.{});
+
+    // Two statements with no deadline: the first must restore DEFAULT (the
+    // connection still carries the 2s value), the second is a no-op for the
+    // timeout state. Neither may error.
+    _ = try d.exec("SELECT 1", &.{});
+    var rows = try d.query("SELECT 1 AS one", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+
+    // The connection must be back to the server default, not leaking 2s.
+    var after_rows = try d.query("SHOW statement_timeout", &.{});
+    defer after_rows.deinit();
+    const after_row = after_rows.next() orelse return error.NoRow;
+    try testing.expectEqualStrings(baseline, after_row.getText(0).?);
+}
+
 test "Postgres: boolean column scans via getBool (t/f wire format)" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

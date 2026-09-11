@@ -22,6 +22,24 @@ fn toDriverError(err: anyerror) driver.Error {
     };
 }
 
+/// Errnos whose driver.Error carries caller-actionable meaning (constraint
+/// violations, timeouts, retryable transaction aborts) and must be propagated
+/// verbatim instead of collapsing into the generic MySQLExecFailed /
+/// MySQLStmtFailed.
+fn isDistinctErrno(err: driver.Error) bool {
+    return switch (err) {
+        error.QueryTimeout,
+        error.UniqueViolation,
+        error.NotNullViolation,
+        error.ForeignKeyViolation,
+        error.DeadlockDetected,
+        error.SerializationFailure,
+        error.LockTimeout,
+        => true,
+        else => false,
+    };
+}
+
 /// Log a failed mysql_options call (non-fatal: connection can still proceed
 /// with defaults, e.g. a missing socket timeout just loses the guard).
 fn checkOpt(name: []const u8, rc: c_int) void {
@@ -47,7 +65,8 @@ pub fn errnoToError(errno: c_uint) driver.Error {
         1451, 1452 => error.ForeignKeyViolation, // FK constraint fails
         1064, 1146, 1054, 1060 => error.QueryFailed, // Syntax / no such table / bad column
         1142, 1143 => error.ExecFailed, // Permission denied
-        1205, 1213 => error.TxFailed, // Lock wait / deadlock
+        1213 => error.DeadlockDetected, // ER_LOCK_DEADLOCK
+        1205 => error.LockTimeout, // ER_LOCK_WAIT_TIMEOUT
         1317, 1406 => error.ExecFailed, // Query interrupted / data too long
         1969 => error.QueryTimeout, // MariaDB ER_STATEMENT_TIMEOUT
         2002, 2003, 2006, 2013 => error.ConnectionFailed, // Connection lost
@@ -72,6 +91,11 @@ pub const MySQLDriver = struct {
     /// Optional prepared-statement cache. Set this field after `connect()` to
     /// enable caching; null (the default) disables it.
     cache: ?cache.PreparedCache(16, *c.MYSQL_STMT) = null,
+    /// Server-side statement timeout currently set on this connection, in
+    /// milliseconds. `null` means the server DEFAULT (no timeout). Tracked so
+    /// a statement only pays a `SET SESSION` round trip when the desired value
+    /// differs from what the connection already has.
+    current_server_timeout_ms: ?u32 = null,
 
     /// Fail fast when the connection has been lost (avoids segfault on the
     /// stale libmysqlclient handle).
@@ -209,13 +233,39 @@ pub const MySQLDriver = struct {
     /// set max_execution_time (MySQL 8) or max_statement_time (MariaDB; the
     /// variable name is unknown to MySQL and vice versa, hence the fallback).
     /// max_execution_time takes milliseconds; max_statement_time takes seconds.
+    ///
+    /// Only sends `SET SESSION` when the desired value differs from the
+    /// connection's current one: a statement with no deadline costs zero extra
+    /// round trips (the old code reset unconditionally after every statement),
+    /// and a statement with a deadline skips the trailing reset because the
+    /// next statement restores DEFAULT for itself. Leaving a non-default value
+    /// on a pooled connection is harmless for the same reason.
     fn applyServerTimeout(self: *MySQLDriver, ctx: ?*const driver.ExecutionContext) driver.Error!void {
-        const ms_opt = if (ctx) |cx| cx.remainingMs() else null;
-        const ms = ms_opt orelse return {};
+        const desired: ?u32 = if (ctx) |cx| cx.remainingMs() else null;
+        if (self.current_server_timeout_ms == desired) return;
+
+        if (desired == null) {
+            if (self.exec("SET SESSION max_execution_time = DEFAULT", &.{})) |_| {
+                self.current_server_timeout_ms = null;
+                return;
+            } else |err| {
+                // MariaDB doesn't know max_execution_time.
+                if (self.exec("SET SESSION max_statement_time = DEFAULT", &.{})) |_| {
+                    self.current_server_timeout_ms = null;
+                    return;
+                } else |err2| {
+                    std.log.warn("mysql: could not reset server-side statement timeout ({s}, {s})", .{ @errorName(err), @errorName(err2) });
+                    return;
+                }
+            }
+        }
+
+        const ms = desired.?;
         const sql = try std.fmt.allocPrint(self.allocator, "SET SESSION max_execution_time = {d}", .{ms});
         defer self.allocator.free(sql);
         if (self.exec(sql, &.{})) |_| {
-            return {};
+            self.current_server_timeout_ms = desired;
+            return;
         } else |err| {
             // MySQL 8 accepts max_execution_time; MariaDB doesn't, so fall
             // back to max_statement_time (seconds). If that also fails the
@@ -225,19 +275,12 @@ pub const MySQLDriver = struct {
             const sql2 = try std.fmt.allocPrint(self.allocator, "SET SESSION max_statement_time = {d}", .{sec});
             defer self.allocator.free(sql2);
             if (self.exec(sql2, &.{})) |_| {
-                return {};
+                self.current_server_timeout_ms = desired;
+                return;
             } else |err2| {
                 std.log.warn("mysql: could not set server-side statement timeout ({s}, {s})", .{ @errorName(err), @errorName(err2) });
             }
         }
-    }
-
-    fn resetServerTimeout(self: *MySQLDriver) void {
-        _ = self.exec("SET SESSION max_execution_time = DEFAULT", &.{}) catch {
-            _ = self.exec("SET SESSION max_statement_time = DEFAULT", &.{}) catch |err| {
-                std.log.warn("mysql: could not reset server-side statement timeout ({s})", .{@errorName(err)});
-            };
-        };
     }
 
     /// Bind `args` to `binds`/`str_bufs`/`int_bufs`/`float_bufs`/`bool_bufs`.
@@ -314,8 +357,21 @@ pub const MySQLDriver = struct {
                 // Timeouts and constraint violations are distinct outcomes
                 // (callers rely on e.g. UniqueViolation for upsert fallbacks);
                 // everything else collapses to the generic exec failure.
-                if (err == error.QueryTimeout or err == error.UniqueViolation or
-                    err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
+                if (isDistinctErrno(err)) return err;
+                return error.MySQLExecFailed;
+            }
+
+            // A statement that returns rows (a no-arg `SELECT` issued through
+            // exec) leaves its result set pending; libmysql then rejects the
+            // next command with errno 2014 "Commands out of sync". Consume and
+            // free it. Statements with no result set (INSERT/UPDATE/DDL) yield
+            // NULL here with errno 0 — the common exec path.
+            if (c.mysql_store_result(self.conn)) |res| {
+                c.mysql_free_result(res);
+            } else if (c.mysql_errno(self.conn) != 0) {
+                const err = errnoToError(c.mysql_errno(self.conn));
+                self.markDead(err);
+                if (isDistinctErrno(err)) return err;
                 return error.MySQLExecFailed;
             }
 
@@ -389,8 +445,7 @@ pub const MySQLDriver = struct {
             self.markDead(err);
             // Statement timeouts and constraint violations are distinct
             // outcomes; the rest collapse to the generic stmt failure.
-            if (err == error.QueryTimeout or err == error.UniqueViolation or
-                err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
+            if (isDistinctErrno(err)) return err;
             logMySQLError(self, self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
@@ -466,8 +521,7 @@ pub const MySQLDriver = struct {
             self.markDead(err);
             // Statement timeouts and constraint violations are distinct
             // outcomes; the rest collapse to the generic stmt failure.
-            if (err == error.QueryTimeout or err == error.UniqueViolation or
-                err == error.NotNullViolation or err == error.ForeignKeyViolation) return err;
+            if (isDistinctErrno(err)) return err;
             logMySQLError(self, self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
@@ -614,6 +668,7 @@ pub const MySQLDriver = struct {
                 var saved: SavedTimeouts = undefined;
                 try self_ptr.applySocketTimeout(ctx, &saved);
                 defer self_ptr.restoreSocketTimeout(saved);
+                try self_ptr.applyServerTimeout(ctx);
                 return self_ptr.exec(q, a) catch |err| return toDriverError(err);
             }
         }.f,
@@ -623,8 +678,9 @@ pub const MySQLDriver = struct {
                 var saved: SavedTimeouts = undefined;
                 try self_ptr.applySocketTimeout(ctx, &saved);
                 defer self_ptr.restoreSocketTimeout(saved);
+                // applyServerTimeout only sends SET when the connection's
+                // current value differs, so no trailing reset is needed.
                 try self_ptr.applyServerTimeout(ctx);
-                defer self_ptr.resetServerTimeout();
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
             }
         }.f,
@@ -1062,7 +1118,10 @@ test "MySQL errnoToError maps common errnos" {
     try std.testing.expectEqual(driver.Error.NotNullViolation, errnoToError(1048));
     try std.testing.expectEqual(driver.Error.ForeignKeyViolation, errnoToError(1451));
     try std.testing.expectEqual(driver.Error.ForeignKeyViolation, errnoToError(1452));
-    try std.testing.expectEqual(driver.Error.TxFailed, errnoToError(1213));
+    try std.testing.expectEqual(driver.Error.DeadlockDetected, errnoToError(1213));
+    try std.testing.expectEqual(driver.Error.LockTimeout, errnoToError(1205));
+    try std.testing.expect(driver.isRetryable(errnoToError(1213)));
+    try std.testing.expect(driver.isRetryable(errnoToError(1205)));
     try std.testing.expectEqual(driver.Error.QueryTimeout, errnoToError(1969));
     try std.testing.expectEqual(driver.Error.QueryTimeout, errnoToError(3024));
     try std.testing.expectEqual(driver.Error.ConnectionFailed, errnoToError(2006));

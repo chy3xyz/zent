@@ -36,6 +36,52 @@ pub const Error = error{
     NotNullViolation,
     /// A foreign key constraint was violated.
     ForeignKeyViolation,
+    /// The server detected a deadlock between concurrent transactions and
+    /// aborted this one (PostgreSQL SQLSTATE 40P01, MySQL errno 1213). The
+    /// whole transaction must be replayed; see `retryTx`.
+    DeadlockDetected,
+    /// The transaction could not be serialized against a concurrent commit
+    /// (PostgreSQL SQLSTATE 40001). Produced only under SERIALIZABLE /
+    /// REPEATABLE READ isolation; the whole transaction must be replayed.
+    SerializationFailure,
+    /// A lock (or the statement) exceeded the configured lock/statement
+    /// timeout (PostgreSQL SQLSTATE 55P03, MySQL errno 1205, SQLite
+    /// SQLITE_BUSY / SQLITE_LOCKED). The statement may succeed on retry once
+    /// the competing transaction finishes.
+    LockTimeout,
+};
+
+/// Returns true when `err` is transient and the operation may be retried.
+///
+/// These errors do not indicate a bad statement or bad data; they mean the
+/// attempt lost a race (deadlock, serialization conflict, lock timeout) or the
+/// connection dropped. For transaction-scoped errors the retry must replay the
+/// whole transaction — use `retryTx` rather than retrying a single statement.
+pub fn isRetryable(err: Error) bool {
+    return isRetryableAny(err);
+}
+
+/// `anyerror`-accepting form of `isRetryable`, used by `retryTx` whose body
+/// may surface errors outside `driver.Error`.
+fn isRetryableAny(err: anyerror) bool {
+    return switch (err) {
+        error.DeadlockDetected,
+        error.SerializationFailure,
+        error.LockTimeout,
+        error.ConnectionFailed,
+        => true,
+        else => false,
+    };
+}
+
+/// Backoff policy for `retryTx`.
+pub const RetryOpts = struct {
+    /// Total attempts, including the first. `1` disables retrying.
+    max_attempts: u32 = 3,
+    /// Delay before the first retry; doubled on every subsequent retry.
+    base_backoff_ms: u32 = 50,
+    /// Upper bound for a single retry delay.
+    max_backoff_ms: u32 = 1000,
 };
 
 /// A single database row exposed for scanning.
@@ -317,3 +363,213 @@ pub const Driver = struct {
         return self.vtable.beginSavepoint(self.ptr, name);
     }
 };
+
+fn sleepBackoffMs(ms: u64) void {
+    if (ms == 0) return;
+    var req = std.c.timespec{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&req, null);
+}
+
+fn backoffDelay(attempt: u32, opts: RetryOpts) u64 {
+    var delay: u64 = opts.base_backoff_ms;
+    var i: u32 = 1;
+    while (i < attempt) : (i += 1) {
+        delay = @min(delay *| 2, @as(u64, opts.max_backoff_ms));
+    }
+    return delay;
+}
+
+/// Run `body` inside a transaction, replaying the WHOLE transaction when an
+/// attempt fails with a retryable error (`isRetryable`).
+///
+/// Retrying a single statement is not enough: PostgreSQL's 40001/40P01 and
+/// MySQL's 1205/1213 abort the transaction, so every statement issued after
+/// the failure is rejected until the transaction is rolled back. `retryTx`
+/// therefore opens a fresh transaction per attempt.
+///
+/// `body` is invoked as `body(ctx, tx)` and runs statements through
+/// `tx.exec` / `tx.query`; it must NOT call `tx.commit` / `tx.rollback` /
+/// `tx.deinit` itself — the helper owns the transaction lifecycle. On success
+/// the transaction is committed; on failure it is rolled back. `Tx.deinit` is
+/// called exactly once per attempt (the driver contract), including attempts
+/// that fail and attempts that are retried. Between retryable attempts the
+/// helper sleeps with exponential backoff derived from `opts`.
+///
+/// Example:
+///     fn transfer(ctx: *Ctx, tx: driver.Tx) anyerror!void {
+///         _ = try tx.exec("UPDATE account SET bal = bal - 1 WHERE id = $1", &.{...});
+///     }
+///     try driver.retryTx(d, &ctx, transfer, .{ .max_attempts = 5 });
+pub fn retryTx(d: Driver, ctx: anytype, body: anytype, opts: RetryOpts) anyerror!void {
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        const tx = d.beginTx() catch |err| {
+            if (isRetryableAny(err) and attempt < opts.max_attempts) {
+                sleepBackoffMs(backoffDelay(attempt, opts));
+                continue;
+            }
+            return err;
+        };
+
+        if (body(ctx, tx)) |_| {
+            tx.commit() catch |err| {
+                // A failed commit still requires exactly one deinit.
+                tx.rollback() catch {};
+                tx.deinit();
+                if (isRetryableAny(err) and attempt < opts.max_attempts) {
+                    sleepBackoffMs(backoffDelay(attempt, opts));
+                    continue;
+                }
+                return err;
+            };
+            tx.deinit();
+            return;
+        } else |err| {
+            tx.rollback() catch {};
+            tx.deinit();
+            if (isRetryableAny(err) and attempt < opts.max_attempts) {
+                sleepBackoffMs(backoffDelay(attempt, opts));
+                continue;
+            }
+            return err;
+        }
+    }
+}
+
+const MockTxState = struct {
+    begin_calls: u32 = 0,
+    commit_calls: u32 = 0,
+    rollback_calls: u32 = 0,
+    deinit_calls: u32 = 0,
+    body_calls: u32 = 0,
+    fail_times: u32 = 0,
+    fail_with: anyerror = error.DeadlockDetected,
+};
+
+fn mockExec(_: *anyopaque, _: ?*const ExecutionContext, _: []const u8, _: []const Value) Error!Result {
+    return .{ .rows_affected = 0, .last_insert_id = null };
+}
+
+fn mockQuery(_: *anyopaque, _: ?*const ExecutionContext, _: []const u8, _: []const Value) Error!Rows {
+    return error.QueryFailed;
+}
+
+fn mockCommit(ptr: *anyopaque) Error!void {
+    const s: *MockTxState = @ptrCast(@alignCast(ptr));
+    s.commit_calls += 1;
+}
+
+fn mockRollback(ptr: *anyopaque) Error!void {
+    const s: *MockTxState = @ptrCast(@alignCast(ptr));
+    s.rollback_calls += 1;
+}
+
+fn mockTxDeinit(ptr: *anyopaque) void {
+    const s: *MockTxState = @ptrCast(@alignCast(ptr));
+    s.deinit_calls += 1;
+}
+
+const mock_vtable = Driver.VTable{
+    .exec = mockExec,
+    .query = mockQuery,
+    .beginTx = struct {
+        fn f(ptr: *anyopaque) Error!Tx {
+            const s: *MockTxState = @ptrCast(@alignCast(ptr));
+            s.begin_calls += 1;
+            return Tx{
+                .inner = .{ .ptr = ptr, .vtable = &mock_vtable },
+                .commitFn = mockCommit,
+                .rollbackFn = mockRollback,
+                .deinitFn = mockTxDeinit,
+                .ptr = ptr,
+            };
+        }
+    }.f,
+    .close = struct {
+        fn f(_: *anyopaque) void {}
+    }.f,
+    .dialect = struct {
+        fn f(_: *anyopaque) Dialect {
+            return Dialect.sqlite;
+        }
+    }.f,
+    .ping = struct {
+        fn f(_: *anyopaque) Error!void {}
+    }.f,
+    .inTransaction = struct {
+        fn f(_: *anyopaque) bool {
+            return false;
+        }
+    }.f,
+    .beginSavepoint = struct {
+        fn f(_: *anyopaque, _: []const u8) Error!Tx {
+            return error.QueryFailed;
+        }
+    }.f,
+};
+
+test "isRetryable classifies transient errors" {
+    try std.testing.expect(isRetryable(error.DeadlockDetected));
+    try std.testing.expect(isRetryable(error.SerializationFailure));
+    try std.testing.expect(isRetryable(error.LockTimeout));
+    try std.testing.expect(isRetryable(error.ConnectionFailed));
+    // Non-transient: a duplicate key or a syntax error will fail again.
+    try std.testing.expect(!isRetryable(error.UniqueViolation));
+    try std.testing.expect(!isRetryable(error.ExecFailed));
+    try std.testing.expect(!isRetryable(error.OutOfMemory));
+}
+
+fn bodyFailFirst(state: *MockTxState, tx: Tx) anyerror!void {
+    _ = tx;
+    state.body_calls += 1;
+    if (state.body_calls <= state.fail_times) return state.fail_with;
+}
+
+test "retryTx replays the whole transaction on a retryable error" {
+    var state = MockTxState{ .fail_times = 1, .fail_with = error.DeadlockDetected };
+    const drv = Driver{ .ptr = &state, .vtable = &mock_vtable };
+
+    try retryTx(drv, &state, bodyFailFirst, .{ .max_attempts = 3, .base_backoff_ms = 0, .max_backoff_ms = 0 });
+
+    try std.testing.expectEqual(@as(u32, 2), state.body_calls);
+    try std.testing.expectEqual(@as(u32, 2), state.begin_calls);
+    // First attempt rolled back, second committed.
+    try std.testing.expectEqual(@as(u32, 1), state.rollback_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.commit_calls);
+    // deinit exactly once per attempt (the hard driver contract).
+    try std.testing.expectEqual(@as(u32, 2), state.deinit_calls);
+}
+
+test "retryTx does not retry a non-retryable error" {
+    var state = MockTxState{ .fail_times = 5, .fail_with = error.UniqueViolation };
+    const drv = Driver{ .ptr = &state, .vtable = &mock_vtable };
+
+    try std.testing.expectError(
+        error.UniqueViolation,
+        retryTx(drv, &state, bodyFailFirst, .{ .max_attempts = 3, .base_backoff_ms = 0, .max_backoff_ms = 0 }),
+    );
+
+    try std.testing.expectEqual(@as(u32, 1), state.body_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.begin_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.rollback_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.commit_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.deinit_calls);
+}
+
+test "retryTx stops after max_attempts and returns the last error" {
+    var state = MockTxState{ .fail_times = 100, .fail_with = error.LockTimeout };
+    const drv = Driver{ .ptr = &state, .vtable = &mock_vtable };
+
+    try std.testing.expectError(
+        error.LockTimeout,
+        retryTx(drv, &state, bodyFailFirst, .{ .max_attempts = 3, .base_backoff_ms = 0, .max_backoff_ms = 0 }),
+    );
+
+    try std.testing.expectEqual(@as(u32, 3), state.begin_calls);
+    try std.testing.expectEqual(@as(u32, 3), state.deinit_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.commit_calls);
+}
