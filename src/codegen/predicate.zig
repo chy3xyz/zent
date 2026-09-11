@@ -530,3 +530,49 @@ test "Predicates: Has{Edge}With accepts the target entity's typed predicates" {
     try std.testing.expect(std.mem.indexOf(u8, q.sql, "\"model\" =") != null);
     try std.testing.expect(std.mem.indexOf(u8, q.sql, "\"year\" >=") != null);
 }
+
+test "Predicates: Contains binds the pattern, ContainsEscaped wraps it" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const User = schema("User", .{ .fields = &.{field.String("name")} });
+    const info = comptime fromSchema(User);
+    const infos = comptime &[_]TypeInfo{info};
+    const preds = comptime makePredicates(infos, infos[0]);
+
+    const allocator = std.testing.allocator;
+
+    // `Contains` binds the value verbatim: the caller supplies the wildcards
+    // (this is why it is the MySQL-safe variant and why passing "foo" is an
+    // exact match, not a substring search).
+    {
+        var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(sql.Table("users"));
+        _ = try s.where(preds.nameContains("foo"));
+        const q = try s.query();
+        try std.testing.expectEqualStrings("SELECT `id` FROM `users` WHERE `name` LIKE ?", q.sql);
+        try std.testing.expectEqual(@as(usize, 1), q.args.len);
+        try std.testing.expectEqualStrings("foo", q.args[0].string);
+
+        var s2 = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        defer s2.deinit();
+        _ = s2.from(sql.Table("users"));
+        _ = try s2.where(preds.nameContains("%foo%"));
+        const q2 = try s2.query();
+        try std.testing.expectEqualStrings("%foo%", q2.args[0].string);
+    }
+
+    // `ContainsEscaped` adds the wildcards itself and escapes the input, so it
+    // takes a literal substring and renders no bound arguments.
+    {
+        var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(sql.Table("users"));
+        _ = try s.where(preds.nameContainsEscaped("fo%o"));
+        const q = try s.query();
+        try std.testing.expectEqualStrings("SELECT `id` FROM `users` WHERE `name` LIKE '%fo!%o%' ESCAPE '!'", q.sql);
+        try std.testing.expectEqual(@as(usize, 0), q.args.len);
+    }
+}

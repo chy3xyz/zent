@@ -125,6 +125,19 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 ---
 
+### Z14 — `Contains` semantics vs its name (and a doc mismatch)
+
+| | |
+|--|--|
+| **Problem** | Two related things. (a) `BEST_PRACTICES.md` §3a documented `xContains(v)` as `col LIKE '%v%'`, but the implementation binds `v` verbatim (`col LIKE ?`), so following the doc produces an exact match instead of a substring search. (b) The name itself invites that mistake: `Contains` is the only one of the five LIKE predicates that does **not** add the wildcards — `ContainsEscaped`, `HasPrefix`, `HasSuffix` and `ContainsFold` all do, and all escape the input. |
+| **Evidence** | `src/codegen/predicate.zig` (`Contains` → `sql.Like(col, v)`; the others → the escaped family); §3a now carries a corrected table; the new test `Predicates: Contains binds the pattern, ContainsEscaped wraps it` pins both renderings. |
+| **Impact** | Silently wrong results rather than an error: `xContains("foo")` matches only `foo`, and `%`/`_` in the argument stay live wildcards. zapi avoided this because it passes `%v%` explicitly (Z1 drove it to `Contains` for MySQL safety), so the consumer semantics are correct — but a new caller reading the docs would not be. |
+| **Proposal** | (a) **Done**: docs corrected and the behaviour pinned by a test. (b) **Open**: either rename `Contains` to `Like` (matches what it does; a renaming break) or keep the name and add a wrapping `ContainsLiteral` alias, so that every predicate whose name says "contains" actually wraps. Decide before the next consumer adopts it. |
+| **Acceptance** | Docs and tests agree with the implementation (done), and the naming question is settled so the next reader cannot be misled. |
+| **Status** | **Partially fixed** (docs + test in the release after v0.37.0); the rename/alias decision is **Open**. |
+
+---
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -142,5 +155,6 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z11 | Decimal field | P2 | **Fixed** v0.31.0 |
 | Z12 | Complex UPDATE expr | P2 | **Fixed** v0.31.0 |
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
+| Z14 | `Contains` semantics vs name | P2 | **Partially fixed** — docs+test done, naming **Open** |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.

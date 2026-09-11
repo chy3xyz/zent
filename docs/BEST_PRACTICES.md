@@ -206,11 +206,18 @@ Every field gets these (`client.<entity>.predicates.<field><Suffix>`):
 
 | Suffix | Renders |
 |---|---|
-| `Contains` | `col LIKE '%v%'` (wildcards in `v` stay **live**) |
-| `ContainsEscaped` | `col LIKE '%v%' ESCAPE …` (wildcards in `v` are **literal**) |
+| `Contains` | `col LIKE ?` — `v` is bound **verbatim**, so **you supply the wildcards**: `xContains("%foo%")` matches a substring, `xContains("foo")` is an exact match. Parameterised, so it is the MySQL-safe one. |
+| `ContainsEscaped` | `col LIKE '%v%' ESCAPE …` — `%` is added for you and any `%`/`_` in `v` is escaped, so `v` is a **literal substring** |
 | `HasPrefix` `HasSuffix` | `col LIKE 'v%'` / `col LIKE '%v'`, escaped like `ContainsEscaped` |
 | `ContainsFold` | `LOWER(col) LIKE LOWER('%v%')` — non-sargable |
 | `EQFold` | `LOWER(col) = LOWER(?)` |
+
+`Contains` is the odd one out: it does **not** wrap the value, because it
+binds it as a parameter (which is what makes it safe on MySQL — see
+`ISSUES_FROM_ZAPI.md` Z1). `ContainsEscaped`, `HasPrefix`, `HasSuffix` and
+`ContainsFold` all add the wildcards themselves and escape the user input, so
+they take a literal substring. Passing an unescaped `%foo%` to
+`ContainsEscaped` would therefore search for a literal `%`.
 
 Edges get `Has<Edge>()`, `NotHas<Edge>()`, and `Has<Edge>With(preds)`. The
 `With` form takes the **target entity's own typed predicates**, so a

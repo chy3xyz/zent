@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Docs
+- Corrected the `Contains` row in the predicate catalogue (`BEST_PRACTICES`
+  §3a): it binds the value verbatim (`col LIKE ?`) and does **not** add `%`,
+  unlike `ContainsEscaped`, `HasPrefix`, `HasSuffix` and `ContainsFold`. The
+  old wording described `ContainsEscaped` and would have led callers to write
+  an exact match where they meant a substring search. A test now pins both
+  renderings, and `ISSUES_FROM_ZAPI.md` records the naming question (Z14).
 ## [0.37.0] - 2026-09-12
 
 ### Added
