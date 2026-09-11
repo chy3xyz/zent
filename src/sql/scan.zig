@@ -103,6 +103,50 @@ pub fn zeroInit(comptime T: type) T {
     return value;
 }
 
+/// Maps a Zig struct field to the physical column it is read from.
+pub const ColumnMap = struct {
+    /// Zig struct field name (the struct field the value is written to).
+    name: []const u8,
+    /// Physical SQL column name (the result-set column to read).
+    column: []const u8,
+};
+
+/// Like `scanRowNamed`, but columns are resolved through an explicit
+/// `columns` mapping: `ColumnMap.column` is looked up in the row and the
+/// value is written to `ColumnMap.name`. Used for entities whose Zig field
+/// names differ from their SQL column names (`StorageKey`).
+pub fn scanRowNamedMapped(comptime T: type, allocator: std.mem.Allocator, row: Row, columns: []const ColumnMap) !T {
+    return scanRowNamedMappedWithArena(T, allocator, row, columns, null);
+}
+
+/// Like `scanRowNamedMapped`, but JSON struct fields are parsed into
+/// `json_arena`.
+pub fn scanRowNamedMappedWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, columns: []const ColumnMap, json_arena: ?*std.heap.ArenaAllocator) !T {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("scanRowNamedMapped supports structs only");
+    var value: T = zeroInit(T);
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
+        if (comptime std.mem.eql(u8, field_name, "edges")) {
+            @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+        } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
+            @field(value, field_name) = json_arena;
+        } else {
+            const lookup = mappedColumn(columns, field_name) orelse field_name;
+            if (findColumnIndex(row, lookup)) |idx| {
+                @field(value, field_name) = try scanColumn(field_type, allocator, row, idx, json_arena);
+            }
+        }
+    }
+    return value;
+}
+
+fn mappedColumn(columns: []const ColumnMap, field_name: []const u8) ?[]const u8 {
+    for (columns) |c| {
+        if (std.mem.eql(u8, c.name, field_name)) return c.column;
+    }
+    return null;
+}
+
 /// Like `scanRowNamed`, but JSON struct fields are parsed into `json_arena`.
 pub fn scanRowNamedWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);

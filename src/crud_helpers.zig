@@ -466,7 +466,8 @@ pub fn increment(
 ) !usize {
     var upd = accessor.Update();
     defer upd.deinit();
-    const expr = comptime field_name ++ " + ?";
+    const col = comptime graph_mod.columnName(@TypeOf(accessor).entity_info, field_name);
+    const expr = comptime col ++ " + ?";
     _ = try upd.setExprArgs(field_name, expr, &.{.{ .int = delta }});
     _ = try upd.Where(predicates);
     return try upd.Save();
@@ -641,19 +642,20 @@ pub fn cursorPage(
     _ = try q.Where(predicates);
 
     const sql_builder = @import("sql/builder.zig");
+    const cursor_sql = graph_mod.columnName(@TypeOf(accessor).entity_info, opts.cursor_col);
     if (opts.after) |after_val| {
         const p = if (opts.desc)
-            sql_builder.LT(opts.cursor_col, .{ .int = after_val })
+            sql_builder.LT(cursor_sql, .{ .int = after_val })
         else
-            sql_builder.GT(opts.cursor_col, .{ .int = after_val });
+            sql_builder.GT(cursor_sql, .{ .int = after_val });
         _ = try q.Where(.{p});
     }
 
     if (opts.before) |before_val| {
         const p = if (opts.desc)
-            sql_builder.GT(opts.cursor_col, .{ .int = before_val })
+            sql_builder.GT(cursor_sql, .{ .int = before_val })
         else
-            sql_builder.LT(opts.cursor_col, .{ .int = before_val });
+            sql_builder.LT(cursor_sql, .{ .int = before_val });
         _ = try q.Where(.{p});
     }
 
@@ -785,12 +787,13 @@ pub fn updateWithVersion(
         _ = try upd.setFieldValue(name, @field(values, name));
     }
 
-    const expr = comptime version_field ++ " + ?";
+    const col = comptime graph_mod.columnName(@TypeOf(accessor).entity_info, version_field);
+    const expr = comptime col ++ " + ?";
     _ = try upd.setExprArgs(version_field, expr, &.{.{ .int = 1 }});
 
     _ = try upd.Where(predicates);
     const sql_builder = @import("sql/builder.zig");
-    _ = try upd.Where(.{sql_builder.EQ(version_field, .{ .int = expected_version })});
+    _ = try upd.Where(.{sql_builder.EQ(col, .{ .int = expected_version })});
 
     const affected = try upd.Save();
     if (affected == 0) {
@@ -818,7 +821,7 @@ pub fn batchSaveOrUpdate(
     for (items) |item| {
         const val = @field(item, match_field);
         const sql_builder = @import("sql/builder.zig");
-        const match_pred = sql_builder.EQ(match_field, switch (@typeInfo(@TypeOf(val))) {
+        const match_pred = sql_builder.EQ(graph_mod.columnName(@TypeOf(accessor).entity_info, match_field), switch (@typeInfo(@TypeOf(val))) {
             .int, .comptime_int => .{ .int = @intCast(val) },
             else => .{ .string = val },
         });

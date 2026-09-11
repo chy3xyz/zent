@@ -151,88 +151,90 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
         @setEvalBranchQuota(1000000);
         var result: Predicates(infos, info) = undefined;
 
-        // Field-based predicates
+        // Field-based predicates. `col` names the generated predicate method
+        // (field name); `sql_col` is the physical column the predicate filters.
         for (info.fields) |f| {
             const col = f.name;
+            const sql_col = f.column_name;
             @field(result, col ++ "EQ") = struct {
                 fn eqFn(v: sql.Value) sql.Predicate {
-                    return sql.EQ(col, v);
+                    return sql.EQ(sql_col, v);
                 }
             }.eqFn;
             @field(result, col ++ "NE") = struct {
                 fn neFn(v: sql.Value) sql.Predicate {
-                    return sql.NE(col, v);
+                    return sql.NE(sql_col, v);
                 }
             }.neFn;
             @field(result, col ++ "GT") = struct {
                 fn gtFn(v: sql.Value) sql.Predicate {
-                    return sql.GT(col, v);
+                    return sql.GT(sql_col, v);
                 }
             }.gtFn;
             @field(result, col ++ "GTE") = struct {
                 fn gteFn(v: sql.Value) sql.Predicate {
-                    return sql.GTE(col, v);
+                    return sql.GTE(sql_col, v);
                 }
             }.gteFn;
             @field(result, col ++ "LT") = struct {
                 fn ltFn(v: sql.Value) sql.Predicate {
-                    return sql.LT(col, v);
+                    return sql.LT(sql_col, v);
                 }
             }.ltFn;
             @field(result, col ++ "LTE") = struct {
                 fn lteFn(v: sql.Value) sql.Predicate {
-                    return sql.LTE(col, v);
+                    return sql.LTE(sql_col, v);
                 }
             }.lteFn;
             @field(result, col ++ "In") = struct {
                 fn inFn(vals: []const sql.Value) sql.Predicate {
-                    return sql.In(col, vals);
+                    return sql.In(sql_col, vals);
                 }
             }.inFn;
             @field(result, col ++ "NotIn") = struct {
                 fn notInFn(vals: []const sql.Value) sql.Predicate {
-                    return sql.NotIn(col, vals);
+                    return sql.NotIn(sql_col, vals);
                 }
             }.notInFn;
             @field(result, col ++ "IsNull") = struct {
                 fn isNullFn() sql.Predicate {
-                    return sql.IsNull(col);
+                    return sql.IsNull(sql_col);
                 }
             }.isNullFn;
             @field(result, col ++ "NotNil") = struct {
                 fn notNilFn() sql.Predicate {
-                    return sql.IsNotNull(col);
+                    return sql.IsNotNull(sql_col);
                 }
             }.notNilFn;
             if (f.field_type == .string or f.field_type == .text) {
                 @field(result, col ++ "Contains") = struct {
                     fn containsFn(v: []const u8) sql.Predicate {
-                        return sql.Like(col, .{ .string = v });
+                        return sql.Like(sql_col, .{ .string = v });
                     }
                 }.containsFn;
                 @field(result, col ++ "ContainsEscaped") = struct {
                     fn containsEscapedFn(v: []const u8) sql.Predicate {
-                        return sql.ContainsEscaped(col, v);
+                        return sql.ContainsEscaped(sql_col, v);
                     }
                 }.containsEscapedFn;
                 @field(result, col ++ "HasPrefix") = struct {
                     fn hasPrefixFn(v: []const u8) sql.Predicate {
-                        return sql.HasPrefixEscaped(col, v);
+                        return sql.HasPrefixEscaped(sql_col, v);
                     }
                 }.hasPrefixFn;
                 @field(result, col ++ "HasSuffix") = struct {
                     fn hasSuffixFn(v: []const u8) sql.Predicate {
-                        return sql.HasSuffixEscaped(col, v);
+                        return sql.HasSuffixEscaped(sql_col, v);
                     }
                 }.hasSuffixFn;
                 @field(result, col ++ "ContainsFold") = struct {
                     fn containsFoldFn(v: []const u8) sql.Predicate {
-                        return sql.ContainsFoldEscaped(col, v);
+                        return sql.ContainsFoldEscaped(sql_col, v);
                     }
                 }.containsFoldFn;
                 @field(result, col ++ "EQFold") = struct {
                     fn eqFoldFn(v: []const u8) sql.Predicate {
-                        return sql.EQFold(col, .{ .string = v });
+                        return sql.EQFold(sql_col, .{ .string = v });
                     }
                 }.eqFoldFn;
             }

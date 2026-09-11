@@ -9,10 +9,10 @@ pub fn Meta(comptime info: TypeInfo) type {
         // Field name constants
         pub const FieldID = info.pk_field;
 
-        // Column names array
+        // Physical SQL column names array.
         pub const Columns = blk: {
             var cols: [info.fields.len][]const u8 = undefined;
-            for (info.fields, 0..) |f, i| cols[i] = f.name;
+            for (info.fields, 0..) |f, i| cols[i] = f.column_name;
             break :blk cols;
         };
 

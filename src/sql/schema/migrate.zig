@@ -421,10 +421,11 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
     comptime {
         var columns: []const ColumnDef = &.{};
 
-        // Generate columns from fields
+        // Generate columns from fields. DDL uses the physical column name
+        // (`StorageKey`), not the Zig field name.
         for (info.fields) |f| {
             const col = ColumnDef{
-                .name = f.name,
+                .name = f.column_name,
                 .sql_type = f.sql_type,
                 .logical_type = f.field_type,
                 .primary_key = f.is_id,
@@ -487,7 +488,7 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
         var pks: []const []const u8 = &.{};
         for (info.fields) |f| {
             if (f.is_id) {
-                pks = pks ++ &[_][]const u8{f.name};
+                pks = pks ++ &[_][]const u8{f.column_name};
             }
         }
 
@@ -813,10 +814,11 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
         var columns: []const ColumnDef = &.{};
         var foreign_keys: []const ForeignKeyDef = &.{};
 
-        // Generate columns from fields
+        // Generate columns from fields. DDL uses the physical column name
+        // (`StorageKey`), not the Zig field name.
         for (info.fields) |f| {
             const col = ColumnDef{
-                .name = f.name,
+                .name = f.column_name,
                 .sql_type = f.sql_type,
                 .logical_type = f.field_type,
                 .primary_key = f.is_id,
@@ -920,7 +922,7 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
         var pks: []const []const u8 = &.{};
         for (info.fields) |f| {
             if (f.is_id) {
-                pks = pks ++ &[_][]const u8{f.name};
+                pks = pks ++ &[_][]const u8{f.column_name};
             }
         }
 

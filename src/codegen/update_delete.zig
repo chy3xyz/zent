@@ -3,6 +3,8 @@ const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
 const buildEdgeStep = @import("graph.zig").buildEdgeStep;
+const columnName = @import("graph.zig").columnName;
+const pkColumn = @import("graph.zig").pkColumn;
 const graph_step = @import("../graph/step.zig");
 const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
@@ -665,7 +667,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                 }
             }
             if (!found) return error.UnknownField;
-            try self.predicates.append(sql.EQ(field_name, value));
+            try self.predicates.append(sql.EQ(columnName(info, field_name), value));
         }
 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
@@ -756,24 +758,24 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
 
             if (version_field) |vf| {
                 if (version_locked) {
-                    const expr = try self.allocator.alloc(u8, vf.name.len + 4);
+                    const expr = try self.allocator.alloc(u8, vf.column_name.len + 4);
                     defer self.allocator.free(expr);
-                    @memcpy(expr[0..vf.name.len], vf.name);
-                    @memcpy(expr[vf.name.len..], " + 1");
-                    _ = try builder.setExpr(vf.name, expr);
+                    @memcpy(expr[0..vf.column_name.len], vf.column_name);
+                    @memcpy(expr[vf.column_name.len..], " + 1");
+                    _ = try builder.setExpr(vf.column_name, expr);
                 }
 
                 for (self.values.items) |fv| {
                     if (version_locked and std.mem.eql(u8, fv.name, vf.name)) continue;
-                    _ = try builder.set(fv.name, fv.value);
+                    _ = try builder.set(columnName(info, fv.name), fv.value);
                 }
 
                 if (version_old_value) |v| {
-                    _ = try builder.where(sql.EQ(vf.name, v));
+                    _ = try builder.where(sql.EQ(vf.column_name, v));
                 }
             } else {
                 for (self.values.items) |fv| {
-                    _ = try builder.set(fv.name, fv.value);
+                    _ = try builder.set(columnName(info, fv.name), fv.value);
                 }
             }
 
@@ -800,7 +802,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             }
 
             for (self.expr_values.items) |fe| {
-                _ = try builder.setExprArgs(fe.name, fe.expr, fe.args);
+                _ = try builder.setExprArgs(columnName(info, fe.name), fe.expr, fe.args);
             }
 
             for (self.predicates.items) |pred| {
@@ -1001,7 +1003,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            try self.predicates.append(sql.EQ(field_name, value));
+            try self.predicates.append(sql.EQ(columnName(info, field_name), value));
         }
 
         const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
@@ -1049,7 +1051,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .null);
-            _ = try builder.where(sql.EQ(info.pk_field, .{ .int = id }));
+            _ = try builder.where(sql.EQ(pkColumn(info), .{ .int = id }));
             const q = try builder.query();
             self.ensureDeadline();
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
@@ -1114,15 +1116,15 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
             if (version_field) |vf| {
                 if (version_locked) {
-                    const expr = try self.allocator.alloc(u8, vf.name.len + 4);
+                    const expr = try self.allocator.alloc(u8, vf.column_name.len + 4);
                     defer self.allocator.free(expr);
-                    @memcpy(expr[0..vf.name.len], vf.name);
-                    @memcpy(expr[vf.name.len..], " + 1");
-                    _ = try builder.setExpr(vf.name, expr);
+                    @memcpy(expr[0..vf.column_name.len], vf.column_name);
+                    @memcpy(expr[vf.column_name.len..], " + 1");
+                    _ = try builder.setExpr(vf.column_name, expr);
                 }
 
                 if (self.version_value) |v| {
-                    _ = try builder.where(sql.EQ(vf.name, v));
+                    _ = try builder.where(sql.EQ(vf.column_name, v));
                 }
             }
 
@@ -1220,7 +1222,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
             if (version_field) |vf| {
                 if (self.version_value) |v| {
-                    _ = try builder.where(sql.EQ(vf.name, v));
+                    _ = try builder.where(sql.EQ(vf.column_name, v));
                 }
             }
 
@@ -1283,12 +1285,14 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
+            var b = sql.BulkUpdateBuilder.init(allocator, driver.dialect(), info.table_name);
+            b.id_column = pkColumn(info);
             return .{
                 .allocator = allocator,
                 .driver = driver,
                 .hooks = hooks,
                 .privacy_ctx = privacy_ctx,
-                .b = sql.BulkUpdateBuilder.init(allocator, driver.dialect(), info.table_name),
+                .b = b,
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
             };
         }
@@ -1320,7 +1324,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
 
         /// Set a field value dynamically (no compile-time checking).
         pub fn set(self: *Self, field_name: []const u8, value: sql.Value) !*Self {
-            _ = try self.b.set(field_name, value);
+            _ = try self.b.set(columnName(info, field_name), value);
             return self;
         }
 
@@ -1391,7 +1395,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            _ = try self.b.where(sql.EQ(field_name, value));
+            _ = try self.b.where(sql.EQ(columnName(info, field_name), value));
         }
 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
@@ -1441,7 +1445,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             for (self.b.rows.items) |r| {
                 for (r.sets.items) |s| {
                     inline for (info.fields) |f| {
-                        if (std.mem.eql(u8, f.name, s.column)) {
+                        if (std.mem.eql(u8, f.column_name, s.column)) {
                             try validateSqlValue(f, s.value);
                             if (f.immutable) return error.ImmutableField;
                         }
@@ -1583,7 +1587,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            const pred = sql.EQ(field_name, value);
+            const pred = sql.EQ(columnName(info, field_name), value);
             for (self.b.groups.items) |*group| {
                 try group.append(pred);
             }

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`StorageKey`: map a Zig field onto a differently-named SQL column.**
+  `field.String("userName").StorageKey("user_name")` decouples the field name
+  used by the fluent API (`setFieldValue("userName", …)`, typed predicates,
+  `Select`/`OrderBy`/`GroupBy`, interceptor `whereEq`) from the physical
+  column emitted in DDL, `INSERT`/`UPDATE`/`SET`, `WHERE`/`ORDER BY`/
+  `GROUP BY`, indexes, and cursor pagination — the mapping needed to adopt
+  zent on an existing schema. `FieldInfo` now carries `column_name` alongside
+  `name`, and `codegen.graph.columnName(info, field)` resolves a field name
+  to its column. Schemas that never call `StorageKey` are unchanged
+  (column name == field name).
 - **Outbox stale-claim recovery.** The claim-based dispatcher added in 0.35.0
   could strand a row in `processing` forever if a dispatcher died after
   claiming it. `OutboxMessage` now has a nullable `claimed_at` column (epoch

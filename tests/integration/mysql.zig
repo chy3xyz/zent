@@ -2651,3 +2651,177 @@ test "MySQL: client certificate satisfies REQUIRE X509 and its absence is reject
     });
     try testing.expectError(error.MySQLConnectFailed, res);
 }
+
+test "MySQL: StorageKey maps field names to distinct column names" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = drv.exec("DROP TABLE IF EXISTS my_storage_account", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_storage_account", &.{}) catch {};
+
+    const MyStorageAccount = schema("MyStorageAccount", .{
+        .table_name = "my_storage_account",
+        .fields = &.{
+            field.String("userName").StorageKey("user_name"),
+            field.String("emailAddr").StorageKey("email_address"),
+            field.Int("loginCount").StorageKey("login_count"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+        .indexes = &.{index.Fields(&.{"loginCount"})},
+    });
+    const graph = comptime buildGraph(&.{MyStorageAccount});
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    const preds = client.my_storage_account.predicates;
+
+    // DDL created the physical columns, not the Zig field names.
+    {
+        var rows = try drv.query("SELECT user_name, email_address, login_count FROM my_storage_account", &.{});
+        rows.deinit();
+    }
+    // The index definition references the mapped column.
+    {
+        var rows = try drv.query(
+            "SELECT COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'my_storage_account'",
+            &.{},
+        );
+        defer rows.deinit();
+        var found_mapped = false;
+        while (rows.next()) |row| {
+            const col = row.getText(0) orelse continue;
+            if (std.mem.eql(u8, col, "login_count")) found_mapped = true;
+            try testing.expect(!std.mem.eql(u8, col, "loginCount"));
+        }
+        try testing.expect(found_mapped);
+    }
+
+    var b1 = try client.my_storage_account.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("userName", "alice");
+    _ = try b1.setFieldValue("emailAddr", "alice@example.com");
+    _ = try b1.setFieldValue("loginCount", @as(i64, 3));
+    var a1 = try b1.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &a1, allocator);
+
+    var b2 = try client.my_storage_account.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("userName", "bob");
+    _ = try b2.setFieldValue("emailAddr", "bob@example.com");
+    _ = try b2.setFieldValue("loginCount", @as(i64, 7));
+    var a2 = try b2.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &a2, allocator);
+
+    {
+        var rows = try drv.query(
+            "SELECT user_name, email_address, login_count FROM my_storage_account WHERE user_name = ?",
+            &.{.{ .string = "alice" }},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("alice", row.getText(0).?);
+        try testing.expectEqualStrings("alice@example.com", row.getText(1).?);
+        try testing.expectEqual(@as(i64, 3), row.getInt(2).?);
+    }
+
+    {
+        var q = client.my_storage_account.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.idEQ(.{ .int = a1.id })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+        try testing.expectEqual(@as(i64, 3), found.items[0].loginCount);
+    }
+
+    {
+        var q = client.my_storage_account.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.emailAddrEQ(.{ .string = "bob@example.com" })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("bob", found.items[0].userName);
+    }
+
+    {
+        var q = client.my_storage_account.Query();
+        defer q.deinit();
+        _ = try q.OrderBy(&.{zent.sql.OrderAsc("userName")});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+        try testing.expectEqualStrings("bob", found.items[1].userName);
+    }
+
+    {
+        var q = client.my_storage_account.Query();
+        defer q.deinit();
+        _ = q.Select(&.{"userName"});
+        _ = try q.Where(.{preds.userNameEQ(.{ .string = "alice" })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+    }
+
+    {
+        var u = client.my_storage_account.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("emailAddr", "alice2@example.com");
+        _ = try u.Where(.{preds.userNameEQ(.{ .string = "alice" })});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var q = client.my_storage_account.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.emailAddrEQ(.{ .string = "alice2@example.com" })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+    }
+
+    {
+        var d = client.my_storage_account.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{preds.userNameEQ(.{ .string = "bob" })});
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+    {
+        var q = client.my_storage_account.Query();
+        defer q.deinit();
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+    }
+
+    {
+        var d = client.my_storage_account.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{preds.userNameEQ(.{ .string = "alice" })});
+        try testing.expectEqual(@as(usize, 1), try d.ForceExec());
+    }
+}

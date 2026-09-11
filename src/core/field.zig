@@ -54,8 +54,20 @@ pub const Field = struct {
     enum_values: []const []const u8 = &.{},
     json_schema: ?type = null,
     sensitive: bool = false,
+    /// Explicit SQL column name. When null the column name equals `name`.
+    /// Set it to map a Zig field onto a differently-named column in an
+    /// existing table (ent's `StorageKey`).
+    storage_key: ?[]const u8 = null,
 
     // Builder methods
+    /// Map this field onto a differently-named SQL column. User-facing APIs
+    /// keep using the Zig field `name`; only SQL generation uses `key`.
+    pub fn StorageKey(self: Field, key: []const u8) Field {
+        var f = self;
+        f.storage_key = key;
+        return f;
+    }
+
     pub fn Optional(self: Field) Field {
         var f = self;
         f.optional = true;

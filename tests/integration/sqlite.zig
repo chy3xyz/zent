@@ -3062,3 +3062,184 @@ fn junctionCount(driver: zent.sql_driver.Driver, table: []const u8, source_col: 
     if (rows.next()) |row| return row.getInt(0) orelse 0;
     return 0;
 }
+
+test "SQLite: StorageKey maps field names to distinct column names" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // Field names intentionally differ from column names (ent `StorageKey`).
+    const Account = schema("StorageAccount", .{
+        .table_name = "storage_account",
+        .fields = &.{
+            field.String("userName").StorageKey("user_name"),
+            field.String("emailAddr").StorageKey("email_address"),
+            field.Int("loginCount").StorageKey("login_count"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+        .indexes = &.{index.Fields(&.{"loginCount"})},
+    });
+    const graph = comptime buildGraph(&.{Account});
+    const infos = graph.types;
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    const preds = client.storage_account.predicates;
+
+    // DDL and the index must reference physical columns, not field names.
+    {
+        var rows = try drv.query("SELECT user_name, email_address, login_count FROM storage_account", &.{});
+        rows.deinit();
+    }
+    {
+        var rows = try drv.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'storage_account'",
+            &.{},
+        );
+        defer rows.deinit();
+        var found_mapped = false;
+        while (rows.next()) |row| {
+            const ddl = row.getText(0) orelse continue;
+            if (std.mem.indexOf(u8, ddl, "login_count") != null) found_mapped = true;
+            try testing.expect(std.mem.indexOf(u8, ddl, "loginCount") == null);
+        }
+        try testing.expect(found_mapped);
+    }
+
+    // Insert: user-facing APIs take field names; SQL uses mapped columns.
+    var b1 = try client.storage_account.Create();
+    defer b1.deinit();
+    _ = try b1.setFieldValue("userName", "alice");
+    _ = try b1.setFieldValue("emailAddr", "alice@example.com");
+    _ = try b1.setFieldValue("loginCount", @as(i64, 3));
+    var a1 = try b1.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &a1, allocator);
+
+    var b2 = try client.storage_account.Create();
+    defer b2.deinit();
+    _ = try b2.setFieldValue("userName", "bob");
+    _ = try b2.setFieldValue("emailAddr", "bob@example.com");
+    _ = try b2.setFieldValue("loginCount", @as(i64, 7));
+    var a2 = try b2.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &a2, allocator);
+
+    // Raw read proves the values landed in the mapped columns.
+    {
+        var rows = try drv.query(
+            "SELECT user_name, email_address, login_count FROM storage_account WHERE user_name = ?",
+            &.{.{ .string = "alice" }},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("alice", row.getText(0).?);
+        try testing.expectEqualStrings("alice@example.com", row.getText(1).?);
+        try testing.expectEqual(@as(i64, 3), row.getInt(2).?);
+    }
+
+    // Fetch by primary key.
+    {
+        var q = client.storage_account.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.idEQ(.{ .int = a1.id })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+        try testing.expectEqual(@as(i64, 3), found.items[0].loginCount);
+    }
+
+    // Typed predicate filtering by field name.
+    {
+        var q = client.storage_account.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.emailAddrEQ(.{ .string = "bob@example.com" })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("bob", found.items[0].userName);
+    }
+
+    // ORDER BY field name maps to the physical column.
+    {
+        var q = client.storage_account.Query();
+        defer q.deinit();
+        _ = try q.OrderBy(&.{zent.sql.OrderAsc("userName")});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+        try testing.expectEqualStrings("bob", found.items[1].userName);
+    }
+
+    // Partial projection (`Select`) with field names.
+    {
+        var q = client.storage_account.Query();
+        defer q.deinit();
+        _ = q.Select(&.{"userName"});
+        _ = try q.Where(.{preds.userNameEQ(.{ .string = "alice" })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+    }
+
+    // Update by field name.
+    {
+        var u = client.storage_account.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("emailAddr", "alice2@example.com");
+        _ = try u.Where(.{preds.userNameEQ(.{ .string = "alice" })});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var q = client.storage_account.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.emailAddrEQ(.{ .string = "alice2@example.com" })});
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+    }
+
+    // Soft delete by field name (soft_delete → UPDATE deleted_at).
+    {
+        var d = client.storage_account.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{preds.userNameEQ(.{ .string = "bob" })});
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+    {
+        var q = client.storage_account.Query();
+        defer q.deinit();
+        var found = try q.All();
+        defer {
+            for (found.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            found.deinit();
+        }
+        // Soft-deleted "bob" is filtered out of the default query scope.
+        try testing.expectEqual(@as(usize, 1), found.items.len);
+        try testing.expectEqualStrings("alice", found.items[0].userName);
+    }
+
+    // Hard delete by field name.
+    {
+        var d = client.storage_account.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{preds.userNameEQ(.{ .string = "alice" })});
+        try testing.expectEqual(@as(usize, 1), try d.ForceExec());
+    }
+}

@@ -3,6 +3,8 @@ const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
 const buildEdgeStep = @import("graph.zig").buildEdgeStep;
+const columnName = @import("graph.zig").columnName;
+const pkColumn = @import("graph.zig").pkColumn;
 const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
 const sql_scan = @import("../sql/scan.zig");
@@ -23,8 +25,15 @@ fn scanEntity(comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Ro
     return sql_scan.scanRow(T, allocator, row);
 }
 
-/// Like `scanEntity` for the name-based (partial projection) scanner.
-fn scanEntityNamed(comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Row) !T {
+/// Like `scanEntity` for the name-based (partial projection) scanner. The
+/// projection emits physical column names, so the row is matched by
+/// `column_name` while values are written back to the Zig `name` fields.
+fn scanEntityNamed(comptime info: TypeInfo, comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Row) !T {
+    const maps = comptime blk: {
+        var m: [info.fields.len]sql_scan.ColumnMap = undefined;
+        for (info.fields, 0..) |f, i| m[i] = .{ .name = f.name, .column = f.column_name };
+        break :blk m;
+    };
     if (comptime @hasField(T, "json_arena")) {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         arena.* = std.heap.ArenaAllocator.init(allocator);
@@ -32,9 +41,9 @@ fn scanEntityNamed(comptime T: type, allocator: std.mem.Allocator, row: sql_driv
             arena.deinit();
             allocator.destroy(arena);
         }
-        return try sql_scan.scanRowNamedWithArena(T, allocator, row, arena);
+        return try sql_scan.scanRowNamedMappedWithArena(T, allocator, row, &maps, arena);
     }
-    return sql_scan.scanRowNamed(T, allocator, row);
+    return sql_scan.scanRowNamedMapped(T, allocator, row, &maps);
 }
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
@@ -82,7 +91,7 @@ fn EdgeInterceptorSink(comptime tinfo: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            try self.preds.append(self.allocator, sql.EQ(field_name, value));
+            try self.preds.append(self.allocator, sql.EQ(columnName(tinfo, field_name), value));
         }
     };
 }
@@ -458,13 +467,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 i += 1;
             }
             try self.or_in_chunks.append(self.allocator, chunks);
-            try self.predicates.append(sql.OrIn(column, chunks));
+            try self.predicates.append(sql.OrIn(columnName(info, column), chunks));
             return self;
         }
 
+        /// Append ORDER BY terms. A plain `.column` term is treated as a
+        /// field name and mapped to its physical column; `.expr`/`.raw` are
+        /// emitted verbatim.
         pub fn OrderBy(self: *Self, terms: []const sql.Order) !*Self {
             for (terms) |t| {
-                try self.order_terms.append(t);
+                switch (t) {
+                    .column => |o| try self.order_terms.append(.{ .column = .{
+                        .name = columnName(info, o.name),
+                        .desc = o.desc,
+                    } }),
+                    else => try self.order_terms.append(t),
+                }
             }
             return self;
         }
@@ -608,7 +626,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         pub fn GroupBy(self: *Self, columns: []const []const u8) !*Self {
             for (columns) |c| {
-                try self.group_cols.append(self.allocator, c);
+                try self.group_cols.append(self.allocator, columnName(info, c));
             }
             return self;
         }
@@ -687,7 +705,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     return null;
                 };
                 const entity = if (self.select_cols != null)
-                    try scanEntityNamed(Entity, self.allocator, row)
+                    try scanEntityNamed(info, Entity, self.allocator, row)
                 else
                     try scanEntity(Entity, self.allocator, row);
                 self.current = entity;
@@ -760,7 +778,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 }
             }
             if (!found) return error.UnknownField;
-            try self.predicates.append(sql.EQ(field_name, value));
+            try self.predicates.append(sql.EQ(columnName(info, field_name), value));
         }
 
         /// Fetch every matching row. Returns `std.array_list.Managed(Entity)`:
@@ -787,7 +805,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
             while (rows.next()) |row| {
                 var entity = if (self.select_cols != null)
-                    try scanEntityNamed(Entity, self.allocator, row)
+                    try scanEntityNamed(info, Entity, self.allocator, row)
                 else
                     try scanEntity(Entity, self.allocator, row);
                 errdefer deinitEntity(infos, info, &entity, self.allocator);
@@ -863,7 +881,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 return null;
             };
             var entity = if (self.select_cols != null)
-                try scanEntityNamed(Entity, self.allocator, row)
+                try scanEntityNamed(info, Entity, self.allocator, row)
             else
                 try scanEntity(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
@@ -902,7 +920,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 return error.NotFound;
             };
             var entity = if (self.select_cols != null)
-                try scanEntityNamed(Entity, self.allocator, row)
+                try scanEntityNamed(info, Entity, self.allocator, row)
             else
                 try scanEntity(Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
@@ -1053,7 +1071,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         fn buildGroupedCountQuery(self: *Self, comptime field_name: []const u8) !sql.OwnedQuery {
             const t = sql.Table(info.table_name);
-            const key_col = sql.ColumnRef{ .table = null, .name = field_name, .raw = false };
+            const col = comptime columnName(info, field_name);
+            const key_col = sql.ColumnRef{ .table = null, .name = col, .raw = false };
             const cnt_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{ key_col, cnt_col });
             _ = selector.from(t);
@@ -1065,7 +1084,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (info.soft_delete and !self.with_trashed) {
                 _ = try selector.where(sql.IsNull("deleted_at"));
             }
-            _ = try selector.groupBy(&.{field_name});
+            _ = try selector.groupBy(&.{col});
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
             }
@@ -1094,7 +1113,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
-            var q = try self.buildAggregateQuery("SUM(\"" ++ field_name ++ "\")");
+            const col = comptime columnName(info, field_name);
+            var q = try self.buildAggregateQuery("SUM(\"" ++ col ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
             var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
@@ -1111,7 +1131,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
-            var q = try self.buildAggregateQuery("AVG(\"" ++ field_name ++ "\")");
+            const col = comptime columnName(info, field_name);
+            var q = try self.buildAggregateQuery("AVG(\"" ++ col ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
             var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
@@ -1127,7 +1148,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
-            var q = try self.buildAggregateQuery("MAX(\"" ++ field_name ++ "\")");
+            const col = comptime columnName(info, field_name);
+            var q = try self.buildAggregateQuery("MAX(\"" ++ col ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
             var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
@@ -1152,7 +1174,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
-            var q = try self.buildAggregateQuery("MIN(\"" ++ field_name ++ "\")");
+            const col = comptime columnName(info, field_name);
+            var q = try self.buildAggregateQuery("MIN(\"" ++ col ++ "\")");
             defer q.deinit();
             self.ensureDeadline();
             var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
@@ -1177,7 +1200,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
-            var q = try self.buildAggregateQuery("COALESCE(SUM(\"" ++ field_name ++ "\"), 0)");
+            const col = comptime columnName(info, field_name);
+            var q = try self.buildAggregateQuery("COALESCE(SUM(\"" ++ col ++ "\"), 0)");
             defer q.deinit();
             self.ensureDeadline();
             var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
@@ -1241,7 +1265,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
             const t = sql.Table(info.table_name);
-            const key_col = sql.ColumnRef{ .table = null, .name = group_field, .raw = false };
+            const group_col = comptime columnName(info, group_field);
+            const key_col = sql.ColumnRef{ .table = null, .name = group_col, .raw = false };
             const val_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{ key_col, val_col });
             _ = selector.from(t);
@@ -1256,7 +1281,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (self.group_cols.items.len > 0) {
                 _ = try selector.groupBy(self.group_cols.items);
             } else {
-                _ = try selector.groupBy(&.{group_field});
+                _ = try selector.groupBy(&.{group_col});
             }
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
@@ -1288,10 +1313,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {
             const t = sql.Table(info.table_name);
             var all_cols: [column_count][]const u8 = undefined;
-            inline for (info.fields[0..column_count], 0..) |f, i| all_cols[i] = f.name;
+            inline for (info.fields[0..column_count], 0..) |f, i| all_cols[i] = f.column_name;
             const cols: []const []const u8 = self.select_cols orelse all_cols[0..column_count];
             var columns: [info.fields.len]sql.ColumnRef = undefined;
-            for (cols, 0..) |cname, i| columns[i] = t.c(cname);
+            // `Select` stores field names; emit their physical columns.
+            for (cols, 0..) |cname, i| columns[i] = t.c(columnName(info, cname));
             var selector = try sql.Select(self.allocator, self.driver.dialect(), columns[0..cols.len]);
             _ = selector.from(t);
             _ = selector.setDistinct(self.distinct);
@@ -1313,22 +1339,24 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                         }
                     }
                     if (!col_valid) return error.InvalidCursor;
+                    const col_sql = columnName(info, col);
+                    const pk_col = pkColumn(info);
                     if (self.cursor_id) |id_val| {
                         // Composite keyset: (col > ?) OR (col = ? AND id > ?)
                         // — ties on the cursor column never drop rows.
-                        const col_cmp = if (self.cursor_desc) sql.LT(col, val) else sql.GT(col, val);
-                        const col_eq = sql.EQ(col, val);
+                        const col_cmp = if (self.cursor_desc) sql.LT(col_sql, val) else sql.GT(col_sql, val);
+                        const col_eq = sql.EQ(col_sql, val);
                         const id_cmp = if (self.cursor_desc)
-                            sql.LT(info.pk_field, .{ .int = id_val })
+                            sql.LT(pk_col, .{ .int = id_val })
                         else
-                            sql.GT(info.pk_field, .{ .int = id_val });
+                            sql.GT(pk_col, .{ .int = id_val });
                         _ = try selector.where(sql.Or(&col_cmp, &sql.And(&col_eq, &id_cmp)));
                     } else {
                         // Single-column cursor (backward compatible).
                         if (self.cursor_desc) {
-                            _ = try selector.where(sql.LT(col, val));
+                            _ = try selector.where(sql.LT(col_sql, val));
                         } else {
-                            _ = try selector.where(sql.GT(col, val));
+                            _ = try selector.where(sql.GT(col_sql, val));
                         }
                     }
                 }
@@ -1343,12 +1371,14 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 _ = selector.having(pred);
             }
             if (self.cursor_col) |col| {
+                const col_sql = columnName(info, col);
+                const pk_col = pkColumn(info);
                 // When cursor pagination is active, ensure ORDER BY col ASC/DESC is present.
                 if (self.order_terms.items.len == 0) {
                     if (self.cursor_desc) {
-                        _ = try selector.orderBy(sql.OrderDesc(col));
+                        _ = try selector.orderBy(sql.OrderDesc(col_sql));
                     } else {
-                        _ = try selector.orderBy(sql.OrderAsc(col));
+                        _ = try selector.orderBy(sql.OrderAsc(col_sql));
                     }
                 }
                 // Auto-add pk tie-breaker for stable keyset pagination
@@ -1357,7 +1387,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     for (self.order_terms.items) |term| {
                         switch (term) {
                             .column => |o| {
-                                if (std.mem.eql(u8, o.name, info.pk_field)) {
+                                if (std.mem.eql(u8, o.name, pk_col)) {
                                     has_id = true;
                                     break;
                                 }
@@ -1367,9 +1397,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     }
                     if (!has_id) {
                         if (self.cursor_desc) {
-                            _ = try selector.orderBy(sql.OrderDesc(info.pk_field));
+                            _ = try selector.orderBy(sql.OrderDesc(pk_col));
                         } else {
-                            _ = try selector.orderBy(sql.OrderAsc(info.pk_field));
+                            _ = try selector.orderBy(sql.OrderAsc(pk_col));
                         }
                     }
                 }

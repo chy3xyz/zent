@@ -2,6 +2,8 @@ const std = @import("std");
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
+const columnName = @import("graph.zig").columnName;
+const pkColumn = @import("graph.zig").pkColumn;
 const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
@@ -280,7 +282,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                         try validateSqlValue(f, fv.value);
                     }
                 }
-                try columns.append(fv.name);
+                try columns.append(columnName(info, fv.name));
                 try args.append(fv.value);
             }
 
@@ -298,9 +300,18 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // ON DUPLICATE KEY UPDATE (the old REPLACE prefix has been removed).
             // For plain Save (or_replace=false) the suffix is empty.
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
-            const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
+            // Conflict targets are field names on the API surface; translate
+            // them to physical column names before emitting SQL.
+            const mapped_conflict: ?[]const []const u8 = if (conflict_columns) |cc| blk: {
+                const buf = try self.allocator.alloc([]const u8, cc.len);
+                for (cc, 0..) |c, i| buf[i] = columnName(info, c);
+                break :blk buf;
+            } else null;
+            defer if (mapped_conflict) |m| self.allocator.free(m);
+            const pk_col = pkColumn(info);
+            const upsert_conflict_cols: []const []const u8 = mapped_conflict orelse &[_][]const u8{pk_col};
             const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer, self.upsert_set_exprs, info.table_name);
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, pk_col, pk_is_integer, self.upsert_set_exprs, info.table_name);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
             const ignore_suffix: []const u8 = if (ignore_conflicts and is_postgres) " ON CONFLICT DO NOTHING" else "";
@@ -324,7 +335,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
                 // Build the full SQL: q.sql + ignore suffix + PG/SQLite UPSERT suffix + RETURNING.
                 // MySQL never reaches this branch because it does not support RETURNING.
-                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{info.pk_field});
+                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{pk_col});
                 defer self.allocator.free(ret_suffix);
 
                 const full_sql_len = q.sql.len + ignore_suffix.len + upsert_suffix.len + ret_suffix.len;
@@ -1167,7 +1178,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             var columns = std.array_list.Managed([]const u8).init(self.allocator);
             defer columns.deinit();
             for (first_row.items) |fv| {
-                try columns.append(fv.name);
+                try columns.append(columnName(info, fv.name));
             }
 
             // Collect all values into a flat array for MultiInsert.
@@ -1190,9 +1201,16 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
             const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
             const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
-            const upsert_conflict_cols: []const []const u8 = conflict_columns orelse &.{info.pk_field};
+            const mapped_conflict: ?[]const []const u8 = if (conflict_columns) |cc| blk: {
+                const buf = try self.allocator.alloc([]const u8, cc.len);
+                for (cc, 0..) |c, i| buf[i] = columnName(info, c);
+                break :blk buf;
+            } else null;
+            defer if (mapped_conflict) |m| self.allocator.free(m);
+            const pk_col = pkColumn(info);
+            const upsert_conflict_cols: []const []const u8 = mapped_conflict orelse &[_][]const u8{pk_col};
             const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
-            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, info.pk_field, pk_is_integer, null, info.table_name);
+            const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, pk_col, pk_is_integer, null, info.table_name);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
             const query = sql.MultiInsert(self.allocator, self.driver.dialect(), info.table_name, columns.items, self.rows.items.len, flat_values) catch |err| return mapBuildError(err);
             defer query.deinit();
@@ -1202,7 +1220,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
 
             if (supports_returning) {
                 // SQLite / PostgreSQL: append RETURNING clause and query.
-                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{info.pk_field});
+                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{pk_col});
                 defer self.allocator.free(ret_suffix);
                 const full_sql = try self.allocator.alloc(u8, query.sql.len + upsert_suffix.len + ret_suffix.len);
                 defer self.allocator.free(full_sql);
@@ -1312,6 +1330,7 @@ test "validateSqlValue positive" {
     const f = field_mod.Int("age").Positive();
     const info = FieldInfo{
         .name = f.name,
+        .column_name = f.storage_key orelse f.name,
         .field_type = f.field_type,
         .zig_type = i64,
         .sql_type = "INTEGER",
@@ -1336,6 +1355,7 @@ test "validateSqlValue range" {
     const f = field_mod.Int("age").Range(0, 120);
     const info = FieldInfo{
         .name = f.name,
+        .column_name = f.storage_key orelse f.name,
         .field_type = f.field_type,
         .zig_type = i64,
         .sql_type = "INTEGER",
@@ -1360,6 +1380,7 @@ test "validateSqlValue match" {
     const f = field_mod.String("email").Match("@");
     const info = FieldInfo{
         .name = f.name,
+        .column_name = f.storage_key orelse f.name,
         .field_type = f.field_type,
         .zig_type = []const u8,
         .sql_type = "TEXT",

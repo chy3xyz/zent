@@ -150,6 +150,48 @@ paths (`"posts.comments"`) filter on the head edge only. Edges must live in
 the same graph as the parent (see §8a); cross-graph eager loading is a
 compile error by design.
 
+### Field names vs column names (`StorageKey`)
+
+A field has a **Zig name** (the struct field, used by every user-facing API)
+and a **column name** (the SQL identifier). They are equal by default; use
+`StorageKey` when the field name and the physical column differ (mapping an
+existing table):
+
+```zig
+const User = schema("User", .{
+    .table_name = "users",
+    .fields = &.{
+        field.String("userName").StorageKey("user_name"),
+        field.String("emailAddr").StorageKey("email_address"),
+    },
+});
+
+// APIs take the field name; SQL is generated with the column name.
+_ = try b.setFieldValue("userName", "alice");
+_ = try q.Where(.{client.user.predicates.userNameEQ(.{ .string = "alice" })});
+_ = try q.OrderBy(&.{zent.sql.OrderAsc("userName")});
+```
+
+Only one name is exposed per layer:
+
+- **Field names** (what you pass): `setFieldValue` / `setValue`, the typed
+  `predicates.<field>…`, `Select`, `OrderBy` (plain `.column` terms),
+  `GroupBy`, `Cursor`/`CursorAfter`, `WhereIn`, interceptor `whereEq`,
+  `SaveOrUpdateOn`, and the `crud_helpers` wrappers (`increment`,
+  `updateWithVersion`, `batchSaveOrUpdate`, `scopedBy`, `paginatedWithOptions`,
+  `latest`, `cursorPage`). Unknown names fall back to the string you passed,
+  so raw column names still work.
+- **Column names** (what zent emits): DDL and migration columns, index
+  columns/names, `INSERT` column lists, `UPDATE … SET`, `WHERE`/`ORDER BY`/
+  `GROUP BY`, and the projection used by `Select` (rows are matched by column
+  and written back to the struct by field name).
+
+Raw escape hatches stay SQL-level: `sql.EQ`/`sql.OrderAsc` handed to the
+low-level `Selector`/`Update` builders, `SelectExpr`, `UpsertSetExpr.column`
+and its `{t:col}`/`{x:col}` tokens, edge `.OrderBy("col")`, and EntQL
+expression identifiers all take the **physical column name**. With
+`StorageKey` that means writing `user_name`, not `userName`.
+
 ## 3a. Predicate catalogue
 
 Every field gets these (`client.<entity>.predicates.<field><Suffix>`):

@@ -9,7 +9,16 @@ const graph_step = @import("../graph/step.zig");
 const value = @import("../sql/value.zig");
 
 pub const FieldInfo = struct {
+    /// Zig struct field name. Used for `@field(entity, name)` access and as
+    /// the argument users pass to the fluent API (`setFieldValue`, typed
+    /// predicates, `Select`, interceptors' `whereEq`, …). This is NOT the SQL
+    /// column name.
     name: []const u8,
+    /// SQL column name. Equals `name` unless the schema declared
+    /// `.StorageKey("...")` on the field. Every SQL identifier the codegen
+    /// emits (INSERT column lists, UPDATE SET, WHERE/ORDER BY/GROUP BY,
+    /// DDL columns, indexes) MUST use `column_name`, never `name`.
+    column_name: []const u8,
     field_type: field_mod.FieldType,
     zig_type: type,
     /// Legacy SQLite-oriented type string retained for API compatibility.
@@ -73,6 +82,22 @@ pub const TypeInfo = struct {
     annotations: []const Annotation = &.{},
 };
 
+/// Resolve a user-supplied field name to its SQL column name. Falls back to
+/// `field_name` unchanged when no field matches, so raw column names keep
+/// working. Use this wherever a field-name argument is about to be emitted as
+/// a SQL identifier.
+pub fn columnName(comptime info: TypeInfo, field_name: []const u8) []const u8 {
+    inline for (info.fields) |f| {
+        if (std.mem.eql(u8, f.name, field_name)) return f.column_name;
+    }
+    return field_name;
+}
+
+/// SQL column backing the primary key (honors `StorageKey` on the PK field).
+pub fn pkColumn(comptime info: TypeInfo) []const u8 {
+    return columnName(info, info.pk_field);
+}
+
 /// Build a TypeInfo from a schema type at comptime.
 /// Build a TypeInfo from a schema type at comptime with the default (SQLite) dialect.
 pub fn fromSchema(comptime S: type) TypeInfo {
@@ -125,7 +150,7 @@ pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
 
         var indexes: []const IndexInfo = &.{};
         for (schema_indexes) |i| {
-            indexes = indexes ++ &[_]IndexInfo{toIndexInfo(i, name)};
+            indexes = indexes ++ &[_]IndexInfo{toIndexInfo(i, name, all_schema_fields)};
         }
 
         return TypeInfo{
@@ -161,6 +186,7 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, co
         const is_id = std.mem.eql(u8, f.name, pk_field);
         return FieldInfo{
             .name = f.name,
+            .column_name = f.storage_key orelse f.name,
             .field_type = f.field_type,
             .zig_type = field_mod.zigType(f.field_type, f.zig_type),
             .sql_type = field_mod.sqlType(f.field_type, dialect),
@@ -251,13 +277,29 @@ fn findInverse(comptime edges: []const edge_mod.Edge, edge_name: []const u8) ?ed
     return null;
 }
 
-fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8) IndexInfo {
+/// Resolve a field's `StorageKey` from the raw schema field list, falling
+/// back to the given name when no field matches (e.g. an already-physical
+/// column name).
+fn storageKeyOf(comptime fields: []const field_mod.Field, comptime name: []const u8) []const u8 {
+    inline for (fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f.storage_key orelse f.name;
+    }
+    return name;
+}
+
+fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8, comptime schema_fields: []const field_mod.Field) IndexInfo {
     comptime {
         @setEvalBranchQuota(1000000);
-        const name = i.name orelse generateIndexName(type_name, i.columns);
+        // Index columns are declared with field names; DDL must reference the
+        // physical column names (the generated index name follows suit).
+        var mapped: []const []const u8 = &.{};
+        for (i.columns) |col| {
+            mapped = mapped ++ &[_][]const u8{storageKeyOf(schema_fields, col)};
+        }
+        const name = i.name orelse generateIndexName(type_name, mapped);
         return IndexInfo{
             .name = name,
-            .columns = i.columns,
+            .columns = mapped,
             .unique = i.unique,
         };
     }
@@ -412,10 +454,11 @@ fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdg
         for (info.edges) |e| {
             if (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) {
                 const fk_col_name = e.field_name orelse e.name ++ "_id";
-                // Schema 已声明该 FK 列 → 不重复注入（避免重复字段/谓词）。
+                // Schema 已声明该 FK 列（按字段名或映射后的列名）→ 不重复注入
+                // （避免重复字段/谓词）。
                 var exists = false;
                 for (fields) |f| {
-                    if (std.mem.eql(u8, f.name, fk_col_name)) {
+                    if (std.mem.eql(u8, f.name, fk_col_name) or std.mem.eql(u8, f.column_name, fk_col_name)) {
                         exists = true;
                         break;
                     }
@@ -423,6 +466,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdg
                 if (exists) continue;
                 fields = fields ++ &[_]FieldInfo{FieldInfo{
                     .name = fk_col_name,
+                    .column_name = fk_col_name,
                     .field_type = .int,
                     .zig_type = i64,
                     .sql_type = "INTEGER",
@@ -464,7 +508,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdg
                 const fk_col_name = e.field_name orelse toSnakeCase(other_info.name) ++ "_id";
                 var exists = false;
                 for (fields) |f| {
-                    if (std.mem.eql(u8, f.name, fk_col_name)) {
+                    if (std.mem.eql(u8, f.name, fk_col_name) or std.mem.eql(u8, f.column_name, fk_col_name)) {
                         exists = true;
                         break;
                     }
@@ -472,6 +516,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdg
                 if (!exists) {
                     fields = fields ++ &[_]FieldInfo{FieldInfo{
                         .name = fk_col_name,
+                        .column_name = fk_col_name,
                         .field_type = .int,
                         .zig_type = i64,
                         .sql_type = "INTEGER",
@@ -555,9 +600,9 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
         const target_col = target_table ++ "_id";
         return graph_step.Step{
             .from_table = source_table,
-            .from_column = "id",
+            .from_column = pkColumn(source_info),
             .to_table = target_table,
-            .to_column = "id",
+            .to_column = pkColumn(target_info),
             .edge_rel = .m2m,
             .edge_table = junction,
             .edge_columns = &[_][]const u8{ target_col, source_col },
@@ -572,9 +617,9 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
         const is_to = edge.kind == .to;
         return graph_step.Step{
             .from_table = source_table,
-            .from_column = source_info.pk_field,
+            .from_column = pkColumn(source_info),
             .to_table = target_table,
-            .to_column = target_info.pk_field,
+            .to_column = pkColumn(target_info),
             .edge_rel = if (is_to) .o2m else .m2o,
             .edge_table = if (is_to) target_table else source_table,
             .edge_columns = &[_][]const u8{fk_col},
