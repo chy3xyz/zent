@@ -64,6 +64,9 @@ pub fn ConnPool(comptime D: type) type {
             /// Called when a connection is released back to the pool.
             onRelease: ?*const fn (ctx: ?*anyopaque) void = null,
             /// Called when a caller starts waiting for an available connection.
+            /// Fires at most once per `borrow`, after the pool mutex is
+            /// released, and only when `max_wait_ms > 0` actually blocks the
+            /// caller.
             onWait: ?*const fn (ctx: ?*anyopaque) void = null,
             /// Called when borrow fails with a pool-level or connection error.
             onError: ?*const fn (ctx: ?*anyopaque, err: anyerror) void = null,
@@ -93,10 +96,19 @@ pub fn ConnPool(comptime D: type) type {
             /// want to share an `Io` across multiple pools or use a custom implementation
             /// can provide an explicit `std.Io` here.
             io: ?std.Io = null,
-            /// Maximum time in milliseconds to wait for a connection when the
-            /// DEPRECATED: replaced by `max_retries` + `retry_backoff_ms`.
-            /// pool is exhausted. Zero means non-blocking (returns
-            /// `error.PoolExhausted` immediately).
+            /// Total time budget in milliseconds that a single `borrow` may
+            /// spend waiting for a connection once the pool is exhausted.
+            ///
+            /// When non-zero, borrowers block on the pool condition variable
+            /// instead of polling and are woken as soon as a connection is
+            /// released (see `borrow` for the waiting/fairness contract). When
+            /// the budget is used up, `borrow` falls back to the
+            /// `max_retries` + `retry_backoff_ms` path and then reports
+            /// `error.PoolExhausted`.
+            ///
+            /// Zero (the default) means non-blocking: no waiting happens and a
+            /// failed attempt immediately returns `error.PoolExhausted` (after
+            /// the legacy retries). This preserves the historical behavior.
             max_wait_ms: u32 = 0,
             /// Elapsed time in milliseconds at which a pooled query/exec is
             /// reported through `Metrics.onSlowQuery`. Zero disables reporting.
@@ -137,6 +149,12 @@ pub fn ConnPool(comptime D: type) type {
         all: std.ArrayListUnmanaged(*PooledEntry) = .empty,
         available: std.ArrayListUnmanaged(*PooledEntry) = .empty,
         closed: bool = false,
+        /// Source of waiter tickets, handed out under `mutex`. See `borrow`.
+        next_ticket: u64 = 0,
+        /// Tickets of the borrowers currently blocked on `cond`, in ascending
+        /// arrival order (tickets are assigned under the mutex, so appends stay
+        /// sorted). Best-effort fairness bookkeeping only — see `borrow`.
+        wait_tickets: std.ArrayListUnmanaged(u64) = .empty,
         owned_io: ?*std.Io.Threaded = null,
 
         /// Create a thread-safe Io instance owned by the pool.
@@ -184,15 +202,24 @@ pub fn ConnPool(comptime D: type) type {
 
         /// Close every connection and free pool bookkeeping.
         ///
-        /// The caller must ensure no other thread is currently in `borrow`,
-        /// `release`, or any `asDriver` operation before calling `deinit`, because
-        /// the owned `Io` instance is destroyed immediately after the pool mutex
-        /// is released.
+        /// # Caller contract
+        ///
+        /// No other thread may be inside `borrow`, `release`, or any `asDriver`
+        /// operation — **including a thread currently blocked waiting for a
+        /// connection** — while `deinit` runs. Waiters are woken by the
+        /// `broadcast` below and return `error.PoolClosed` once they observe
+        /// `closed`, but that observation requires the pool mutex and the
+        /// owned `Io` to still be alive: `deinit` destroys the owned `Io`
+        /// immediately after releasing the mutex and then sets `self` to
+        /// `undefined`, so a waiter still inside `borrow` at that point touches
+        /// freed state. Using `deinit` to interrupt blocked borrowers is
+        /// therefore undefined behavior; drain or cancel them first.
         pub fn deinit(self: *Self) void {
             const io = self.io;
             self.mutex.lockUncancelable(io);
             self.closed = true;
-            // Wake any waiters so they observe the closed state.
+            // Wake any waiters so they observe the closed state (see the
+            // caller contract above: this is only safe when none are blocked).
             self.cond.broadcast(io);
             for (self.all.items) |entry| {
                 entry.conn.close();
@@ -200,6 +227,7 @@ pub fn ConnPool(comptime D: type) type {
             }
             self.all.deinit(self.allocator);
             self.available.deinit(self.allocator);
+            self.wait_tickets.deinit(self.allocator);
             self.mutex.unlock(io);
             if (self.owned_io) |t| {
                 t.deinit();
@@ -329,40 +357,174 @@ pub fn ConnPool(comptime D: type) type {
             }
         }
 
+        /// How many times a younger waiter steps aside for an older ticket
+        /// before taking an available connection itself. Bounds the fairness
+        /// deferral so a descheduled or about-to-time-out older waiter can
+        /// never stall another borrower.
+        const max_fair_deferrals: u32 = 8;
+
+        /// Best-effort fairness decision: true when `ticket` should let an
+        /// older waiting ticket take a connection that the pool looks able to
+        /// hand out right now. The caller must hold `self.mutex`.
+        fn shouldDeferNoLock(self: *Self, ticket: u64) bool {
+            if (self.wait_tickets.items.len == 0) return false;
+            // Tickets are assigned and appended under the mutex, so the list is
+            // sorted by arrival and the head is the oldest waiting ticket.
+            if (self.wait_tickets.items[0] >= ticket) return false;
+            return self.available.items.len > 0 or self.all.items.len < self.options.max_connections;
+        }
+
+        /// Claim the next waiter ticket and record it as waiting. Returns null
+        /// when the bookkeeping allocation fails; the caller then falls back to
+        /// the non-blocking retry path instead of blocking untracked. The
+        /// caller must hold `self.mutex`.
+        fn registerWaiterNoLock(self: *Self) ?u64 {
+            const ticket = self.next_ticket;
+            self.wait_tickets.append(self.allocator, ticket) catch return null;
+            self.next_ticket += 1;
+            return ticket;
+        }
+
+        /// Drop `ticket` from the waiting set; no-op when it is not present.
+        /// The caller must hold `self.mutex`.
+        fn unregisterWaiterNoLock(self: *Self, ticket: u64) void {
+            for (self.wait_tickets.items, 0..) |t, i| {
+                if (t == ticket) {
+                    _ = self.wait_tickets.orderedRemove(i);
+                    return;
+                }
+            }
+        }
+
+        /// Release the ticket held by this call, if any. The caller must hold
+        /// `self.mutex`.
+        fn dropTicketNoLock(self: *Self, ticket: *?u64) void {
+            if (ticket.*) |t| {
+                self.unregisterWaiterNoLock(t);
+                ticket.* = null;
+            }
+        }
+
         /// Borrow a connection from the pool.
         ///
-        /// Retries up to `max_retries` times with linear backoff when the
-        /// pool is exhausted. Performs idle eviction and health checks on each
-        /// borrow attempt.
+        /// Performs idle eviction and health checks on each attempt.
+        ///
+        /// With the default `max_wait_ms == 0` the call is non-blocking: a
+        /// failed attempt is retried up to `max_retries` times with linear
+        /// `retry_backoff_ms` backoff, then reports `error.PoolExhausted`.
+        ///
+        /// When `max_wait_ms > 0` and no connection can be handed out or
+        /// opened (the pool is exhausted, or opening one failed), the caller
+        /// blocks on the pool condition variable instead of polling, and is
+        /// woken as soon as a connection is released. `max_wait_ms` is the
+        /// total budget for the whole call, measured from entry; once it runs
+        /// out the call falls back to the legacy retry/backoff path and then
+        /// reports `error.PoolExhausted`. A closed pool reports
+        /// `error.PoolClosed`.
+        ///
+        /// Waiting is **best-effort fair, not strict FIFO**: every blocked
+        /// borrower holds a ticket and defers to a lower (older) ticket that is
+        /// still waiting when a connection looks available. A waiter that is
+        /// descheduled, timing out, or could not be ticketed (bookkeeping OOM)
+        /// never blocks another borrower forever — after a bounded number of
+        /// deferrals the connection goes to whichever waiter is awake.
         pub fn borrow(self: *Self) !*D {
             const io = self.io;
+            const waiting_enabled = self.options.max_wait_ms > 0;
+
+            // Absolute deadline for the total wait budget; `.none` selects the
+            // legacy non-blocking path, which needs no clock reads.
+            const wait_start: ?std.Io.Clock.Timestamp = if (waiting_enabled)
+                std.Io.Clock.Timestamp.now(io, .awake)
+            else
+                null;
+            const wait_deadline: std.Io.Timeout = if (wait_start) |start|
+                .{ .deadline = start.addDuration(.{
+                    .raw = std.Io.Duration.fromMilliseconds(@intCast(self.options.max_wait_ms)),
+                    .clock = .awake,
+                }) }
+            else
+                .none;
+
+            var ticket: ?u64 = null;
+            var deferrals: u32 = 0;
+            var wait_done = !waiting_enabled;
             var attempt: u32 = 0;
-            while (true) : (attempt += 1) {
+
+            while (true) {
                 // The locked section only records the outcome; the metrics
-                // callback fires after the mutex is released so it can safely
+                // callbacks fire after the mutex is released so they can safely
                 // re-enter the pool.
                 var borrowed: ?*PooledEntry = null;
                 var was_closed = false;
-                {
-                    self.mutex.lockUncancelable(io);
-                    defer self.mutex.unlock(io);
+                var deferred = false;
+                var started_waiting = false;
 
+                self.mutex.lockUncancelable(io);
+                {
                     if (self.closed) {
+                        self.dropTicketNoLock(&ticket);
                         was_closed = true;
+                    } else if (!wait_done and ticket != null and
+                        deferrals < max_fair_deferrals and self.shouldDeferNoLock(ticket.?))
+                    {
+                        deferrals += 1;
+                        deferred = true;
                     } else if (self.tryBorrowNoLock()) |entry| {
+                        self.dropTicketNoLock(&ticket);
                         borrowed = entry;
+                    } else if (!wait_done) {
+                        if (ticket == null) {
+                            ticket = self.registerWaiterNoLock();
+                            started_waiting = ticket != null;
+                        }
+                        if (ticket != null) {
+                            // Registration above and this wait share one critical
+                            // section, so a `release` cannot slip in between and
+                            // lose its signal. `waitTimeout` drops the mutex while
+                            // blocked and re-acquires it before returning.
+                            self.cond.waitTimeout(io, &self.mutex, wait_deadline) catch |err| switch (err) {
+                                error.Timeout => wait_done = true,
+                                // `borrow` has no `Canceled` in its error set
+                                // (callers go through `driver.Error`), so treat
+                                // a canceled wait as budget exhaustion and let
+                                // the legacy retry path finish.
+                                error.Canceled => wait_done = true,
+                            };
+                            if (wait_done) self.dropTicketNoLock(&ticket);
+                        } else {
+                            // No ticket available, so do not block untracked.
+                            wait_done = true;
+                        }
                     }
                 }
+                self.mutex.unlock(io);
 
                 if (borrowed) |entry| {
-                    if (self.options.metrics.onBorrow) |cb| cb(self.options.metrics.context, 0);
+                    if (self.options.metrics.onBorrow) |cb| {
+                        const wait_ms: u32 = if (wait_start) |start| blk: {
+                            const elapsed = start.untilNow(io).raw.toMilliseconds();
+                            break :blk @intCast(std.math.clamp(elapsed, 0, std.math.maxInt(u32)));
+                        } else 0;
+                        cb(self.options.metrics.context, wait_ms);
+                    }
                     return &entry.conn;
                 }
                 if (was_closed) return error.PoolClosed;
+                if (started_waiting) {
+                    if (self.options.metrics.onWait) |cb| cb(self.options.metrics.context);
+                }
+                if (deferred) {
+                    // Let the older ticket reach the mutex first.
+                    io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+                    continue;
+                }
+                if (!wait_done) continue;
 
                 if (attempt >= self.options.max_retries) break;
                 const backoff_ms: i64 = @as(i64, self.options.retry_backoff_ms) * (@as(i64, attempt) + 1);
-                self.io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+                attempt += 1;
+                io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
             }
 
             if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, error.PoolExhausted);
@@ -460,6 +622,10 @@ pub fn ConnPool(comptime D: type) type {
                     }
                 }
             }
+            // Closing connections frees room below `max_connections`, so blocked
+            // borrowers may be able to open a fresh one instead of waiting out
+            // their `max_wait_ms` budget.
+            if (reaped > 0) self.cond.broadcast(io);
             return reaped;
         }
 
@@ -473,6 +639,7 @@ pub fn ConnPool(comptime D: type) type {
 
             var i: usize = self.available.items.len;
             var healthy: usize = 0;
+            var dropped: usize = 0;
             while (i > 0) {
                 i -= 1;
                 const entry = self.available.items[i];
@@ -480,10 +647,14 @@ pub fn ConnPool(comptime D: type) type {
                     // closeConnection removes the entry from both lists;
                     // iterating in reverse makes the orderedRemove safe.
                     self.closeConnection(entry);
+                    dropped += 1;
                     continue;
                 };
                 healthy += 1;
             }
+            // Dropping dead connections frees room below `max_connections`, so
+            // blocked borrowers may be able to open a fresh one.
+            if (dropped > 0) self.cond.broadcast(io);
             return healthy;
         }
 
@@ -1531,4 +1702,204 @@ test "ConnPool metrics callbacks run outside the mutex and may re-enter" {
     const c2 = try pool.borrow();
     pool.release(c2);
     try std.testing.expectEqual(@as(usize, 2), pool.available.items.len);
+}
+
+/// Minimal driver for the blocking-borrow tests: it opens, closes, and reports
+/// "not in a transaction" (the only driver call `release` makes on the plain
+/// return path). These tests never execute SQL, so the rest is `unreachable`.
+const StubDriver = struct {
+    /// Present so the driver has non-trivial alignment; `release` derives the
+    /// enclosing `PooledEntry` with `@fieldParentPtr("conn", …)`.
+    id: usize = 0,
+
+    pub fn asDriver(self: *@This()) driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn close(self: *@This()) void {
+        _ = self;
+    }
+
+    fn stubExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+        unreachable;
+    }
+    fn stubQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+        unreachable;
+    }
+    fn stubBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+        unreachable;
+    }
+    fn stubBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+        unreachable;
+    }
+    fn stubClose(_: *anyopaque) void {
+        unreachable;
+    }
+    fn stubDialect(_: *anyopaque) Dialect {
+        return .sqlite;
+    }
+    fn stubPing(_: *anyopaque) driver.Error!void {}
+    fn stubInTransaction(_: *anyopaque) bool {
+        return false;
+    }
+
+    const vtable = driver.Driver.VTable{
+        .exec = stubExec,
+        .query = stubQuery,
+        .beginTx = stubBeginTx,
+        .close = stubClose,
+        .dialect = stubDialect,
+        .ping = stubPing,
+        .inTransaction = stubInTransaction,
+        .beginSavepoint = stubBeginSavepoint,
+    };
+};
+
+fn stubConnect(allocator: std.mem.Allocator) anyerror!StubDriver {
+    _ = allocator;
+    return StubDriver{};
+}
+
+test "ConnPool blocked borrow is served by a release" {
+    // std.testing.allocator (SafeAllocator) is single-threaded; the pool here is
+    // shared with spawned threads, so use a thread-safe allocator.
+    const allocator = std.heap.page_allocator;
+    const P = ConnPool(StubDriver);
+
+    var pool = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 5000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const Holder = struct {
+        pool: *P,
+        held: std.atomic.Value(bool),
+        release_now: std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            const conn = self.pool.borrow() catch unreachable;
+            self.held.store(true, .release);
+            // `std.Thread.yield` rather than `Io.sleep`: this thread was not
+            // spawned by the pool's `Io`. The loop is bounded because every
+            // main-thread path (including failures) flips `release_now`.
+            while (!self.release_now.load(.acquire)) std.Thread.yield() catch {};
+            self.pool.release(conn);
+        }
+    };
+
+    const Waiter = struct {
+        pool: *P,
+        got: std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            const conn = self.pool.borrow() catch return;
+            self.pool.release(conn);
+            self.got.store(true, .release);
+        }
+    };
+
+    var holder = Holder{
+        .pool = &pool,
+        .held = std.atomic.Value(bool).init(false),
+        .release_now = std.atomic.Value(bool).init(false),
+    };
+    var waiter = Waiter{ .pool = &pool, .got = std.atomic.Value(bool).init(false) };
+
+    const holder_thread = try std.Thread.spawn(.{}, Holder.run, .{&holder});
+    var holder_ready = false;
+    var spins: usize = 0;
+    while (!holder_ready and spins < 5000) : (spins += 1) {
+        holder_ready = holder.held.load(.acquire);
+        if (!holder_ready) pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+
+    // Deterministic synchronization point: a waiter registers its ticket and
+    // starts waiting inside one critical section, so once the ticket is visible
+    // the waiter is committed to parking and cannot miss the release. No
+    // timing-based ordering is involved.
+    var waiter_parked = false;
+    spins = 0;
+    while (!waiter_parked and spins < 5000) : (spins += 1) {
+        const io = pool.io;
+        pool.mutex.lockUncancelable(io);
+        waiter_parked = pool.wait_tickets.items.len > 0;
+        pool.mutex.unlock(io);
+        if (!waiter_parked) pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    // Release unconditionally so a broken borrow fails assertions (or the
+    // bounded `max_wait_ms` elapses) instead of hanging the test.
+    holder.release_now.store(true, .release);
+    holder_thread.join();
+    waiter_thread.join();
+
+    try std.testing.expect(holder_ready);
+    try std.testing.expect(waiter_parked);
+    try std.testing.expect(waiter.got.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
+}
+
+test "ConnPool zero wait budget does not park a borrower" {
+    const allocator = std.testing.allocator;
+    const P = ConnPool(StubDriver);
+
+    var pool = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 0,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.borrow();
+    defer pool.release(c1);
+
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolExhausted, pool.borrow());
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+
+    // The wait path is never entered: no ticket is taken and no condition wait
+    // happens. The elapsed check is a generous sanity bound, not a timing
+    // assertion.
+    try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
+    try std.testing.expect(elapsed_ms < 1000);
+}
+
+test "ConnPool wait budget expiry returns PoolExhausted" {
+    const allocator = std.testing.allocator;
+    const P = ConnPool(StubDriver);
+
+    var pool = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 50,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    // Hold the only connection: the second borrow must park for its whole
+    // budget and then report exhaustion rather than returning at once or
+    // waiting forever.
+    const c1 = try pool.borrow();
+    defer pool.release(c1);
+
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolExhausted, pool.borrow());
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+
+    try std.testing.expect(elapsed_ms >= 40);
+    // The timed-out waiter must not leave a phantom ticket behind, or later
+    // waiters would defer to a borrower that is no longer there.
+    try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
 }

@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Blocking, timeout-bounded connection waits.** `Options.max_wait_ms` is no
+  longer dead configuration: when it is non-zero and no connection can be
+  handed out or opened, `borrow` waits on the pool condition variable (woken
+  by `release`) instead of sleeping between retries, and gives up with
+  `error.PoolExhausted` once the budget — measured from the start of the call
+  — is spent. After the wait is exhausted the call still falls back to the
+  existing `max_retries` + `retry_backoff_ms` path, so `max_wait_ms = 0` (the
+  default) keeps the previous non-blocking semantics exactly. Waiting is
+  **best-effort fair, not strict FIFO**: each waiter holds a ticket and defers
+  to an older ticket that is still waiting, but a descheduled, timed-out, or
+  unticketed waiter never blocks another borrower indefinitely.
+  `Metrics.onWait` now fires (at most once per `borrow`, outside the mutex) and
+  `Metrics.onBorrow` reports the real wait time. `reapIdleConnections` and
+  `pingIdleConnections` also wake waiters when they drop connections, since
+  that frees room below `max_connections`.
+
+### Changed
+- **`ConnPool.deinit`'s caller contract now names blocked borrowers.** The
+  caller must ensure no other thread is inside `borrow`/`release`/`asDriver`
+  when `deinit` runs — explicitly including a thread blocked waiting for a
+  connection. A woken waiter observes `closed` and returns
+  `error.PoolClosed`, but that requires the pool mutex and the owned `Io` to
+  still be alive, and `deinit` destroys both immediately after releasing the
+  mutex; using `deinit` to interrupt blocked borrowers is undefined behavior.
+
 ### Fixed
 - **Nested eager loading issues one query per level instead of one per
   parent.** `WithEdge("posts.comments")` recursed once per parent entity, so
