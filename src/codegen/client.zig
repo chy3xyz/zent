@@ -215,7 +215,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return bdb;
         }
 
-        const QueryEdgeError = sql_driver.Error || error{TypeMismatch};
+        const QueryEdgeError = sql_driver.Error || error{ TypeMismatch, BuildFailed };
 
         /// Query target entities via an edge.
         /// Example: user_client.QueryEdge("cars", &.{alice.id}) returns Car entities.
@@ -483,25 +483,6 @@ fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
     @compileError("Edge not found: " ++ name ++ " on " ++ info.name);
 }
 
-fn getEdgeFKColumn(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) []const u8 {
-    if (edge.kind == .to) {
-        // Target table holds the FK. Look for inverse From edge.
-        for (target_info.edges) |target_edge| {
-            if (target_edge.kind == .from) {
-                if (target_edge.ref) |ref| {
-                    if (std.mem.eql(u8, ref, edge.name)) {
-                        return target_edge.name ++ "_id";
-                    }
-                }
-            }
-        }
-        return toSnakeCase(source_info.name) ++ "_id";
-    } else {
-        // From edge: this entity holds the FK
-        return edge.name ++ "_id";
-    }
-}
-
 fn QueryTargetsResult(
     comptime infos: []const TypeInfo,
     comptime source_name: []const u8,
@@ -513,10 +494,23 @@ fn QueryTargetsResult(
     return std.array_list.Managed(EntityGen(infos, target_info));
 }
 
-const QueryTargetsError = sql_driver.Error || error{TypeMismatch};
+const QueryTargetsError = sql_driver.Error || error{ TypeMismatch, BuildFailed };
 
 /// Query target entities via an O2M/M2M edge.
 /// For example: queryTargets(infos, "User", "cars", &[1], allocator, driver) returns Car entities for user 1.
+///
+/// The traversal is rebuilt through `buildEdgeStep` +
+/// `graph_neighbors.appendSetNeighborsFiltered`, so placeholders and
+/// identifier quoting follow the driver dialect (`$n` on PostgreSQL,
+/// backticks on MySQL) instead of the hardcoded `?`/`"…"` this helper used
+/// to emit. Soft-deleted target rows are excluded, matching the eager-load
+/// read contract.
+///
+/// Known boundary: this helper takes no privacy_ctx/interceptors, so it
+/// applies only the target's soft-delete scope — it does **not** run the
+/// target's privacy policy or the interceptor chain. Callers that need
+/// tenant isolation (or any other policy/interceptor scoping) must use
+/// `WithEdge`/eager loading instead.
 pub fn queryTargets(
     comptime infos: []const TypeInfo,
     comptime source_name: []const u8,
@@ -529,99 +523,44 @@ pub fn queryTargets(
     const edge = comptime findEdgeInfo(source_info, edge_name);
     const target_info = comptime findTypeInfo(infos, edge.target_name);
     const TargetEntity = comptime EntityGen(infos, target_info);
+    const step = comptime buildEdgeStep(edge, source_info, target_info);
 
     if (parent_ids.len == 0) {
         return std.array_list.Managed(TargetEntity).init(allocator);
     }
 
-    if (edge.relation == .m2m) {
-        // M2M: query via junction table or edge schema (through)
-        const source_table = source_info.table_name;
-        const target_table = target_info.table_name;
+    var parent_id_values = try allocator.alloc(sql.Value, parent_ids.len);
+    defer allocator.free(parent_id_values);
+    for (parent_ids, 0..) |id, i| parent_id_values[i] = .{ .int = id };
 
-        // Build SQL with placeholders using ArrayList
-        var sql_buf = std.array_list.Managed(u8).init(allocator);
-        defer sql_buf.deinit();
-
-        // Determine junction table name
-        if (edge.through_name) |tn| {
-            try sql_buf.print("SELECT * FROM \"{s}\" WHERE \"id\" IN (SELECT \"{s}_id\" FROM \"{s}\" WHERE \"{s}_id\" IN (", .{ target_table, target_table, tn, source_table });
-        } else if (std.mem.lessThan(u8, source_table, target_table)) {
-            try sql_buf.print("SELECT * FROM \"{s}\" WHERE \"id\" IN (SELECT \"{s}_id\" FROM \"{s}_{s}\" WHERE \"{s}_id\" IN (", .{ target_table, target_table, source_table, target_table, source_table });
-        } else {
-            try sql_buf.print("SELECT * FROM \"{s}\" WHERE \"id\" IN (SELECT \"{s}_id\" FROM \"{s}_{s}\" WHERE \"{s}_id\" IN (", .{ target_table, target_table, target_table, source_table, source_table });
-        }
-        for (parent_ids, 0..) |_, i| {
-            if (i > 0) try sql_buf.appendSlice(", ");
-            try sql_buf.append('?');
-        }
-        try sql_buf.appendSlice("))");
-        const sql_text = sql_buf.items;
-
-        var args = try allocator.alloc(sql.Value, parent_ids.len);
-        defer allocator.free(args);
-        for (parent_ids, 0..) |id, i| {
-            args[i] = .{ .int = id };
-        }
-
-        var rows = try driver.query(sql_text, args);
-        defer rows.deinit();
-
-        var result = std.array_list.Managed(TargetEntity).init(allocator);
-        errdefer result.deinit();
-
-        while (rows.next()) |row| {
-            const entity = try sql_scan.scanRow(TargetEntity, allocator, row);
-            try result.append(entity);
-        }
-        return result;
-    } else {
-        // O2M / O2O
-        const target_table = target_info.table_name;
-        const fk_col = comptime getEdgeFKColumn(edge, source_info, target_info);
-
-        var sql_buf = std.array_list.Managed(u8).init(allocator);
-        defer sql_buf.deinit();
-
-        if (edge.kind == .to) {
-            // To edge: FK is in target table
-            try sql_buf.print("SELECT * FROM \"{s}\" WHERE \"{s}\" IN (", .{ target_table, fk_col });
-        } else {
-            // From edge: FK is in source table; use subquery
-            const source_table = source_info.table_name;
-            try sql_buf.print("SELECT * FROM \"{s}\" WHERE \"id\" IN (SELECT \"{s}\" FROM \"{s}\" WHERE \"id\" IN (", .{
-                target_table, fk_col, source_table,
-            });
-        }
-        for (parent_ids, 0..) |_, i| {
-            if (i > 0) try sql_buf.appendSlice(", ");
-            try sql_buf.append('?');
-        }
-        if (edge.kind == .from) {
-            try sql_buf.appendSlice("))");
-        } else {
-            try sql_buf.append(')');
-        }
-        const sql_text = sql_buf.items;
-
-        var args = try allocator.alloc(sql.Value, parent_ids.len);
-        defer allocator.free(args);
-        for (parent_ids, 0..) |id, i| {
-            args[i] = .{ .int = id };
-        }
-
-        var rows = try driver.query(sql_text, args);
-        defer rows.deinit();
-
-        var result = std.array_list.Managed(TargetEntity).init(allocator);
-        errdefer result.deinit();
-
-        while (rows.next()) |row| {
-            const entity = try sql_scan.scanRow(TargetEntity, allocator, row);
-            try result.append(entity);
-        }
-        return result;
+    var extra_preds_buf: [1]sql.Predicate = undefined;
+    var extra_preds: []const sql.Predicate = &.{};
+    if (target_info.soft_delete) {
+        extra_preds_buf[0] = sql.IsNull("deleted_at");
+        extra_preds = extra_preds_buf[0..1];
     }
+
+    var b = sql.Builder.init(allocator, driver.dialect());
+    defer b.deinit();
+    graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_id_values, extra_preds) catch |err| {
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
+    };
+
+    const qr = b.query();
+    var rows = try driver.query(qr.sql, qr.args);
+    defer rows.deinit();
+
+    var result = std.array_list.Managed(TargetEntity).init(allocator);
+    errdefer result.deinit();
+
+    while (rows.next()) |row| {
+        // The projection is `target.*` followed by a trailing `__fk` column.
+        // Positional scanRow reads only the entity's own (leading) columns,
+        // so the extra `__fk` is ignored; no name-based scan is needed.
+        const entity = try sql_scan.scanRow(TargetEntity, allocator, row);
+        try result.append(entity);
+    }
+    return result;
 }
 
 // ------------------------------------------------------------------

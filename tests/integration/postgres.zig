@@ -1899,3 +1899,225 @@ test "Postgres: eager-loaded children respect interceptor tenant scope" {
         try testing.expectEqualStrings("p1-t1", children[0].name);
     }
 }
+
+test "Postgres: QueryEdge edge traversal uses dialect placeholders and quoting" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CarBase = schema("PgQtCar", .{
+        .fields = &.{field.String("model")},
+    });
+    const GroupBase = schema("PgQtGroup", .{
+        .fields = &.{field.String("name")},
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const UserBase = schema("PgQtUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const Car = struct {
+        pub const schema_name = CarBase.schema_name;
+        pub const fields = CarBase.fields;
+        pub const edges = &.{edge.From("owner", UserBase).Ref("cars")};
+        pub const indexes = CarBase.indexes;
+        pub const policy = CarBase.policy;
+        pub const is_view = CarBase.is_view;
+        pub const view_sql = CarBase.view_sql;
+        pub const soft_delete = CarBase.soft_delete;
+    };
+    const Group = struct {
+        pub const schema_name = GroupBase.schema_name;
+        pub const fields = GroupBase.fields;
+        pub const edges = &.{edge.To("users", UserBase)};
+        pub const indexes = GroupBase.indexes;
+        pub const policy = GroupBase.policy;
+        pub const is_view = GroupBase.is_view;
+        pub const view_sql = GroupBase.view_sql;
+        pub const soft_delete = GroupBase.soft_delete;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{ edge.To("cars", CarBase), edge.To("groups", GroupBase) };
+        pub const indexes = UserBase.indexes;
+        pub const policy = UserBase.policy;
+        pub const is_view = UserBase.is_view;
+        pub const view_sql = UserBase.view_sql;
+        pub const soft_delete = UserBase.soft_delete;
+    };
+
+    const graph = comptime buildGraph(&.{ User, Car, Group });
+    const infos = graph.types;
+    const user_info = infos[0];
+    const car_info = infos[1];
+    const group_info = infos[2];
+
+    // Junction first: it references both entity tables.
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_qt_group_pg_qt_user CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_qt_car CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_qt_group CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_qt_user CASCADE", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    // One defer (drops run junction → car → group → user) keeps the cleanup
+    // order independent of LIFO defer ordering.
+    defer {
+        _ = drv.exec("DROP TABLE IF EXISTS pg_qt_group_pg_qt_user CASCADE", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS pg_qt_car CASCADE", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS pg_qt_group CASCADE", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS pg_qt_user CASCADE", &.{}) catch {};
+    }
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var g1: i64 = 0;
+    var g2: i64 = 0;
+    var g3: i64 = 0;
+    {
+        var b = try client.pg_qt_group.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "g1");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, group_info, &e, allocator);
+        g1 = e.id;
+    }
+    {
+        var b = try client.pg_qt_group.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "g2");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, group_info, &e, allocator);
+        g2 = e.id;
+    }
+    {
+        var b = try client.pg_qt_group.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "g3");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, group_info, &e, allocator);
+        g3 = e.id;
+    }
+
+    var alice: i64 = 0;
+    {
+        var b = try client.pg_qt_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "alice");
+        _ = try b.AddEdge("groups", &.{ g1, g2 });
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, user_info, &e, allocator);
+        alice = e.id;
+    }
+    var bob: i64 = 0;
+    {
+        var b = try client.pg_qt_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "bob");
+        _ = try b.AddEdge("groups", &.{g3});
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, user_info, &e, allocator);
+        bob = e.id;
+    }
+
+    var bob_car: i64 = 0;
+    {
+        var b = try client.pg_qt_car.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("model", "a1");
+        _ = try b.setFieldValue("owner_id", alice);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, car_info, &e, allocator);
+    }
+    {
+        var b = try client.pg_qt_car.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("model", "a2");
+        _ = try b.setFieldValue("owner_id", alice);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, car_info, &e, allocator);
+    }
+    {
+        var b = try client.pg_qt_car.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("model", "b1");
+        _ = try b.setFieldValue("owner_id", bob);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, car_info, &e, allocator);
+        bob_car = e.id;
+    }
+
+    // Soft-delete one of alice's groups; the traversal must not surface it.
+    {
+        var d = client.pg_qt_group.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{client.pg_qt_group.predicates.idEQ(.{ .int = g2 })});
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    // O2M: alice's two cars.
+    {
+        var cars = try client.pg_qt_user.QueryEdge("cars", &.{alice});
+        defer {
+            for (cars.items) |*e| zent.codegen.deinitEntity(infos, car_info, e, allocator);
+            cars.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), cars.items.len);
+        var saw_a1 = false;
+        var saw_a2 = false;
+        for (cars.items) |c| {
+            if (std.mem.eql(u8, c.model, "a1")) saw_a1 = true;
+            if (std.mem.eql(u8, c.model, "a2")) saw_a2 = true;
+        }
+        try testing.expect(saw_a1 and saw_a2);
+    }
+
+    // Multi-parent O2M: the IN list spans both users.
+    {
+        var cars = try client.pg_qt_user.QueryEdge("cars", &.{ alice, bob });
+        defer {
+            for (cars.items) |*e| zent.codegen.deinitEntity(infos, car_info, e, allocator);
+            cars.deinit();
+        }
+        try testing.expectEqual(@as(usize, 3), cars.items.len);
+    }
+
+    // M2M: alice belongs to g1 (g2 is soft-deleted).
+    {
+        var groups = try client.pg_qt_user.QueryEdge("groups", &.{alice});
+        defer {
+            for (groups.items) |*e| zent.codegen.deinitEntity(infos, group_info, e, allocator);
+            groups.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), groups.items.len);
+        try testing.expectEqual(g1, groups.items[0].id);
+    }
+
+    // M2M: bob belongs to g3.
+    {
+        var groups = try client.pg_qt_user.QueryEdge("groups", &.{bob});
+        defer {
+            for (groups.items) |*e| zent.codegen.deinitEntity(infos, group_info, e, allocator);
+            groups.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), groups.items.len);
+        try testing.expectEqual(g3, groups.items[0].id);
+    }
+
+    // M2O inverse: car -> owner.
+    {
+        var owners = try client.pg_qt_car.QueryEdge("owner", &.{bob_car});
+        defer {
+            for (owners.items) |*e| zent.codegen.deinitEntity(infos, user_info, e, allocator);
+            owners.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), owners.items.len);
+        try testing.expectEqualStrings("bob", owners.items[0].name);
+    }
+
+    // Empty parent list short-circuits without touching the database.
+    {
+        var none = try client.pg_qt_user.QueryEdge("cars", &[_]i64{});
+        defer none.deinit();
+        try testing.expectEqual(@as(usize, 0), none.items.len);
+    }
+}
