@@ -74,6 +74,11 @@ pub const MigrateOptions = struct {
     /// even when they may cause data loss. When false (default), type mismatches
     /// are silently ignored.
     allow_data_loss: bool = false,
+
+    /// How long to wait for the cross-process migration lock before giving up
+    /// with `error.MigrationLockTimeout`. `0` disables locking entirely.
+    /// SQLite ignores this (single-writer database, see `lockMigration`).
+    lock_timeout_ms: u32 = 10_000,
 };
 
 /// CREATE TABLE statement for the migration history table.
@@ -123,24 +128,46 @@ fn buildRecordInsertSQL(dialect: Dialect, buf: []u8) ![]const u8 {
     );
 }
 
-/// Build the dialect-appropriate SELECT statement for listing applied versions.
+/// Build the dialect-appropriate SELECT statement for listing applied
+/// migrations. The checksum column may be NULL (schema-diff migrations and
+/// rows written before checksums existed).
 fn buildListVersionsSQL(dialect: Dialect, buf: []u8) ![]const u8 {
     _ = dialect;
-    return std.fmt.bufPrint(buf, "SELECT version FROM zent_schema_migrations ORDER BY version", .{});
+    return std.fmt.bufPrint(buf, "SELECT version, checksum FROM zent_schema_migrations ORDER BY version", .{});
 }
 
-/// Read all applied migration versions, ordered ascending.
-fn appliedVersions(allocator: std.mem.Allocator, drv: sql_driver.Driver) ![]i64 {
+/// One row of the migration history table.
+pub const AppliedMigration = struct {
+    version: i64,
+    /// Recorded checksum. NULL for schema-diff migrations (their DDL is
+    /// generated at runtime, so there is no stable content to hash) and for
+    /// rows written before checksum verification existed.
+    checksum: ?[]u8,
+};
+
+/// Read all applied migrations, ordered ascending. Each non-null `checksum`
+/// is owned by the returned slice; free with `freeAppliedMigrations`.
+fn appliedMigrations(allocator: std.mem.Allocator, drv: sql_driver.Driver) ![]AppliedMigration {
     var sql_buf: [256]u8 = undefined;
     const sql = try buildListVersionsSQL(drv.dialect(), &sql_buf);
     var rows = try drv.query(sql, &.{});
     defer rows.deinit();
-    var list = std.array_list.Managed(i64).init(allocator);
-    errdefer list.deinit();
+    var list = std.array_list.Managed(AppliedMigration).init(allocator);
+    errdefer {
+        for (list.items) |m| if (m.checksum) |c| allocator.free(c);
+        list.deinit();
+    }
     while (rows.next()) |row| {
-        if (row.getInt(0)) |v| try list.append(v);
+        const version = row.getInt(0) orelse continue;
+        const checksum: ?[]u8 = if (row.getText(1)) |t| try allocator.dupe(u8, t) else null;
+        try list.append(.{ .version = version, .checksum = checksum });
     }
     return list.toOwnedSlice();
+}
+
+fn freeAppliedMigrations(allocator: std.mem.Allocator, applied: []AppliedMigration) void {
+    for (applied) |m| if (m.checksum) |c| allocator.free(c);
+    allocator.free(applied);
 }
 
 /// Insert a row into the migration history table.
@@ -159,11 +186,139 @@ fn recordMigration(drv: sql_driver.Driver, version: i64, checksum: ?[]const u8) 
 }
 
 /// True when `version` is already recorded in the history table.
-fn versionContains(versions: []const i64, version: i64) bool {
-    for (versions) |v| {
-        if (v == version) return true;
+fn versionContains(applied: []const AppliedMigration, version: i64) bool {
+    for (applied) |m| {
+        if (m.version == version) return true;
     }
     return false;
+}
+
+/// Advisory lock key for PostgreSQL cross-process migration exclusion.
+/// ASCII "zent_mig" packed into an i64; exposed so tests can contend for the
+/// same lock.
+pub const advisory_lock_key: i64 = 0x7A65_6E74_5F6D6967;
+
+/// Lock name used by MySQL's GET_LOCK/RELEASE_LOCK.
+pub const mysql_lock_name = "zent_schema_migration";
+
+const MigrationLockError = sql_driver.Error || error{MigrationLockTimeout};
+
+const timespec = extern struct { tv_sec: c_long, tv_nsec: c_long };
+extern fn nanosleep(req: *const timespec, rem: ?*timespec) c_int;
+
+fn sleepMs(ms: u32) void {
+    const ts = timespec{
+        .tv_sec = @intCast(ms / 1000),
+        .tv_nsec = @intCast(@as(u64, ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = nanosleep(&ts, null);
+}
+
+/// Acquire the cross-process migration lock, returning true when it is held
+/// (the caller must then call `unlockMigration`). `timeout_ms == 0` disables
+/// locking.
+///
+/// SQLite is skipped: it is a single-writer database and the migration DDL
+/// already runs inside one transaction, so there is no concurrent writer to
+/// fence off.
+///
+/// PostgreSQL polls `pg_try_advisory_lock` until `timeout_ms` elapses;
+/// MySQL uses `GET_LOCK` with a second-granularity timeout. A genuine timeout
+/// is `error.MigrationLockTimeout`. If the lock statement itself fails (old
+/// server, restricted permissions), the failure is logged as a warning and
+/// the migration proceeds unlocked rather than becoming unusable; that
+/// degradation is deliberate.
+///
+/// Both advisory locks are session-scoped, so the driver passed here must
+/// keep one connection for the whole migration (the helpers migrate on a
+/// single borrowed connection). A round-robin pool driver would acquire and
+/// release on different sessions, making the fence ineffective.
+fn lockMigration(drv: sql_driver.Driver, timeout_ms: u32) MigrationLockError!bool {
+    if (timeout_ms == 0) return false;
+    const name = drv.dialect().name;
+    if (std.mem.eql(u8, name, "sqlite")) return false;
+
+    if (std.mem.eql(u8, name, "postgres")) {
+        var sql_buf: [128]u8 = undefined;
+        const sql = std.fmt.bufPrint(&sql_buf, "SELECT pg_try_advisory_lock({d})", .{advisory_lock_key}) catch return false;
+        const poll_ms: u32 = 25;
+        var waited: u32 = 0;
+        while (true) {
+            var rows = drv.query(sql, &.{}) catch |err| {
+                std.log.warn("zent migrations: pg advisory lock unavailable ({s}); continuing without lock", .{@errorName(err)});
+                return false;
+            };
+            defer rows.deinit();
+            const acquired = if (rows.next()) |row| (row.getBool(0) orelse false) else false;
+            if (acquired) return true;
+            if (waited >= timeout_ms) return error.MigrationLockTimeout;
+            const step = @min(poll_ms, timeout_ms - waited);
+            sleepMs(step);
+            waited += step;
+        }
+    }
+
+    if (std.mem.eql(u8, name, "mysql")) {
+        var sql_buf: [160]u8 = undefined;
+        // GET_LOCK timeouts are whole seconds; a sub-second request rounds up
+        // to 1 so a small test timeout does not become "wait forever".
+        const secs: u32 = @max(1, timeout_ms / 1000);
+        const sql = std.fmt.bufPrint(&sql_buf, "SELECT GET_LOCK('{s}', {d})", .{ mysql_lock_name, secs }) catch return false;
+        var rows = drv.query(sql, &.{}) catch |err| {
+            std.log.warn("zent migrations: MySQL GET_LOCK unavailable ({s}); continuing without lock", .{@errorName(err)});
+            return false;
+        };
+        defer rows.deinit();
+        const row = rows.next() orelse return false;
+        if (row.getInt(0)) |v| {
+            if (v == 1) return true;
+            if (v == 0) return error.MigrationLockTimeout;
+        }
+        std.log.warn("zent migrations: MySQL GET_LOCK returned NULL; continuing without lock", .{});
+        return false;
+    }
+
+    // Unknown dialect: no external lock (same reasoning as SQLite).
+    return false;
+}
+
+/// Best-effort release of the lock taken by `lockMigration`.
+fn unlockMigration(drv: sql_driver.Driver) void {
+    const name = drv.dialect().name;
+    if (std.mem.eql(u8, name, "postgres")) {
+        var sql_buf: [128]u8 = undefined;
+        const sql = std.fmt.bufPrint(&sql_buf, "SELECT pg_advisory_unlock({d})", .{advisory_lock_key}) catch return;
+        _ = drv.exec(sql, &.{}) catch |err| {
+            std.log.warn("zent migrations: pg advisory unlock failed ({s})", .{@errorName(err)});
+        };
+    } else if (std.mem.eql(u8, name, "mysql")) {
+        var sql_buf: [160]u8 = undefined;
+        const sql = std.fmt.bufPrint(&sql_buf, "SELECT RELEASE_LOCK('{s}')", .{mysql_lock_name}) catch return;
+        _ = drv.exec(sql, &.{}) catch |err| {
+            std.log.warn("zent migrations: MySQL RELEASE_LOCK failed ({s})", .{@errorName(err)});
+        };
+    }
+}
+
+/// Reject a pending migration file whose content no longer matches the
+/// checksum recorded when it was applied. Rows with a NULL checksum (schema
+/// diffs) are not verifiable and are skipped.
+fn verifyFileChecksums(applied: []const AppliedMigration, files: []const MigrationFile) !void {
+    for (files) |f| {
+        for (applied) |m| {
+            if (m.version != f.version) continue;
+            if (m.checksum) |stored| {
+                if (!std.mem.eql(u8, stored, f.checksum)) {
+                    std.log.warn(
+                        "zent migrations: checksum mismatch for migration {d} ({s}): recorded {s}, file now {s}; refusing to continue",
+                        .{ f.version, f.name, stored, f.checksum },
+                    );
+                    return error.MigrationChecksumMismatch;
+                }
+            }
+            break;
+        }
+    }
 }
 
 /// Column definition for CREATE TABLE.
@@ -1093,6 +1248,12 @@ fn alterColumnTypeSQL(
 /// Phase 3 Task 12: DROP COLUMN is gated behind `opts.drop_columns`; ALTER
 /// TYPE is gated behind `opts.allow_data_loss`. Both are opt-in to prevent
 /// accidental schema destruction.
+///
+/// Concurrency: a cross-process advisory lock (`opts.lock_timeout_ms`, see
+/// `lockMigration`) is taken before any introspection so two instances
+/// deploying at once cannot both pass the "table missing" checks and race on
+/// DDL. Checksums are not verified here because schema-diff migrations record
+/// NULL; files are verified by `migrateFromFilesWithOptions`.
 pub fn migrateSchemaWithOptions(
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
@@ -1157,14 +1318,24 @@ pub fn migrateSchemaWithOptions(
         return;
     }
 
+    // Cross-process mutual exclusion: without it, two instances starting at
+    // once both see a table/column as missing (TOCTOU on the introspection
+    // checks) and race on the same DDL. Held for the whole run; on any error
+    // path the `defer` still releases it.
+    const lock_held = try lockMigration(driver, opts.lock_timeout_ms);
+    defer if (lock_held) unlockMigration(driver);
+
     // Bootstrap the history table outside the transaction; the SQL is
     // already idempotent (CREATE TABLE IF NOT EXISTS) and there's no
     // point rolling it back if a later step fails.
     try ensureMigrationsTable(driver);
 
-    // Read already-applied versions once, before opening the transaction.
-    const applied = try appliedVersions(allocator, driver);
-    defer allocator.free(applied);
+    // Read already-applied migrations once, before opening the transaction.
+    // Schema-diff migrations record a NULL checksum (their DDL is generated
+    // at runtime), so there is nothing to verify here; checksum validation
+    // lives on the file-based path (`verifyFileChecksums`).
+    const applied = try appliedMigrations(allocator, driver);
+    defer freeAppliedMigrations(allocator, applied);
 
     var tx = try driver.beginTx();
     errdefer tx.deinit();
@@ -1382,6 +1553,10 @@ pub const FileMigrationOptions = struct {
     /// If true, rollback skips migrations that have no .down.sql file.
     /// If false, missing down files produce error.MissingDownMigration.
     allow_missing_down: bool = true,
+    /// How long to wait for the cross-process migration lock before giving up
+    /// with `error.MigrationLockTimeout`. `0` disables locking. SQLite
+    /// ignores this (single-writer database, see `lockMigration`).
+    lock_timeout_ms: u32 = 10_000,
 };
 
 const MigrationFile = struct {
@@ -1397,6 +1572,8 @@ pub const MigrateFilesError = sql_driver.Error || std.Io.Dir.OpenError || std.Io
     InvalidMigrationFilename,
     DuplicateMigrationVersion,
     MissingDownMigration,
+    MigrationChecksumMismatch,
+    MigrationLockTimeout,
 };
 
 /// Parse a migration filename and return the numeric version if it matches the
@@ -1619,12 +1796,20 @@ pub fn migrateFromFilesWithOptions(
         return;
     }
 
+    // Cross-process exclusion (see `lockMigration`); released on every exit.
+    const lock_held = try lockMigration(driver, opts.lock_timeout_ms);
+    defer if (lock_held) unlockMigration(driver);
+
     try ensureMigrationsTable(driver);
-    const applied = try appliedVersions(allocator, driver);
-    defer allocator.free(applied);
+    const applied = try appliedMigrations(allocator, driver);
+    defer freeAppliedMigrations(allocator, applied);
 
     const files = try readMigrationDir(io, allocator, dir_path);
     defer freeMigrationFiles(allocator, files);
+
+    // An applied file whose content changed is exactly the "edited migration"
+    // mistake checksums exist to catch; refuse before touching any DDL.
+    try verifyFileChecksums(applied, files);
 
     var tx = try driver.beginTx();
     errdefer tx.deinit();
@@ -1660,9 +1845,14 @@ pub fn rollbackFilesWithOptions(
     steps: usize,
     opts: FileMigrationOptions,
 ) MigrateFilesError!void {
+    // Cross-process exclusion; a rollback races the same DDL checks as an
+    // apply, so it takes the same lock.
+    const lock_held = try lockMigration(driver, opts.lock_timeout_ms);
+    defer if (lock_held) unlockMigration(driver);
+
     try ensureMigrationsTable(driver);
-    const applied = try appliedVersions(allocator, driver);
-    defer allocator.free(applied);
+    const applied = try appliedMigrations(allocator, driver);
+    defer freeAppliedMigrations(allocator, applied);
     if (applied.len == 0) return;
 
     const files = try readMigrationDir(io, allocator, dir_path);
@@ -1676,7 +1866,7 @@ pub fn rollbackFilesWithOptions(
     var i: usize = applied.len;
     while (i > 0 and rolled < steps) {
         i -= 1;
-        const version = applied[i];
+        const version = applied[i].version;
         const mf = for (files) |f| {
             if (f.version == version) break f;
         } else continue;
@@ -1974,4 +2164,96 @@ test "Migrate schema alters column type when opts.allow_data_loss set (SQLite â€
             try std.testing.expect(std.mem.eql(u8, col_type, "TEXT"));
         }
     }
+}
+
+test "file migration checksum mismatch is rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+
+    const dir_name = "test_migrations_checksum_mismatch";
+    try std.Io.Dir.cwd().createDirPath(io, dir_name);
+    defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{
+            .sub_path = "001_create_cs_items.up.sql",
+            .data = "CREATE TABLE cs_items (id INTEGER PRIMARY KEY, name TEXT);",
+        });
+    }
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    try migrateFromFilesWithOptions(io, allocator, drv.asDriver(), dir_name, .{});
+
+    // Simulate an edited migration: the recorded checksum no longer matches
+    // the file on disk.
+    _ = try drv.exec("UPDATE zent_schema_migrations SET checksum = 'deadbeef' WHERE version = 1", &.{});
+
+    try std.testing.expectError(
+        error.MigrationChecksumMismatch,
+        migrateFromFilesWithOptions(io, allocator, drv.asDriver(), dir_name, .{}),
+    );
+}
+
+test "lock_timeout_ms is a no-op on SQLite and repeated runs succeed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+
+    const dir_name = "test_migrations_lock_sqlite";
+    try std.Io.Dir.cwd().createDirPath(io, dir_name);
+    defer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{
+            .sub_path = "001_create_lock_items.up.sql",
+            .data = "CREATE TABLE lock_items (id INTEGER PRIMARY KEY, name TEXT);",
+        });
+        try dir.writeFile(io, .{
+            .sub_path = "002_add_lock_item.up.sql",
+            .data = "INSERT INTO lock_items (id, name) VALUES (1, 'first');",
+        });
+    }
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    try migrateFromFilesWithOptions(io, allocator, drv.asDriver(), dir_name, .{ .lock_timeout_ms = 50 });
+    // Second run: everything is already applied; the lock path must neither
+    // block nor fail (SQLite skips the external lock entirely).
+    try migrateFromFilesWithOptions(io, allocator, drv.asDriver(), dir_name, .{ .lock_timeout_ms = 50 });
+
+    var rows = try drv.query("SELECT COUNT(*) FROM lock_items", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try std.testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+
+    // Unlocking is skipped too: a second acquire/release cycle still works.
+    try rollbackFilesWithOptions(io, allocator, drv.asDriver(), dir_name, 1, .{ .lock_timeout_ms = 50 });
+}
+
+test "schema-diff migration succeeds with locking enabled (SQLite)" {
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    const LockItem = schema("LockDiffItem", .{
+        .fields = &.{field.String("name")},
+    });
+    const info = comptime fromSchema(LockItem);
+    const infos = &[_]TypeInfo{info};
+
+    try migrateSchemaWithOptions(std.testing.allocator, drv.asDriver(), infos, .{ .lock_timeout_ms = 100 });
+    // Re-running also acquires/releases the (skipped) lock cleanly.
+    try migrateSchemaWithOptions(std.testing.allocator, drv.asDriver(), infos, .{ .lock_timeout_ms = 100 });
 }

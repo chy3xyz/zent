@@ -66,7 +66,7 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) MUST be `deinit`'d.
 - `driver.Tx` MUST be `deinit`'d exactly once, regardless of `commit`/`rollback`.
 - `sql.QueryResult` (`{ sql, args }`) borrows from the builder; `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) transfers ownership and MUST be `deinit`'d.
-- The root `Client` owns its `InterceptorChain`: register with `client_mod.UseInterceptor(infos, &client, i)` and release with `client_mod.DeinitClient(infos, &client)` (only needed when `UseInterceptor` was called). Register before `beginTx` — the tx client borrows the same chain.
+- The root `Client` lazily heap-allocates its `InterceptorChain` on first `client_mod.UseInterceptor(infos, &client, i)`; release it with `client_mod.DeinitClient(infos, &client)` **once, on the value that registered**. Value copies (helpers, `withContext`, tx clients) borrow the same chain and must not be deinit'd; `withInterceptors(chain)` borrows a caller-owned chain, which `DeinitClient` leaves alone. `StoreEnv`/`PooledEnv`/`ShardedEnv` release the clients they created on `deinit` (each shard client individually). Register before `beginTx` — the tx client borrows the same chain.
 - Use `std.testing.allocator` in tests so `zig build test` reports leaks with non-zero exit.
 
 ## Layout

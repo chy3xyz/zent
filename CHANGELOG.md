@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Migration locking and checksum verification.** `MigrateOptions.lock_timeout_ms`
+  (default 10 s, `0` disables) takes an advisory lock for the whole migration:
+  `pg_advisory_lock` on PostgreSQL and `GET_LOCK`/`RELEASE_LOCK` on MySQL, so
+  several instances starting at once no longer race on the existence/absence
+  checks. A lock that cannot be taken and a timeout both surface as
+  `error.MigrationLockTimeout`; if the lock statement is unsupported or
+  denied, the migration warns and continues rather than failing. SQLite relies
+  on its single-writer transaction instead. Already-applied file migrations
+  now have their recorded checksum compared against the file on disk
+  (`error.MigrationChecksumMismatch`), so an edited migration is caught
+  instead of silently skipped. The history table's `checksum` column may be
+  NULL (schema-diff migrations and rows predating verification), which is
+  treated as "not recorded" rather than a mismatch.
+
+### Fixed
+- **Interceptor chains survive a `Client` move.** `Client` held its interceptor
+  chain **by value** while every entity sub-client stored a pointer into that
+  field, so any move of the `Client` value — `makeClient`'s return, the
+  helpers storing it, `withContext`, a tx client — left those pointers
+  dangling and the next query touched freed memory. The chain is now lazily
+  heap-allocated on first `UseInterceptor`, so a move relocates a pointer, not
+  the chain. `Client.owns_interceptors` distinguishes an owned chain from one
+  borrowed via `withInterceptors`, and `DeinitClient` frees only the former;
+  call it once, on the value that registered. `StoreEnv`/`PooledEnv`/
+  `ShardedEnv` deinit the client they created, which previously leaked any
+  registered chain.
+- **Global hook registry can be released.** `registerGlobal` took a
+  caller-owned pointer with no way to unregister, so a chain that went out of
+  scope left the registry dangling into freed memory. `unregisterGlobal(chain)`
+  clears it only when that chain is the registered one.
+
 ## [0.35.0] - 2026-09-11
 
 ### Added

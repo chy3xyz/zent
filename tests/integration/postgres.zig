@@ -2397,3 +2397,30 @@ test "Postgres: outbox claim is exclusive and requeue re-enables a row" {
     try testing.expectEqual(@as(usize, 1), third.len);
     try testing.expectEqual(id1, third[0].id);
 }
+
+test "Postgres: migration lock times out while another session holds it" {
+    const allocator = testing.allocator;
+
+    // Two independent sessions: the first holds the advisory lock, the second
+    // runs the migrator and must give up after a short timeout.
+    var holder = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer holder.close();
+    var waiter = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer waiter.close();
+
+    _ = try holder.exec("SELECT pg_advisory_lock($1)", &.{.{ .int = migrate.advisory_lock_key }});
+    defer _ = holder.exec("SELECT pg_advisory_unlock($1)", &.{.{ .int = migrate.advisory_lock_key }}) catch {};
+
+    // The schema is irrelevant: the lock is taken before any introspection
+    // or DDL, so the migrator fails without touching the database.
+    const LockProbe = schema("PgLockProbe", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{LockProbe});
+    const infos = graph.types;
+
+    const res = migrate.migrateSchemaWithOptions(allocator, waiter.asDriver(), infos, .{
+        .lock_timeout_ms = 250,
+    });
+    try testing.expectError(error.MigrationLockTimeout, res);
+}

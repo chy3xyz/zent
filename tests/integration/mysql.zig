@@ -2474,3 +2474,30 @@ test "MySQL: outbox claim is exclusive and requeue re-enables a row" {
     try testing.expectEqual(@as(usize, 1), third.len);
     try testing.expectEqual(id1, third[0].id);
 }
+
+test "MySQL: migration lock times out while another session holds it" {
+    const allocator = testing.allocator;
+
+    // Two independent sessions: the first holds the named lock, the second
+    // runs the migrator and must give up when GET_LOCK returns 0.
+    var holder = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer holder.close();
+    var waiter = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer waiter.close();
+
+    _ = try holder.exec("SELECT GET_LOCK(?, 0)", &.{.{ .string = migrate.mysql_lock_name }});
+    defer _ = holder.exec("SELECT RELEASE_LOCK(?)", &.{.{ .string = migrate.mysql_lock_name }}) catch {};
+
+    const LockProbe = schema("MyLockProbe", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{LockProbe});
+    const infos = graph.types;
+
+    // GET_LOCK timeouts are whole seconds, so the migrator waits 1s before
+    // reporting the timeout.
+    const res = migrate.migrateSchemaWithOptions(allocator, waiter.asDriver(), infos, .{
+        .lock_timeout_ms = 1000,
+    });
+    try testing.expectError(error.MigrationLockTimeout, res);
+}
