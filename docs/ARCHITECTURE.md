@@ -64,7 +64,22 @@ cross-cutting:
 - **Tx** — `driver.Tx` MUST be `deinit`'d exactly once regardless of
   `commit`/`rollback`.
 - **Bulk builders** — `BulkInsertBuilder.Save/SaveOrUpdate` return
-  `Managed(i64)` ids; caller deinits the collection.
+  `Managed(i64)` ids; caller deinits the collection. A batch is split into
+  several statements when the dialect's bound-parameter limit requires it
+  (`chunkRows(n)` overrides the derived size), and the ids from every chunk
+  are accumulated into that same collection.
+- **Interceptor chain** — the root `Client` heap-allocates its
+  `InterceptorChain` lazily on the first `UseInterceptor` and owns it; the
+  entity sub-clients hold a pointer to it, so moving the `Client` value (which
+  `makeClient`, the helper structs, `withContext` and tx clients all do) only
+  moves a pointer. `DeinitClient` releases it and must be called **once, on
+  the value that registered**; copies borrow, and a chain supplied through
+  `withInterceptors` stays the caller's to free.
+- **Parked borrowers** — `ConnPool.borrow` waits on the pool condition when
+  `max_wait_ms > 0`. `ConnPool.deinit` therefore requires that no thread is
+  inside `borrow`/`release`/`asDriver`, **including threads waiting for a
+  connection**: deinit destroys the mutex and the pool's `Io` right after
+  dropping the mutex, so interrupting a parked borrower is undefined.
 - Tests use `std.testing.allocator` so leaks fail `zig build test`.
 
 ## Driver abstraction

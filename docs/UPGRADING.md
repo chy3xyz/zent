@@ -123,3 +123,48 @@ use `field.JSON(name, T)`; untyped documents use `field.JSONValue(name)`
 - `examples/advanced/` demonstrates composite unique indexes, paged
   listing, sensitive-field masking (`toMaskedJson`) and the outbox
   (`zig build run-advanced`).
+
+## 10. v0.36 API changes and required migrations
+
+Adopting v0.36 on an existing database or codebase needs these four steps.
+
+**Schema migration (outbox).** `OutboxMessage` gained a nullable `claimed_at`
+column, written when a row is claimed. Existing deployments must run a
+migration to add it; `migrateSchema` adds missing columns automatically, and
+downgrading requires dropping the column by hand. Without it, claiming still
+works but `requeueStale` cannot tell how long a row has been processing.
+
+**Allocator argument (table creation).** `Client.createAllTables` and
+`migrate.createAllTables`/`createTables` now take an allocator as the first
+argument:
+
+```zig
+// before
+try Client.createAllTables(infos, drv.asDriver());
+// after
+try Client.createAllTables(allocator, infos, drv.asDriver());
+```
+
+The migration module no longer reaches for `std.heap.page_allocator`
+internally, so allocate/free pair on the allocator you pass.
+
+**Migrations now lock by default.** `MigrateOptions.lock_timeout_ms` defaults
+to 10 s and takes an advisory lock for the duration (`pg_advisory_lock` on
+PostgreSQL, `GET_LOCK` on MySQL; SQLite relies on its single-writer
+transaction). Concurrent instances therefore serialise instead of racing, and
+contention returns `error.MigrationLockTimeout`. Pass `lock_timeout_ms = 0` to
+restore the old unlocked behaviour, or if your database role cannot take
+advisory locks — an unsupported or denied lock statement degrades to a warning
+and the migration proceeds.
+
+**Pool waiting is opt-in but changes `max_wait_ms` meaning.** It used to be
+dead configuration; it is now the total budget for one `borrow`, after which
+the caller parks on the pool condition instead of failing immediately. The
+default is `0`, which keeps the previous non-blocking behaviour exactly, so
+nothing changes until you set it — but if you were passing it expecting no
+effect, you now get queueing.
+
+Two smaller notes: `FieldInfo` gained `column_name` alongside `name` (only
+relevant if you construct `TypeInfo` values yourself — `fromSchema` fills it),
+and `queryTargetsByValue` accepts `.string` primary keys for UUID-keyed
+entities, with `queryTargets` unchanged as the integer-only wrapper.

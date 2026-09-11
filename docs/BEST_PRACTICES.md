@@ -455,6 +455,75 @@ A no-op `UPDATE` (all values already equal) therefore returns `0` on MySQL and
 `1` on the others. Never write `if (affected == 0) return error.NotFound` —
 use an explicit `SELECT`/`Count()` or check a genuinely changing column.
 
+## 5f. Connection pool
+
+`ConnPool(D)` wraps any driver implementing `asDriver()` + `close()` and
+exposes the same `driver.Driver`, so pooled and direct drivers are
+interchangeable.
+
+```zig
+var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+    .connect = openFn,
+    .min_connections = 4,
+    .max_connections = 16,
+    .max_wait_ms = 2_000,          // queue instead of failing instantly
+    .max_idle_secs = 300,
+    .max_lifetime_secs = 3_600,
+    .health_check_on_borrow = true,
+    .slow_query_threshold_ms = 200,
+    .metrics = metrics,
+});
+defer pool.deinit();
+const drv = pool.asDriver();
+```
+
+- **`max_wait_ms`** is the total budget for one `borrow` when every connection
+  is checked out: the caller parks on the pool condition and is woken by a
+  `release`, then falls back to the retry/backoff path on expiry. `0` (the
+  default) keeps the non-blocking behaviour — immediate `error.PoolExhausted`.
+  Fairness is best-effort: later arrivals defer to older tickets, but there is
+  no wake-up forwarding, so do not rely on strict FIFO.
+- **`health_check_on_borrow` runs inside the pool mutex**, so it serialises
+  concurrent borrows. With a fast local server the ping is usually cheaper than
+  the tail latency it adds; measure before enabling it on a remote database.
+- **Metrics callbacks run outside the mutex** and may re-enter the pool.
+- **`deinit` requires quiescence**: no thread may be inside
+  `borrow`/`release`/`asDriver`, *including threads parked waiting for a
+  connection*. `deinit` destroys the mutex and the pool's `Io` immediately
+  after dropping the mutex, so interrupting a parked borrower is undefined.
+  Drain your workload first (or stop accepting requests) before you deinit.
+- The pool does not run a background reaper: call `reapIdleConnections` /
+  `pingIdleConnections` from your own timer if you need them, and note that
+  `min_connections` is only warmed up at `init` — it is not maintained.
+- Each connection gets only the driver's fixed session setup
+  (`client_encoding` on PostgreSQL, `utf8mb4` on MySQL). There is no per
+  connection init hook, so session variables such as `SET app.tenant_id` for
+  row-level security have to be issued by the caller on a borrowed connection.
+
+## 5g. Eager loading (`WithEdge`)
+
+```zig
+var q = client.owner.Query();
+defer q.deinit();
+_ = try q.WithEdge("items.notes");
+const owners = try q.All();
+```
+
+- **One query per level**, not per parent. `items.notes` costs three
+  statements (owners, items, notes) regardless of how many owners match;
+  nested levels are gathered into a single batch rather than recursed per
+  parent.
+- **Parents over the parameter limit are chunked**: an eager load spanning more
+  than 500 parent rows splits its `IN` list into several statements.
+- **The target's read contract is applied inside the neighbour `WHERE`** —
+  soft-delete filtering, privacy policy/row filters and the interceptor chain —
+  before any per-parent `LIMIT` ranking, so a filtered row cannot consume a
+  per-parent limit slot. `WithTrashed()` includes soft-deleted targets too.
+- `QueryEdge`/`queryTargets(ById)`, the traversal helper used outside a
+  builder, applies the target's soft-delete scope only. It takes no
+  `privacy_ctx`/`interceptors`, so it is **not** tenant-scoped — use `WithEdge`
+  when you need that, or call it with ids you have already scoped yourself.
+
 ## 6. Transactions
 
 ```zig
