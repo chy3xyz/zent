@@ -239,6 +239,17 @@ pub const Predicate = union(enum) {
     /// Raw SQL fragment with bound args spliced at each `?` marker, in order.
     raw_args: RawArgsOp,
     in_subquery: struct { column: []const u8, sql: []const u8 },
+    /// `column IN (SELECT select_column FROM table WHERE preds)`, rendered
+    /// against the enclosing builder so identifiers and placeholders follow
+    /// the dialect and the subquery's bound args splice in SQL order
+    /// (`$n` on PostgreSQL, `?` on SQLite/MySQL). `preds` is borrowed and must
+    /// outlive the enclosing query build.
+    in_select: struct {
+        column: []const u8,
+        table: []const u8,
+        select_column: []const u8,
+        preds: []const Predicate,
+    },
     exists_subquery: []const u8,
     /// EXISTS subquery generated lazily via a function pointer.
     /// The function receives a Builder and appends the subquery body (without "EXISTS").
@@ -401,6 +412,21 @@ pub const Predicate = union(enum) {
                 try b.qualifiedIdent(p.column);
                 try b.writeString(" IN (");
                 try b.writeString(p.sql);
+                try b.writeByte(')');
+            },
+            .in_select => |p| {
+                try b.qualifiedIdent(p.column);
+                try b.writeString(" IN (SELECT ");
+                try b.qualifiedIdent(p.select_column);
+                try b.writeString(" FROM ");
+                try b.ident(p.table);
+                if (p.preds.len > 0) {
+                    try b.writeString(" WHERE ");
+                    for (p.preds, 0..) |pred, i| {
+                        if (i > 0) try b.writeString(" AND ");
+                        try pred.appendTo(b);
+                    }
+                }
                 try b.writeByte(')');
             },
             .exists_subquery => |sql_text| {
@@ -644,6 +670,18 @@ pub fn RawArgs(sql_text: []const u8, args: []const Value) Predicate {
 
 pub fn InSubquery(column: []const u8, sql_text: []const u8) Predicate {
     return .{ .in_subquery = .{ .column = column, .sql = sql_text } };
+}
+
+/// `column IN (SELECT select_column FROM table WHERE preds)`. Predicates are
+/// rendered through the enclosing builder, so dialect placeholders and bound
+/// args stay aligned with the outer statement. `preds` is borrowed.
+pub fn InSelect(column: []const u8, table: []const u8, select_column: []const u8, preds: []const Predicate) Predicate {
+    return .{ .in_select = .{
+        .column = column,
+        .table = table,
+        .select_column = select_column,
+        .preds = preds,
+    } };
 }
 
 pub fn ExistsSubquery(sql_text: []const u8) Predicate {
@@ -1128,6 +1166,13 @@ pub fn Select(allocator: std.mem.Allocator, dialect: Dialect, columns: []const C
 // INSERT
 // ------------------------------------------------------------------
 
+/// One item in an `INSERT … SELECT` select list: a source column reference or
+/// a bound value.
+pub const SelectItem = union(enum) {
+    column: []const u8,
+    value: Value,
+};
+
 pub const InsertBuilder = struct {
     b: Builder,
     table: []const u8,
@@ -1135,6 +1180,10 @@ pub const InsertBuilder = struct {
     rows: std.array_list.Managed(std.array_list.Managed(Value)),
     or_replace: bool,
     or_ignore: bool,
+    /// When set, the statement is `INSERT … SELECT` instead of `VALUES`.
+    select_from: ?[]const u8 = null,
+    select_items: []const SelectItem = &.{},
+    select_preds: []const Predicate = &.{},
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
         return .{
@@ -1167,7 +1216,24 @@ pub const InsertBuilder = struct {
         return i;
     }
 
-    pub fn query(i: *InsertBuilder) !QueryResult {
+    /// Turn the statement into `INSERT [OR IGNORE] INTO table (cols) SELECT
+    /// items FROM from_table [WHERE preds]` instead of a VALUES list. The
+    /// select list and predicates render in SQL order, so bound args (and
+    /// `$n` numbering on PostgreSQL) stay aligned. `items` and `preds` are
+    /// borrowed until the query is built.
+    pub fn fromSelect(
+        i: *InsertBuilder,
+        from_table: []const u8,
+        items: []const SelectItem,
+        preds: []const Predicate,
+    ) !*InsertBuilder {
+        i.select_from = from_table;
+        i.select_items = items;
+        i.select_preds = preds;
+        return i;
+    }
+
+    fn writeStatement(i: *InsertBuilder) !void {
         if (i.or_replace) {
             try i.b.writeString("INSERT OR REPLACE INTO ");
         } else if (i.or_ignore) {
@@ -1190,6 +1256,26 @@ pub const InsertBuilder = struct {
             }
             try i.b.writeByte(')');
         }
+        if (i.select_from) |from_table| {
+            try i.b.writeString(" SELECT ");
+            for (i.select_items, 0..) |item, idx| {
+                if (idx > 0) try i.b.writeString(", ");
+                switch (item) {
+                    .column => |col| try i.b.ident(col),
+                    .value => |val| try i.b.arg(val),
+                }
+            }
+            try i.b.writeString(" FROM ");
+            try i.b.ident(from_table);
+            if (i.select_preds.len > 0) {
+                try i.b.writeString(" WHERE ");
+                for (i.select_preds, 0..) |pred, idx| {
+                    if (idx > 0) try i.b.writeString(" AND ");
+                    try pred.appendTo(&i.b);
+                }
+            }
+            return;
+        }
         try i.b.writeString(" VALUES ");
         for (i.rows.items, 0..) |row, ri| {
             if (ri > 0) try i.b.writeString(", ");
@@ -1200,44 +1286,17 @@ pub const InsertBuilder = struct {
             }
             try i.b.writeByte(')');
         }
+    }
+
+    pub fn query(i: *InsertBuilder) !QueryResult {
+        try i.writeStatement();
         return i.b.query();
     }
 
     /// Same as `query` but transfers ownership of the SQL buffer and args.
     /// Caller MUST call `deinit` (typically via `defer`).
     pub fn takeQuery(i: *InsertBuilder) !OwnedQuery {
-        if (i.or_replace) {
-            try i.b.writeString("INSERT OR REPLACE INTO ");
-        } else if (i.or_ignore) {
-            if (std.mem.eql(u8, i.b.dialect.name, "mysql")) {
-                try i.b.writeString("INSERT IGNORE INTO ");
-            } else if (std.mem.eql(u8, i.b.dialect.name, "sqlite3")) {
-                try i.b.writeString("INSERT OR IGNORE INTO ");
-            } else {
-                try i.b.writeString("INSERT INTO ");
-            }
-        } else {
-            try i.b.writeString("INSERT INTO ");
-        }
-        try i.b.ident(i.table);
-        if (i.col_names.items.len > 0) {
-            try i.b.writeString(" (");
-            for (i.col_names.items, 0..) |col, idx| {
-                if (idx > 0) try i.b.writeString(", ");
-                try i.b.ident(col);
-            }
-            try i.b.writeByte(')');
-        }
-        try i.b.writeString(" VALUES ");
-        for (i.rows.items, 0..) |row, ri| {
-            if (ri > 0) try i.b.writeString(", ");
-            try i.b.writeByte('(');
-            for (row.items, 0..) |val, ci| {
-                if (ci > 0) try i.b.writeString(", ");
-                try i.b.arg(val);
-            }
-            try i.b.writeByte(')');
-        }
+        try i.writeStatement();
         return i.b.takeQuery();
     }
 };
@@ -1290,12 +1349,44 @@ pub const UpdateSetValue = union(enum) {
     value: Value,
     expr: []const u8,
     expr_args: UpdateSetExprArgs,
+    /// Set the column to a scalar subquery `(SELECT select_column FROM table
+    /// WHERE preds)`, rendered through the enclosing builder so dialect
+    /// placeholders and bound args stay aligned. `preds` is borrowed.
+    subquery: struct {
+        table: []const u8,
+        select_column: []const u8,
+        preds: []const Predicate,
+    },
 };
 
 pub const UpdateSet = struct {
     column: []const u8,
     set_value: UpdateSetValue,
 };
+
+/// Render one UPDATE SET value into the builder: a bound literal, a raw
+/// expression, an expression with `?` placeholders, or a scalar subquery.
+pub fn appendSetValue(b: *Builder, sv: UpdateSetValue) !void {
+    switch (sv) {
+        .value => |v| try b.arg(v),
+        .expr => |e| try b.writeString(e),
+        .expr_args => |e| try appendExprWithArgs(b, e.expr, e.args),
+        .subquery => |sq| {
+            try b.writeString("(SELECT ");
+            try b.ident(sq.select_column);
+            try b.writeString(" FROM ");
+            try b.ident(sq.table);
+            if (sq.preds.len > 0) {
+                try b.writeString(" WHERE ");
+                for (sq.preds, 0..) |pred, i| {
+                    if (i > 0) try b.writeString(" AND ");
+                    try pred.appendTo(b);
+                }
+            }
+            try b.writeByte(')');
+        },
+    }
+}
 
 pub const UpdateBuilder = struct {
     b: Builder,
@@ -1320,7 +1411,7 @@ pub const UpdateBuilder = struct {
                     u.b.allocator.free(e.expr);
                     u.b.allocator.free(e.args);
                 },
-                .value => {},
+                .value, .subquery => {},
             }
         }
         u.b.deinit();
@@ -1356,6 +1447,23 @@ pub const UpdateBuilder = struct {
         return u;
     }
 
+    /// Set a column to a scalar subquery: `col = (SELECT select_column FROM
+    /// table WHERE preds)`. `preds` is borrowed until the query is built.
+    pub fn setSubquery(
+        u: *UpdateBuilder,
+        column: []const u8,
+        table: []const u8,
+        select_column: []const u8,
+        preds: []const Predicate,
+    ) !*UpdateBuilder {
+        try u.sets.append(.{ .column = column, .set_value = .{ .subquery = .{
+            .table = table,
+            .select_column = select_column,
+            .preds = preds,
+        } } });
+        return u;
+    }
+
     pub fn where(u: *UpdateBuilder, pred: Predicate) !*UpdateBuilder {
         try u.wheres.append(pred);
         return u;
@@ -1369,13 +1477,7 @@ pub const UpdateBuilder = struct {
             if (i > 0) try u.b.writeString(", ");
             try u.b.ident(s.column);
             try u.b.writeString(" = ");
-            switch (s.set_value) {
-                .value => |v| try u.b.arg(v),
-                .expr => |e| try u.b.writeString(e),
-                .expr_args => |e| {
-                    try appendExprWithArgs(&u.b, e.expr, e.args);
-                },
-            }
+            try appendSetValue(&u.b, s.set_value);
         }
         if (u.wheres.items.len > 0) {
             try u.b.writeString(" WHERE ");
@@ -1395,13 +1497,7 @@ pub const UpdateBuilder = struct {
             if (i > 0) try u.b.writeString(", ");
             try u.b.ident(s.column);
             try u.b.writeString(" = ");
-            switch (s.set_value) {
-                .value => |v| try u.b.arg(v),
-                .expr => |e| try u.b.writeString(e),
-                .expr_args => |e| {
-                    try appendExprWithArgs(&u.b, e.expr, e.args);
-                },
-            }
+            try appendSetValue(&u.b, s.set_value);
         }
         if (u.wheres.items.len > 0) {
             try u.b.writeString(" WHERE ");

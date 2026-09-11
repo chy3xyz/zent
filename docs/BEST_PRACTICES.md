@@ -371,6 +371,48 @@ try Client.UseInterceptor(infos, &client, .{
 - Per-entity registration (without a root client): borrow a caller-owned
   chain via `entity_client.withInterceptors(&chain)`.
 
+## 5e. Edge writes (associations)
+
+Associations are maintained on the `Update` builder; the statements are
+scoped to the rows the update's own `Where` matches.
+
+```zig
+var u = client.user.Update();
+defer u.deinit();
+_ = try u.Where(.{client.user.predicates.idEQ(.{ .int = uid })});
+
+_ = try u.AddEdgeIDs("groups", &.{ g1, g2 });   // idempotent
+_ = try u.RemoveEdgeIDs("groups", &.{g1});
+_ = try u.ClearEdge("groups");                   // every matched source
+_ = try u.Save();
+```
+
+Semantics per edge kind:
+
+| Edge | `Add` | `Remove` | `Set` | `Clear` |
+|---|---|---|---|---|
+| M2M | insert junction rows | delete junction rows | — | delete all junctions |
+| `To` o2m/o2o (FK in target) | — | — | detach old owner, attach `ids` | NULL the FK |
+| `From` (FK on this row) | not supported — use `setFieldValue` | | | |
+
+- Wrong edge kind for the method is a **compile error** with the reason.
+- `SetEdgeIDs` is replace-semantics and empty `ids` behaves like `ClearEdge`.
+  It requires the `Where` to match **exactly one** source row (the attach
+  resolves the source id with a scalar subquery, so a multi-row match is
+  rejected by the database instead of silently picking one).
+- Detaching requires a nullable FK; a `NOT NULL` FK is rejected at comptime.
+- These run after the UPDATE body. Wrap in `beginTx` when you need the row
+  change and the association change to be atomic.
+- Prefer them over raw junction SQL: table and column names come from the
+  schema, so quoting and placeholders follow the dialect.
+
+### `rows_affected` is not portable
+
+MySQL reports **changed** rows; SQLite and PostgreSQL report **matched** rows.
+A no-op `UPDATE` (all values already equal) therefore returns `0` on MySQL and
+`1` on the others. Never write `if (affected == 0) return error.NotFound` —
+use an explicit `SELECT`/`Count()` or check a genuinely changing column.
+
 ## 6. Transactions
 
 ```zig

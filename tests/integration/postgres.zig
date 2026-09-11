@@ -2121,3 +2121,233 @@ test "Postgres: QueryEdge edge traversal uses dialect placeholders and quoting" 
         try testing.expectEqual(@as(usize, 0), none.items.len);
     }
 }
+
+test "Postgres: Update edge writes maintain M2M and O2M associations" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CarBase = schema("PgEwCar", .{
+        .fields = &.{ field.String("model"), field.Int("owner_id").Optional() },
+    });
+    const GroupBase = schema("PgEwGroup", .{
+        .fields = &.{field.String("name")},
+    });
+    const UserBase = schema("PgEwUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const UserGroup = schema("PgEwUserGroup", .{
+        .fields = &.{ field.Int("pg_ew_user_id"), field.Int("pg_ew_group_id") },
+        // Explicit through schemas need their own uniqueness guarantee for
+        // idempotent `INSERT ... ON CONFLICT DO NOTHING`.
+        .indexes = &.{index.Fields(&.{ "pg_ew_user_id", "pg_ew_group_id" }).Unique()},
+    });
+    const Car = struct {
+        pub const schema_name = CarBase.schema_name;
+        pub const fields = CarBase.fields;
+        pub const edges = &.{edge.From("owner", UserBase).Ref("cars")};
+        pub const indexes = CarBase.indexes;
+    };
+    const Group = struct {
+        pub const schema_name = GroupBase.schema_name;
+        pub const fields = GroupBase.fields;
+        pub const edges = &.{edge.To("users", UserBase).Through(UserGroup)};
+        pub const indexes = GroupBase.indexes;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{
+            edge.To("cars", CarBase),
+            edge.To("groups", GroupBase).Through(UserGroup),
+        };
+        pub const indexes = UserBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ User, Car, Group, UserGroup });
+    const infos = graph.types;
+    const user_info = infos[0];
+    const car_info = infos[1];
+    const group_info = infos[2];
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_ew_user_group CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_ew_car CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_ew_group CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_ew_user CASCADE", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer {
+        _ = drv.exec("DROP TABLE IF EXISTS pg_ew_user_group CASCADE", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS pg_ew_car CASCADE", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS pg_ew_group CASCADE", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS pg_ew_user CASCADE", &.{}) catch {};
+    }
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var uids: [2]i64 = undefined;
+    for (&uids, 0..) |*out, i| {
+        var b = try client.pg_ew_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", if (i == 0) "u1" else "u2");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, user_info, &e, allocator);
+        out.* = e.id;
+    }
+    var gids: [3]i64 = undefined;
+    for (&gids, 0..) |*out, i| {
+        var b = try client.pg_ew_group.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", if (i == 0) "g1" else if (i == 1) "g2" else "g3");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, group_info, &e, allocator);
+        out.* = e.id;
+    }
+    var cids: [3]i64 = undefined;
+    for (&cids, 0..) |*out, i| {
+        var b = try client.pg_ew_car.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("model", if (i == 0) "c1" else if (i == 1) "c2" else "c3");
+        if (i == 0) {
+            _ = try b.setFieldValue("owner_id", uids[0]);
+        } else if (i == 1) {
+            _ = try b.setFieldValue("owner_id", uids[1]);
+        }
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, car_info, &e, allocator);
+        out.* = e.id;
+    }
+
+    const preds = client.pg_ew_user.predicates;
+
+    // M2M Add is idempotent: applying the same ids twice keeps two rows.
+    for (0..2) |_| {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u1");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[0] })});
+        _ = try u.AddEdgeIDs("groups", &.{ gids[0], gids[1] });
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var groups = try client.pg_ew_user.QueryEdge("groups", &.{uids[0]});
+        defer {
+            for (groups.items) |*e| zent.codegen.deinitEntity(infos, group_info, e, allocator);
+            groups.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), groups.items.len);
+    }
+
+    // Seed u2 with g3 so we can prove scope isolation.
+    {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u2");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[1] })});
+        _ = try u.AddEdgeIDs("groups", &.{gids[2]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    // Remove one association from u1 only.
+    {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u1");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[0] })});
+        _ = try u.RemoveEdgeIDs("groups", &.{gids[0]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var groups = try client.pg_ew_user.QueryEdge("groups", &.{uids[0]});
+        defer {
+            for (groups.items) |*e| zent.codegen.deinitEntity(infos, group_info, e, allocator);
+            groups.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), groups.items.len);
+        try testing.expectEqual(gids[1], groups.items[0].id);
+    }
+
+    // Give u2 g1 too, then Clear u1: u2 must keep both associations.
+    {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u2");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[1] })});
+        _ = try u.AddEdgeIDs("groups", &.{gids[0]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u1");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[0] })});
+        _ = try u.ClearEdge("groups");
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var groups = try client.pg_ew_user.QueryEdge("groups", &.{uids[0]});
+        defer {
+            for (groups.items) |*e| zent.codegen.deinitEntity(infos, group_info, e, allocator);
+            groups.deinit();
+        }
+        try testing.expectEqual(@as(usize, 0), groups.items.len);
+    }
+    {
+        var groups = try client.pg_ew_user.QueryEdge("groups", &.{uids[1]});
+        defer {
+            for (groups.items) |*e| zent.codegen.deinitEntity(infos, group_info, e, allocator);
+            groups.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), groups.items.len);
+    }
+
+    // O2M Set: detaches c1 from u1 and attaches c3 to u1.
+    {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u1");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[0] })});
+        _ = try u.SetEdgeIDs("cars", &.{cids[2]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectPgCarOwner(&client, infos, car_info, cids[0], null);
+    try expectPgCarOwner(&client, infos, car_info, cids[2], uids[0]);
+    try expectPgCarOwner(&client, infos, car_info, cids[1], uids[1]);
+
+    // O2M Clear nulls u1's FK; u2's car is untouched.
+    {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u1");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[0] })});
+        _ = try u.ClearEdge("cars");
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectPgCarOwner(&client, infos, car_info, cids[2], null);
+    try expectPgCarOwner(&client, infos, car_info, cids[1], uids[1]);
+
+    // Set with empty ids is replace-with-empty: detach only.
+    {
+        var u = client.pg_ew_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "u2");
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[1] })});
+        _ = try u.SetEdgeIDs("cars", &.{});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectPgCarOwner(&client, infos, car_info, cids[1], null);
+}
+
+fn expectPgCarOwner(
+    client: anytype,
+    comptime infos: []const zent.codegen.graph.TypeInfo,
+    comptime car_info: zent.codegen.graph.TypeInfo,
+    car_id: i64,
+    expected: ?i64,
+) !void {
+    var q = client.pg_ew_car.Query();
+    defer q.deinit();
+    _ = try q.Where(.{client.pg_ew_car.predicates.idEQ(.{ .int = car_id })});
+    var car = (try q.First()) orelse return error.NoRow;
+    defer zent.codegen.deinitEntity(infos, car_info, &car, std.testing.allocator);
+    try std.testing.expectEqual(expected, car.owner_id);
+}

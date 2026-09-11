@@ -103,7 +103,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
     const CreateBuilder = CreateGen(infos, info, Entity);
     const BulkInsertBuilder = BulkInsertGen(infos, info, Entity);
     const QueryBuilder = QueryGen(infos, info, Entity);
-    const UpdateBuilder = UpdateGen(info);
+    const UpdateBuilder = UpdateGen(infos, info);
     const DeleteBuilder = DeleteGen(info);
     const BulkUpdateBuilder = BulkUpdateGen(info);
     const BulkDeleteBuilder = BulkDeleteGen(info);

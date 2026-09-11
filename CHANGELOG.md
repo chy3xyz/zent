@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Edge writes on `UpdateBuilder`.** Association maintenance no longer needs
+  hand-written junction SQL: `AddEdgeIDs(edge, ids)` (idempotent),
+  `RemoveEdgeIDs(edge, ids)`, `SetEdgeIDs(edge, ids)` (replace, detaching the
+  previous owner first) and `ClearEdge(edge)`. M2M edges write the junction
+  table; `To` o2m/o2o edges move the FK in the target table. Wrong edge kinds
+  fail at compile time with an actionable message, and non-nullable FKs are
+  rejected for detach operations. The statements are scoped by a subquery over
+  the same predicate set as the parent UPDATE, so they inherit its privacy /
+  interceptor scoping — wrap the update in `beginTx` for atomicity.
+
+### Docs
+- Documented the predicate catalogue (`BEST_PRACTICES` §3a) and the new edge
+  writes (§5e), including a cross-dialect note that MySQL's
+  `rows_affected` counts *changed* rows while SQLite/PostgreSQL count
+  *matched* rows.
+
 ## [0.34.0] - 2026-09-07
 
 ### Added

@@ -1,6 +1,9 @@
 const std = @import("std");
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
+const EdgeInfo = @import("graph.zig").EdgeInfo;
+const buildEdgeStep = @import("graph.zig").buildEdgeStep;
+const graph_step = @import("../graph/step.zig");
 const sql = @import("../sql/builder.zig");
 const sql_driver = @import("../sql/driver.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
@@ -133,8 +136,172 @@ fn toSqlValue(v: anytype) sql.Value {
     };
 }
 
+fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {
+    for (infos) |ti| {
+        if (std.mem.eql(u8, ti.name, name)) return ti;
+    }
+    @compileError("TypeInfo not found: " ++ name);
+}
+
+fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
+    for (info.edges) |e| {
+        if (std.mem.eql(u8, e.name, name)) return e;
+    }
+    @compileError("Edge not found: " ++ name ++ " on " ++ info.name);
+}
+
+fn findField(comptime info: TypeInfo, comptime name: []const u8) ?FieldInfo {
+    for (info.fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return null;
+}
+
+/// A deferred edge write registered on an Update builder. The ids slice is
+/// borrowed from the caller (matching `CreateBuilder.AddEdge`) and must stay
+/// valid until `Save()`.
+const EdgeAction = struct {
+    op: EdgeOp,
+    edge_name: []const u8,
+    ids: []const i64,
+};
+
+const EdgeOp = enum {
+    /// M2M: insert junction rows.
+    add_ids,
+    /// M2M: delete the given junction rows.
+    remove_ids,
+    /// O2M/O2O: point the given target rows at the matched source.
+    set_ids,
+    /// M2M: delete all junction rows of the matched sources.
+    /// O2M/O2O: NULL the FK of target rows pointing at the matched sources.
+    clear,
+};
+
+/// Build the idempotent junction insert for one target id:
+///   INSERT OR IGNORE / INSERT IGNORE / INSERT
+///   INTO <junction> (<source_col>, <target_col>)
+///   SELECT <source_pk>, <target_id> FROM <source_table> WHERE <preds>
+///
+/// The source ids come from the WHERE subquery, so the statement never
+/// pre-SELECTs ids or builds an IN list (no read-then-write race, no
+/// parameter-count ceiling). PostgreSQL has no ignore prefix, so the
+/// `ON CONFLICT DO NOTHING` clause is appended there.
+fn buildM2MAddQuery(
+    allocator: std.mem.Allocator,
+    dialect: Dialect,
+    step: graph_step.Step,
+    source_table: []const u8,
+    target_id: i64,
+    preds: []const sql.Predicate,
+) !sql.OwnedQuery {
+    var ib = sql.InsertOrIgnore(allocator, dialect, step.edge_table);
+    defer ib.deinit();
+    _ = try ib.columns(&.{ step.sourcePK(), step.targetPK() });
+    var items = [_]sql.SelectItem{
+        .{ .column = step.from_column },
+        .{ .value = .{ .int = target_id } },
+    };
+    _ = try ib.fromSelect(source_table, &items, preds);
+    var q = try ib.takeQuery();
+    errdefer q.deinit();
+    if (std.mem.eql(u8, dialect.name, "postgres")) {
+        const full = try std.fmt.allocPrint(allocator, "{s} ON CONFLICT DO NOTHING", .{q.sql});
+        allocator.free(q.sql);
+        q.sql = full;
+    }
+    return q;
+}
+
+/// DELETE the given target ids from the junction for every matched source.
+fn buildM2MRemoveQuery(
+    allocator: std.mem.Allocator,
+    dialect: Dialect,
+    step: graph_step.Step,
+    source_table: []const u8,
+    ids: []const i64,
+    preds: []const sql.Predicate,
+) !sql.OwnedQuery {
+    var vals = try allocator.alloc(sql.Value, ids.len);
+    defer allocator.free(vals);
+    for (ids, 0..) |id, i| vals[i] = .{ .int = id };
+    var db = sql.Delete(allocator, dialect, step.edge_table);
+    defer db.deinit();
+    _ = try db.where(sql.In(step.targetPK(), vals));
+    _ = try db.where(sql.InSelect(step.sourcePK(), source_table, step.from_column, preds));
+    return db.takeQuery();
+}
+
+/// DELETE every junction row whose source is matched by the update predicate.
+fn buildM2MClearQuery(
+    allocator: std.mem.Allocator,
+    dialect: Dialect,
+    step: graph_step.Step,
+    source_table: []const u8,
+    preds: []const sql.Predicate,
+) !sql.OwnedQuery {
+    var db = sql.Delete(allocator, dialect, step.edge_table);
+    defer db.deinit();
+    _ = try db.where(sql.InSelect(step.sourcePK(), source_table, step.from_column, preds));
+    return db.takeQuery();
+}
+
+/// NULL the FK of every target row pointing at a matched source. Soft-deleted
+/// targets are skipped when the target entity has soft delete enabled, so a
+/// trashed row is never treated as a live association.
+fn buildTargetDetachQuery(
+    allocator: std.mem.Allocator,
+    dialect: Dialect,
+    step: graph_step.Step,
+    source_table: []const u8,
+    target_soft_delete: bool,
+    preds: []const sql.Predicate,
+) !sql.OwnedQuery {
+    var ub = sql.Update(allocator, dialect, step.to_table);
+    defer ub.deinit();
+    _ = try ub.set(step.edge_columns[0], .null);
+    _ = try ub.where(sql.InSelect(step.edge_columns[0], source_table, step.from_column, preds));
+    if (target_soft_delete) _ = try ub.where(sql.IsNull("deleted_at"));
+    return ub.takeQuery();
+}
+
+/// Point the given target ids at the matched source:
+///   UPDATE <target> SET <fk> = (SELECT <source_pk> FROM <source> WHERE <preds>)
+///   WHERE <target_pk> IN (<ids>)
+///
+/// The scalar subquery must resolve to exactly one source row; O2M/O2O `Set`
+/// is therefore scoped to a single source (ent parity with UpdateOne).
+fn buildTargetAttachQuery(
+    allocator: std.mem.Allocator,
+    dialect: Dialect,
+    step: graph_step.Step,
+    source_table: []const u8,
+    target_soft_delete: bool,
+    ids: []const i64,
+    preds: []const sql.Predicate,
+) !sql.OwnedQuery {
+    var vals = try allocator.alloc(sql.Value, ids.len);
+    defer allocator.free(vals);
+    for (ids, 0..) |id, i| vals[i] = .{ .int = id };
+    var ub = sql.Update(allocator, dialect, step.to_table);
+    defer ub.deinit();
+    _ = try ub.setSubquery(step.edge_columns[0], source_table, step.from_column, preds);
+    _ = try ub.where(sql.In(step.to_column, vals));
+    if (target_soft_delete) _ = try ub.where(sql.IsNull("deleted_at"));
+    return ub.takeQuery();
+}
+
 /// Generate an Update builder for an entity.
-pub fn UpdateBuilder(comptime info: TypeInfo) type {
+///
+/// Edge writes (`AddEdgeIDs` / `RemoveEdgeIDs` / `SetEdgeIDs` / `ClearEdge`)
+/// are deferred and executed by `Save` in registration order, after the main
+/// UPDATE. They are scoped by the *same* source predicate set the UPDATE uses
+/// (caller `Where` + privacy filters + interceptor predicates), expressed as
+/// an `IN (SELECT …)` subquery so no ids are read out first. On a
+/// pool/transaction client they run on the same connection/transaction, but
+/// atomicity across the main UPDATE plus the edge statements requires the
+/// caller to wrap the work in `beginTx`.
+pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     const FieldExpr = struct {
         name: []const u8,
         expr: []const u8,
@@ -150,6 +317,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
         expr_values: std.array_list.Managed(FieldExpr),
         predicates: std.array_list.Managed(sql.Predicate),
         json_strings: std.array_list.Managed([]const u8),
+        edge_actions: std.array_list.Managed(EdgeAction),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         /// Shared interceptor chain borrowed from the entity client.
@@ -168,6 +336,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 .expr_values = std.array_list.Managed(FieldExpr).init(allocator),
                 .predicates = std.array_list.Managed(sql.Predicate).init(allocator),
                 .json_strings = std.array_list.Managed([]const u8).init(allocator),
+                .edge_actions = std.array_list.Managed(EdgeAction).init(allocator),
             };
         }
 
@@ -181,6 +350,7 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
             }
             self.expr_values.deinit();
             self.predicates.deinit();
+            self.edge_actions.deinit();
         }
 
         /// Set a column to an expression with bound parameters, e.g. atomic
@@ -307,6 +477,167 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
             }
             return self;
+        }
+
+        // ------------------------------------------------------------------
+        // Edge writes
+        // ------------------------------------------------------------------
+        //
+        // These methods register deferred statements that `Save` runs after
+        // the main UPDATE, scoped to the source rows the UPDATE matched. The
+        // per-edge methods are generated at comptime from `info.edges`.
+        //
+        // A `from` edge (the FK lives on *this* row) has no method here: set
+        // the FK column directly with `setFieldValue` — an UPDATE on the row
+        // already expresses detach/attach for it.
+
+        /// M2M: add junction rows linking every matched source to each target
+        /// id. Idempotent — a repeat add is a no-op (INSERT OR IGNORE /
+        /// INSERT IGNORE / ON CONFLICT DO NOTHING). Empty `ids` is a no-op.
+        pub fn AddEdgeIDs(self: *Self, comptime edge_name: []const u8, ids: []const i64) !*Self {
+            comptime {
+                const edge = findEdgeInfo(info, edge_name);
+                if (edge.relation != .m2m) {
+                    @compileError("AddEdgeIDs requires an M2M edge (junction/through table): " ++ edge_name ++ " on " ++ info.name);
+                }
+            }
+            try self.edge_actions.append(.{ .op = .add_ids, .edge_name = edge_name, .ids = ids });
+            return self;
+        }
+
+        /// M2M: delete junction rows linking every matched source to the
+        /// given target ids. Empty `ids` is a no-op.
+        pub fn RemoveEdgeIDs(self: *Self, comptime edge_name: []const u8, ids: []const i64) !*Self {
+            comptime {
+                const edge = findEdgeInfo(info, edge_name);
+                if (edge.relation != .m2m) {
+                    @compileError("RemoveEdgeIDs requires an M2M edge (junction/through table): " ++ edge_name ++ " on " ++ info.name);
+                }
+            }
+            try self.edge_actions.append(.{ .op = .remove_ids, .edge_name = edge_name, .ids = ids });
+            return self;
+        }
+
+        /// O2M/O2O (FK in the target table): point the given target ids at the
+        /// matched source, detaching them from their previous owner first.
+        /// Replace semantics: an empty `ids` clears the association, like
+        /// `ClearEdge`.
+        ///
+        /// The update predicate must match exactly one source row — the attach
+        /// statement resolves the source id with a scalar subquery, so a
+        /// multi-row source set is rejected by PostgreSQL/MySQL rather than
+        /// silently picking one (ent UpdateOne parity for bulk Update).
+        pub fn SetEdgeIDs(self: *Self, comptime edge_name: []const u8, ids: []const i64) !*Self {
+            comptime {
+                const edge = findEdgeInfo(info, edge_name);
+                if (!(edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o))) {
+                    @compileError("SetEdgeIDs requires a To edge whose FK lives in the target table (o2m/o2o): " ++ edge_name ++ " on " ++ info.name);
+                }
+                checkDetachableFK(edge);
+            }
+            try self.edge_actions.append(.{ .op = .set_ids, .edge_name = edge_name, .ids = ids });
+            return self;
+        }
+
+        /// M2M: delete every junction row of the matched sources.
+        /// O2M/O2O: NULL the FK of target rows pointing at the matched sources.
+        ///
+        /// With no `Where` predicate this affects every source row, matching
+        /// ent's bulk `Clear` semantics.
+        pub fn ClearEdge(self: *Self, comptime edge_name: []const u8) !*Self {
+            comptime {
+                const edge = findEdgeInfo(info, edge_name);
+                const writable = edge.relation == .m2m or
+                    (edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o));
+                if (!writable) {
+                    @compileError("ClearEdge supports M2M and To o2m/o2o edges only; a 'from' edge stores its FK on this row — use setFieldValue to detach it: " ++ edge_name);
+                }
+                if (edge.relation != .m2m) checkDetachableFK(edge);
+            }
+            try self.edge_actions.append(.{ .op = .clear, .edge_name = edge_name, .ids = &.{} });
+            return self;
+        }
+
+        /// Compile-time guard: detaching targets needs a nullable FK column.
+        fn checkDetachableFK(comptime edge: EdgeInfo) void {
+            const target_info = comptime findTypeInfo(infos, edge.target_name);
+            const step = comptime buildEdgeStep(edge, info, target_info);
+            const fk_col = step.edge_columns[0];
+            if (comptime findField(target_info, fk_col)) |f| {
+                if (!f.optional and !f.nillable) {
+                    @compileError("Edge FK column '" ++ fk_col ++ "' on " ++ target_info.name ++ " is NOT NULL; detaching targets requires a nullable FK");
+                }
+            }
+        }
+
+        /// Run every registered edge write, in registration order. Each
+        /// statement reuses `self.predicates` (caller `Where` + privacy +
+        /// interceptor scope) as its source subquery. Soft-deleted targets are
+        /// excluded from O2M/O2O FK writes; M2M junction rows are skipped for
+        /// trashed targets by the read paths, not by the write.
+        fn execEdgeActions(self: *Self) SaveError!void {
+            if (self.edge_actions.items.len == 0) return;
+            const dialect = self.driver.dialect();
+            inline for (info.edges) |edge| {
+                if (comptime edge.relation == .m2m) {
+                    const target_info = comptime findTypeInfo(infos, edge.target_name);
+                    const step = comptime buildEdgeStep(edge, info, target_info);
+                    for (self.edge_actions.items) |action| {
+                        if (!std.mem.eql(u8, action.edge_name, edge.name)) continue;
+                        switch (action.op) {
+                            .add_ids => for (action.ids) |target_id| {
+                                var q = buildM2MAddQuery(self.allocator, dialect, step, info.table_name, target_id, self.predicates.items) catch |err| return mapBuildError(err);
+                                defer q.deinit();
+                                self.ensureDeadline();
+                                _ = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
+                            },
+                            .remove_ids => {
+                                if (action.ids.len == 0) continue;
+                                var q = buildM2MRemoveQuery(self.allocator, dialect, step, info.table_name, action.ids, self.predicates.items) catch |err| return mapBuildError(err);
+                                defer q.deinit();
+                                self.ensureDeadline();
+                                _ = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
+                            },
+                            .clear => {
+                                var q = buildM2MClearQuery(self.allocator, dialect, step, info.table_name, self.predicates.items) catch |err| return mapBuildError(err);
+                                defer q.deinit();
+                                self.ensureDeadline();
+                                _ = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
+                            },
+                            .set_ids => unreachable,
+                        }
+                    }
+                } else if (comptime edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o)) {
+                    const target_info = comptime findTypeInfo(infos, edge.target_name);
+                    const step = comptime buildEdgeStep(edge, info, target_info);
+                    const target_soft_delete = target_info.soft_delete;
+                    for (self.edge_actions.items) |action| {
+                        if (!std.mem.eql(u8, action.edge_name, edge.name)) continue;
+                        switch (action.op) {
+                            .set_ids => {
+                                {
+                                    var dq = buildTargetDetachQuery(self.allocator, dialect, step, info.table_name, target_soft_delete, self.predicates.items) catch |err| return mapBuildError(err);
+                                    defer dq.deinit();
+                                    self.ensureDeadline();
+                                    _ = try self.driver.execCtx(&self.execution_context, dq.sql, dq.args);
+                                }
+                                if (action.ids.len == 0) continue;
+                                var aq = buildTargetAttachQuery(self.allocator, dialect, step, info.table_name, target_soft_delete, action.ids, self.predicates.items) catch |err| return mapBuildError(err);
+                                defer aq.deinit();
+                                self.ensureDeadline();
+                                _ = try self.driver.execCtx(&self.execution_context, aq.sql, aq.args);
+                            },
+                            .clear => {
+                                var q = buildTargetDetachQuery(self.allocator, dialect, step, info.table_name, target_soft_delete, self.predicates.items) catch |err| return mapBuildError(err);
+                                defer q.deinit();
+                                self.ensureDeadline();
+                                _ = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
+                            },
+                            .add_ids, .remove_ids => unreachable,
+                        }
+                    }
+                }
+            }
         }
 
         /// Run the interceptor chain (`.update`). Interceptor errors
@@ -488,6 +819,11 @@ pub fn UpdateBuilder(comptime info: TypeInfo) type {
                 after_hooks_fired = true;
                 return error.OptimisticLockConflict;
             }
+
+            // Edge maintenance runs after the main UPDATE (matching
+            // CreateBuilder.AddEdge, which inserts junction rows before its
+            // after-hooks) and is scoped by the same source predicates.
+            try self.execEdgeActions();
 
             // After hooks on success.
             rthook.globalAfter(&hook_ctx);
@@ -1374,7 +1710,7 @@ test "Update builder basic" {
     });
 
     const info = comptime fromSchema(User);
-    const Upd = UpdateBuilder(info);
+    const Upd = UpdateBuilder(&.{info}, info);
 
     var u = Upd.init(std.testing.allocator, undefined, &.{}, null);
     defer u.deinit();
@@ -1416,7 +1752,7 @@ test "Update builder SaveOne and Delete builder ExecOne compile" {
     });
 
     const info = comptime fromSchema(User);
-    const Upd = UpdateBuilder(info);
+    const Upd = UpdateBuilder(&.{info}, info);
     const Del = DeleteBuilder(info);
 
     var u = Upd.init(std.testing.allocator, undefined, &.{}, null);
@@ -1502,7 +1838,7 @@ test "Update and delete execution methods expose explicit driver error unions" {
     });
 
     const info = comptime fromSchema(User);
-    const Upd = UpdateBuilder(info);
+    const Upd = UpdateBuilder(&.{info}, info);
     const Del = DeleteBuilder(info);
     const BulkUpd = BulkUpdateBuilder(info);
     const BulkDel = BulkDeleteBuilder(info);
@@ -1960,4 +2296,168 @@ test "updated_at auto-maintained by UpdateBuilder (TimeMixin)" {
     var after_explicit = (try q3.First()) orelse return error.NoRow;
     defer deinitEntity(infos, info, &after_explicit, allocator);
     try std.testing.expectEqual(@as(?i64, 42), after_explicit.updated_at);
+}
+
+// ------------------------------------------------------------------
+// Edge write tests
+// ------------------------------------------------------------------
+
+const m2m_test_step = graph_step.Step{
+    .from_table = "user",
+    .from_column = "id",
+    .to_table = "group",
+    .to_column = "id",
+    .edge_rel = .m2m,
+    .edge_table = "user_group",
+    .edge_columns = &[_][]const u8{ "group_id", "user_id" },
+    .inverse = false,
+};
+
+const o2m_test_step = graph_step.Step{
+    .from_table = "user",
+    .from_column = "id",
+    .to_table = "car",
+    .to_column = "id",
+    .edge_rel = .o2m,
+    .edge_table = "car",
+    .edge_columns = &[_][]const u8{"owner_id"},
+    .inverse = false,
+};
+
+test "edge write SQL shape: M2M add is idempotent per dialect" {
+    const allocator = std.testing.allocator;
+    const preds = [_]sql.Predicate{sql.EQ("id", .{ .int = 1 })};
+
+    {
+        var q = try buildM2MAddQuery(allocator, Dialect.sqlite, m2m_test_step, "user", 9, &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "INSERT OR IGNORE INTO \"user_group\" (\"user_id\", \"group_id\") SELECT \"id\", ? FROM \"user\" WHERE \"id\" = ?",
+            q.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 2), q.args.len);
+        try std.testing.expectEqual(@as(i64, 9), q.args[0].int);
+        try std.testing.expectEqual(@as(i64, 1), q.args[1].int);
+    }
+    {
+        var q = try buildM2MAddQuery(allocator, Dialect.postgres, m2m_test_step, "user", 9, &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "INSERT INTO \"user_group\" (\"user_id\", \"group_id\") SELECT \"id\", $1 FROM \"user\" WHERE \"id\" = $2 ON CONFLICT DO NOTHING",
+            q.sql,
+        );
+    }
+    {
+        var q = try buildM2MAddQuery(allocator, Dialect.mysql, m2m_test_step, "user", 9, &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "INSERT IGNORE INTO `user_group` (`user_id`, `group_id`) SELECT `id`, ? FROM `user` WHERE `id` = ?",
+            q.sql,
+        );
+    }
+}
+
+test "edge write SQL shape: M2M remove and clear scope by source subquery" {
+    const allocator = std.testing.allocator;
+    const preds = [_]sql.Predicate{sql.EQ("id", .{ .int = 1 })};
+
+    {
+        var q = try buildM2MRemoveQuery(allocator, Dialect.sqlite, m2m_test_step, "user", &.{ 2, 3 }, &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "DELETE FROM \"user_group\" WHERE \"group_id\" IN (?, ?) AND \"user_id\" IN (SELECT \"id\" FROM \"user\" WHERE \"id\" = ?)",
+            q.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 3), q.args.len);
+    }
+    {
+        var q = try buildM2MClearQuery(allocator, Dialect.postgres, m2m_test_step, "user", &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "DELETE FROM \"user_group\" WHERE \"user_id\" IN (SELECT \"id\" FROM \"user\" WHERE \"id\" = $1)",
+            q.sql,
+        );
+    }
+}
+
+test "edge write SQL shape: O2M detach and attach" {
+    const allocator = std.testing.allocator;
+    const preds = [_]sql.Predicate{sql.EQ("id", .{ .int = 1 })};
+
+    {
+        var q = try buildTargetDetachQuery(allocator, Dialect.sqlite, o2m_test_step, "user", false, &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "UPDATE \"car\" SET \"owner_id\" = ? WHERE \"owner_id\" IN (SELECT \"id\" FROM \"user\" WHERE \"id\" = ?)",
+            q.sql,
+        );
+    }
+    {
+        var q = try buildTargetDetachQuery(allocator, Dialect.sqlite, o2m_test_step, "user", true, &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "UPDATE \"car\" SET \"owner_id\" = ? WHERE \"owner_id\" IN (SELECT \"id\" FROM \"user\" WHERE \"id\" = ?) AND \"deleted_at\" IS NULL",
+            q.sql,
+        );
+    }
+    {
+        var q = try buildTargetAttachQuery(allocator, Dialect.postgres, o2m_test_step, "user", false, &.{ 5, 6 }, &preds);
+        defer q.deinit();
+        try std.testing.expectEqualStrings(
+            "UPDATE \"car\" SET \"owner_id\" = (SELECT \"id\" FROM \"user\" WHERE \"id\" = $1) WHERE \"id\" IN ($2, $3)",
+            q.sql,
+        );
+    }
+}
+
+test "UpdateBuilder registers edge writes and reuses source predicates" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const edge_mod = @import("../core/edge.zig");
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const CarBase = schema("EwCar", .{
+        .fields = &.{ field.String("model"), field.Int("owner_id").Optional() },
+    });
+    const GroupBase = schema("EwGroup", .{
+        .fields = &.{field.String("name")},
+    });
+    const UserBase = schema("EwUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const Car = struct {
+        pub const schema_name = CarBase.schema_name;
+        pub const fields = CarBase.fields;
+        pub const edges = &.{edge_mod.From("owner", UserBase).Ref("cars")};
+        pub const indexes = CarBase.indexes;
+    };
+    const Group = struct {
+        pub const schema_name = GroupBase.schema_name;
+        pub const fields = GroupBase.fields;
+        pub const edges = &.{edge_mod.To("users", UserBase)};
+        pub const indexes = GroupBase.indexes;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{ edge_mod.To("cars", CarBase), edge_mod.To("groups", GroupBase) };
+        pub const indexes = UserBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ User, Car, Group });
+    const infos = graph.types;
+    const user_info = comptime findTypeInfo(infos, "EwUser");
+    const Upd = UpdateBuilder(infos, user_info);
+
+    var u = Upd.init(std.testing.allocator, undefined, &.{}, null);
+    defer u.deinit();
+
+    _ = try u.AddEdgeIDs("groups", &.{1});
+    _ = try u.RemoveEdgeIDs("groups", &.{2});
+    _ = try u.ClearEdge("groups");
+    _ = try u.SetEdgeIDs("cars", &.{3});
+    _ = try u.ClearEdge("cars");
+    try std.testing.expectEqual(@as(usize, 5), u.edge_actions.items.len);
+    try std.testing.expectEqual(EdgeOp.add_ids, u.edge_actions.items[0].op);
+    try std.testing.expectEqual(EdgeOp.set_ids, u.edge_actions.items[3].op);
 }
