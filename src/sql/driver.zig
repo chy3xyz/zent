@@ -204,11 +204,25 @@ pub const Rows = struct {
     }
 };
 
-pub fn monotonicNs() i64 {
+/// Read a clock into nanoseconds, or null when the syscall fails.
+fn readClockNs(clock: std.c.CLOCK) ?i64 {
     var ts: std.c.timespec = undefined;
-    const rc = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    if (rc != 0) unreachable;
+    if (std.c.clock_gettime(clock, &ts) != 0) return null;
     return @as(i64, ts.sec) * std.time.ns_per_s + @as(i64, ts.nsec);
+}
+
+pub fn monotonicNs() i64 {
+    if (readClockNs(std.c.CLOCK.MONOTONIC)) |ns| return ns;
+    // CLOCK_MONOTONIC is always available on the platforms this library
+    // targets, but a hard `unreachable` here would be undefined behaviour in
+    // ReleaseFast and would abort the process in ReleaseSafe. Degrade to the
+    // wall clock (non-monotonic, so deadline arithmetic is approximate) and
+    // say so rather than trapping.
+    std.log.warn("clock_gettime(CLOCK_MONOTONIC) failed; timing falls back to the wall clock", .{});
+    if (readClockNs(std.c.CLOCK.REALTIME)) |ns| return ns;
+    // Both clocks failed: report 0 so deadlines computed from here still
+    // compare consistently (a deadline is `now + budget`).
+    return 0;
 }
 
 /// Execution context carried by driver operations.

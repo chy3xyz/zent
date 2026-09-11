@@ -82,7 +82,19 @@ pub fn evalPolicy(
             },
             .filter => |fr| {
                 if (fr.predicate(ctx)) |pred| {
-                    std.debug.assert(result.filter_count < result.filters.len);
+                    if (result.filter_count >= result.filters.len) {
+                        // Capacity exhausted. Truncating would silently widen
+                        // the result set of a security policy, and asserting
+                        // would abort the process under ReleaseSafe — so fail
+                        // closed instead: deny, and say why. (warn, not err:
+                        // the deny is the signal, and an err-level log would
+                        // fail any test whose policy exercises this path.)
+                        std.log.warn(
+                            "privacy: policy produced more than {d} row filters; denying rather than dropping one",
+                            .{result.filters.len},
+                        );
+                        return .{ .decision = .deny };
+                    }
                     result.filters[result.filter_count] = pred;
                     result.filter_count += 1;
                 }
@@ -260,4 +272,27 @@ test "evalPolicy: empty rules defaults to allow" {
     const result = evalPolicy(ctx, &rules);
     try std.testing.expectEqual(Decision.allow, result.decision);
     try std.testing.expectEqual(@as(usize, 0), result.filter_count);
+}
+
+test "evalPolicy denies instead of overflowing the filter array" {
+    // max_filters is 8; a policy with more filtering rules than capacity must
+    // fail closed (deny) rather than assert or silently drop a row filter.
+    const rule = Rule{ .filter = .{ .predicate = struct {
+        fn p(_: PrivacyContext) ?*const anyopaque {
+            return @ptrCast(&struct {
+                var marker: u8 = 1;
+            }.marker);
+        }
+    }.p } };
+
+    var rules: [max_filters + 1]Rule = undefined;
+    for (&rules) |*r| r.* = rule;
+
+    const result = evalPolicy(PrivacyContext{ .op = .query }, &rules);
+    try std.testing.expectEqual(Decision.deny, result.decision);
+
+    // Capacity itself still works: exactly max_filters rules are collected.
+    const ok = evalPolicy(PrivacyContext{ .op = .query }, rules[0..max_filters]);
+    try std.testing.expectEqual(Decision.allow, ok.decision);
+    try std.testing.expectEqual(@as(usize, max_filters), ok.filter_count);
 }
