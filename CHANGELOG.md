@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-09-12
+
 ### Added
 - **Blocking, timeout-bounded connection waits.** `Options.max_wait_ms` is no
   longer dead configuration: when it is non-zero and no connection can be
