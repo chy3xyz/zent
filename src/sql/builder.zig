@@ -264,7 +264,15 @@ pub const Predicate = union(enum) {
         column: []const u8,
         needle: []const u8,
         escape: u8 = '\\',
+        /// Where the wildcard sits: `%needle%` / `needle%` / `%needle`.
+        mode: LikeMode = .contains,
+        /// Wrap both sides in `LOWER(...)` for case-insensitive matching.
+        /// Note this makes the predicate non-sargable (index unusable).
+        fold: bool = false,
     };
+
+    /// Wildcard placement for the escaped-LIKE family.
+    pub const LikeMode = enum { contains, prefix, suffix };
     pub const RawArgsOp = struct { sql: []const u8, args: []const Value };
 
     pub fn appendTo(self: Predicate, b: *Builder) !void {
@@ -311,12 +319,17 @@ pub const Predicate = union(enum) {
                 // MySQL: use '!' as escape character because '\' would
                 // escape the closing quote in string literals.
                 const escape: u8 = if (std.mem.eql(u8, b.dialect.name, "mysql")) '!' else p.escape;
+                if (p.fold) try b.writeString("LOWER(");
                 try b.qualifiedIdent(p.column);
-                try b.writeString(" LIKE '");
-                try b.writeByte('%');
-                try writeLikeEscaped(b, p.needle, escape);
-                try b.writeByte('%');
+                if (p.fold) try b.writeByte(')');
+                try b.writeString(" LIKE ");
+                if (p.fold) try b.writeString("LOWER(");
                 try b.writeByte('\'');
+                if (p.mode == .contains or p.mode == .suffix) try b.writeByte('%');
+                try writeLikeEscaped(b, p.needle, escape);
+                if (p.mode == .contains or p.mode == .prefix) try b.writeByte('%');
+                try b.writeByte('\'');
+                if (p.fold) try b.writeByte(')');
                 try b.writeString(" ESCAPE '");
                 try b.writeByte(escape);
                 try b.writeByte('\'');
@@ -509,6 +522,23 @@ pub fn Like(column: []const u8, value: Value) Predicate {
 /// stays literal. Backward compatible: `Like`/`Contains` are unchanged.
 pub fn ContainsEscaped(column: []const u8, needle: []const u8) Predicate {
     return .{ .like_escaped = .{ .column = column, .needle = needle } };
+}
+
+/// `col LIKE 'needle%' ESCAPE …` with the needle escaped like
+/// `ContainsEscaped` (user input stays literal).
+pub fn HasPrefixEscaped(column: []const u8, needle: []const u8) Predicate {
+    return .{ .like_escaped = .{ .column = column, .needle = needle, .mode = .prefix } };
+}
+
+/// `col LIKE '%needle' ESCAPE …`, escaping as in `ContainsEscaped`.
+pub fn HasSuffixEscaped(column: []const u8, needle: []const u8) Predicate {
+    return .{ .like_escaped = .{ .column = column, .needle = needle, .mode = .suffix } };
+}
+
+/// Case-insensitive contains: `LOWER(col) LIKE LOWER('%needle%') ESCAPE …`.
+/// Non-sargable by construction (the LOWER() wrapper defeats a plain index).
+pub fn ContainsFoldEscaped(column: []const u8, needle: []const u8) Predicate {
+    return .{ .like_escaped = .{ .column = column, .needle = needle, .fold = true } };
 }
 
 fn writeLikeEscaped(b: *Builder, needle: []const u8, escape: u8) !void {

@@ -150,6 +150,41 @@ paths (`"posts.comments"`) filter on the head edge only. Edges must live in
 the same graph as the parent (see §8a); cross-graph eager loading is a
 compile error by design.
 
+## 3a. Predicate catalogue
+
+Every field gets these (`client.<entity>.predicates.<field><Suffix>`):
+
+| Suffix | Signature | Renders |
+|---|---|---|
+| `EQ` `NE` `GT` `GTE` `LT` `LTE` | `(sql.Value)` | `col = ?` / `<> ?` / `> ?` / `>= ?` / `< ?` / `<= ?` |
+| `In` `NotIn` | `([]const sql.Value)` | `col IN (?, ?)` / `col NOT IN (?, ?)` |
+| `IsNull` `NotNil` | `()` | `col IS NULL` / `col IS NOT NULL` |
+
+`string`/`text` fields additionally get:
+
+| Suffix | Renders |
+|---|---|
+| `Contains` | `col LIKE '%v%'` (wildcards in `v` stay **live**) |
+| `ContainsEscaped` | `col LIKE '%v%' ESCAPE …` (wildcards in `v` are **literal**) |
+| `HasPrefix` `HasSuffix` | `col LIKE 'v%'` / `col LIKE '%v'`, escaped like `ContainsEscaped` |
+| `ContainsFold` | `LOWER(col) LIKE LOWER('%v%')` — non-sargable |
+| `EQFold` | `LOWER(col) = LOWER(?)` |
+
+Edges get `Has<Edge>()`, `NotHas<Edge>()`, and `Has<Edge>With(preds)`. The
+`With` form takes the **target entity's own typed predicates**, so a
+traversal filter never needs hand-written SQL:
+
+```zig
+_ = try q.Where(.{client.user.predicates.HasCarsWith(&.{
+    client.car.predicates.modelEQ(.{ .string = "Tesla" }),
+    client.car.predicates.yearGTE(.{ .int = 2020 }),
+})});
+```
+
+Prefer these over `sql.Raw`/`sql.Like` + hand-written column names: the typed
+forms validate the column against the schema and pick the right quoting and
+placeholder style per dialect.
+
 ## 4. Aggregates
 
 ```zig
