@@ -544,8 +544,10 @@ fn QueryTargetsResult(
 
 const QueryTargetsError = sql_driver.Error || error{ TypeMismatch, BuildFailed };
 
-/// Query target entities via an O2M/M2M edge.
-/// For example: queryTargets(infos, "User", "cars", &[1], allocator, driver) returns Car entities for user 1.
+/// Value-typed traversal: accepts any primary key type — `.int` for integer
+/// PKs, `.string` for UUID/textual PKs. `queryTargets` delegates here.
+/// For example: queryTargetsByValue(infos, "User", "cars", &.{.{ .int = 1 }}, allocator, driver) returns Car entities for user 1,
+/// and queryTargetsByValue(infos, "User", "cars", &.{.{ .string = "0192..." }}, allocator, driver) does the same for a UUID-keyed User.
 ///
 /// The traversal is rebuilt through `buildEdgeStep` +
 /// `graph_neighbors.appendSetNeighborsFiltered`, so placeholders and
@@ -559,11 +561,11 @@ const QueryTargetsError = sql_driver.Error || error{ TypeMismatch, BuildFailed }
 /// target's privacy policy or the interceptor chain. Callers that need
 /// tenant isolation (or any other policy/interceptor scoping) must use
 /// `WithEdge`/eager loading instead.
-pub fn queryTargets(
+pub fn queryTargetsByValue(
     comptime infos: []const TypeInfo,
     comptime source_name: []const u8,
     comptime edge_name: []const u8,
-    parent_ids: []const i64,
+    parent_ids: []const sql.Value,
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
 ) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
@@ -577,10 +579,6 @@ pub fn queryTargets(
         return std.array_list.Managed(TargetEntity).init(allocator);
     }
 
-    var parent_id_values = try allocator.alloc(sql.Value, parent_ids.len);
-    defer allocator.free(parent_id_values);
-    for (parent_ids, 0..) |id, i| parent_id_values[i] = .{ .int = id };
-
     var extra_preds_buf: [1]sql.Predicate = undefined;
     var extra_preds: []const sql.Predicate = &.{};
     if (target_info.soft_delete) {
@@ -590,7 +588,7 @@ pub fn queryTargets(
 
     var b = sql.Builder.init(allocator, driver.dialect());
     defer b.deinit();
-    graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_id_values, extra_preds) catch |err| {
+    graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_ids, extra_preds) catch |err| {
         return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
     };
 
@@ -609,6 +607,24 @@ pub fn queryTargets(
         try result.append(entity);
     }
     return result;
+}
+
+/// Integer-key convenience wrapper over `queryTargetsByValue`.
+/// For example: queryTargets(infos, "User", "cars", &[1], allocator, driver) returns Car entities for user 1.
+/// Callers whose primary keys are UUID/textual call `queryTargetsByValue`
+/// directly with `.{ .string = ... }` values.
+pub fn queryTargets(
+    comptime infos: []const TypeInfo,
+    comptime source_name: []const u8,
+    comptime edge_name: []const u8,
+    parent_ids: []const i64,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
+    const values = try allocator.alloc(sql.Value, parent_ids.len);
+    defer allocator.free(values);
+    for (parent_ids, 0..) |id, i| values[i] = .{ .int = id };
+    return queryTargetsByValue(infos, source_name, edge_name, values, allocator, driver);
 }
 
 // ------------------------------------------------------------------

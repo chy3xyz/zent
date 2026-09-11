@@ -2606,3 +2606,127 @@ test "Postgres: StorageKey maps field names to distinct column names" {
         try testing.expectEqual(@as(usize, 1), try d.ForceExec());
     }
 }
+
+test "Postgres: queryTargetsByValue traverses UUID-keyed parents" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // `field.UUID` types the FK column as a native PostgreSQL UUID, while the
+    // driver binds textual parameters. Raw DDL is used here only to pin the
+    // exact column type for this parameter-typing test; the DDL the library
+    // generates for a UUID primary key is covered by the createAllTables test
+    // below.
+    const ItemBase = schema("PgUqvItem", .{
+        .fields = &.{ field.String("model"), field.UUID("pg_uqv_user_id") },
+    });
+    const UserBase = schema("PgUqvUser", .{
+        .fields = &.{ field.UUID("id"), field.String("name") },
+        .edges = &.{edge.To("items", ItemBase).Field("pg_uqv_user_id")},
+    });
+    const infos = comptime buildGraph(&.{ UserBase, ItemBase }).types;
+    const user_info = infos[0];
+    const item_info = infos[1];
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_uqv_item CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_uqv_user CASCADE", &.{});
+    defer {
+        _ = drv.exec("DROP TABLE IF EXISTS pg_uqv_item CASCADE", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS pg_uqv_user CASCADE", &.{}) catch {};
+    }
+    _ = try drv.exec("CREATE TABLE pg_uqv_user (id UUID PRIMARY KEY, name TEXT NOT NULL)", &.{});
+    _ = try drv.exec("CREATE TABLE pg_uqv_item (id SERIAL PRIMARY KEY, model TEXT NOT NULL, pg_uqv_user_id UUID NOT NULL)", &.{});
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    const alice_id = "01920000-0000-7000-8000-000000000001";
+    const bob_id = "01920000-0000-7000-8000-000000000002";
+    const users = [_][]const u8{ alice_id, bob_id };
+    for (users, 0..) |uid, i| {
+        var b = try client.pg_uqv_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("id", uid);
+        _ = try b.setFieldValue("name", if (i == 0) "alice" else "bob");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, user_info, &e, allocator);
+    }
+
+    const items = [_][2][]const u8{
+        .{ alice_id, "a1" },
+        .{ alice_id, "a2" },
+        .{ bob_id, "b1" },
+    };
+    for (items) |item| {
+        var b = try client.pg_uqv_item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("pg_uqv_user_id", item[0]);
+        _ = try b.setFieldValue("model", item[1]);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, item_info, &e, allocator);
+    }
+
+    // `WHERE pg_uqv_user_id IN ($1)` binds $1 as text against a native UUID
+    // column: PostgreSQL infers the parameter type from the comparison, so no
+    // explicit `::uuid` cast is needed.
+    {
+        var rows = try Client.queryTargetsByValue(infos, "PgUqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, item_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+    }
+    {
+        var rows = try Client.queryTargetsByValue(infos, "PgUqvUser", "items", &.{
+            .{ .string = alice_id },
+            .{ .string = bob_id },
+        }, allocator, drv.asDriver());
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, item_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 3), rows.items.len);
+    }
+}
+
+test "Postgres: createAllTables keeps a UUID primary key typed as UUID" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // DDL comes from the library rather than raw SQL: the auto-increment
+    // rewrite used to mark every id column as auto-increment, which turned a
+    // UUID primary key into SERIAL on PostgreSQL and into an unindexable TEXT
+    // key on MySQL. This asserts the generated type, then round-trips a row
+    // through the generated client to prove the column is usable.
+    const DocBase = schema("PgUuidDoc", .{
+        .fields = &.{ field.UUID("id"), field.String("title") },
+    });
+    const infos = comptime buildGraph(&.{DocBase}).types;
+    const doc_info = infos[0];
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_uuid_doc CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_uuid_doc CASCADE", &.{}) catch {};
+
+    try Client.createAllTables(allocator, infos, drv.asDriver());
+
+    {
+        var rows = try drv.query(
+            "SELECT data_type FROM information_schema.columns " ++
+                "WHERE table_name = 'pg_uuid_doc' AND column_name = 'id'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("uuid", row.getText(0).?);
+    }
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    var b = try client.pg_uuid_doc.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("id", "01920000-0000-7000-8000-0000000000f1");
+    _ = try b.setFieldValue("title", "t");
+    var saved = try b.Save();
+    defer zent.codegen.deinitEntity(infos, doc_info, &saved, allocator);
+    try testing.expectEqualStrings("01920000-0000-7000-8000-0000000000f1", saved.id);
+}

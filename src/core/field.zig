@@ -281,6 +281,10 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
         .enum_ => return "TEXT",
         .uuid => {
             if (std.mem.eql(u8, dialect.name, "postgres")) return "UUID";
+            // MySQL cannot index TEXT without a key length, so a UUID primary
+            // key would fail CREATE TABLE (errno 1170). CHAR(36) holds the
+            // canonical 8-4-4-4-12 form and is indexable.
+            if (std.mem.eql(u8, dialect.name, "mysql")) return "CHAR(36)";
             return "TEXT";
         },
         .decimal => {

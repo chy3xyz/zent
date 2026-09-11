@@ -432,7 +432,10 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
                 .default_value = defaultValueStr(f),
-                .auto_increment = f.is_id,
+                // Only an integer primary key auto-increments. Marking every id as
+                // auto-increment made PostgreSQL rewrite a UUID PK to SERIAL and
+                // MySQL reject a TEXT PK, silently generating the wrong column type.
+                .auto_increment = f.is_id and f.field_type == .int,
             };
             columns = columns ++ &[_]ColumnDef{col};
         }
@@ -825,7 +828,10 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
                 .default_value = defaultValueStr(f),
-                .auto_increment = f.is_id,
+                // Only an integer primary key auto-increments. Marking every id as
+                // auto-increment made PostgreSQL rewrite a UUID PK to SERIAL and
+                // MySQL reject a TEXT PK, silently generating the wrong column type.
+                .auto_increment = f.is_id and f.field_type == .int,
             };
             columns = columns ++ &[_]ColumnDef{col};
         }

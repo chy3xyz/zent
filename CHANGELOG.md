@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`queryTargetsByValue` for UUID/textual primary keys.** `QueryEdge`'s
+  traversal helper only accepted `[]const i64` parents, so entities keyed by
+  a `field.UUID("id")` string PK could not traverse edges at all. The new
+  `codegen.client.queryTargetsByValue(infos, source, edge, parent_ids:
+  []const sql.Value, …)` takes any PK type (`.int` or `.string`), and
+  `queryTargets` keeps its signature as an integer-only wrapper that
+  delegates to it. Same semantics — empty-list short-circuit, dialect
+  placeholders, target soft-delete scope, caller-owned result.
 - **`StorageKey`: map a Zig field onto a differently-named SQL column.**
   `field.String("userName").StorageKey("user_name")` decouples the field name
   used by the fluent API (`setFieldValue("userName", …)`, typed predicates,
@@ -56,6 +64,15 @@ All notable changes to this project will be documented in this file.
   certificate satisfies `REQUIRE X509` while its absence does not.
 
 ### Fixed
+- **A UUID primary key is no longer rewritten to an integer.** `TableDef`
+  marked *every* id column as auto-increment, so PostgreSQL replaced the
+  declared type with `SERIAL` — a `field.UUID("id")` primary key silently came
+  out as `integer` — and MySQL appended `AUTO_INCREMENT` to a `TEXT` column,
+  failing `CREATE TABLE` with errno 1170. Auto-increment now applies only to
+  integer ids, and MySQL maps `uuid` to `CHAR(36)` instead of `TEXT`, which
+  cannot be indexed without a key length. Covered by a per-dialect test that
+  runs the library's own `createAllTables` (asserting the emitted column type
+  on PostgreSQL and MySQL) and round-trips a UUID-keyed row.
 - **Interceptor chains survive a `Client` move.** `Client` held its interceptor
   chain **by value** while every entity sub-client stored a pointer into that
   field, so any move of the `Client` value — `makeClient`'s return, the

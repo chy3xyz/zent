@@ -2712,6 +2712,123 @@ test "SQLite: QueryEdge edge traversal covers O2M, M2M and M2O" {
     }
 }
 
+test "SQLite: queryTargetsByValue traverses UUID-keyed parents" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ItemBase = schema("UqvItem", .{
+        .fields = &.{ field.String("model"), field.UUID("uqv_user_id") },
+    });
+    const UserBase = schema("UqvUser", .{
+        .fields = &.{ field.UUID("id"), field.String("name") },
+        .edges = &.{edge.To("items", ItemBase).Field("uqv_user_id")},
+    });
+    // An integer-keyed pair in the same graph exercises the i64 bridge.
+    const BudgetBase = schema("UqvBudget", .{
+        .fields = &.{ field.Int("amount"), field.Int("uqv_owner_id") },
+    });
+    const OwnerBase = schema("UqvOwner", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("budgets", BudgetBase).Field("uqv_owner_id")},
+    });
+
+    const infos = comptime buildGraph(&.{ UserBase, ItemBase, OwnerBase, BudgetBase }).types;
+    const user_info = infos[0];
+    const item_info = infos[1];
+    const budget_info = infos[3];
+
+    _ = try drv.exec("DROP TABLE IF EXISTS uqv_item", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS uqv_budget", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS uqv_user", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS uqv_owner", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer {
+        _ = drv.exec("DROP TABLE IF EXISTS uqv_item", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS uqv_budget", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS uqv_user", &.{}) catch {};
+        _ = drv.exec("DROP TABLE IF EXISTS uqv_owner", &.{}) catch {};
+    }
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    const alice_id = "01920000-0000-7000-8000-000000000001";
+    const bob_id = "01920000-0000-7000-8000-000000000002";
+    const users = [_][]const u8{ alice_id, bob_id };
+    for (users, 0..) |uid, i| {
+        var b = try client.uqv_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("id", uid);
+        _ = try b.setFieldValue("name", if (i == 0) "alice" else "bob");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, user_info, &e, allocator);
+    }
+
+    const items = [_][2][]const u8{
+        .{ alice_id, "a1" },
+        .{ alice_id, "a2" },
+        .{ bob_id, "b1" },
+    };
+    for (items) |item| {
+        var b = try client.uqv_item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("uqv_user_id", item[0]);
+        _ = try b.setFieldValue("model", item[1]);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, item_info, &e, allocator);
+    }
+
+    // UUID/textual parents travel as `.string` values.
+    {
+        var rows = try Client.queryTargetsByValue(infos, "UqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, item_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+        var saw_a1 = false;
+        var saw_a2 = false;
+        for (rows.items) |r| {
+            if (std.mem.eql(u8, r.model, "a1")) saw_a1 = true;
+            if (std.mem.eql(u8, r.model, "a2")) saw_a2 = true;
+        }
+        try testing.expect(saw_a1 and saw_a2);
+    }
+
+    // Multi-parent IN list spans both UUID keys.
+    {
+        var rows = try Client.queryTargetsByValue(infos, "UqvUser", "items", &.{
+            .{ .string = alice_id },
+            .{ .string = bob_id },
+        }, allocator, drv.asDriver());
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, item_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 3), rows.items.len);
+    }
+
+    // Empty parent list short-circuits without touching the database.
+    {
+        var rows = try Client.queryTargetsByValue(infos, "UqvUser", "items", &[_]zent.sql.Value{}, allocator, drv.asDriver());
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 0), rows.items.len);
+    }
+
+    // The integer bridge still binds `.int` parents.
+    _ = try drv.exec("INSERT INTO uqv_owner (id, name) VALUES (1, 'o1')", &.{});
+    _ = try drv.exec("INSERT INTO uqv_budget (id, amount, uqv_owner_id) VALUES (1, 10, 1)", &.{});
+    _ = try drv.exec("INSERT INTO uqv_budget (id, amount, uqv_owner_id) VALUES (2, 20, 1)", &.{});
+    {
+        var rows = try Client.queryTargets(infos, "UqvOwner", "budgets", &.{1}, allocator, drv.asDriver());
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, budget_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+    }
+}
+
 test "SQLite: Update edge writes maintain M2M and O2M associations" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");
@@ -3242,4 +3359,32 @@ test "SQLite: StorageKey maps field names to distinct column names" {
         _ = try d.Where(.{preds.userNameEQ(.{ .string = "alice" })});
         try testing.expectEqual(@as(usize, 1), try d.ForceExec());
     }
+}
+
+test "SQLite: createAllTables keeps a UUID primary key typed as UUID" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // DDL comes from the library rather than raw SQL: the auto-increment
+    // rewrite used to mark every id column as auto-increment, which turned a
+    // UUID primary key into SERIAL on PostgreSQL and into an unindexable TEXT
+    // key on MySQL. On SQLite the column stays TEXT with a PRIMARY KEY, so the
+    // round-trip through the generated client is the assertion.
+    const DocBase = schema("UuidDoc", .{
+        .fields = &.{ field.UUID("id"), field.String("title") },
+    });
+    const infos = comptime buildGraph(&.{DocBase}).types;
+    const doc_info = infos[0];
+
+    try Client.createAllTables(allocator, infos, drv.asDriver());
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    var b = try client.uuid_doc.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("id", "01920000-0000-7000-8000-0000000000f3");
+    _ = try b.setFieldValue("title", "t");
+    var saved = try b.Save();
+    defer zent.codegen.deinitEntity(infos, doc_info, &saved, allocator);
+    try testing.expectEqualStrings("01920000-0000-7000-8000-0000000000f3", saved.id);
 }
