@@ -3341,6 +3341,93 @@ test "SQLite: zent.scope scopes a raw SELECT that bypasses the builders" {
     }
 }
 
+test "SQLite: zent.scope composes with crud_helpers.queryRows on raw SQL" {
+    // `crud_helpers.queryRows` is the typed-mapper layer consumers actually
+    // reach for, and it runs the statement as written — the same bypass class
+    // as the raw `driver.query` path, one layer up. It cannot apply a scope
+    // itself (a statement may join several tables), so the contract is the
+    // composition below; this test is what makes that claim checkable rather
+    // than a doc comment.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ItemBase = schema("ScopeRowsItem", .{
+        .fields = &.{
+            field.String("code"),
+            field.Int("app_id"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    const graph = comptime buildGraph(&.{ItemBase});
+    const infos = graph.types;
+
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("app_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    var ids: [3]i64 = undefined;
+    for (&ids, 0..) |*out, i| {
+        var b = try client.scope_rows_item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", if (i == 0) "i1" else if (i == 1) "i2" else "i3");
+        _ = try b.setFieldValue("app_id", @as(i64, if (i == 1) 2 else 1));
+        var e = try b.Save();
+        defer client.scope_rows_item.deinitRow(&e);
+        out.* = e.id;
+    }
+    {
+        var d = client.scope_rows_item.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{client.scope_rows_item.predicates.idEQ(.{ .int = ids[2] })});
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    const Row = struct { code: []const u8 };
+
+    // Unscoped: the mapper layer happily returns every tenant's rows — and the
+    // soft-deleted one. This is the "before" the composition has to fix.
+    {
+        var r = try zent.crud_helpers.queryRows(Row, drv.asDriver(), "SELECT code FROM scope_rows_item", &.{}, allocator, struct {
+            fn f(a: std.mem.Allocator, row: zent.sql_driver.Row) !Row {
+                return .{ .code = try a.dupe(u8, row.getText(0) orelse "") };
+            }
+        }.f);
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 3), r.items.len);
+    }
+
+    // Scoped: same helper, same statement, with the fragment spliced in.
+    {
+        var scope = try zent.scope.forClient(infos, "scope_rows_item", &client.scope_rows_item, .{});
+        defer scope.deinit();
+        const stmt = try zent.scope.withClause(scope, allocator, "SELECT code FROM scope_rows_item", false);
+        defer allocator.free(stmt);
+
+        var r = try zent.crud_helpers.queryRows(Row, drv.asDriver(), stmt, scope.args, allocator, struct {
+            fn f(a: std.mem.Allocator, row: zent.sql_driver.Row) !Row {
+                return .{ .code = try a.dupe(u8, row.getText(0) orelse "") };
+            }
+        }.f);
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 1), r.items.len);
+        try testing.expectEqualStrings("i1", r.items[0].code);
+    }
+}
+
 test "SQLite: Update edge writes maintain M2M and O2M associations" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");

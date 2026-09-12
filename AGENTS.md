@@ -6,7 +6,7 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.40.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.41.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
@@ -90,7 +90,10 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - **Raw SQL is unscoped unless it goes through `zent.scope`.** The builders are
   where privacy and interceptors run, so a hand-written statement has to ask
   for the fragment (`forClient` + `withClause`). Any new raw-SQL helper must
-  route through `appendTargetScopePreds`, not re-implement the chain.
+  route through `appendTargetScopePreds`, not re-implement the chain — or, if it
+  cannot (a statement may join several tables), say loudly that it is a
+  pass-through and document the `zent.scope` composition. `crud_helpers.queryRows`
+  is that case; `BEST_PRACTICES` §5 has the full path table.
 - **Positional row scans are column-count guarded.** `scanRow*` rejects a
   result set narrower than the struct with `error.ColumnCountMismatch`; the
   drivers do not all bounds-check. Keep that check when adding a scanner.

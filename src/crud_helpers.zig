@@ -168,6 +168,23 @@ pub fn freeOwnedStrings(allocator: std.mem.Allocator, comptime T: type, val: T) 
 ///     } }.f);
 /// defer r.deinit();
 /// ```
+///
+/// **This helper applies no scope.** `sql` is executed as written: no
+/// soft-delete filter, no privacy policy, no interceptor. It cannot apply one
+/// on your behalf either — a statement may join several tables, and only the
+/// caller knows which of them the rows are about. Build the scope yourself and
+/// splice it in, so a raw query cannot quietly read another tenant's rows:
+///
+/// ```zig
+/// var scope = try zent.scope.forClient(infos, "product", &client.product, .{ .alias = "p" });
+/// defer scope.deinit();
+/// const stmt = try zent.scope.withClause(scope, alloc, "SELECT p.id, p.name FROM product p", false);
+/// defer alloc.free(stmt);
+/// const r = try zent.crud_helpers.queryRows(ProductRow, driver, stmt, scope.args, alloc, map);
+/// ```
+///
+/// `zent.scope` also covers `driver.query` calls made directly; see
+/// `BEST_PRACTICES.md` §5 for the list of raw paths and what each one needs.
 pub fn queryRows(
     comptime T: type,
     driver: anytype,

@@ -302,7 +302,25 @@ while (rows.next()) |row| {
 
 **Collect rows generically** with `crud_helpers.queryRows(T, driver, sql, args,
 alloc, mapRow)` — it returns an owned `Rows(T)` that frees strings + slice in
-one `deinit()`.
+one `deinit()`. It runs the statement **as written**, so pair it with
+`zent.scope` (below) exactly like a bare `driver.query` call.
+
+### Which raw paths need scoping
+
+Every path here executes SQL that you wrote; none of them can apply the read
+contract on your behalf. The scope fragment comes from `zent.scope`, and you
+splice it in.
+
+| Path | Scoped by default? | What to do |
+|---|---|---|
+| `driver.query` / `driver.exec` | no | `zent.scope` + `withClause` |
+| `crud_helpers.queryRows` | no | same (it is a mapper over `driver.query`) |
+| `driver.queryCtx` / `execCtx` | no | same — the context carries a deadline only |
+| `sql.Explain` (`explainSql`) | n/a | diagnostic only: it wraps the statement in `EXPLAIN` and never executes it |
+| `QueryBuilder` / `QueryEdge` / `WithEdge` | **yes** | nothing to do |
+| `crud_helpers` entity helpers (`first`/`all`/…) | **yes** | they go through a builder |
+| `entql` (`Parse`) | **yes** | it lowers to builder predicates |
+| `PreparedCache` | n/a | keyed on the final SQL text, byte-compared — two tenants produce two entries, never a shared statement |
 
 ### Scoping raw SQL (`zent.scope`)
 

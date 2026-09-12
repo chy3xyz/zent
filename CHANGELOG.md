@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Docs
+- **Which raw paths are scoped, and which are not.** `crud_helpers.queryRows`
+  is a mapper over `driver.query` and runs your statement as written — the same
+  bypass class as the raw path `zent.scope` was added for, one layer up in the
+  library's own convenience API. Its doc now says so and shows the composition,
+  `BEST_PRACTICES` §5 gained a table of every raw path with what each needs,
+  and an integration test performs the composition end to end (unscoped
+  statement → 3 tenants' rows, scoped → 1) so the claim is checkable rather
+  than asserted. Two paths were audited and found already safe: `PreparedCache`
+  keys on the final SQL text with a byte comparison (per-tenant statements can
+  never be shared), and `explainSql` only wraps a statement in `EXPLAIN` —
+  `Format` has no `ANALYZE`, so it never executes one.
+
 ## [0.40.0] - 2026-09-12
 
 ### Added
