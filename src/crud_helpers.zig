@@ -157,8 +157,9 @@ pub fn freeOwnedStrings(allocator: std.mem.Allocator, comptime T: type, val: T) 
 }
 
 /// Run a raw driver query and collect the rows into an owned `Rows(T)` slice.
-/// `mapRow(allocator, row)` returns one `T` per result row and MAY return an
-/// error union (`!T`). Contract: every string field of the returned `T` must
+/// `mapRow(allocator, row)` returns one `T` per result row and **must** return
+/// an error union (`!T`) — the result is `try`-ed, so a plain `T` is a compile
+/// error. (The doc used to say "MAY", which never matched the code.) Contract: every string field of the returned `T` must
 /// be allocated with the passed `allocator` (dupe borrowed row text) so
 /// `Rows(T).deinit()` can free it exactly once. Example:
 /// ```zig
@@ -1553,6 +1554,232 @@ test "crud_helpers: updateWithVersion optimistic locking and batchSaveOrUpdate" 
     const res = try batchSaveOrUpdate(client.document, batch_items, "doc_code");
     try std.testing.expectEqual(@as(usize, 1), res.created_count);
     try std.testing.expectEqual(@as(usize, 1), res.updated_count);
+}
+
+test "setFieldValue accepts the documented value shapes" {
+    // The accepted set was undocumented and only partly exercised: no test in
+    // `zig build test` ever set a float field (only an example compiled one),
+    // and nothing set a JSON field through the update path. Both are pinned
+    // here, together with the create/update asymmetry that turned out to be an
+    // accident — update rejected `std.json.Value` while create accepted it.
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Payload = struct { kind: []const u8 };
+    const ShapeRow = Schema("ShapeRow", .{
+        // No explicit `id`: the graph injects the autoincrement primary key,
+        // and declaring one by hand would make it a plain NOT NULL column.
+        .fields = &.{
+            field.Bool("flag"),
+            field.Int("count"),
+            field.Float("price"),
+            field.String("name"),
+            field.Enum("status", &.{ "active", "archived" }),
+            field.JSON("payload", Payload),
+            field.JSONValue("raw"),
+            field.Int("maybe").Optional(),
+        },
+    });
+    const info = comptime fromSchema(ShapeRow);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    var client = client_mod.makeClient(infos, allocator, drv.asDriver());
+
+    var created_id: i64 = 0;
+    {
+        var b = try client.shape_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("flag", true);
+        _ = try b.setFieldValue("count", 7); // comptime_int → Int
+        _ = try b.setFieldValue("price", 19.5); // comptime_float → Float
+        _ = try b.setFieldValue("name", "literal"); // *const [N:0]u8
+        _ = try b.setFieldValue("status", "active"); // enum tag string
+        _ = try b.setFieldValue("payload", Payload{ .kind = "struct" }); // JSON struct
+        _ = try b.setFieldValue("raw", std.json.Value{ .integer = 1 }); // JSONValue → std.json.Value
+        _ = try b.setFieldValue("maybe", @as(?i64, null)); // NULL
+        var e = try b.Save();
+        created_id = e.id;
+        client.shape_row.deinitRow(&e);
+    }
+    {
+        // The rows the docs promise, read back.
+        var q = client.shape_row.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer client.shape_row.deinitRows(&rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+        try std.testing.expect(rows.items[0].flag);
+        try std.testing.expectEqual(@as(i64, 7), rows.items[0].count);
+        try std.testing.expectEqual(@as(f64, 19.5), rows.items[0].price);
+        try std.testing.expectEqualStrings("literal", rows.items[0].name);
+        try std.testing.expectEqualStrings("active", rows.items[0].status);
+        try std.testing.expectEqual(@as(?i64, null), rows.items[0].maybe);
+    }
+
+    // Update path: float, a JSON struct, and — the asymmetry that was fixed —
+    // `std.json.Value`, which only the create path used to accept.
+    {
+        var u = client.shape_row.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("price", @as(f64, 20.25)); // f64 (not comptime)
+        _ = try u.setFieldValue("payload", Payload{ .kind = "updated" });
+        _ = try u.Where(.{client.shape_row.predicates.idEQ(.{ .int = created_id })});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    // A `field.JSONValue` column takes the untyped union — this is the pair the
+    // create and update builders used to disagree about (update rejected it).
+    {
+        var u = client.shape_row.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("raw", std.json.Value{ .string = "untyped" });
+        _ = try u.Where(.{client.shape_row.predicates.idEQ(.{ .int = created_id })});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var q = client.shape_row.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer client.shape_row.deinitRows(&rows);
+        try std.testing.expectEqual(@as(f64, 20.25), rows.items[0].price);
+    }
+
+    // A slice value for a string field, and the create path's `std.json.Value`
+    // (which the docs promise), so both builders agree on the JSON column.
+    {
+        const name_slice: []const u8 = "from-slice";
+        var b = try client.shape_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("flag", false);
+        _ = try b.setFieldValue("count", @as(i64, 1));
+        _ = try b.setFieldValue("price", @as(f64, 1.0));
+        _ = try b.setFieldValue("name", name_slice);
+        _ = try b.setFieldValue("status", "archived"); // string literal → Enum
+        _ = try b.setFieldValue("payload", Payload{ .kind = "created-untyped" });
+        _ = try b.setFieldValue("raw", std.json.Value{ .integer = 3 });
+        var e = try b.Save();
+        client.shape_row.deinitRow(&e);
+    }
+}
+
+test "Where accepts every documented shape, on every builder" {
+    // The contract used to live in five copies of the same switch, and the
+    // copies had already drifted from the compile error they were meant to
+    // enforce (it listed four shapes and omitted all the pointer forms). This
+    // test pins all seven shapes — including the pointer forms, which had no
+    // coverage anywhere — so narrowing `Where` fails here instead of in a
+    // consumer's build.
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const sql_mod = @import("sql/builder.zig");
+
+    const ShapeItem = Schema("ShapeItem", .{
+        .fields = &.{ field.Int("id"), field.Int("n") },
+    });
+    const info = comptime fromSchema(ShapeItem);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    var client = client_mod.makeClient(infos, allocator, drv.asDriver());
+    const preds = client.shape_item.predicates;
+
+    // Each closure gets a fresh builder and applies one shape. `expect` is the
+    // number of predicates the builder must end up holding.
+    const Case = struct { name: []const u8, apply: *const fn (*@TypeOf(client.shape_item.Query())) anyerror!void, expect: usize };
+    _ = Case;
+
+    // 1. a single predicate (union value)
+    {
+        var q = client.shape_item.Query();
+        defer q.deinit();
+        _ = try q.Where(preds.idEQ(.{ .int = 1 }));
+        try std.testing.expectEqual(@as(usize, 1), q.predicates.items.len);
+    }
+    // 2. a pointer to one
+    {
+        var q = client.shape_item.Query();
+        defer q.deinit();
+        const p = preds.idEQ(.{ .int = 1 });
+        _ = try q.Where(&p);
+        try std.testing.expectEqual(@as(usize, 1), q.predicates.items.len);
+    }
+    // 3. a tuple value
+    {
+        var q = client.shape_item.Query();
+        defer q.deinit();
+        _ = try q.Where(.{ preds.idEQ(.{ .int = 1 }), preds.nEQ(.{ .int = 2 }) });
+        try std.testing.expectEqual(@as(usize, 2), q.predicates.items.len);
+    }
+    // 4. a pointer to a tuple — the `&.{...}` literal form
+    {
+        var q = client.shape_item.Query();
+        defer q.deinit();
+        _ = try q.Where(&.{ preds.idEQ(.{ .int = 1 }), preds.nEQ(.{ .int = 2 }) });
+        try std.testing.expectEqual(@as(usize, 2), q.predicates.items.len);
+    }
+    // 5. an array value
+    {
+        var q = client.shape_item.Query();
+        defer q.deinit();
+        const arr = [_]sql_mod.Predicate{ preds.idEQ(.{ .int = 1 }), preds.nEQ(.{ .int = 2 }) };
+        _ = try q.Where(arr);
+        try std.testing.expectEqual(@as(usize, 2), q.predicates.items.len);
+    }
+    // 6. a pointer to an array
+    {
+        var q = client.shape_item.Query();
+        defer q.deinit();
+        const arr = [_]sql_mod.Predicate{ preds.idEQ(.{ .int = 1 }), preds.nEQ(.{ .int = 2 }) };
+        _ = try q.Where(&arr);
+        try std.testing.expectEqual(@as(usize, 2), q.predicates.items.len);
+    }
+    // 7. a slice
+    {
+        var q = client.shape_item.Query();
+        defer q.deinit();
+        const slice = [_]sql_mod.Predicate{ preds.idEQ(.{ .int = 1 }), preds.nEQ(.{ .int = 2 }) };
+        _ = try q.Where(slice[0..]);
+        try std.testing.expectEqual(@as(usize, 2), q.predicates.items.len);
+    }
+    // (A pointer *to* a slice is deliberately not a shape: `for` over the
+    // pointer is not indexable, so it has never compiled — see the table on
+    // `sql.appendPredicates`.)
+
+    // The same shapes must reach the mutation builders, which each delegate to
+    // the same helper: a narrowing there would be invisible from a query test.
+    {
+        var u = client.shape_item.Update();
+        defer u.deinit();
+        _ = try u.Where(&.{preds.idEQ(.{ .int = 1 })});
+        _ = try u.Where(preds.nEQ(.{ .int = 2 }));
+        try std.testing.expectEqual(@as(usize, 2), u.predicates.items.len);
+    }
+    {
+        var d = client.shape_item.Delete();
+        defer d.deinit();
+        _ = try d.Where(&.{preds.idEQ(.{ .int = 1 })});
+        _ = try d.Where(preds.nEQ(.{ .int = 2 }));
+        try std.testing.expectEqual(@as(usize, 2), d.predicates.items.len);
+    }
+    {
+        var bd = try client.shape_item.BulkDelete();
+        defer bd.deinit();
+        _ = try bd.Where(&.{preds.idEQ(.{ .int = 1 })});
+        _ = try bd.Where(preds.nEQ(.{ .int = 2 }));
+        try std.testing.expectEqual(@as(usize, 2), bd.b.groups.items[0].items.len);
+    }
 }
 
 test "Where and crud_helpers support dynamic []sql.Predicate slices and single predicates" {

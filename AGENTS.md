@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.41.1** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.42.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (323 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (325 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -35,6 +35,14 @@ fmt → build → unit tests → version consistency → integration tests
 - Match the surrounding code's style and naming. Run `zig fmt` before committing.
 - Public API is fluent/chainable like ent (e.g. `client.user.Create()` → `setFieldValue("name", "foo")` → `Save()`; builder methods return `!*Self`, so chain each step with `try`).
 - Use `comptime` for schema introspection; no external code generation.
+- **An `anytype` parameter is an API contract, and its accepted shapes are part
+  of it.** State them in the doc comment and pin every shape in a test, because
+  a body that happens to work for value/pointer/tuple/slice variants is easy to
+  narrow by accident and only a test notices. v0.40.0 did exactly that to
+  `crud_helpers.deinitRows` and broke every consumer passing `&rows`. The
+  worked examples: `sql.appendPredicates` (seven shapes, one implementation,
+  one table, one test), `codegen.entity.deinitEntityList`'s callers, and
+  `setFieldValue`'s value-shape table.
 - Drivers: SQLite is first-class, PostgreSQL and MySQL are present but less
   exercised; the library never forces C linkage — consumers link their own
   sqlite/pg/mysql (see README "Consumer wiring").

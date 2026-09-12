@@ -281,6 +281,22 @@ test "scope.forTable renders the tenant and soft-delete contract" {
         try testing.expectEqualStrings("SELECT * FROM scope_order", buf.items);
     }
 
+    // `writeClause` works with any sink that has `writeAll([]const u8)` — the
+    // doc claims `std.Io.Writer` qualifies, so exercise a real one instead of
+    // only the test double.
+    {
+        var frag = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{});
+        defer frag.deinit();
+
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeClause(frag, &w, false);
+        try testing.expectEqualStrings(
+            " WHERE (\"deleted_at\" IS NULL AND \"app_id\" = ?)",
+            w.buffered(),
+        );
+    }
+
     // `writeClause` picks WHERE or AND, so the call site does not have to.
     {
         var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{});

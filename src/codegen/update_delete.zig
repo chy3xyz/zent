@@ -401,6 +401,27 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
         }
 
         /// Set a field value with compile-time name and type checking.
+        ///
+        /// Accepted, per the *field's* declared type (a wrong pair is a
+        /// `@compileError` naming both types):
+        ///
+        /// | Field type | Accepted values |
+        /// |---|---|
+        /// | `Bool` | `bool` |
+        /// | `Int` | `i64`, `comptime_int` |
+        /// | `Float` | `f64`, `comptime_float` |
+        /// | `String`/`Text`/`UUID`/`Decimal`/`Bytes` | `[]const u8` or a string literal. **Not** a `[N]u8` array value, even though `canSetField` accepts the type — `toSqlValue` cannot turn one into a slice and the attempt is a compile error (recorded as Z18) |
+        /// | `Enum` | `[]const u8` or a string literal. The field's Zig type is `[]const u8`, so a Zig `enum` *value* is not accepted, and the tag text is **not** checked against the declared tag list — pass a string that is one of them |
+        /// | `JSON` (via `field.JSON(name, T)`) | a value of `T`: a struct is serialised. A `std.json.Value` field (`field.JSONValue`) takes a `std.json.Value`. The two are not interchangeable — `canSetField` compares against `T` |
+        /// | `Optional(T)` | any accepted value for `T`, or `@as(?T, null)` for NULL |
+        ///
+        /// Not accepted: a bare `null` literal (write `@as(?T, null)`), an
+        /// integer type other than `i64`/`comptime_int`, a non-`u8` slice or
+        /// array, a Zig `enum` value for an `Enum` field (pass the tag string),
+        /// and a plain `struct` for a non-JSON field. The contract also
+        /// lives in `canSetField`; the test `setFieldValue accepts the
+        /// documented value shapes` exercises every row, so narrowing this
+        /// fails there rather than in a consumer's build.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
@@ -412,17 +433,13 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
                         }
-                        if (f.field_type == .enum_ and f.enum_values.len > 0) {
-                            const actual_info = @typeInfo(Actual);
-                            if (actual_info == .array and actual_info.array.child == u8) {
-                                var valid = false;
-                                for (f.enum_values) |ev| {
-                                    if (std.mem.eql(u8, ev, value)) valid = true;
-                                }
-                                if (!valid) @compileError("Invalid enum value for field '" ++ field_name ++ "': '" ++ value ++ "'");
-                            }
-                        }
-                        if (f.field_type == .json and @typeInfo(Actual) == .@"struct") {
+                        // `std.json.Value` is accepted wherever a JSON struct is:
+                        // the create builders always took it, and update/bulk
+                        // rejecting it was an accident of the copy, not a
+                        // decision (both paths just serialise the value).
+                        if (f.field_type == .json and
+                            (@typeInfo(Actual) == .@"struct" or Actual == std.json.Value))
+                        {
                             needs_json = true;
                         }
                         if (f.immutable) @compileError("Field is immutable: " ++ field_name);
@@ -443,42 +460,14 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
         }
 
         /// Add predicates for WHERE clause.
+        /// Add predicates to the WHERE clause.
+        ///
+        /// Accepts a single `sql.Predicate`, a tuple/array/slice of them, or a
+        /// pointer to any of those (`&.{ … }` is the common literal form). The
+        /// full shape table lives on `sql.appendPredicates`, which is the one
+        /// implementation all builders delegate to.
         pub fn Where(self: *Self, predicates: anytype) !*Self {
-            const PredT = @TypeOf(predicates);
-            const pred_info = @typeInfo(PredT);
-            switch (pred_info) {
-                .@"union" => {
-                    try self.predicates.append(predicates);
-                },
-                .pointer => |ptr| {
-                    if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
-                        try self.predicates.append(predicates.*);
-                    } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
-                        inline for (predicates.*) |p| {
-                            try self.predicates.append(p);
-                        }
-                    } else {
-                        for (predicates) |p| {
-                            try self.predicates.append(p);
-                        }
-                    }
-                },
-                .array => {
-                    for (predicates) |p| {
-                        try self.predicates.append(p);
-                    }
-                },
-                .@"struct" => |s| {
-                    if (s.is_tuple) {
-                        inline for (predicates) |p| {
-                            try self.predicates.append(p);
-                        }
-                    } else {
-                        @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate");
-                    }
-                },
-                else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
-            }
+            try sql.appendPredicates(&self.predicates, predicates, "UpdateBuilder.Where");
             return self;
         }
 
@@ -939,43 +928,14 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             return self;
         }
 
-        /// Add predicates for WHERE clause.
+        /// Add predicates to the WHERE clause.
+        ///
+        /// Accepts a single `sql.Predicate`, a tuple/array/slice of them, or a
+        /// pointer to any of those (`&.{ … }` is the common literal form). The
+        /// full shape table lives on `sql.appendPredicates`, which is the one
+        /// implementation all builders delegate to.
         pub fn Where(self: *Self, predicates: anytype) !*Self {
-            const PredT = @TypeOf(predicates);
-            const pred_info = @typeInfo(PredT);
-            switch (pred_info) {
-                .@"union" => {
-                    try self.predicates.append(predicates);
-                },
-                .pointer => |ptr| {
-                    if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
-                        try self.predicates.append(predicates.*);
-                    } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
-                        inline for (predicates.*) |p| {
-                            try self.predicates.append(p);
-                        }
-                    } else {
-                        for (predicates) |p| {
-                            try self.predicates.append(p);
-                        }
-                    }
-                },
-                .array => {
-                    for (predicates) |p| {
-                        try self.predicates.append(p);
-                    }
-                },
-                .@"struct" => |s| {
-                    if (s.is_tuple) {
-                        inline for (predicates) |p| {
-                            try self.predicates.append(p);
-                        }
-                    } else {
-                        @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate");
-                    }
-                },
-                else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
-            }
+            try sql.appendPredicates(&self.predicates, predicates, "DeleteBuilder.Where");
             return self;
         }
 
@@ -1330,6 +1290,27 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         }
 
         /// Set a field value with compile-time name and type checking.
+        ///
+        /// Accepted, per the *field's* declared type (a wrong pair is a
+        /// `@compileError` naming both types):
+        ///
+        /// | Field type | Accepted values |
+        /// |---|---|
+        /// | `Bool` | `bool` |
+        /// | `Int` | `i64`, `comptime_int` |
+        /// | `Float` | `f64`, `comptime_float` |
+        /// | `String`/`Text`/`UUID`/`Decimal`/`Bytes` | `[]const u8` or a string literal. **Not** a `[N]u8` array value, even though `canSetField` accepts the type — `toSqlValue` cannot turn one into a slice and the attempt is a compile error (recorded as Z18) |
+        /// | `Enum` | `[]const u8` or a string literal. The field's Zig type is `[]const u8`, so a Zig `enum` *value* is not accepted, and the tag text is **not** checked against the declared tag list — pass a string that is one of them |
+        /// | `JSON` (via `field.JSON(name, T)`) | a value of `T`: a struct is serialised. A `std.json.Value` field (`field.JSONValue`) takes a `std.json.Value`. The two are not interchangeable — `canSetField` compares against `T` |
+        /// | `Optional(T)` | any accepted value for `T`, or `@as(?T, null)` for NULL |
+        ///
+        /// Not accepted: a bare `null` literal (write `@as(?T, null)`), an
+        /// integer type other than `i64`/`comptime_int`, a non-`u8` slice or
+        /// array, a Zig `enum` value for an `Enum` field (pass the tag string),
+        /// and a plain `struct` for a non-JSON field. The contract also
+        /// lives in `canSetField`; the test `setFieldValue accepts the
+        /// documented value shapes` exercises every row, so narrowing this
+        /// fails there rather than in a consumer's build.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
@@ -1341,17 +1322,13 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
                         }
-                        if (f.field_type == .enum_ and f.enum_values.len > 0) {
-                            const actual_info = @typeInfo(Actual);
-                            if (actual_info == .array and actual_info.array.child == u8) {
-                                var valid = false;
-                                for (f.enum_values) |ev| {
-                                    if (std.mem.eql(u8, ev, value)) valid = true;
-                                }
-                                if (!valid) @compileError("Invalid enum value for field '" ++ field_name ++ "': '" ++ value ++ "'");
-                            }
-                        }
-                        if (f.field_type == .json and @typeInfo(Actual) == .@"struct") {
+                        // `std.json.Value` is accepted wherever a JSON struct is:
+                        // the create builders always took it, and update/bulk
+                        // rejecting it was an accident of the copy, not a
+                        // decision (both paths just serialise the value).
+                        if (f.field_type == .json and
+                            (@typeInfo(Actual) == .@"struct" or Actual == std.json.Value))
+                        {
                             needs_json = true;
                         }
                         if (f.immutable) @compileError("Field is immutable: " ++ field_name);
@@ -1527,42 +1504,13 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
 
         /// Add predicates for the current row's WHERE clause.
         /// Groups are ORed together in the final DELETE.
+        ///
+        /// Accepts the same shapes as the other builders (see
+        /// `sql.appendPredicates`); each predicate lands in the current group,
+        /// because the groups are ORed.
         pub fn Where(self: *Self, predicates: anytype) !*Self {
-            const PredT = @TypeOf(predicates);
-            const pred_info = @typeInfo(PredT);
-            switch (pred_info) {
-                .@"union" => {
-                    _ = try self.b.where(predicates);
-                },
-                .pointer => |ptr| {
-                    if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
-                        _ = try self.b.where(predicates.*);
-                    } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
-                        inline for (predicates.*) |p| {
-                            _ = try self.b.where(p);
-                        }
-                    } else {
-                        for (predicates) |p| {
-                            _ = try self.b.where(p);
-                        }
-                    }
-                },
-                .array => {
-                    for (predicates) |p| {
-                        _ = try self.b.where(p);
-                    }
-                },
-                .@"struct" => |s| {
-                    if (s.is_tuple) {
-                        inline for (predicates) |p| {
-                            _ = try self.b.where(p);
-                        }
-                    } else {
-                        @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate");
-                    }
-                },
-                else => @compileError("Where expects a predicate, tuple, array, or slice of sql.Predicate"),
-            }
+            const group = &self.b.groups.items[self.b.groups.items.len - 1];
+            try sql.appendPredicates(group, predicates, "BulkDeleteBuilder.Where");
             return self;
         }
 

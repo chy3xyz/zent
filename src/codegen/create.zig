@@ -102,6 +102,27 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         /// Set a field value with compile-time name and type checking.
+        ///
+        /// Accepted, per the *field's* declared type (a wrong pair is a
+        /// `@compileError` naming both types):
+        ///
+        /// | Field type | Accepted values |
+        /// |---|---|
+        /// | `Bool` | `bool` |
+        /// | `Int` | `i64`, `comptime_int` |
+        /// | `Float` | `f64`, `comptime_float` |
+        /// | `String`/`Text`/`UUID`/`Decimal`/`Bytes` | `[]const u8` or a string literal. **Not** a `[N]u8` array value, even though `canSetField` accepts the type — `toSqlValue` cannot turn one into a slice and the attempt is a compile error (recorded as Z18) |
+        /// | `Enum` | `[]const u8` or a string literal. The field's Zig type is `[]const u8`, so a Zig `enum` *value* is not accepted, and the tag text is **not** checked against the declared tag list — pass a string that is one of them |
+        /// | `JSON` (via `field.JSON(name, T)`) | a value of `T`: a struct is serialised. A `std.json.Value` field (`field.JSONValue`) takes a `std.json.Value`. The two are not interchangeable — `canSetField` compares against `T` |
+        /// | `Optional(T)` | any accepted value for `T`, or `@as(?T, null)` for NULL |
+        ///
+        /// Not accepted: a bare `null` literal (write `@as(?T, null)`), an
+        /// integer type other than `i64`/`comptime_int`, a non-`u8` slice or
+        /// array, a Zig `enum` value for an `Enum` field (pass the tag string),
+        /// and a plain `struct` for a non-JSON field. The contract also
+        /// lives in `canSetField`; the test `setFieldValue accepts the
+        /// documented value shapes` exercises every row, so narrowing this
+        /// fails there rather than in a consumer's build.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
@@ -112,16 +133,6 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                         const Actual = @TypeOf(value);
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
-                        }
-                        if (f.field_type == .enum_ and f.enum_values.len > 0) {
-                            const actual_info = @typeInfo(Actual);
-                            if (actual_info == .array and actual_info.array.child == u8) {
-                                var valid = false;
-                                for (f.enum_values) |ev| {
-                                    if (std.mem.eql(u8, ev, value)) valid = true;
-                                }
-                                if (!valid) @compileError("Invalid enum value for field '" ++ field_name ++ "': '" ++ value ++ "'");
-                            }
                         }
                         if (f.field_type == .json and
                             (@typeInfo(Actual) == .@"struct" or Actual == std.json.Value))
@@ -1037,6 +1048,28 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             return self;
         }
 
+        /// Set a field value with compile-time name and type checking.
+        ///
+        /// Accepted, per the *field's* declared type (a wrong pair is a
+        /// `@compileError` naming both types):
+        ///
+        /// | Field type | Accepted values |
+        /// |---|---|
+        /// | `Bool` | `bool` |
+        /// | `Int` | `i64`, `comptime_int` |
+        /// | `Float` | `f64`, `comptime_float` |
+        /// | `String`/`Text`/`UUID`/`Decimal`/`Bytes` | `[]const u8` or a string literal. **Not** a `[N]u8` array value, even though `canSetField` accepts the type — `toSqlValue` cannot turn one into a slice and the attempt is a compile error (recorded as Z18) |
+        /// | `Enum` | `[]const u8` or a string literal. The field's Zig type is `[]const u8`, so a Zig `enum` *value* is not accepted, and the tag text is **not** checked against the declared tag list — pass a string that is one of them |
+        /// | `JSON` (via `field.JSON(name, T)`) | a value of `T`: a struct is serialised. A `std.json.Value` field (`field.JSONValue`) takes a `std.json.Value`. The two are not interchangeable — `canSetField` compares against `T` |
+        /// | `Optional(T)` | any accepted value for `T`, or `@as(?T, null)` for NULL |
+        ///
+        /// Not accepted: a bare `null` literal (write `@as(?T, null)`), an
+        /// integer type other than `i64`/`comptime_int`, a non-`u8` slice or
+        /// array, a Zig `enum` value for an `Enum` field (pass the tag string),
+        /// and a plain `struct` for a non-JSON field. The contract also
+        /// lives in `canSetField`; the test `setFieldValue accepts the
+        /// documented value shapes` exercises every row, so narrowing this
+        /// fails there rather than in a consumer's build.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
@@ -1047,16 +1080,6 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                         const Actual = @TypeOf(value);
                         if (!canSetField(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
-                        }
-                        if (f.field_type == .enum_ and f.enum_values.len > 0) {
-                            const actual_info = @typeInfo(Actual);
-                            if (actual_info == .array and actual_info.array.child == u8) {
-                                var valid = false;
-                                for (f.enum_values) |ev| {
-                                    if (std.mem.eql(u8, ev, value)) valid = true;
-                                }
-                                if (!valid) @compileError("Invalid enum value for field '" ++ field_name ++ "': '" ++ value ++ "'");
-                            }
                         }
                         if (f.field_type == .json and
                             (@typeInfo(Actual) == .@"struct" or Actual == std.json.Value))

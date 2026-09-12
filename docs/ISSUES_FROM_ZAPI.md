@@ -179,6 +179,19 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 ---
 
+### Z18 — `setFieldValue`'s accepted set is written in three places and they disagree
+
+| | |
+|--|--|
+| **Problem** | The set of Zig values a field accepts is expressed by `canSetField` (the type check), `toSqlValue` (the conversion), and now the doc table. Two of them do not agree: `canSetField` accepts a `[N]u8` **array value** for a string-ish field, but `toSqlValue` cannot turn one into a slice (`array literal requires address-of operator (&) to coerce to slice type '[]const u8'`), so that argument type is a compile error *after* passing the check — with a message that names neither the field nor the function. The same shape of drift produced the dead enum-tag validation removed in the same release: it compared the runtime `value` inside a `comptime` block, so it could never fire, and it turned a `[N]u8` argument into `unable to resolve comptime value`. |
+| **Evidence** | `src/codegen/create.zig` (`canSetField` — the `switch (@typeInfo(Actual))` with an `.array` branch; `toSqlValue` — the matching `.array` branch that cannot compile), duplicated in `src/codegen/update_delete.zig`. Reproduce with `setFieldValue("name", "abcd".*)`. |
+| **Impact** | Low blast radius, high confusion: the accepted set is documented from three directions, so a caller who reads any one of them may be wrong. This is the same disease as the five `Where` copies (fixed in v0.42.0) and the eight interceptor sinks. |
+| **Proposal** | **Open.** Pick one home for the contract — a single `fieldAccepts(Expected, Actual)` used by both the check and the conversion — or drop the `.array` branch from `canSetField` so the failure lands at the type check with a message naming the field. The doc table added in v0.42.0 describes what actually works today; it should be generated from, not parallel to, the code. |
+| **Acceptance** | One place decides; the doc table and the compiler cannot disagree; a `[N]u8` argument either works end to end or is rejected by name. |
+| **Status** | **Open** (found while writing the value-shape table; deliberately not fixed in that release to keep the blast radius at zero). |
+
+---
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -200,5 +213,6 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z15 | Edge writes on `From` edges | P2 | **Open** — deferred, design-sized |
 | Z16 | Multi-graph first-class | P2 | **Stage 1 done** v0.39.0 (actionable error); stages 2/3 **Open** per ROI |
 | Z17 | Entity release shape | P2 | **Fixed** v0.40.0 — `deinitRow`/`deinitRows`/`deinitEdgeRows` |
+| Z18 | `setFieldValue` accepted set drifts | P2 | **Open** — `canSetField` vs `toSqlValue` disagree |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.

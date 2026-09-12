@@ -3297,6 +3297,18 @@ test "SQLite: zent.scope scopes a raw SELECT that bypasses the builders" {
         try testing.expect(saw_o1);
     }
 
+    // `forClient` accepts the client by value as well as by pointer (its
+    // parameter is `anytype`, and only the pointer form had coverage) — the
+    // statement it produces must be identical.
+    {
+        var by_ptr = try zent.scope.forClient(infos, "scope_raw_order", &client.scope_raw_order, .{});
+        defer by_ptr.deinit();
+        var by_value = try zent.scope.forClient(infos, "scope_raw_order", client.scope_raw_order, .{});
+        defer by_value.deinit();
+        try testing.expectEqualStrings(by_ptr.sql, by_value.sql);
+        try testing.expect(by_ptr.sql.len > 0);
+    }
+
     // Tenant 2 sees its own row, which is what makes this a scope rather than
     // a hardcoded filter.
     tenant = 2;

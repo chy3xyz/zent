@@ -559,6 +559,57 @@ pub fn appendEqUnlessPresent(list: *std.array_list.Managed(Predicate), column: [
     try list.append(EQ(column, value));
 }
 
+/// Append `predicates` to `list`, accepting **every** shape a call site may
+/// reasonably pass. This is the one place that defines what `Where` accepts,
+/// because the previous five copies of this switch had already drifted from the
+/// contract they were meant to enforce (the compile error listed four shapes
+/// and omitted all the pointer forms).
+///
+/// Accepted, where `P` is `sql.Predicate`:
+///
+/// | Shape | Example |
+/// |---|---|
+/// | a predicate | `preds.idEQ(.{ .int = 1 })` |
+/// | a pointer to one | `&preds.idEQ(…)` (or any `*P` / `*const P`) |
+/// | a tuple | `.{ preds.aEQ(…), preds.bEQ(…) }` |
+/// | a pointer to a tuple | `&.{ … }` |
+/// | an array | `[2]P{ … }` |
+/// | a pointer to an array | `&[_]P{ … }` / `&.{ … }` |
+/// | a slice | `[]const P` or `&slice_literal` |
+///
+/// Note the boundary: a pointer *to* a slice (`&some_slice`) is **not**
+/// accepted — it never was, in any of the five copies — because a `for` over
+/// the pointer is not indexable. Pass the slice itself. This list is
+/// deliberately narrower than "every shape that type-checks somewhere": it is
+/// what the test in this file exercises, so the two cannot disagree.
+///
+/// Anything else is a compile error naming the function that asked for it
+/// (`where` is passed in so the message points at the caller's API, not at
+/// this helper).
+pub fn appendPredicates(list: *std.array_list.Managed(Predicate), predicates: anytype, comptime where: []const u8) !void {
+    switch (@typeInfo(@TypeOf(predicates))) {
+        .@"union" => try list.append(predicates),
+        .pointer => |ptr| {
+            if (ptr.size == .one and @typeInfo(ptr.child) == .@"union") {
+                try list.append(predicates.*);
+            } else if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct" and @typeInfo(ptr.child).@"struct".is_tuple) {
+                inline for (predicates.*) |p| try list.append(p);
+            } else {
+                for (predicates) |p| try list.append(p);
+            }
+        },
+        .array => for (predicates) |p| try list.append(p),
+        .@"struct" => |st| {
+            if (st.is_tuple) {
+                inline for (predicates) |p| try list.append(p);
+            } else {
+                @compileError(where ++ ": expected a sql.Predicate, or a tuple/array/slice of them, by value or by pointer");
+            }
+        },
+        else => @compileError(where ++ ": expected a sql.Predicate, or a tuple/array/slice of them, by value or by pointer"),
+    }
+}
+
 /// Append `pred`, qualifying a bare column with `qualifier` when the predicate
 /// has one. Used wherever a predicate is emitted into a statement that may
 /// join another table owning the same column — an unqualified tenant column is

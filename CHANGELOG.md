@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **The `anytype` contract is now written down and tested, starting with the
+  two most-used parameters.** `Where(predicates)` existed as five copies of the
+  same `switch`, and the copies had already drifted from the contract they were
+  supposed to enforce: the `@compileError` listed four accepted shapes and
+  omitted every pointer form, and the doc comments said nothing at all. All
+  four builders now delegate to one `sql.appendPredicates`, whose doc carries
+  the shape table and whose test exercises all seven shapes on every builder —
+  including the pointer forms, which had no coverage anywhere. A pointer *to* a
+  slice is documented as **not** a shape: `for` over the pointer is not
+  indexable, so it never compiled, and saying so is better than implying it.
+
+- **`setFieldValue`'s accepted values are documented** (the table is on the
+  builder methods) and pinned by a test that exercises every row. Writing it
+  exposed two smaller things: no test in `zig build test` had ever set a
+  **float** field (only an example compiled one), and **`std.json.Value` was
+  accepted by the create path but not by update/bulk** — an accident of the
+  copy, now consistent.
+
+### Fixed
+- **Removed an unreachable `Enum` tag validation.** It compared the runtime
+  `value` inside a `comptime` block, so it could never fire; reaching it turned
+  a `[N]u8` argument into `unable to resolve comptime value` instead of a useful
+  error. The docs now state that the tag text is passed through unvalidated
+  (recorded with the remaining `canSetField`/`toSqlValue` disagreement as Z18).
+
 ## [0.41.1] - 2026-09-12
 
 ### Fixed
