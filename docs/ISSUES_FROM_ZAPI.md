@@ -138,6 +138,32 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 ---
 
+### Z15 — Edge writes are unavailable on `From` edges
+
+| | |
+|--|--|
+| **Problem** | `UpdateBuilder.SetEdgeIDs` and `ClearEdge` reject `From` edges at compile time. An entity that owns the FK (`edge.From("owner", User)`) can only be re-pointed through `setFieldValue`, even though the two operations are the same write from the caller's point of view. |
+| **Evidence** | `src/codegen/update_delete.zig:536` (`SetEdgeIDs requires a To edge whose FK lives in the target table`), `:555` (`… a 'from' edge stores its FK on this row — use setFieldValue to detach it`). |
+| **Impact** | Not a correctness gap — `setFieldValue("owner_id", id)` works and is what the `@compileError` tells you to write. It is an API-shape inconsistency: the same intent needs a different spelling depending on which side of the edge holds the column, and the compile error is the only place that is explained. |
+| **Proposal** | **Open.** Make `SetEdgeIDs`/`ClearEdge` accept `From` edges by writing the FK column directly on the row being updated (single-row `UPDATE`, no subquery), then decide whether `ClearEdge` should set NULL or refuse when the FK is NOT NULL. Needs a design pass: the current implementation is subquery-shaped because `To` edges detach a *target*, while a `From` edge detaches *this* row, so the generated SQL and the `rows_affected` semantics differ. |
+| **Acceptance** | Either the operations work on `From` edges with tests per dialect, or `BEST_PRACTICES` §5e states the asymmetry as intended rather than only the compile error saying so. |
+| **Status** | **Open** (deferred; design-sized, recorded here so it is not lost). |
+
+---
+
+### Z16 — Multi-graph is documented, not first-class
+
+| | |
+|--|--|
+| **Problem** | Z3 shipped the playbook (one graph per database, `WithEdge` cannot cross graphs) but the deferred "option b" is still open: edges whose target lives in another graph are not resolved, the `Client` type is not generic over a graph set, and a cross-graph `WithEdge` fails at runtime rather than at comptime. |
+| **Evidence** | Z3 in this file (option b marked deferred); `docs/BEST_PRACTICES.md` §8a is the discipline that carries the guarantee today; `src/graph/neighbors.zig` resolves `to_table` from the *current* graph's `TypeInfo` only. |
+| **Impact** | Silent scope creep risk rather than a hard failure: correctness depends on the consumer following §8a, and the compiler cannot help. This is the one remaining place where the library asks for discipline instead of enforcing a boundary. |
+| **Proposal** | **Open.** Make the graph set part of the type (`Client(infos_a, infos_b)`), so an edge whose target is not in scope becomes a compile error, and cross-graph traversal needs an explicit join API. Larger than it looks: `EntityGen`/`ClientGen` are already comptime-recursive, so the graph set has to be threaded without blowing the comptime budget (§7a). |
+| **Acceptance** | A cross-graph `WithEdge` fails to compile with a message naming both graphs, or the docs state explicitly that runtime discipline is the contract. |
+| **Status** | **Open** (deferred; design-sized, recorded here so it is not lost). |
+
+---
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -156,5 +182,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z12 | Complex UPDATE expr | P2 | **Fixed** v0.31.0 |
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
 | Z14 | `Contains` semantics vs name | P2 | **Partially fixed** — docs+test done, naming **Open** |
+| Z15 | Edge writes on `From` edges | P2 | **Open** — deferred, design-sized |
+| Z16 | Multi-graph first-class | P2 | **Open** — deferred, design-sized |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.

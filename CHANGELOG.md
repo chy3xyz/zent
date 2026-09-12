@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING: `queryTargets` / `queryTargetsByValue` are now fail-closed, like
+  `WithEdge`.** The two bulk neighbour readers disagreed on tenant isolation:
+  `WithEdge` scoped eager-loaded targets (soft-delete → privacy →
+  interceptors), while `queryTargets`/`queryTargetsByValue`/`QueryEdge` applied
+  soft-delete only and documented the gap as a "known boundary". The target
+  read contract now lives in one place
+  (`codegen.query.appendTargetScopePreds`) and both readers call it, so the
+  posture cannot drift again. `EntityClient.QueryEdge` forwards the client's
+  `privacy_ctx`/`interceptors` and keeps its signature; the two free functions
+  gained the arguments, and the previous soft-delete-only behaviour is
+  preserved under the explicit names
+  `queryTargetsUnscoped`/`queryTargetsByValueUnscoped`. A policy-bearing target
+  now returns `error.PrivacyDenied` from a context-less traversal instead of
+  silently skipping the policy. Migration steps in `UPGRADING.md` §11.
+
+### Added
+- **NULL-tolerant row scanning.** Every scanner was strict: a NULL in a
+  non-optional field is `error.TypeMismatch`, which is the right default for
+  entity reads (a NULL in a non-nullable schema column means the row does not
+  match the schema). It is the wrong contract for ad-hoc queries and DTOs —
+  `LEFT JOIN`ed lookups, aggregate outputs, tables where an absent value is
+  ordinary — and callers were hand-rolling scanners to get the other
+  behaviour. `scanRowLenient[WithArena]`, `scanRowNamedLenient[WithArena]`,
+  `scanRowNamedLenientMapped[WithArena]` add the second contract: a NULL (or
+  an absent column, for the named variants) leaves the field at its default —
+  the declared Zig default when the field has one, else zero, `null` for
+  optionals, `.null` for `std.json.Value`. The strict scanners are untouched;
+  the named scanners now share one implementation with their lenient twins.
+
+- **Regression coverage for the JOIN-shaped eager loads.** The qualification
+  fix above shipped with only an `o2m` regression test, whose neighbour query
+  joins nothing — so it could not have caught the bug. The same scenario is
+  now covered for `m2o` (joins the source) and `m2m` (joins the junction) with
+  the tenant column on both sides, on SQLite, PostgreSQL and MySQL. Reverting
+  the qualification makes all three fail with the dialect's own ambiguity
+  error, which pins the fix end to end.
+
 ### Fixed
 - **Eager-loaded targets: interceptor predicates are now qualified with the
   target table.** v0.35 started running the interceptor chain on eager-loaded
@@ -46,43 +84,6 @@ All notable changes to this project will be documented in this file.
   invisible (the query never reaches the success-path query log). It now also
   emits the statement at `debug` level.
 
-- **`queryTargets` / `QueryEdge` no longer fail open.** The two bulk neighbour
-  readers disagreed on tenant isolation: `WithEdge` scoped eager-loaded
-  targets (soft-delete → privacy → interceptors), while
-  `queryTargets`/`queryTargetsByValue`/`QueryEdge` applied soft-delete only and
-  documented the gap as a "known boundary". The target read contract now lives
-  in one place (`codegen.query.appendTargetScopePreds`) and both readers call
-  it, so the posture cannot drift again. `EntityClient.QueryEdge` forwards the
-  client's `privacy_ctx`/`interceptors` and keeps its signature; the free
-  functions gained the two arguments, and the previous soft-delete-only
-  behaviour is preserved under the explicit names
-  `queryTargetsUnscoped`/`queryTargetsByValueUnscoped`. A policy-bearing target
-  now returns `error.PrivacyDenied` from a context-less traversal instead of
-  silently skipping the policy (breaking, and intended — see
-  `UPGRADING.md` §11).
-
-- **Eager-load × interceptor coverage for the JOIN-shaped edges.** The
-  qualification fix above shipped with only an `o2m` regression test, whose
-  neighbour query joins nothing — so it could not have caught the bug. The
-  same scenario is now covered for `m2o` (joins the source) and `m2m` (joins
-  the junction) with the tenant column on both sides, on SQLite, PostgreSQL
-  and MySQL. Reverting the qualification makes all three fail with the
-  dialect's own ambiguity error, which pins the fix end to end.
-
-### Added
-- **NULL-tolerant row scanning.** Every scanner was strict: a NULL in a
-  non-optional field is `error.TypeMismatch`, which is the right default for
-  entity reads (a NULL in a non-nullable schema column means the row does not
-  match the schema). It is the wrong contract for ad-hoc queries and DTOs —
-  `LEFT JOIN`ed lookups, aggregate outputs, tables where an absent value is
-  ordinary — and callers were hand-rolling scanners to get the other
-  behaviour. `scanRowLenient[WithArena]`, `scanRowNamedLenient[WithArena]`,
-  `scanRowNamedLenientMapped[WithArena]` add the second contract: a NULL (or
-  an absent column, for the named variants) leaves the field at its default —
-  the declared Zig default when the field has one, else zero, `null` for
-  optionals, `.null` for `std.json.Value`. The strict scanners are untouched;
-  the named scanners now share one implementation with their lenient twins.
-
 ### Docs
 - Corrected the `Contains` row in the predicate catalogue (`BEST_PRACTICES`
   §3a): it binds the value verbatim (`col LIKE ?`) and does **not** add `%`,
@@ -90,6 +91,12 @@ All notable changes to this project will be documented in this file.
   old wording described `ContainsEscaped` and would have led callers to write
   an exact match where they meant a substring search. A test now pins both
   renderings, and `ISSUES_FROM_ZAPI.md` records the naming question (Z14).
+- Recorded two deliberately deferred design items in `ISSUES_FROM_ZAPI.md`
+  rather than leaving them in a chat thread: **Z15** (edge writes are
+  unavailable on `From` edges — same intent, different spelling per side) and
+  **Z16** (multi-graph is a documented discipline, not a first-class type, so
+  a cross-graph `WithEdge` fails at runtime). Both carry evidence, impact and
+  an acceptance criterion for whoever picks them up.
 
 ## [0.37.0] - 2026-09-12
 
