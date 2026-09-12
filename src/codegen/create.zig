@@ -6,6 +6,7 @@ const EdgeInfo = @import("graph.zig").EdgeInfo;
 const columnName = @import("graph.zig").columnName;
 const pkColumn = @import("graph.zig").pkColumn;
 const sql = @import("../sql/builder.zig");
+const field_value = @import("field_value.zig");
 const sql_driver = @import("../sql/driver.zig");
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const Hook = @import("../runtime/hook.zig").Hook;
@@ -103,26 +104,13 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
         /// Set a field value with compile-time name and type checking.
         ///
-        /// Accepted, per the *field's* declared type (a wrong pair is a
-        /// `@compileError` naming both types):
-        ///
-        /// | Field type | Accepted values |
-        /// |---|---|
-        /// | `Bool` | `bool` |
-        /// | `Int` | `i64`, `comptime_int` |
-        /// | `Float` | `f64`, `comptime_float` |
-        /// | `String`/`Text`/`UUID`/`Decimal`/`Bytes` | `[]const u8` or a string literal. **Not** a `[N]u8` array value, even though `canSetField` accepts the type — `toSqlValue` cannot turn one into a slice and the attempt is a compile error (recorded as Z18) |
-        /// | `Enum` | `[]const u8` or a string literal. The field's Zig type is `[]const u8`, so a Zig `enum` *value* is not accepted, and the tag text is **not** checked against the declared tag list — pass a string that is one of them |
-        /// | `JSON` (via `field.JSON(name, T)`) | a value of `T`: a struct is serialised. A `std.json.Value` field (`field.JSONValue`) takes a `std.json.Value`. The two are not interchangeable — `canSetField` compares against `T` |
-        /// | `Optional(T)` | any accepted value for `T`, or `@as(?T, null)` for NULL |
-        ///
-        /// Not accepted: a bare `null` literal (write `@as(?T, null)`), an
-        /// integer type other than `i64`/`comptime_int`, a non-`u8` slice or
-        /// array, a Zig `enum` value for an `Enum` field (pass the tag string),
-        /// and a plain `struct` for a non-JSON field. The contract also
-        /// lives in `canSetField`; the test `setFieldValue accepts the
-        /// documented value shapes` exercises every row, so narrowing this
-        /// fails there rather than in a consumer's build.
+        /// The accepted shapes are decided by `codegen.field_value` and pinned
+        /// in both directions by its tests: `Int` ← `i64`/`comptime_int`,
+        /// `Float` ← `f64`/`comptime_float`, `Bool` ← `bool`, string-ish fields
+        /// ← `[]const u8` or a string literal, `JSON` ← the field's own Zig
+        /// type (or `std.json.Value` for `field.JSONValue`), `Optional(T)` ← a
+        /// bare value for `T` or an `?T`. A wrong pair is a `@compileError`
+        /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
@@ -131,7 +119,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     if (std.mem.eql(u8, f.name, field_name)) {
                         const Expected = if (f.optional) ?f.zig_type else f.zig_type;
                         const Actual = @TypeOf(value);
-                        if (!canSetField(Expected, Actual)) {
+                        if (!field_value.accepts(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
                         }
                         if (f.field_type == .json and
@@ -152,7 +140,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 return try self.setValue(field_name, .{ .string = json_str });
             }
 
-            return try self.setValue(field_name, toSqlValue(value));
+            return try self.setValue(field_name, field_value.toSqlValue(value));
         }
 
         /// Add target IDs for an M2M edge.
@@ -751,62 +739,6 @@ pub fn fillAuditUser(
     }
 }
 
-fn canSetField(comptime Expected: type, Actual: type) bool {
-    const Unwrapped = if (@typeInfo(Expected) == .optional)
-        @typeInfo(Expected).optional.child
-    else
-        Expected;
-
-    if (Expected == Actual) return true;
-    if (Unwrapped == Actual) return true; // optional field accepts bare value
-    if (Unwrapped == i64 and Actual == comptime_int) return true;
-    if (Unwrapped == f64 and Actual == comptime_float) return true;
-    if (Unwrapped == []const u8) {
-        return switch (@typeInfo(Actual)) {
-            .pointer => |ptr| {
-                if (ptr.size == .slice and ptr.child == u8) return true;
-                if (ptr.size == .one) {
-                    const child_ti = @typeInfo(ptr.child);
-                    if (child_ti == .array) return child_ti.array.child == u8;
-                }
-                return false;
-            },
-            .array => |arr| arr.child == u8,
-            else => false,
-        };
-    }
-    return false;
-}
-
-fn toSqlValue(v: anytype) sql.Value {
-    const T = @TypeOf(v);
-    if (T == comptime_int) return .{ .int = v };
-    if (T == comptime_float) return .{ .float = v };
-
-    const ti = @typeInfo(T);
-    switch (ti) {
-        .optional => {
-            if (v) |payload| return toSqlValue(payload);
-            return .null;
-        },
-        .bool => return .{ .bool = v },
-        .int => return .{ .int = v },
-        .float => return .{ .float = v },
-        .pointer => |ptr| {
-            if (ptr.size == .slice and ptr.child == u8) return .{ .string = v };
-            if (ptr.size == .one) {
-                const child_ti = @typeInfo(ptr.child);
-                if (child_ti == .array and child_ti.array.child == u8) return .{ .string = v };
-            }
-        },
-        .array => |arr| {
-            if (arr.child == u8) return .{ .string = v };
-        },
-        else => {},
-    }
-    @compileError("Unsupported value type: " ++ @typeName(T));
-}
-
 /// Dialect-aware upsert suffix shared by single-row `SaveOrUpdate` and the
 /// bulk `SaveOrUpdate`. The single-row SQLite path deliberately returns ""
 /// (it uses INSERT OR REPLACE instead); the bulk path passes
@@ -1050,26 +982,13 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
 
         /// Set a field value with compile-time name and type checking.
         ///
-        /// Accepted, per the *field's* declared type (a wrong pair is a
-        /// `@compileError` naming both types):
-        ///
-        /// | Field type | Accepted values |
-        /// |---|---|
-        /// | `Bool` | `bool` |
-        /// | `Int` | `i64`, `comptime_int` |
-        /// | `Float` | `f64`, `comptime_float` |
-        /// | `String`/`Text`/`UUID`/`Decimal`/`Bytes` | `[]const u8` or a string literal. **Not** a `[N]u8` array value, even though `canSetField` accepts the type — `toSqlValue` cannot turn one into a slice and the attempt is a compile error (recorded as Z18) |
-        /// | `Enum` | `[]const u8` or a string literal. The field's Zig type is `[]const u8`, so a Zig `enum` *value* is not accepted, and the tag text is **not** checked against the declared tag list — pass a string that is one of them |
-        /// | `JSON` (via `field.JSON(name, T)`) | a value of `T`: a struct is serialised. A `std.json.Value` field (`field.JSONValue`) takes a `std.json.Value`. The two are not interchangeable — `canSetField` compares against `T` |
-        /// | `Optional(T)` | any accepted value for `T`, or `@as(?T, null)` for NULL |
-        ///
-        /// Not accepted: a bare `null` literal (write `@as(?T, null)`), an
-        /// integer type other than `i64`/`comptime_int`, a non-`u8` slice or
-        /// array, a Zig `enum` value for an `Enum` field (pass the tag string),
-        /// and a plain `struct` for a non-JSON field. The contract also
-        /// lives in `canSetField`; the test `setFieldValue accepts the
-        /// documented value shapes` exercises every row, so narrowing this
-        /// fails there rather than in a consumer's build.
+        /// The accepted shapes are decided by `codegen.field_value` and pinned
+        /// in both directions by its tests: `Int` ← `i64`/`comptime_int`,
+        /// `Float` ← `f64`/`comptime_float`, `Bool` ← `bool`, string-ish fields
+        /// ← `[]const u8` or a string literal, `JSON` ← the field's own Zig
+        /// type (or `std.json.Value` for `field.JSONValue`), `Optional(T)` ← a
+        /// bare value for `T` or an `?T`. A wrong pair is a `@compileError`
+        /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
             comptime {
@@ -1078,7 +997,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                     if (std.mem.eql(u8, f.name, field_name)) {
                         const Expected = if (f.optional) ?f.zig_type else f.zig_type;
                         const Actual = @TypeOf(value);
-                        if (!canSetField(Expected, Actual)) {
+                        if (!field_value.accepts(Expected, Actual)) {
                             @compileError("Type mismatch for field '" ++ field_name ++ "': expected " ++ @typeName(Expected) ++ ", got " ++ @typeName(Actual));
                         }
                         if (f.field_type == .json and
@@ -1099,7 +1018,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 return try self.setValue(field_name, .{ .string = json_str });
             }
 
-            return try self.setValue(field_name, toSqlValue(value));
+            return try self.setValue(field_name, field_value.toSqlValue(value));
         }
 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };

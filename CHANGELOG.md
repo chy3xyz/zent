@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`setFieldValue`'s accepted set is decided in one place (Z18).** The contract
+  lived in three — `canSetField` (the check), `toSqlValue` (the conversion) and
+  a doc table — and the first two existed twice, once in `create.zig` and once
+  in `update_delete.zig`, where they had drifted apart in both implementation
+  and accepted set. All of it is now `src/codegen/field_value.zig`:
+  `accepts(Expected, Actual)` decides, `toSqlValue` converts, and the module's
+  tests check both directions — including the shapes that must be **rejected**,
+  which no doc table can do.
+
+  With one place to fix, the broken shape is gone rather than documented: a
+  `[N]u8` **array value** is no longer accepted. Converting one would have to
+  return a pointer into the callee's own by-value parameter, so it could never
+  have worked; it previously passed the type check and then failed inside
+  `toSqlValue` with a message naming neither the field nor the function. Now it
+  fails at the check ("expected `[]const u8`, got `[4]u8`"), and `toSqlValue`
+  carries an explicit branch telling the caller to pass a slice or a literal.
+
 ## [0.42.0] - 2026-09-12
 
 ### Changed
