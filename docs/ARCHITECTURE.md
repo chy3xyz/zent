@@ -96,7 +96,8 @@ consumer links its own sqlite/libpq/mariadb (see README "Consumer wiring").
 - **New field types**: extend `src/core/field.zig` descriptors + the scan
   mapping in `src/codegen/create.zig` (`valueToType`) and the row scanners
   in `src/sql/scan.zig` (`scanRow` / `scanRowNamed` / `scanRowOffset` /
-  `scanRowNoAlloc`).
+  `scanRowNoAlloc`, plus the NULL-tolerant `scanRowLenient*` family used for
+  ad-hoc DTO queries — the strict scanners are what entity reads use).
 - **New predicates**: add to `src/codegen/predicate.zig` + the generated
   `makePredicates`; keep the SQL renderer in `src/sql/builder.zig`.
 - **New dialect**: implement the driver vtable + dialect quirks

@@ -58,6 +58,19 @@ All notable changes to this project will be documented in this file.
   and MySQL. Reverting the qualification makes all three fail with the
   dialect's own ambiguity error, which pins the fix end to end.
 
+### Added
+- **NULL-tolerant row scanning.** Every scanner was strict: a NULL in a
+  non-optional field is `error.TypeMismatch`, which is the right default for
+  entity reads (a NULL in a non-nullable schema column means the row does not
+  match the schema). It is the wrong contract for ad-hoc queries and DTOs —
+  `LEFT JOIN`ed lookups, aggregate outputs, tables where an absent value is
+  ordinary — and callers were hand-rolling scanners to get the other
+  behaviour. `scanRowLenient[WithArena]`, `scanRowNamedLenient[WithArena]`,
+  `scanRowNamedLenientMapped[WithArena]` add the second contract: a NULL (or
+  an absent column, for the named variants) leaves the field at its default —
+  the declared Zig default when the field has one, else zero, `null` for
+  optionals, `.null` for `std.json.Value`. The strict scanners are untouched;
+  the named scanners now share one implementation with their lenient twins.
 
 ### Docs
 - Corrected the `Contains` row in the predicate catalogue (`BEST_PRACTICES`
@@ -66,6 +79,7 @@ All notable changes to this project will be documented in this file.
   old wording described `ContainsEscaped` and would have led callers to write
   an exact match where they meant a substring search. A test now pins both
   renderings, and `ISSUES_FROM_ZAPI.md` records the naming question (Z14).
+
 ## [0.37.0] - 2026-09-12
 
 ### Added

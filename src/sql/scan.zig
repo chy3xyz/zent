@@ -103,6 +103,77 @@ pub fn zeroInit(comptime T: type) T {
     return value;
 }
 
+/// Like `zeroInit`, but a field carrying a declared Zig default keeps that
+/// default instead of being zeroed. This is the "default value" the lenient
+/// scanners fall back to, so a DTO can express what an absent column means
+/// (`retries: u32 = 3`) without an explicit conversion step.
+///
+/// `std.json.Value` has no zeroable representation, so it still defaults to
+/// `.null`.
+fn defaultInit(comptime T: type) T {
+    var value: T = undefined;
+    const ei = @typeInfo(T).@"struct";
+    inline for (ei.field_names, ei.field_types, ei.field_attrs) |fname, ftype, attrs| {
+        if (attrs.defaultValue(ftype)) |declared| {
+            @field(value, fname) = declared;
+        } else if (comptime ftype == std.json.Value) {
+            @field(value, fname) = .null;
+        } else {
+            @field(value, fname) = std.mem.zeroes(ftype);
+        }
+    }
+    return value;
+}
+
+/// Scan a database row with the **NULL-is-absent** policy: a NULL column
+/// leaves its struct field at the default value from `defaultInit` (declared
+/// Zig default, else zero; `null` for optionals, `.null` for
+/// `std.json.Value`) instead of failing with `error.TypeMismatch`.
+///
+/// Every other scanner here is strict, which is the right default for entity
+/// reads — a NULL in a non-optional schema column means the row does not
+/// match the schema. This variant exists for the other, equally common
+/// contract: ad-hoc queries and DTOs whose columns are genuinely nullable
+/// (`LEFT JOIN`ed lookups, aggregate outputs, PHP-style "absent means
+/// default" tables). Without it, callers hand-roll a scanner to get that
+/// behaviour.
+///
+/// Only the NULL policy differs: column mapping stays positional
+/// (declaration order), and a NULL for an optional field still yields `null`.
+/// Scalar `T` reads a single column and yields its zero value on NULL.
+pub fn scanRowLenient(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
+    return scanRowLenientWithArena(T, allocator, row, null);
+}
+
+/// Like `scanRowLenient`, but JSON struct fields are parsed into
+/// `json_arena`, matching `scanRowWithArena`.
+pub fn scanRowLenientWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
+    const info = @typeInfo(T);
+    switch (info) {
+        .@"struct" => |s| {
+            var value: T = defaultInit(T);
+            var col_idx: usize = 0;
+            inline for (s.field_names, s.field_types) |field_name, field_type| {
+                if (comptime std.mem.eql(u8, field_name, "edges")) {
+                    @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
+                } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
+                    @field(value, field_name) = json_arena;
+                } else {
+                    if (!row.isNull(col_idx)) {
+                        @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx, json_arena);
+                    }
+                    col_idx += 1;
+                }
+            }
+            return value;
+        },
+        else => {
+            if (row.isNull(0)) return std.mem.zeroes(T);
+            return scanRowWithArena(T, allocator, row, json_arena);
+        },
+    }
+}
+
 /// Maps a Zig struct field to the physical column it is read from.
 pub const ColumnMap = struct {
     /// Zig struct field name (the struct field the value is written to).
@@ -122,22 +193,7 @@ pub fn scanRowNamedMapped(comptime T: type, allocator: std.mem.Allocator, row: R
 /// Like `scanRowNamedMapped`, but JSON struct fields are parsed into
 /// `json_arena`.
 pub fn scanRowNamedMappedWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, columns: []const ColumnMap, json_arena: ?*std.heap.ArenaAllocator) !T {
-    const info = @typeInfo(T);
-    if (info != .@"struct") @compileError("scanRowNamedMapped supports structs only");
-    var value: T = zeroInit(T);
-    inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
-        if (comptime std.mem.eql(u8, field_name, "edges")) {
-            @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
-        } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
-            @field(value, field_name) = json_arena;
-        } else {
-            const lookup = mappedColumn(columns, field_name) orelse field_name;
-            if (findColumnIndex(row, lookup)) |idx| {
-                @field(value, field_name) = try scanColumn(field_type, allocator, row, idx, json_arena);
-            }
-        }
-    }
-    return value;
+    return scanRowNamedImpl(T, allocator, row, columns, json_arena, false);
 }
 
 fn mappedColumn(columns: []const ColumnMap, field_name: []const u8) ?[]const u8 {
@@ -149,17 +205,60 @@ fn mappedColumn(columns: []const ColumnMap, field_name: []const u8) ?[]const u8 
 
 /// Like `scanRowNamed`, but JSON struct fields are parsed into `json_arena`.
 pub fn scanRowNamedWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
+    return scanRowNamedImpl(T, allocator, row, &.{}, json_arena, false);
+}
+
+/// Like `scanRowNamedLenient`, but JSON struct fields are parsed into
+/// `json_arena`.
+pub fn scanRowNamedLenientWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
+    return scanRowNamedImpl(T, allocator, row, &.{}, json_arena, true);
+}
+
+/// Name-resolved counterpart of `scanRowLenient`, and the variant most
+/// partial projections want: a column absent from the result set *or* NULL
+/// leaves its field at the default, so a `SELECT` that omits columns and a
+/// `LEFT JOIN` that produces NULLs behave the same way.
+pub fn scanRowNamedLenient(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
+    return scanRowNamedLenientWithArena(T, allocator, row, null);
+}
+
+/// Like `scanRowNamedLenientWithArena`, but columns are resolved through an
+/// explicit `columns` mapping (`ColumnMap.column` is read, `ColumnMap.name` is
+/// written), matching `scanRowNamedMappedWithArena`.
+pub fn scanRowNamedLenientMappedWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, columns: []const ColumnMap, json_arena: ?*std.heap.ArenaAllocator) !T {
+    return scanRowNamedImpl(T, allocator, row, columns, json_arena, true);
+}
+
+/// Like `scanRowNamedLenientMappedWithArena` with the caller's allocator for
+/// JSON fields.
+pub fn scanRowNamedLenientMapped(comptime T: type, allocator: std.mem.Allocator, row: Row, columns: []const ColumnMap) !T {
+    return scanRowNamedImpl(T, allocator, row, columns, null, true);
+}
+
+/// Shared body of the name-resolved scanners. `lenient` picks the NULL
+/// policy; an empty `columns` slice means "field name is the column name".
+fn scanRowNamedImpl(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    row: Row,
+    columns: []const ColumnMap,
+    json_arena: ?*std.heap.ArenaAllocator,
+    comptime lenient: bool,
+) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanRowNamed supports structs only");
-    var value: T = zeroInit(T);
+    var value: T = if (lenient) defaultInit(T) else zeroInit(T);
     inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
         if (comptime std.mem.eql(u8, field_name, "edges")) {
             @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
         } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
             @field(value, field_name) = json_arena;
         } else {
-            if (findColumnIndex(row, field_name)) |idx| {
-                @field(value, field_name) = try scanColumn(field_type, allocator, row, idx, json_arena);
+            const lookup = mappedColumn(columns, field_name) orelse field_name;
+            if (findColumnIndex(row, lookup)) |idx| {
+                if (!lenient or !row.isNull(idx)) {
+                    @field(value, field_name) = try scanColumn(field_type, allocator, row, idx, json_arena);
+                }
             }
         }
     }
@@ -536,6 +635,106 @@ test "scan optional null" {
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
     const v = try scanRow(?i32, std.testing.allocator, row);
     try std.testing.expectEqual(@as(?i32, null), v);
+}
+
+test "scanRowLenient leaves NULL fields at their default instead of failing" {
+    const Dto = struct {
+        id: i64,
+        name: []const u8,
+        age: i32,
+        score: i32,
+        retries: i32 = 3,
+    };
+    const data = MockRowData{
+        .ints = &.{ 7, null, null, 42, null },
+        .floats = &.{ null, null, null, null, null },
+        .texts = &.{ null, null, null, null, null },
+        .bools = &.{ null, null, null, null, null },
+        // `name`, `age` and `retries` are NULL; `id` and `score` are not.
+        .nulls = &.{ false, true, true, false, true },
+    };
+    const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+
+    // The strict contract is unchanged: a NULL in a non-optional field is an
+    // error, which is what keeps the lenient variant opt-in.
+    try std.testing.expectError(error.TypeMismatch, scanRow(Dto, std.testing.allocator, row));
+
+    const dto = try scanRowLenient(Dto, std.testing.allocator, row);
+    try std.testing.expectEqual(@as(i64, 7), dto.id);
+    try std.testing.expectEqual(@as(i32, 42), dto.score);
+    try std.testing.expectEqualStrings("", dto.name);
+    try std.testing.expectEqual(@as(i32, 0), dto.age);
+    // A declared Zig default wins over the zero value.
+    try std.testing.expectEqual(@as(i32, 3), dto.retries);
+}
+
+test "scanRowLenient keeps null for optional fields and reads scalars" {
+    const Dto = struct {
+        id: i64,
+        nickname: ?[]const u8,
+        age: ?i32,
+    };
+    const data = MockRowData{
+        .ints = &.{ 9, null, null },
+        .floats = &.{ null, null, null },
+        .texts = &.{ null, null, null },
+        .bools = &.{ null, null, null },
+        .nulls = &.{ false, true, true },
+    };
+    const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+    const dto = try scanRowLenient(Dto, std.testing.allocator, row);
+    try std.testing.expectEqual(@as(i64, 9), dto.id);
+    try std.testing.expectEqual(@as(?[]const u8, null), dto.nickname);
+    try std.testing.expectEqual(@as(?i32, null), dto.age);
+
+    // Scalar reads: NULL yields the zero value rather than an error.
+    const null_scalar = MockRowData{
+        .ints = &.{null},
+        .floats = &.{null},
+        .texts = &.{null},
+        .bools = &.{null},
+        .nulls = &.{true},
+    };
+    const srow = Row{ .ptr = @ptrCast(@constCast(&null_scalar)), .vtable = &mock_vtable };
+    try std.testing.expectEqual(@as(i64, 0), try scanRowLenient(i64, std.testing.allocator, srow));
+}
+
+test "scanRowNamedLenient tolerates NULL and missing columns alike" {
+    const Dto = struct {
+        id: i64,
+        name: []const u8,
+    };
+    // `name` is NULL; `age`/`score`/`bio` exist in the row but not in the DTO,
+    // so they are simply never looked up.
+    const data = MockRowData{
+        .ints = &.{ 4, null, null, null, null },
+        .floats = &.{ null, null, null, null, null },
+        .texts = &.{ null, null, null, null, null },
+        .bools = &.{ null, null, null, null, null },
+        .nulls = &.{ false, true, true, true, true },
+    };
+    const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+
+    // Strict named scanning tolerates a *missing* column but not a NULL one —
+    // which is exactly the split the lenient scanner removes.
+    try std.testing.expectError(error.TypeMismatch, scanRowNamed(Dto, std.testing.allocator, row));
+
+    const dto = try scanRowNamedLenient(Dto, std.testing.allocator, row);
+    try std.testing.expectEqual(@as(i64, 4), dto.id);
+    try std.testing.expectEqualStrings("", dto.name);
+
+    // The mapped variant resolves physical column names through `columns`.
+    const Mapped = struct {
+        primary: i64,
+        label: []const u8,
+    };
+    const mapping = [_]ColumnMap{
+        .{ .name = "primary", .column = "id" },
+        .{ .name = "label", .column = "name" },
+    };
+    const mapped = try scanRowNamedLenientMapped(Mapped, std.testing.allocator, row, &mapping);
+    try std.testing.expectEqual(@as(i64, 4), mapped.primary);
+    try std.testing.expectEqualStrings("", mapped.label);
 }
 
 test "scan enum from int and string" {
