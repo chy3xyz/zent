@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-09-12
+
 ### Changed
 - **The `anytype` contract is now written down and tested, starting with the
   two most-used parameters.** `Where(predicates)` existed as five copies of the
