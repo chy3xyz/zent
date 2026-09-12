@@ -27,8 +27,19 @@ All notable changes to this project will be documented in this file.
   would then suppress the interceptor's value, turning "add a predicate" into a
   way to escape tenant scoping. Covered by a unit test that asserts the
   identical pair collapses while a differing value is kept. Applies to the
-  query, update and delete builders; the two bulk builders still append
-  unconditionally (tracked as follow-up).
+  query, update and delete builders, and (as of this release) to the bulk
+  update/delete builders too — the bulk delete sink dedupes per ORed group,
+  so the injected scope still lands in every branch.
+
+- **Interceptor `whereEq` sink audit.** All eight sinks now go through the
+  same `appendEqUnlessPresent` helper. The two create-path sinks
+  (`CreateBuilder`/`BulkInsertBuilder`) are deliberately *not* dedupe sites:
+  they fill omitted columns rather than adding predicates, and they keep the
+  existing "an explicitly set field wins" rule, which is the documented
+  contract of `fillAuditUser` too. That makes create-time injection a default
+  filler, **not** an enforcement point — see the note in `BEST_PRACTICES`
+  §3e. Enforcement on writes belongs in a privacy policy (`Deny`), which the
+  caller cannot override.
 
 - **`stmt_prepare` failures log the statement.** The MySQL driver reported
   only `errno`/message on a failed prepare, leaving the offending SQL

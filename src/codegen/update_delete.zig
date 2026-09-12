@@ -1384,7 +1384,11 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         }
 
         /// QueryView sink: add a global `field_name = value` predicate after
-        /// validating the field against the entity schema.
+        /// validating the field against the entity schema. Uses the (column,
+        /// value) dedupe so a caller predicate that already pins the tenant
+        /// column does not emit a second placeholder — while a *different*
+        /// value is still appended, so this can never suppress the
+        /// interceptor's own value.
         fn addEqPredicate(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(sink));
             var found = false;
@@ -1395,7 +1399,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            _ = try self.b.where(sql.EQ(columnName(info, field_name), value));
+            try sql.appendEqUnlessPresent(&self.b.predicates, columnName(info, field_name), value);
         }
 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
@@ -1576,7 +1580,10 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
 
         /// QueryView sink: add `field_name = value` to every WHERE group
         /// (groups are ORed, so the filter must AND into each one), after
-        /// validating the field against the entity schema.
+        /// validating the field against the entity schema. Deduped per group
+        /// on the (column, value) pair, for the same reason as the bulk
+        /// update sink above — and with the same guarantee that a differing
+        /// value is still appended into every group.
         fn addEqPredicate(sink: *anyopaque, field_name: []const u8, value: sql.Value) anyerror!void {
             const self: *Self = @ptrCast(@alignCast(sink));
             var found = false;
@@ -1587,9 +1594,9 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            const pred = sql.EQ(columnName(info, field_name), value);
+            const column = columnName(info, field_name);
             for (self.b.groups.items) |*group| {
-                try group.append(pred);
+                try sql.appendEqUnlessPresent(group, column, value);
             }
         }
 
@@ -1830,6 +1837,76 @@ test "BulkDelete builder basic" {
     try std.testing.expectEqual(@as(usize, 2), d.b.groups.items.len);
     try std.testing.expectEqual(@as(usize, 1), d.b.groups.items[0].items.len);
     try std.testing.expectEqual(@as(usize, 1), d.b.groups.items[1].items.len);
+}
+
+test "bulk interceptor sinks dedupe the tenant EQ without suppressing a differing value" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Doc = schema("BulkScopeDoc", .{
+        .fields = &.{ field.String("title"), field.Int("tenant_id") },
+    });
+    const info = comptime fromSchema(Doc);
+
+    var driver = try @import("../sql/sqlite.zig").SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer driver.close();
+
+    // Bulk UPDATE: the interceptor's EQ collapses into a caller predicate that
+    // already pins the same (column, value) pair.
+    {
+        var chain = intercept.InterceptorChain.init(std.testing.allocator);
+        defer chain.deinit();
+        try chain.use(.{ .intercept = struct {
+            fn f(_: ?*anyopaque, view: *intercept.QueryView) anyerror!void {
+                try view.whereEq("tenant_id", .{ .int = 1 });
+            }
+        }.f });
+
+        var u = BulkUpdateBuilder(info).init(std.testing.allocator, driver.asDriver(), &.{}, null);
+        defer u.deinit();
+        u.interceptors = &chain;
+        _ = try u.Row(1);
+        _ = try u.setFieldValue("title", "x");
+        _ = try u.b.where(sql.EQ("tenant_id", .{ .int = 1 }));
+        try u.runInterceptors(.update);
+        try std.testing.expectEqual(@as(usize, 1), u.b.predicates.items.len);
+
+        // A *differing* value must still be appended: skipping the injected
+        // predicate here would let a caller-supplied tenant column suppress
+        // the interceptor's scope.
+        var other = BulkUpdateBuilder(info).init(std.testing.allocator, driver.asDriver(), &.{}, null);
+        defer other.deinit();
+        other.interceptors = &chain;
+        _ = try other.Row(1);
+        _ = try other.setFieldValue("title", "x");
+        _ = try other.b.where(sql.EQ("tenant_id", .{ .int = 2 }));
+        try other.runInterceptors(.update);
+        try std.testing.expectEqual(@as(usize, 2), other.b.predicates.items.len);
+    }
+
+    // Bulk DELETE: every ORed group gets the deduped EQ (or the value), since
+    // the injected scope has to hold in each branch.
+    {
+        var chain = intercept.InterceptorChain.init(std.testing.allocator);
+        defer chain.deinit();
+        try chain.use(.{ .intercept = struct {
+            fn f(_: ?*anyopaque, view: *intercept.QueryView) anyerror!void {
+                try view.whereEq("tenant_id", .{ .int = 1 });
+            }
+        }.f });
+
+        var d = try BulkDeleteBuilder(info).init(std.testing.allocator, driver.asDriver(), &.{}, null);
+        defer d.deinit();
+        d.interceptors = &chain;
+        _ = try d.Where(.{sql.EQ("tenant_id", .{ .int = 1 })});
+        _ = try d.Next();
+        _ = try d.Where(.{sql.EQ("title", .{ .string = "gone" })});
+        try d.runInterceptors(.delete);
+        try std.testing.expectEqual(@as(usize, 1), d.b.groups.items[0].items.len);
+        // Second group had no tenant predicate, so the injected one is added.
+        try std.testing.expectEqual(@as(usize, 2), d.b.groups.items[1].items.len);
+    }
 }
 
 test "Update and delete execution methods expose explicit driver error unions" {

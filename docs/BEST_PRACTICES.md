@@ -411,9 +411,19 @@ try Client.UseInterceptor(infos, &client, .{
 - Interceptor errors abort the operation: the first error wins, and all
   errors collapse to `error.InterceptFailed` at the builder boundary
   (execution methods keep explicit error sets).
-- Create / BulkInsert are intercepted: `whereEq` fills an omitted column
-  (if-missing). An explicit value on the builder is kept. Tables without
-  the field still return `UnknownField` (swallow it in the interceptor
+- `whereEq` is **deduped on the (column, value) pair**, never on the column
+  alone: a query that already says `tenant_id = 1` does not get a second
+  placeholder, while a caller predicate carrying a *different* value is kept.
+  That asymmetry is deliberate — deduping by column would let a caller
+  suppress the interceptor's own value, turning "add a predicate" into a
+  tenant-scope bypass.
+- Create / BulkInsert are intercepted differently, and the difference matters:
+  `whereEq` **fills an omitted column** (if-missing). An explicit value on the
+  builder wins. That makes create-time injection a *default filler*, not an
+  enforcement point — a caller who sets `tenant_id` explicitly still writes
+  that value. Use a privacy policy (`Deny`) for a write constraint the caller
+  cannot override, and treat the interceptor's fill as convenience. Tables
+  without the field still return `UnknownField` (swallow it in the interceptor
   when the column is optional across the graph).
 - `beginTx` copies the chain pointer into the TxClient, so registered
   interceptors also apply inside transactions. Register before `beginTx`.
