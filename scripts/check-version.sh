@@ -3,7 +3,9 @@
 #   1. build.zig.zon version must be referenced by README.md / README_CN.md
 #   2. build.zig.zon version must equal src/version.zig (the mirror consumers
 #      read at comptime, e.g. `zent.version`)
-#   3. package version must never be older than the latest git tag
+#   3. CHANGELOG.md must not declare the same version twice, and its first
+#      version section must be the package version
+#   4. package version must never be older than the latest git tag
 #      (guards the tag/version drift that hit v0.12.1 vs v0.17.0 tags)
 # Run in CI so a manual bump can never leave the repo inconsistent.
 set -euo pipefail
@@ -33,6 +35,24 @@ if [[ -z "$MIRROR" ]]; then
 elif [[ "$MIRROR" != "$VERSION" ]]; then
   echo "check-version: src/version.zig is $MIRROR but build.zig.zon is $VERSION" >&2
   echo "check-version: keep them in sync (scripts/bump-version.sh does both)" >&2
+  fail=1
+fi
+
+# CHANGELOG hygiene: a version declared twice means someone hand-wrote the
+# release section and then let the release script promote [Unreleased] as well
+# — the resulting empty duplicate silently absorbs the real entries for any
+# reader that stops at the first heading.
+DUPES="$(grep '^## \[' CHANGELOG.md | sort | uniq -d || true)"
+if [[ -n "$DUPES" ]]; then
+  echo "check-version: CHANGELOG.md declares a version section twice:" >&2
+  echo "$DUPES" >&2
+  echo "check-version: do not pre-write the release section; scripts/release.sh promotes [Unreleased] itself" >&2
+  fail=1
+fi
+
+FIRST_VERSION_SECTION="$(grep '^## \[[0-9]' CHANGELOG.md | head -1 || true)"
+if [[ "$FIRST_VERSION_SECTION" != "## [$VERSION]"* ]]; then
+  echo "check-version: CHANGELOG.md's first version section is '${FIRST_VERSION_SECTION:-none}', expected ## [$VERSION]" >&2
   fail=1
 fi
 

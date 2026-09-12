@@ -4,7 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.39.1] - 2026-09-12
+### Fixed
+- **Duplicate version heading in the previous CHANGELOG.** v0.39.1 declared
+  `## [0.39.1]` twice — an empty one (the promoted `[Unreleased]`) above the
+  real one — because the release section had been hand-written before
+  `release.sh` ran, and the script promotes `[Unreleased]` itself. Merged, and
+  `check-version.sh` now fails on a version declared twice or when the first
+  CHANGELOG section is not the package version, so the mistake cannot ship
+  again. `docs/RELEASING.md` states the rule. No code changed in this release.
 
 ## [0.39.1] - 2026-09-12
 

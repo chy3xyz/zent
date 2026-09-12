@@ -26,8 +26,19 @@ git push origin main --tags
 
 - `build.zig.zon` `.version` is the single source of truth; `.fingerprint`
   is the permanent package identity and **must never change**.
+- `src/version.zig` mirrors it for consumers (`zent.version`) so a pin can be
+  checked without consulting git; `check-version.sh` gates the two, and both
+  bump scripts update both.
+- **Never hand-write the release section in `CHANGELOG.md`.** `release.sh` /
+  `bump-version.sh` promote `[Unreleased]` to the new version themselves, so a
+  section you add first survives as a second, empty heading with the same
+  version — the real entries then sit under the duplicate. v0.39.1 shipped
+  that way. Write future entries under `[Unreleased]` and let the script move
+  them; `check-version.sh` now fails on a duplicated version heading.
 - `check-version.sh` runs in CI: README/README_CN must reference the current
-  version, and the package version must be ≥ the latest tag.
+  version, `src/version.zig` must match, the first CHANGELOG version section
+  must be the package version, and the package version must be ≥ the latest
+  tag.
 - CHANGELOG keeps a `[Unreleased]` section at the top (Keep a Changelog flow).
 
 ## Zig version pin
