@@ -3656,6 +3656,32 @@ test "SQLite: Update edge writes maintain M2M and O2M associations" {
     }
     try expectCarOwner(&client, infos, car_info, cids[1], null);
 
+    // An edge-only update needs no companion field at all. Until Z19 was fixed
+    // this produced `UPDATE … WHERE …` (no SET) and failed to prepare, which is
+    // why every block above pairs its edge call with a `setFieldValue`. The
+    // statement now touches the matched rows with a primary-key self-assignment,
+    // so `rows_affected` keeps meaning "rows the predicate matched". c1 is
+    // unowned at this point, so this is a real change and `1` is the honest
+    // count.
+    {
+        try expectCarOwner(&client, infos, car_info, cids[0], null);
+        var u = client.ew_user.Update();
+        defer u.deinit();
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[0] })});
+        _ = try u.SetEdgeIDs("cars", &.{cids[0]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectCarOwner(&client, infos, car_info, cids[0], uids[0]);
+
+    // With nothing to set *and* no edge action, an UPDATE has no meaning: it is
+    // a named error now instead of a driver syntax error.
+    {
+        var u = client.ew_user.Update();
+        defer u.deinit();
+        _ = try u.Where(.{preds.idEQ(.{ .int = uids[0] })});
+        try testing.expectError(error.NoFieldsToUpdate, u.Save());
+    }
+
     // A `From` edge — `EwCar.owner`, whose FK is a column of the row being
     // updated — is writable too, and it needs no companion `setFieldValue`:
     // the association *is* a SET field, so the statement is valid on its own.

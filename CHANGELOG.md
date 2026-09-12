@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **An edge-only update works, and an empty update says why (Z19).** With no
+  `setFieldValue` and only an edge write registered, `Save()` emitted
+  `UPDATE t WHERE …` — no `SET` clause — and the database rejected it with a
+  prepare error that named nothing (`near "WHERE": syntax error`). Every
+  existing edge-write test worked around it by pairing the edge call with an
+  unrelated `setFieldValue`, so the habit was everywhere and the reason nowhere.
+
+  Now:
+  - no `SET` field **with** edge actions → the statement touches the matched
+    rows with a primary-key self-assignment. One statement, hooks still fire,
+    and `rows_affected` keeps meaning "rows the predicate matched" — the reading
+    every edge-write test already assumes. (MySQL still reports *changed* rows,
+    the documented caveat for any no-op update.)
+  - no `SET` field **and** no edge action → `error.NoFieldsToUpdate`, naming the
+    cause instead of quoting the database.
+
+  The check runs after `fillAuditUser` and the `updated_at`/version maintenance,
+  so an entity that contributes a column there is not mistaken for empty.
+  Falsified by dropping the self-assignment, which restores the original syntax
+  error in the test.
+
 ## [0.44.0] - 2026-09-12
 
 ### Added

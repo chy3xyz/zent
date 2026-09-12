@@ -550,9 +550,13 @@ Semantics per edge kind:
 - `To`/M2M edge writes run **after** the UPDATE body, so wrap both in
   `beginTx` when they must be atomic. A `From` edge write is part of the UPDATE
   itself and needs no such care.
-- Every edge write needs the UPDATE to have at least one `SET` field; a `From`
-  edge supplies one, other kinds need a `setFieldValue` alongside (a
-  `SET`-less UPDATE is invalid SQL — tracked as Z19).
+- An edge-only update needs **no** companion field: with nothing to `SET`, the
+  statement touches the matched rows with a primary-key self-assignment, so the
+  hooks fire and `rows_affected` keeps meaning "rows the predicate matched".
+  (Before v0.45 this emitted `UPDATE … WHERE …` and failed to prepare — which is
+  why older code, and the tests, pair every edge call with a `setFieldValue`.)
+- An update with neither a field nor an edge action is
+  `error.NoFieldsToUpdate` rather than a driver syntax error.
 - Prefer them over raw junction SQL: table and column names come from the
   schema, so quoting and placeholders follow the dialect.
 

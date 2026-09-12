@@ -629,7 +629,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             try sql.appendEqUnlessPresent(&self.predicates, columnName(info, field_name), value);
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed, NoFieldsToUpdate };
         const SaveOneError = SaveError || error{ NotFound, NotSingular };
 
         /// Execute the UPDATE and return rows affected.
@@ -762,6 +762,29 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
 
             for (self.expr_values.items) |fe| {
                 _ = try builder.setExprArgs(columnName(info, fe.name), fe.expr, fe.args);
+            }
+
+            // A SET-less UPDATE is invalid SQL (`UPDATE t WHERE …`), and it used
+            // to be exactly what an edge-only update produced — a prepare error
+            // that said nothing about the cause. Decide here instead:
+            //
+            //   * nothing to set and nothing to do → a named error rather than
+            //     a syntax error from the driver;
+            //   * nothing to set but edge actions registered → the association
+            //     change is the intent, so touch the matched rows with a
+            //     primary-key self-assignment. That keeps one statement, keeps
+            //     the before/after hooks meaningful, and keeps `rows_affected`
+            //     meaning "rows the predicate matched" the way the rest of this
+            //     file assumes (MySQL still reports *changed* rows, which is the
+            //     documented caveat for every no-op update).
+            //
+            // The check sits after `fillAuditUser` and the `updated_at`/version
+            // maintenance above, so an entity that contributes a column there is
+            // not mistaken for empty.
+            if (builder.sets.items.len == 0) {
+                if (self.edge_actions.items.len == 0) return error.NoFieldsToUpdate;
+                const pk = comptime pkColumn(info);
+                _ = try builder.setExpr(pk, pk);
             }
 
             for (self.predicates.items) |pred| {
@@ -1336,7 +1359,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             try sql.appendEqUnlessPresent(&self.b.predicates, columnName(info, field_name), value);
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed, NoFieldsToUpdate };
 
         /// Execute the bulk UPDATE and return rows affected.
         pub fn Save(self: *Self) SaveError!usize {
@@ -1828,7 +1851,7 @@ test "Update and delete execution methods expose explicit driver error unions" {
     const Del = DeleteBuilder(info);
     const BulkUpd = BulkUpdateBuilder(info);
     const BulkDel = BulkDeleteBuilder(info);
-    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed, NoFieldsToUpdate };
     const SaveOneError = SaveError || error{ NotFound, NotSingular };
     const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
     const ExecOneError = ExecError || error{ NotFound, NotSingular };
