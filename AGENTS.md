@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.38.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.39.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (313 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (322 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -85,7 +85,15 @@ Entities and queries are explicitly owned by the caller. See the contract:
   loading was fail-closed.
 - **Neighbour queries qualify injected predicates with the target table.**
   m2o joins the source and m2m joins the junction, so a bare column is
-  ambiguous whenever both sides own it.
+  ambiguous whenever both sides own it. Qualification lives in one helper
+  (`sql.appendQualifiedPred`) shared with `zent.scope`; never re-inline it.
+- **Raw SQL is unscoped unless it goes through `zent.scope`.** The builders are
+  where privacy and interceptors run, so a hand-written statement has to ask
+  for the fragment (`forClient` + `withClause`). Any new raw-SQL helper must
+  route through `appendTargetScopePreds`, not re-implement the chain.
+- **Positional row scans are column-count guarded.** `scanRow*` rejects a
+  result set narrower than the struct with `error.ColumnCountMismatch`; the
+  drivers do not all bounds-check. Keep that check when adding a scanner.
 
 ## Layout
 
