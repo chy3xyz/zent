@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-09-12
+
 ### Added
 - **One-call entity release: `deinitRows` / `deinitRow` / `deinitEdgeRows`.**
   Freeing a page took `deinitEntity(infos, info, &e, alloc)` per item plus
