@@ -17,7 +17,7 @@
 //!     if (!std.mem.eql(u8, zent.version, "0.38.0")) @compileError("zent pin drift");
 //! }
 //! ```
-pub const version = "0.43.0";
+pub const version = "0.44.0";
 
 const std = @import("std");
 

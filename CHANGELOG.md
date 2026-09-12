@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-09-12
+
 ### Added
 - **Edge writes work on `From` edges (Z15).** `SetEdgeIDs` and `ClearEdge`
   rejected every edge whose FK lives on the row being updated, so the same
