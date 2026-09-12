@@ -6,13 +6,13 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.37.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.38.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (306 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
-- `zig build test-integration` — run SQLite integration tests
+- `zig build test` — run unit tests (313 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
 - `zig build run-complex` — run the `examples/complex` e-commerce demo
@@ -68,6 +68,24 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `sql.QueryResult` (`{ sql, args }`) borrows from the builder; `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) transfers ownership and MUST be `deinit`'d.
 - The root `Client` lazily heap-allocates its `InterceptorChain` on first `client_mod.UseInterceptor(infos, &client, i)`; release it with `client_mod.DeinitClient(infos, &client)` **once, on the value that registered**. Value copies (helpers, `withContext`, tx clients) borrow the same chain and must not be deinit'd; `withInterceptors(chain)` borrows a caller-owned chain, which `DeinitClient` leaves alone. `StoreEnv`/`PooledEnv`/`ShardedEnv` release the clients they created on `deinit` (each shard client individually). Register before `beginTx` — the tx client borrows the same chain.
 - Use `std.testing.allocator` in tests so `zig build test` reports leaks with non-zero exit.
+
+## Security invariants (do not regress)
+
+- **Interceptor `whereEq` dedupes on the (column, value) pair, never the
+  column.** Column-only dedupe lets a caller predicate suppress the
+  interceptor's own value = a tenant bypass. All eight `add_eq_fn` sinks go
+  through `sql.appendEqUnlessPresent`; the two create-path sinks are a
+  *filler* (an explicitly set field wins), so a write constraint the caller
+  must not override belongs in a privacy policy, not an interceptor.
+- **Both bulk neighbour readers share the target read contract.** `WithEdge`
+  and `client.queryTargets*`/`QueryEdge` all funnel through
+  `codegen.query.appendTargetScopePreds` (soft-delete → privacy →
+  interceptors). Never re-implement that chain at a second call site — the
+  previous hand-rolled copy is what left `QueryEdge` fail-open while eager
+  loading was fail-closed.
+- **Neighbour queries qualify injected predicates with the target table.**
+  m2o joins the source and m2m joins the junction, so a bare column is
+  ambiguous whenever both sides own it.
 
 ## Layout
 
