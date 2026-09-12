@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-09-12
+
 ### Added
 - **`zent.scope`: the read contract for raw SQL.** Raw statements bypassed
   privacy and the interceptor chain entirely, because an injected predicate
