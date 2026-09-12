@@ -5,6 +5,10 @@ pub const sql_cache = @import("sql/cache.zig");
 pub const sql_dialect = @import("sql/dialect.zig");
 pub const sql_driver = @import("sql/driver.zig");
 pub const sql_scan = @import("sql/scan.zig");
+/// The package version, readable at comptime (`zent.version`). Mirrors
+/// `build.zig.zon`; both are gated by `scripts/check-version.sh`. Use it to
+/// check a dependency pin without consulting git.
+pub const version = @import("version.zig").version;
 pub const sql_sqlite = @import("sql/sqlite.zig");
 pub const sql_postgres = @import("sql/postgres.zig");
 pub const sql_mysql = @import("sql/mysql.zig");

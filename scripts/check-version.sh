@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Release-consistency gate:
 #   1. build.zig.zon version must be referenced by README.md / README_CN.md
-#   2. package version must never be older than the latest git tag
+#   2. build.zig.zon version must equal src/version.zig (the mirror consumers
+#      read at comptime, e.g. `zent.version`)
+#   3. package version must never be older than the latest git tag
 #      (guards the tag/version drift that hit v0.12.1 vs v0.17.0 tags)
 # Run in CI so a manual bump can never leave the repo inconsistent.
 set -euo pipefail
@@ -22,6 +24,17 @@ for f in README.md README_CN.md; do
     fail=1
   fi
 done
+
+# The comptime mirror consumers read must match the package manifest.
+MIRROR="$(sed -n 's/^pub const version = "\([0-9.]*\)";$/\1/p' src/version.zig | head -1)"
+if [[ -z "$MIRROR" ]]; then
+  echo "check-version: cannot read version from src/version.zig" >&2
+  fail=1
+elif [[ "$MIRROR" != "$VERSION" ]]; then
+  echo "check-version: src/version.zig is $MIRROR but build.zig.zon is $VERSION" >&2
+  echo "check-version: keep them in sync (scripts/bump-version.sh does both)" >&2
+  fail=1
+fi
 
 # Drift guard: latest tag (e.g. v0.18.0) must not be newer than the package.
 # `git tag --sort=-v:refname` uses git's built-in version sort, so this works

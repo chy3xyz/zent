@@ -41,6 +41,7 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
             total_fields += 4; // In, NotIn, IsNull, NotNil
             if (f.field_type == .string or f.field_type == .text) {
                 total_fields += 2; // Contains + ContainsEscaped
+                total_fields += 1; // Like (the verbatim-LIKE name for Contains)
                 total_fields += 4; // HasPrefix, HasSuffix, ContainsFold, EQFold
             }
         }
@@ -95,6 +96,17 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
             if (f.field_type == .string or f.field_type == .text) {
                 const contains_name = fieldName(f.name, "Contains");
                 field_names[idx] = contains_name;
+                field_types[idx] = StringPredFn;
+                field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(StringPredFn) };
+                idx += 1;
+                // `Like` is the same predicate under a name that says what it
+                // does. `Contains` binds the pattern verbatim, so it is an
+                // equality on the literal string unless the caller supplies
+                // the wildcards — a trap that has bitten at least one consumer
+                // and one doc. New code should use `Like`; `Contains` stays as
+                // the historical alias (renaming it is a breaking change).
+                const like_name = fieldName(f.name, "Like");
+                field_names[idx] = like_name;
                 field_types[idx] = StringPredFn;
                 field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(StringPredFn) };
                 idx += 1;
@@ -212,6 +224,11 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
                         return sql.Like(sql_col, .{ .string = v });
                     }
                 }.containsFn;
+                @field(result, col ++ "Like") = struct {
+                    fn likeFn(v: []const u8) sql.Predicate {
+                        return sql.Like(sql_col, .{ .string = v });
+                    }
+                }.likeFn;
                 @field(result, col ++ "ContainsEscaped") = struct {
                     fn containsEscapedFn(v: []const u8) sql.Predicate {
                         return sql.ContainsEscaped(sql_col, v);
@@ -562,6 +579,18 @@ test "Predicates: Contains binds the pattern, ContainsEscaped wraps it" {
         _ = try s2.where(preds.nameContains("%foo%"));
         const q2 = try s2.query();
         try std.testing.expectEqualStrings("%foo%", q2.args[0].string);
+    }
+
+    // `Like` is the same predicate under a name that does not promise a
+    // substring search, so a reader cannot be misled by the call site.
+    {
+        var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(sql.Table("users"));
+        _ = try s.where(preds.nameLike("%foo%"));
+        const q = try s.query();
+        try std.testing.expectEqualStrings("SELECT `id` FROM `users` WHERE `name` LIKE ?", q.sql);
+        try std.testing.expectEqualStrings("%foo%", q.args[0].string);
     }
 
     // `ContainsEscaped` adds the wildcards itself and escapes the input, so it

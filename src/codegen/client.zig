@@ -215,7 +215,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return bdb;
         }
 
-        const QueryEdgeError = sql_driver.Error || error{ TypeMismatch, BuildFailed, PrivacyDenied, InterceptFailed };
+        const QueryEdgeError = sql_driver.Error || error{ TypeMismatch, ColumnCountMismatch, BuildFailed, PrivacyDenied, InterceptFailed };
 
         /// Query target entities via an edge.
         /// Example: user_client.QueryEdge("cars", &.{alice.id}) returns Car entities.
@@ -548,7 +548,7 @@ fn QueryTargetsResult(
     return std.array_list.Managed(EntityGen(infos, target_info));
 }
 
-const QueryTargetsError = sql_driver.Error || error{ TypeMismatch, BuildFailed, PrivacyDenied, InterceptFailed };
+const QueryTargetsError = sql_driver.Error || error{ TypeMismatch, ColumnCountMismatch, BuildFailed, PrivacyDenied, InterceptFailed };
 
 /// Which predicates a neighbour traversal applies to the target rows.
 /// `scoped` matches the eager-load read contract; `soft_delete_only` is the

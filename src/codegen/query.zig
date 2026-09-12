@@ -705,7 +705,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
         }
 
-        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
+        const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
         const ExplainError = error{ OutOfMemory, BuildFailed, InvalidCursor, UnsupportedDialect };
 
@@ -1801,7 +1801,7 @@ test "Query builder execution methods expose explicit driver error union" {
     const infos = &[_]TypeInfo{info};
     const UserEntity = comptime EntityGenerator(infos, info);
     const UserQuery = QueryBuilder(infos, info, UserEntity);
-    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
+    const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
 
     comptime {
         const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
@@ -1873,7 +1873,7 @@ test "query contract tests" {
     const infos = &[_]TypeInfo{info};
     const UserEntity = comptime EntityGenerator(infos, info);
     const QB = QueryBuilder(infos, info, UserEntity);
-    const QE = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, MissingColumn, InvalidEdge, BuildFailed, InvalidCursor, UuidEdgesUnsupported, InterceptFailed };
+    const QE = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, BuildFailed, InvalidCursor, UuidEdgesUnsupported, InterceptFailed };
 
     comptime {
         // Verify all public query method error sets are explicit

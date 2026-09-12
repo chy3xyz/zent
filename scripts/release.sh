@@ -45,6 +45,9 @@ echo "release: $OLD -> $VERSION"
 
 # 1. Bump version in every reference.
 sed -i '' "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" build.zig.zon
+# Also the comptime mirror consumers read (`zent.version`), so
+# scripts/check-version.sh finds them equal.
+sed -i '' "s/^pub const version = \"$OLD\";$/pub const version = \"$VERSION\";/" src/version.zig
 for f in README.md README_CN.md; do
     if [[ -f "$f" ]]; then sed -i '' "s/$OLD/$VERSION/g" "$f"; fi
 done

@@ -163,7 +163,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self;
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed, InterceptFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
 
         /// Run the interceptor chain (`.create`). `whereEq` fills omitted
         /// columns; already-set fields are left alone. Errors collapse to
@@ -1085,7 +1085,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             return try self.setValue(field_name, toSqlValue(value));
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed, InterceptFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
 
         fn runInterceptors(self: *Self) error{InterceptFailed}!void {
             const chain = self.interceptors orelse return;
@@ -1479,8 +1479,8 @@ test "Create builders expose explicit driver error unions" {
     const UserEntity = comptime EntityGen(infos, info);
     const Builder = CreateBuilder(infos, info, UserEntity);
     const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
-    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ValidationFailed, InterceptFailed };
-    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ValidationFailed, InterceptFailed };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
+    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
 
     comptime {
         const save_return = @typeInfo(@TypeOf(Builder.Save)).@"fn".return_type.?;

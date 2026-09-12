@@ -27,6 +27,10 @@ echo "bump-version: $OLD -> $NEW"
 # 1) Single source of truth.
 sed -i '' "s/\.version = \"$OLD\"/.version = \"$NEW\"/" build.zig.zon
 
+# Also the comptime mirror consumers read (`zent.version`), so
+# scripts/check-version.sh finds them equal.
+sed -i '' "s/^pub const version = \"$OLD\";$/pub const version = \"$NEW\";/" src/version.zig
+
 # 2) Derived doc references.
 for f in README.md README_CN.md; do
   if [[ -f "$f" ]]; then

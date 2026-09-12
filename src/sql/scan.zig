@@ -25,6 +25,9 @@ pub fn scanRow(comptime T: type, allocator: std.mem.Allocator, row: Row) !T {
 /// Like `scanRow`, but JSON struct fields are parsed into `json_arena` so a
 /// single arena deinit releases them. Used by entity scans; the entity's
 /// json_arena field is set to `json_arena` so deinitEntity can free it.
+///
+/// A result set narrower than the struct's data fields fails with
+/// `error.ColumnCountMismatch` instead of reading past the end of the row.
 pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
@@ -55,10 +58,12 @@ pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row
             @compileError("Unsupported pointer type for scanning: " ++ @typeName(T));
         },
         .optional => |opt| {
+            try requireColumns(row, 0, 1);
             if (row.isNull(0)) return null;
             return try scanRowWithArena(opt.child, allocator, row, json_arena);
         },
         .@"struct" => |s| {
+            try requireColumns(row, 0, dataFieldCount(s));
             var value: T = undefined;
             var col_idx: usize = 0;
             inline for (s.field_names, s.field_types) |field_name, field_type| {
@@ -73,7 +78,10 @@ pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row
             }
             return value;
         },
-        .@"enum" => return try scanColumn(T, allocator, row, 0, json_arena),
+        .@"enum" => {
+            try requireColumns(row, 0, 1);
+            return try scanColumn(T, allocator, row, 0, json_arena);
+        },
         else => @compileError("Unsupported type for scanning: " ++ @typeName(T)),
     }
 }
@@ -147,10 +155,32 @@ pub fn scanRowLenient(comptime T: type, allocator: std.mem.Allocator, row: Row) 
 
 /// Like `scanRowLenient`, but JSON struct fields are parsed into
 /// `json_arena`, matching `scanRowWithArena`.
+///
+/// Three differences from `scanRowWithArena`, all of them the "absent value"
+/// contract:
+///  - a **NULL** column leaves the field at its default (see `defaultInit`);
+///  - a **value that does not fit the field** (a DECIMAL column read into an
+///    int field, say) does the same instead of failing with `TypeMismatch`;
+///  - a string default is handed back **owned**, so the caller frees every
+///    string field uniformly (a declared default like `"0.00"` is a comptime
+///    literal, and freeing that would be an invalid free).
+///
+/// A **structural** mismatch is still an error: if the result set has fewer
+/// columns than the struct has data fields the scan fails with
+/// `error.ColumnCountMismatch`. Positional scanning would otherwise read past
+/// the end of the row, and the drivers do not all bounds-check (`MySQL` and
+/// `libpq` index a bind/null array directly). Keeping that check while
+/// tolerating value mismatches is the point: wrong projection = error, absent
+/// value = default.
+///
+/// Because value mismatches are tolerated, this scanner can mask a wrong
+/// column mapping. Use the strict scanners for entity reads, where a mismatch
+/// means the schema and the database disagree.
 pub fn scanRowLenientWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
         .@"struct" => |s| {
+            try requireColumns(row, 0, dataFieldCount(s));
             var value: T = defaultInit(T);
             var col_idx: usize = 0;
             inline for (s.field_names, s.field_types) |field_name, field_type| {
@@ -159,8 +189,17 @@ pub fn scanRowLenientWithArena(comptime T: type, allocator: std.mem.Allocator, r
                 } else if (comptime std.mem.eql(u8, field_name, "json_arena")) {
                     @field(value, field_name) = json_arena;
                 } else {
-                    if (!row.isNull(col_idx)) {
-                        @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx, json_arena);
+                    if (row.isNull(col_idx)) {
+                        @field(value, field_name) = try ownDefault(field_type, allocator, @field(value, field_name));
+                    } else {
+                        // An ill-fitting value leaves the field at (an owned
+                        // copy of) its default; anything else — OutOfMemory in
+                        // particular — propagates.
+                        @field(value, field_name) = scanColumn(field_type, allocator, row, col_idx, json_arena) catch |err|
+                            if (err == error.TypeMismatch)
+                                try ownDefault(field_type, allocator, @field(value, field_name))
+                            else
+                                return err;
                     }
                     col_idx += 1;
                 }
@@ -168,10 +207,53 @@ pub fn scanRowLenientWithArena(comptime T: type, allocator: std.mem.Allocator, r
             return value;
         },
         else => {
+            try requireColumns(row, 0, 1);
             if (row.isNull(0)) return std.mem.zeroes(T);
             return scanRowWithArena(T, allocator, row, json_arena);
         },
     }
+}
+
+/// Number of result-set columns a positional scan of `T` consumes: the struct
+/// fields minus the two synthetic ones (`edges`, `json_arena`).
+fn dataFieldCount(comptime s: std.builtin.Type.Struct) usize {
+    var n: usize = 0;
+    for (s.field_names) |fname| {
+        if (std.mem.eql(u8, fname, "edges")) continue;
+        if (std.mem.eql(u8, fname, "json_arena")) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// Reject a result set too narrow for a positional scan before any driver
+/// `getInt`/`isNull` call. `index` is the first column the scan reads, so
+/// `scanRowOffset` counts from its own offset; extra trailing columns are
+/// allowed (`target.*` projections append a computed `__fk`).
+fn requireColumns(row: Row, index: usize, need: usize) error{ColumnCountMismatch}!void {
+    if (row.columnCount() < index + need) return error.ColumnCountMismatch;
+}
+
+/// Hand back a string-shaped default as owned memory, so a lenient scan's
+/// caller can free every string field without knowing whether the scanner
+/// allocated it. Empty slices are returned as-is: `std.mem.Allocator.free`
+/// treats a zero-length slice as a no-op, so there is nothing to own.
+fn ownDefault(comptime T: type, allocator: std.mem.Allocator, value: T) error{OutOfMemory}!T {
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8 and value.len > 0) {
+                return try allocator.dupe(u8, value);
+            }
+        },
+        .optional => |opt| {
+            if (value) |inner| {
+                const owned = try ownDefault(opt.child, allocator, inner);
+                return owned;
+            }
+        },
+        else => {},
+    }
+    return value;
 }
 
 /// Maps a Zig struct field to the physical column it is read from.
@@ -235,8 +317,15 @@ pub fn scanRowNamedLenientMapped(comptime T: type, allocator: std.mem.Allocator,
     return scanRowNamedImpl(T, allocator, row, columns, null, true);
 }
 
-/// Shared body of the name-resolved scanners. `lenient` picks the NULL
-/// policy; an empty `columns` slice means "field name is the column name".
+/// Shared body of the name-resolved scanners. `lenient` picks the contract:
+/// strict keeps `zeroInit` and fails on a NULL, lenient uses `defaultInit`,
+/// tolerates a NULL or an ill-fitting value, and hands back owned string
+/// defaults (see `scanRowLenientWithArena`). An empty `columns` slice means
+/// "field name is the column name".
+///
+/// No column-count guard is needed here: a column that is absent from the
+/// result set is a legitimate partial projection, and `findColumnIndex` is
+/// bounds-safe, so nothing is ever indexed past the row.
 fn scanRowNamedImpl(
     comptime T: type,
     allocator: std.mem.Allocator,
@@ -256,9 +345,23 @@ fn scanRowNamedImpl(
         } else {
             const lookup = mappedColumn(columns, field_name) orelse field_name;
             if (findColumnIndex(row, lookup)) |idx| {
-                if (!lenient or !row.isNull(idx)) {
-                    @field(value, field_name) = try scanColumn(field_type, allocator, row, idx, json_arena);
+                if (row.isNull(idx)) {
+                    if (lenient) {
+                        @field(value, field_name) = try ownDefault(field_type, allocator, @field(value, field_name));
+                    } else {
+                        @field(value, field_name) = try scanColumn(field_type, allocator, row, idx, json_arena);
+                    }
+                } else {
+                    @field(value, field_name) = scanColumn(field_type, allocator, row, idx, json_arena) catch |err|
+                        if (err == error.TypeMismatch and lenient)
+                            try ownDefault(field_type, allocator, @field(value, field_name))
+                        else
+                            return err;
                 }
+            } else if (lenient) {
+                // Absent column: the field keeps its default, but a string
+                // default still has to become owned memory.
+                @field(value, field_name) = try ownDefault(field_type, allocator, @field(value, field_name));
             }
         }
     }
@@ -361,8 +464,12 @@ fn scanRowInnerNoAlloc(comptime T: type, row: Row, comptime offset: usize) !T {
 fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, comptime offset: usize, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
-        .int, .float, .bool, .pointer, .optional, .@"enum" => return scanRowWithArena(T, allocator, row, json_arena),
+        .int, .float, .bool, .pointer, .optional, .@"enum" => {
+            try requireColumns(row, offset, 1);
+            return scanRowWithArena(T, allocator, row, json_arena);
+        },
         .@"struct" => |s| {
+            try requireColumns(row, offset, dataFieldCount(s));
             var value: T = undefined;
             var col_idx: usize = offset;
             inline for (s.field_names, s.field_types) |field_name, field_type| {
@@ -471,6 +578,35 @@ pub fn queryAll(
     sql_text: []const u8,
     args: []const Value,
 ) !std.array_list.Managed(T) {
+    return queryAllImpl(T, allocator, driver, sql_text, args, false);
+}
+
+/// `queryAll` under the **NULL-is-absent** contract: a NULL column, an absent
+/// column, or a value that does not fit its field leaves the field at its
+/// default (`scanRowNamedLenient`). This is the variant ad-hoc reporting
+/// queries want; `queryAll` stays strict for the same reason the strict
+/// scanners do.
+///
+/// Ownership is unchanged: release items with `freeDto`, then `list.deinit()`.
+/// String defaults come back owned, so every string field frees uniformly.
+pub fn queryAllLenient(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    driver: Driver,
+    sql_text: []const u8,
+    args: []const Value,
+) !std.array_list.Managed(T) {
+    return queryAllImpl(T, allocator, driver, sql_text, args, true);
+}
+
+fn queryAllImpl(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    driver: Driver,
+    sql_text: []const u8,
+    args: []const Value,
+    comptime lenient: bool,
+) !std.array_list.Managed(T) {
     var rows = try driver.query(sql_text, args);
     defer rows.deinit();
     var list = std.array_list.Managed(T).init(allocator);
@@ -479,7 +615,8 @@ pub fn queryAll(
         list.deinit();
     }
     while (rows.next()) |row| {
-        try list.append(try scanRowNamed(T, allocator, row));
+        const item = if (lenient) try scanRowNamedLenient(T, allocator, row) else try scanRowNamed(T, allocator, row);
+        try list.append(item);
     }
     if (rows.nextError()) |err| return err;
     return list;
@@ -494,13 +631,35 @@ pub fn queryOne(
     sql_text: []const u8,
     args: []const Value,
 ) !?T {
+    return queryOneImpl(T, allocator, driver, sql_text, args, false);
+}
+
+/// `queryOne` under the NULL-is-absent contract — see `queryAllLenient`.
+pub fn queryOneLenient(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    driver: Driver,
+    sql_text: []const u8,
+    args: []const Value,
+) !?T {
+    return queryOneImpl(T, allocator, driver, sql_text, args, true);
+}
+
+fn queryOneImpl(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    driver: Driver,
+    sql_text: []const u8,
+    args: []const Value,
+    comptime lenient: bool,
+) !?T {
     var rows = try driver.query(sql_text, args);
     defer rows.deinit();
     const row = rows.next() orelse {
         if (rows.nextError()) |err| return err;
         return null;
     };
-    return try scanRowNamed(T, allocator, row);
+    return if (lenient) try scanRowNamedLenient(T, allocator, row) else try scanRowNamed(T, allocator, row);
 }
 
 /// Free the memory owned by a DTO scanned with `scanRowNamed`, `queryAll`,
@@ -518,7 +677,11 @@ pub fn freeDto(comptime T: type, allocator: std.mem.Allocator, dto: *const T) vo
 fn freeDtoValue(comptime T: type, allocator: std.mem.Allocator, value: T) void {
     switch (@typeInfo(T)) {
         .pointer => |ptr| {
-            if (ptr.size == .slice and ptr.child == u8) allocator.free(value);
+            // Length-guarded so a default that never allocated ("" from
+            // `zeroInit`) is harmless to release; a *non-empty* default is
+            // the scanner's responsibility to hand back owned memory (see
+            // `ownDefault`).
+            if (ptr.size == .slice and ptr.child == u8 and value.len > 0) allocator.free(value);
         },
         .optional => |opt| {
             if (value) |v| freeDtoValue(opt.child, allocator, v);
@@ -737,6 +900,130 @@ test "scanRowNamedLenient tolerates NULL and missing columns alike" {
     try std.testing.expectEqualStrings("", mapped.label);
 }
 
+test "positional scan rejects a result set narrower than the struct" {
+    // Positional scanning indexes the row by field order, and the drivers do
+    // not all bounds-check (`MySQL`/`libpq` index a bind/null array directly),
+    // so a narrow projection used to be an out-of-bounds read. Both families
+    // must reject it up front instead.
+    const Dto = struct {
+        id: i64,
+        name: []const u8,
+        age: i32,
+    };
+    // Both present columns are non-NULL, so nothing fails before the scan
+    // reaches the missing third column — that is where the out-of-bounds read
+    // would happen.
+    const narrow = MockRowData{
+        .ints = &.{ 1, null },
+        .floats = &.{ null, null },
+        .texts = &.{ null, "alice" },
+        .bools = &.{ null, null },
+        .nulls = &.{ false, false },
+    };
+    const row = Row{ .ptr = @ptrCast(@constCast(&narrow)), .vtable = &mock_vtable };
+
+    try std.testing.expectError(error.ColumnCountMismatch, scanRow(Dto, std.testing.allocator, row));
+    try std.testing.expectError(error.ColumnCountMismatch, scanRowLenient(Dto, std.testing.allocator, row));
+    try std.testing.expectError(error.ColumnCountMismatch, scanRowOffset(Dto, std.testing.allocator, row, 1));
+
+    // Extra trailing columns stay fine: entity projections are `target.*`
+    // followed by a computed `__fk`.
+    const wide = MockRowData{
+        .ints = &.{ 1, null, 30, 99 },
+        .floats = &.{ null, null, null, null },
+        .texts = &.{ null, "alice", null, null },
+        .bools = &.{ null, null, null, null },
+        .nulls = &.{ false, false, false, false },
+    };
+    const wrow = Row{ .ptr = @ptrCast(@constCast(&wide)), .vtable = &mock_vtable };
+    const dto = try scanRow(Dto, std.testing.allocator, wrow);
+    defer std.testing.allocator.free(dto.name);
+    try std.testing.expectEqualStrings("alice", dto.name);
+    try std.testing.expectEqual(@as(i32, 30), dto.age);
+
+    // Scaffolding rows may legitimately be empty, so the `__fk` allowance is
+    // not a blanket exemption — a zero-column row is still a mismatch.
+    const empty = MockRowData{
+        .ints = &.{},
+        .floats = &.{},
+        .texts = &.{},
+        .bools = &.{},
+        .nulls = &.{},
+    };
+    const erow = Row{ .ptr = @ptrCast(@constCast(&empty)), .vtable = &mock_vtable };
+    try std.testing.expectError(error.ColumnCountMismatch, scanRowLenient(i64, std.testing.allocator, erow));
+}
+
+test "scanRowLenient hands back owned string defaults" {
+    // A declared string default is a comptime literal. Handing that straight
+    // to the caller means their `freeDto` frees a literal — an invalid free.
+    // The lenient scanners must return an owned copy instead.
+    const Dto = struct {
+        id: i64,
+        amount: []const u8 = "0.00",
+    };
+    const data = MockRowData{
+        .ints = &.{ 5, null },
+        .floats = &.{ null, null },
+        .texts = &.{ null, null },
+        .bools = &.{ null, null },
+        .nulls = &.{ false, true },
+    };
+    const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+
+    const dto = try scanRowLenient(Dto, std.testing.allocator, row);
+    try std.testing.expectEqualStrings("0.00", dto.amount);
+    // `std.testing.allocator` rejects a free of the literal, so this line is
+    // the assertion that the copy is owned.
+    freeDto(Dto, std.testing.allocator, &dto);
+
+    // Same for the named variant, and for a column that is present but does
+    // not fit the field.
+    const NDto = struct {
+        id: i64,
+        amount: []const u8 = "0.00",
+    };
+    const ndto = try scanRowNamedLenient(NDto, std.testing.allocator, row);
+    try std.testing.expectEqualStrings("0.00", ndto.amount);
+    freeDto(NDto, std.testing.allocator, &ndto);
+
+    // An empty default needs no copy, and releasing it stays harmless.
+    const EmptyDto = struct {
+        id: i64,
+        note: []const u8,
+    };
+    const edto = try scanRowLenient(EmptyDto, std.testing.allocator, row);
+    try std.testing.expectEqualStrings("", edto.note);
+    freeDto(EmptyDto, std.testing.allocator, &edto);
+}
+
+test "scanRowLenient falls back to the default for values that do not fit" {
+    // The PHP-port contract this scanner exists for: a column the field cannot
+    // hold (DECIMAL text read into an int, say) means "absent", not "abort".
+    // The strict scanner keeps its hard failure.
+    const Dto = struct {
+        id: i64,
+        age: i32,
+        name: []const u8,
+    };
+    const data = MockRowData{
+        // `age` is not NULL but `getInt` yields null → the value does not fit.
+        .ints = &.{ 8, null, null },
+        .floats = &.{ null, null, null },
+        .texts = &.{ null, null, null },
+        .bools = &.{ null, null, null },
+        .nulls = &.{ false, false, true },
+    };
+    const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+
+    try std.testing.expectError(error.TypeMismatch, scanRow(Dto, std.testing.allocator, row));
+
+    const dto = try scanRowLenient(Dto, std.testing.allocator, row);
+    try std.testing.expectEqual(@as(i64, 8), dto.id);
+    try std.testing.expectEqual(@as(i32, 0), dto.age);
+    try std.testing.expectEqualStrings("", dto.name);
+}
+
 test "scan enum from int and string" {
     const Status = enum { active, pending, deleted };
 
@@ -938,6 +1225,47 @@ test "queryAll scans all rows into DTOs by column name and frees cleanly" {
     try std.testing.expectEqual(@as(i64, 2), list.items[1].sku_id);
     try std.testing.expectEqual(@as(?[]const u8, null), list.items[1].memo);
     try std.testing.expectEqualStrings("SELECT sku_id, title, memo FROM sku", drv.last_sql.?);
+}
+
+test "queryAllLenient and queryOneLenient carry the absent-value contract" {
+    // The cheap path a PHP-style port actually uses: `queryAll` used to be
+    // strict-only, so a NULL or an absent column in an ad-hoc report query
+    // forced callers back to hand-rolled `rows.next()` loops.
+    const allocator = std.testing.allocator;
+    const Item = struct {
+        sku_id: i64,
+        title: []const u8,
+        memo: []const u8 = "0.00",
+        unselected: i64,
+    };
+    const rows_data = &[_]NamedRowData{
+        .{
+            // `title` is NULL, `memo` is absent from the projection entirely.
+            .names = &.{ "sku_id", "title" },
+            .ints = &.{ 1, null },
+            .texts = &.{ null, null },
+            .nulls = &.{ false, true },
+        },
+    };
+    var drv = ListDriver{ .rows_data = rows_data };
+
+    // Strict: a NULL `title` is an error, which is why the wrapper exists.
+    try std.testing.expectError(error.TypeMismatch, queryAll(Item, allocator, drv.asDriver(), "SELECT ...", &.{}));
+
+    var list = try queryAllLenient(Item, allocator, drv.asDriver(), "SELECT sku_id, title FROM sku", &.{});
+    defer {
+        for (list.items) |*item| freeDto(Item, allocator, item);
+        list.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqual(@as(i64, 1), list.items[0].sku_id);
+    try std.testing.expectEqualStrings("", list.items[0].title);
+    // The declared default arrives, and `freeDto` above proves it is owned.
+    try std.testing.expectEqualStrings("0.00", list.items[0].memo);
+
+    const one = (try queryOneLenient(Item, allocator, drv.asDriver(), "SELECT ...", &.{})) orelse return error.ExpectedRow;
+    try std.testing.expectEqual(@as(i64, 1), one.sku_id);
+    freeDto(Item, allocator, &one);
 }
 
 test "queryOne scans the first row and returns null when empty" {
