@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Edge writes work on `From` edges (Z15).** `SetEdgeIDs` and `ClearEdge`
+  rejected every edge whose FK lives on the row being updated, so the same
+  intent needed a different spelling depending on which side of the relation
+  owned the column (`setFieldValue("owner_id", …)`). They now accept `From`
+  m2o/o2o edges, and the write goes into the UPDATE's **own** `SET` clause
+  rather than becoming a second statement against the target table: one
+  statement, one predicate, one transaction, and the interceptor/privacy scope
+  covers it like any other column. `error.TooManyEdgeTargets` (returned by the
+  call, not by `Save`) rejects more than one id, since a `From` edge points at a
+  single row; clearing needs a nullable FK, which `ClearEdge` rejects at
+  compile time and `SetEdgeIDs(…, &.{})` at runtime
+  (`error.EdgeNotDetachable`). Covered on SQLite, PostgreSQL and MySQL in the
+  existing edge-write tests, including re-point, clear and rejection —
+  falsified by making the branch a no-op. `AddEdgeIDs`/`RemoveEdgeIDs` stay
+  M2M-only, and their compile errors now point at `SetEdgeIDs` for
+  single-target edges.
+
 ## [0.43.0] - 2026-09-12
 
 ### Fixed

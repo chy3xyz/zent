@@ -413,7 +413,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             comptime {
                 const edge = findEdgeInfo(info, edge_name);
                 if (edge.relation != .m2m) {
-                    @compileError("AddEdgeIDs requires an M2M edge (junction/through table): " ++ edge_name ++ " on " ++ info.name);
+                    @compileError("AddEdgeIDs requires an M2M edge (junction/through table): " ++ edge_name ++ " on " ++ info.name ++ ". A m2o/o2o edge is a single column on one of the two rows — use SetEdgeIDs (or ClearEdge) instead.");
                 }
             }
             try self.edge_actions.append(.{ .op = .add_ids, .edge_name = edge_name, .ids = ids });
@@ -426,7 +426,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             comptime {
                 const edge = findEdgeInfo(info, edge_name);
                 if (edge.relation != .m2m) {
-                    @compileError("RemoveEdgeIDs requires an M2M edge (junction/through table): " ++ edge_name ++ " on " ++ info.name);
+                    @compileError("RemoveEdgeIDs requires an M2M edge (junction/through table): " ++ edge_name ++ " on " ++ info.name ++ ". A m2o/o2o edge is a single column on one of the two rows — use SetEdgeIDs (or ClearEdge) instead.");
                 }
             }
             try self.edge_actions.append(.{ .op = .remove_ids, .edge_name = edge_name, .ids = ids });
@@ -442,13 +442,36 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
         /// statement resolves the source id with a scalar subquery, so a
         /// multi-row source set is rejected by PostgreSQL/MySQL rather than
         /// silently picking one (ent UpdateOne parity for bulk Update).
+        /// M2O/O2O `From` edge (FK on **this** row): the association is a column
+        /// of the row being updated, so the write joins the UPDATE's own `SET`
+        /// clause — one statement, one predicate, one transaction, and the
+        /// interceptor/privacy scope applies to it like any other field.
+        /// At most one id is meaningful; an empty `ids` writes NULL and needs a
+        /// nullable FK (`error.EdgeNotDetachable` otherwise — `ClearEdge`
+        /// rejects it at compile time instead).
+        ///
+        /// More than one id is `error.TooManyEdgeTargets`, **from this call**
+        /// rather than from `Save` — a `From` edge points at a single row, so
+        /// the argument itself is wrong.
         pub fn SetEdgeIDs(self: *Self, comptime edge_name: []const u8, ids: []const i64) !*Self {
+            const edge = comptime findEdgeInfo(info, edge_name);
             comptime {
-                const edge = findEdgeInfo(info, edge_name);
-                if (!(edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o))) {
-                    @compileError("SetEdgeIDs requires a To edge whose FK lives in the target table (o2m/o2o): " ++ edge_name ++ " on " ++ info.name);
+                if (edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o)) {
+                    checkDetachableFK(edge);
+                } else if (!(edge.kind == .from and (edge.relation == .m2o or edge.relation == .o2o))) {
+                    @compileError("SetEdgeIDs requires an edge that owns a foreign key — a To o2m/o2o edge (FK in the target) or a From m2o/o2o edge (FK on this row): " ++ edge_name ++ " on " ++ info.name);
                 }
-                checkDetachableFK(edge);
+            }
+            if (comptime edge.kind == .from) {
+                if (ids.len > 1) return error.TooManyEdgeTargets;
+                const fk_field = comptime selfOwningFKField(edge);
+                if (ids.len == 0) {
+                    if (comptime !selfOwningFKIsNullable(edge)) return error.EdgeNotDetachable;
+                    _ = try self.set(fk_field, .null);
+                } else {
+                    _ = try self.set(fk_field, .{ .int = ids[0] });
+                }
+                return self;
             }
             try self.edge_actions.append(.{ .op = .set_ids, .edge_name = edge_name, .ids = ids });
             return self;
@@ -463,26 +486,49 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             comptime {
                 const edge = findEdgeInfo(info, edge_name);
                 const writable = edge.relation == .m2m or
-                    (edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o));
+                    (edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o)) or
+                    (edge.kind == .from and (edge.relation == .m2o or edge.relation == .o2o));
                 if (!writable) {
-                    @compileError("ClearEdge supports M2M and To o2m/o2o edges only; a 'from' edge stores its FK on this row — use setFieldValue to detach it: " ++ edge_name);
+                    @compileError("ClearEdge supports M2M, To o2m/o2o and From m2o/o2o edges: " ++ edge_name ++ " on " ++ info.name);
                 }
                 if (edge.relation != .m2m) checkDetachableFK(edge);
+            }
+            if (comptime findEdgeInfo(info, edge_name).kind == .from) {
+                // FK on this row: NULL it in the UPDATE's own SET clause.
+                _ = try self.set(selfOwningFKField(findEdgeInfo(info, edge_name)), .null);
+                return self;
             }
             try self.edge_actions.append(.{ .op = .clear, .edge_name = edge_name, .ids = &.{} });
             return self;
         }
 
-        /// Compile-time guard: detaching targets needs a nullable FK column.
+        /// Compile-time guard: detaching needs a nullable FK column — on the
+        /// target for a `To` edge, on this row for a `From` edge.
         fn checkDetachableFK(comptime edge: EdgeInfo) void {
             const target_info = comptime edgeTargetInfo(infos, info, edge);
             const step = comptime buildEdgeStep(edge, info, target_info);
             const fk_col = step.edge_columns[0];
-            if (comptime findField(target_info, fk_col)) |f| {
+            const owner_info = if (edge.kind == .from) info else target_info;
+            if (comptime findField(owner_info, fk_col)) |f| {
                 if (!f.optional and !f.nillable) {
-                    @compileError("Edge FK column '" ++ fk_col ++ "' on " ++ target_info.name ++ " is NOT NULL; detaching targets requires a nullable FK");
+                    @compileError("Edge FK column '" ++ fk_col ++ "' on " ++ owner_info.name ++ " is NOT NULL; detaching requires a nullable FK");
                 }
             }
+        }
+
+        /// The FK field name on **this** entity for a `From` edge. It is a field
+        /// name (what `set` and `checkDetachableFK` take); the SET clause maps
+        /// it to its physical column, exactly as `setFieldValue` does.
+        fn selfOwningFKField(comptime edge: EdgeInfo) []const u8 {
+            const target_info = comptime edgeTargetInfo(infos, info, edge);
+            const step = comptime buildEdgeStep(edge, info, target_info);
+            return step.edge_columns[0];
+        }
+
+        /// Whether the FK column a `From` edge writes can hold NULL.
+        fn selfOwningFKIsNullable(comptime edge: EdgeInfo) bool {
+            const f = comptime findField(info, selfOwningFKField(edge)) orelse return false;
+            return f.optional or f.nillable;
         }
 
         /// Run every registered edge write, in registration order. Each

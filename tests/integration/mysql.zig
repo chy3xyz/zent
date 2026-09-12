@@ -2634,6 +2634,42 @@ test "MySQL: Update edge writes maintain M2M and O2M associations" {
         _ = try u.Save();
     }
     try expectMyCarOwner(&client, infos, car_info, cids[1], null);
+
+    // A `From` edge (my_ew_car.owner) writes its FK column in the UPDATE's own
+    // SET clause — no companion `setFieldValue`, no detach statement, and the
+    // same predicate scopes it. See Z15.
+    {
+        var u = client.my_ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.my_ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        _ = try u.SetEdgeIDs("owner", &.{uids[0]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectMyCarOwner(&client, infos, car_info, cids[0], uids[0]);
+    // Re-point, then clear — both are single-column writes.
+    {
+        var u = client.my_ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.my_ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        _ = try u.SetEdgeIDs("owner", &.{uids[1]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectMyCarOwner(&client, infos, car_info, cids[0], uids[1]);
+    {
+        var u = client.my_ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.my_ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        _ = try u.ClearEdge("owner");
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectMyCarOwner(&client, infos, car_info, cids[0], null);
+    // A From edge points at one row: two ids is an argument error.
+    {
+        var u = client.my_ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.my_ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        try testing.expectError(error.TooManyEdgeTargets, u.SetEdgeIDs("owner", &.{ uids[0], uids[1] }));
+    }
 }
 
 fn expectMyCarOwner(

@@ -3655,6 +3655,60 @@ test "SQLite: Update edge writes maintain M2M and O2M associations" {
         try testing.expectEqual(@as(usize, 1), try u.Save());
     }
     try expectCarOwner(&client, infos, car_info, cids[1], null);
+
+    // A `From` edge — `EwCar.owner`, whose FK is a column of the row being
+    // updated — is writable too, and it needs no companion `setFieldValue`:
+    // the association *is* a SET field, so the statement is valid on its own.
+    // Before this the only spelling was `setFieldValue("owner_id", …)`.
+    {
+        var u = client.ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        _ = try u.SetEdgeIDs("owner", &.{uids[0]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectCarOwner(&client, infos, car_info, cids[0], uids[0]);
+    // Re-point it at the other user: a From edge replaces by writing the column,
+    // so no detach step is involved.
+    {
+        var u = client.ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        _ = try u.SetEdgeIDs("owner", &.{uids[1]});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectCarOwner(&client, infos, car_info, cids[0], uids[1]);
+    // The row's own predicate decides which rows are touched: c1 is the only
+    // car moved, and c2 was left unowned by the M2M/O2M part above.
+    try expectCarOwner(&client, infos, car_info, cids[1], null);
+
+    // `ClearEdge` NULLs the FK (nullable in this schema).
+    {
+        var u = client.ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        _ = try u.ClearEdge("owner");
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectCarOwner(&client, infos, car_info, cids[0], null);
+
+    // An empty id list is the same write as `ClearEdge`; more than one id is
+    // rejected, because a From edge points at a single row.
+    {
+        var u = client.ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        _ = try u.SetEdgeIDs("owner", &.{});
+        try testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    try expectCarOwner(&client, infos, car_info, cids[0], null);
+    {
+        var u = client.ew_car.Update();
+        defer u.deinit();
+        _ = try u.Where(.{client.ew_car.predicates.idEQ(.{ .int = cids[0] })});
+        // Rejected at the call, not at Save — the mistake is in the argument.
+        try testing.expectError(error.TooManyEdgeTargets, u.SetEdgeIDs("owner", &.{ uids[0], uids[1] }));
+    }
 }
 
 fn expectCarOwner(

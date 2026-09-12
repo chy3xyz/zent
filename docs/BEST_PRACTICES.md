@@ -529,16 +529,30 @@ Semantics per edge kind:
 |---|---|---|---|---|
 | M2M | insert junction rows | delete junction rows | — | delete all junctions |
 | `To` o2m/o2o (FK in target) | — | — | detach old owner, attach `ids` | NULL the FK |
-| `From` (FK on this row) | not supported — use `setFieldValue` | | | |
+| `From` m2o/o2o (FK on this row) | — | — | write the FK column (at most one id) | NULL the FK |
 
 - Wrong edge kind for the method is a **compile error** with the reason.
 - `SetEdgeIDs` is replace-semantics and empty `ids` behaves like `ClearEdge`.
-  It requires the `Where` to match **exactly one** source row (the attach
-  resolves the source id with a scalar subquery, so a multi-row match is
-  rejected by the database instead of silently picking one).
-- Detaching requires a nullable FK; a `NOT NULL` FK is rejected at comptime.
-- These run after the UPDATE body. Wrap in `beginTx` when you need the row
-  change and the association change to be atomic.
+  For a `To` edge it requires the `Where` to match **exactly one** source row
+  (the attach resolves the source id with a scalar subquery, so a multi-row
+  match is rejected by the database instead of silently picking one).
+- **A `From` edge is written differently, on purpose**: its FK is a column of
+  the row you are updating, so `SetEdgeIDs`/`ClearEdge` put it in the UPDATE's
+  own `SET` clause instead of emitting a second statement against the target
+  table. One statement, one predicate, one transaction, and the
+  interceptor/privacy scope covers it like any other column. It also means an
+  association change needs no companion `setFieldValue` — the write *is* a SET
+  field. At most one id is meaningful (`error.TooManyEdgeTargets` from the call
+  otherwise); clearing needs a nullable FK, rejected at comptime by `ClearEdge`
+  and at runtime by `SetEdgeIDs(…, &.{})` (`error.EdgeNotDetachable`).
+- Detaching a `To` edge requires a nullable FK on the target; a `NOT NULL` FK is
+  rejected at comptime.
+- `To`/M2M edge writes run **after** the UPDATE body, so wrap both in
+  `beginTx` when they must be atomic. A `From` edge write is part of the UPDATE
+  itself and needs no such care.
+- Every edge write needs the UPDATE to have at least one `SET` field; a `From`
+  edge supplies one, other kinds need a `setFieldValue` alongside (a
+  `SET`-less UPDATE is invalid SQL — tracked as Z19).
 - Prefer them over raw junction SQL: table and column names come from the
   schema, so quoting and placeholders follow the dialect.
 

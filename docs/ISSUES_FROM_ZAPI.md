@@ -145,9 +145,9 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | **Problem** | `UpdateBuilder.SetEdgeIDs` and `ClearEdge` reject `From` edges at compile time. An entity that owns the FK (`edge.From("owner", User)`) can only be re-pointed through `setFieldValue`, even though the two operations are the same write from the caller's point of view. |
 | **Evidence** | `src/codegen/update_delete.zig:536` (`SetEdgeIDs requires a To edge whose FK lives in the target table`), `:555` (`… a 'from' edge stores its FK on this row — use setFieldValue to detach it`). |
 | **Impact** | Not a correctness gap — `setFieldValue("owner_id", id)` works and is what the `@compileError` tells you to write. It is an API-shape inconsistency: the same intent needs a different spelling depending on which side of the edge holds the column, and the compile error is the only place that is explained. |
-| **Proposal** | **Open.** Make `SetEdgeIDs`/`ClearEdge` accept `From` edges by writing the FK column directly on the row being updated (single-row `UPDATE`, no subquery), then decide whether `ClearEdge` should set NULL or refuse when the FK is NOT NULL. Needs a design pass: the current implementation is subquery-shaped because `To` edges detach a *target*, while a `From` edge detaches *this* row, so the generated SQL and the `rows_affected` semantics differ. |
-| **Acceptance** | Either the operations work on `From` edges with tests per dialect, or `BEST_PRACTICES` §5e states the asymmetry as intended rather than only the compile error saying so. |
-| **Status** | **Open** (deferred; design-sized, recorded here so it is not lost). |
+| **Proposal** | **Done** (v0.44.0) — the single-row shape, folded into the main UPDATE rather than emitted as a second statement: a `From` edge's FK is a column of the row being updated, so `SetEdgeIDs`/`ClearEdge` write it in the UPDATE's own `SET` clause. One statement, one predicate, one transaction, and the interceptor/privacy scope covers it like any other column. It also removes a footgun: an association change on a `From` edge needs no companion `setFieldValue`, because the write *is* a SET field. `error.TooManyEdgeTargets` (from the call, not `Save`) for more than one id; clearing requires a nullable FK — compile error via `ClearEdge`, `error.EdgeNotDetachable` via `SetEdgeIDs(…, &.{})`. |
+| **Acceptance** | Met: covered on SQLite, PostgreSQL and MySQL in the existing edge-write tests, including re-point, clear and the multi-id rejection. Falsified by making the branch a no-op, which fails those assertions. |
+| **Status** | **Fixed** v0.44.0. |
 
 ---
 
@@ -192,6 +192,19 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 ---
 
+### Z19 — A `SET`-less UPDATE is invalid SQL, and edge writes can produce one
+
+| | |
+|--|--|
+| **Problem** | `UpdateBuilder.Save()` always emits `UPDATE t SET … WHERE …`. With no `setFieldValue` and only edge actions registered, the SET list is empty and the statement is `UPDATE t WHERE …` — a syntax error from the database (`near "WHERE": syntax error`), not a useful message. |
+| **Evidence** | Hit while writing the Z15 tests: `client.user.Update().Where(…).SetEdgeIDs("cars", …).Save()` fails to prepare. Every existing edge-write test works around it by pairing the edge call with an unrelated `setFieldValue("name", …)` — the habit is in the tests, the reason is nowhere. |
+| **Impact** | Narrow but real: the caller's intent ("just change the association") is expressible, and the resulting error says nothing about the cause. `From` edges stopped hitting it in v0.44.0 because they contribute a SET field; `To`/M2M edges still do. |
+| **Proposal** | **Open.** Where the UPDATE has no SET fields: if edge actions exist, run those and skip the body (the association change is what was asked for) and define what `Save` returns; if none exist either, `error.NoFieldsToUpdate` beats invalid SQL. Small, but it changes `rows_affected` semantics for one path, so it deserves its own pass rather than a ride-along. |
+| **Acceptance** | `Update().Where(…).SetEdgeIDs(…)` either works and documents its return value, or fails with an error naming the cause. |
+| **Status** | **Open** (found while implementing Z15; deliberately not fixed in the same release). |
+
+---
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -210,7 +223,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z12 | Complex UPDATE expr | P2 | **Fixed** v0.31.0 |
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
 | Z14 | `Contains` semantics vs name | P2 | **Partially fixed** — docs+test done, naming **Open** |
-| Z15 | Edge writes on `From` edges | P2 | **Open** — deferred, design-sized |
+| Z15 | Edge writes on `From` edges | P2 | **Fixed** v0.44.0 — FK written in the UPDATE's SET |
 | Z16 | Multi-graph first-class | P2 | **Stage 1 done** v0.39.0 (actionable error); stages 2/3 **Open** per ROI |
 | Z17 | Entity release shape | P2 | **Fixed** v0.40.0 — `deinitRow`/`deinitRows`/`deinitEdgeRows` |
 | Z18 | `setFieldValue` accepted set drifts | P2 | **Fixed** v0.43.0 — one `field_value` module, tested both ways |
