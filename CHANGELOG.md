@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ## [0.39.1] - 2026-09-12
 
+## [0.39.1] - 2026-09-12
+
 ### Fixed
 - **Dead-code gate is clean again.** Routing the 16 edge-target lookups in
   v0.39.0 through `graph.edgeTargetInfo` orphaned four private `findTypeInfo`
