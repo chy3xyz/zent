@@ -547,8 +547,9 @@ try tx.commit();
   struct (PG auto-rolls-back an active tx on close).
 - Nested `beginTx` degrades to savepoints — safe to nest in service
   orchestration.
-- Relative updates (`SET balance = balance + $1`) have no typed form — raw
-  `tx.client.driver.exec`.
+- Relative updates (`SET balance = balance + $1`) are fluent on a single
+  table: `u.setExprArgs("balance", "balance + ?", &.{.{ .int = delta }})`
+  (§5c). Only multi-table `UPDATE ... JOIN` and `UPDATE ... FROM` stay raw.
 
 ## 7. Anti-patterns (each cost a debugging session)
 

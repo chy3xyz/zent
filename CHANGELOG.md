@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Eager-loaded targets: interceptor predicates are now qualified with the
+  target table.** v0.35 started running the interceptor chain on eager-loaded
+  targets (a security fix — otherwise cross-tenant rows leak through edges).
+  The injected `whereEq("app_id", …)` was rendered as a bare column, so any
+  `m2o`/`m2m` neighbour query — which `INNER JOIN`s the source (or junction)
+  table — failed to prepare with "Column 'app_id' in where clause is
+  ambiguous" whenever both sides owned the column. `appendSetNeighborsFiltered`
+  now emits `target.col` for the EQ predicates the interceptor emits, which is
+  also what the predicate intends: scope the loaded target rows. Predicates
+  that already carry a qualifier are untouched. Regression test added
+  (`appendSetNeighborsFiltered qualifies interceptor EQ with the target table`).
+
+- **Interceptor `whereEq` is idempotent, and never suppresses a differing
+  value.** The interceptor sinks appended unconditionally, so a query that
+  already constrained the tenant column emitted `AND app_id = ? AND app_id = ?`
+  — redundant parameters and, more importantly, a sign that injection ignored
+  what the query already said. Injection now skips only when the **(column,
+  value) pair** is already present. Deduping on the column alone would have
+  been worse than the bug: a caller-supplied predicate for the tenant column
+  would then suppress the interceptor's value, turning "add a predicate" into a
+  way to escape tenant scoping. Covered by a unit test that asserts the
+  identical pair collapses while a differing value is kept. Applies to the
+  query, update and delete builders; the two bulk builders still append
+  unconditionally (tracked as follow-up).
+
+- **`stmt_prepare` failures log the statement.** The MySQL driver reported
+  only `errno`/message on a failed prepare, leaving the offending SQL
+  invisible (the query never reaches the success-path query log). It now also
+  emits the statement at `debug` level.
+
+
 ### Docs
 - Corrected the `Contains` row in the predicate catalogue (`BEST_PRACTICES`
   §3a): it binds the value verbatim (`col LIKE ?`) and does **not** add `%`,

@@ -667,7 +667,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                 }
             }
             if (!found) return error.UnknownField;
-            try self.predicates.append(sql.EQ(columnName(info, field_name), value));
+            try sql.appendEqUnlessPresent(&self.predicates, columnName(info, field_name), value);
         }
 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed };
@@ -1003,7 +1003,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            try self.predicates.append(sql.EQ(columnName(info, field_name), value));
+            try sql.appendEqUnlessPresent(&self.predicates, columnName(info, field_name), value);
         }
 
         const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };

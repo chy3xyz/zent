@@ -788,7 +788,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 }
             }
             if (!found) return error.UnknownField;
-            try self.predicates.append(sql.EQ(columnName(info, field_name), value));
+            try sql.appendEqUnlessPresent(&self.predicates, columnName(info, field_name), value);
         }
 
         /// Fetch every matching row. Returns `std.array_list.Managed(Entity)`:

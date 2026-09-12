@@ -1,7 +1,8 @@
 const std = @import("std");
 const Dialect = @import("dialect.zig").Dialect;
 const Step = @import("../graph/step.zig").Step;
-pub const Value = @import("value.zig").Value;
+const value_mod = @import("value.zig");
+pub const Value = value_mod.Value;
 
 pub const QueryResult = struct {
     sql: []const u8,
@@ -538,6 +539,24 @@ pub fn GTE(column: []const u8, value: Value) Predicate {
 
 pub fn LTE(column: []const u8, value: Value) Predicate {
     return .{ .lte = .{ .column = column, .value = value } };
+}
+
+/// Append `column = value` unless an identical EQ is already present.
+///
+/// Dedupe is deliberately on the **(column, value) pair**, never on the column
+/// alone: skipping because the column is already constrained would let a
+/// caller-supplied predicate suppress an interceptor-injected tenant value,
+/// which would turn "add a predicate" into a way to escape tenant scoping.
+pub fn appendEqUnlessPresent(list: *std.array_list.Managed(Predicate), column: []const u8, value: Value) !void {
+    for (list.items) |p| {
+        switch (p) {
+            .eq => |b| {
+                if (std.mem.eql(u8, b.column, column) and value_mod.eql(b.value, value)) return;
+            },
+            else => {},
+        }
+    }
+    try list.append(EQ(column, value));
 }
 
 pub fn Like(column: []const u8, value: Value) Predicate {
@@ -2335,4 +2354,34 @@ test "InChunked splits large IN lists" {
     const q = b.query();
     try std.testing.expectEqual(@as(usize, 1200), q.args.len);
     try std.testing.expect(std.mem.indexOf(u8, q.sql, "OR") != null);
+}
+
+test "appendEqUnlessPresent dedupes the pair, never the column alone" {
+    const allocator = std.testing.allocator;
+    var list = std.array_list.Managed(Predicate).init(allocator);
+    defer list.deinit();
+
+    try appendEqUnlessPresent(&list, "app_id", .{ .int = 1 });
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+
+    // Identical pair: idempotent, so running an interceptor twice (or an
+    // explicit predicate plus an injected one with the same value) does not
+    // duplicate the parameter.
+    try appendEqUnlessPresent(&list, "app_id", .{ .int = 1 });
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+
+    // Same column, different value: MUST be kept. Dropping it would let a
+    // caller predicate suppress an interceptor-injected tenant value, turning
+    // a query predicate into a way to escape tenant scoping.
+    try appendEqUnlessPresent(&list, "app_id", .{ .int = 2 });
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+
+    // Different column, and string payloads compared by content.
+    try appendEqUnlessPresent(&list, "tenant_id", .{ .int = 1 });
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try appendEqUnlessPresent(&list, "region", .{ .string = "eu" });
+    try appendEqUnlessPresent(&list, "region", .{ .string = "eu" });
+    try std.testing.expectEqual(@as(usize, 4), list.items.len);
+    try appendEqUnlessPresent(&list, "region", .{ .string = "us" });
+    try std.testing.expectEqual(@as(usize, 5), list.items.len);
 }
