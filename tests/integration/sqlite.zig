@@ -2424,6 +2424,216 @@ test "SQLite: eager-loaded children respect interceptor tenant scope" {
     }
 }
 
+test "SQLite: eager-load interceptor scope is unambiguous on JOIN edges (m2o + m2m)" {
+    // Companion to the o2m test above. The o2m neighbour query is a flat
+    // `SELECT … FROM target WHERE fk IN (…)`, so a bare interceptor EQ could
+    // never be ambiguous there. The two other edge shapes JOIN a second table
+    // into the same FROM clause — `s` (the source) for m2o, `j` (the junction)
+    // for m2m — and when that second table owns the same tenant column the
+    // unqualified EQ fails at prepare time with "ambiguous column name".
+    // The m2m junction below deliberately carries its own `app_id`.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const XjFileBase = schema("XjFile", .{
+        .fields = &.{ field.String("path"), field.Int("app_id") },
+    });
+    const XjImageBase = schema("XjImage", .{
+        .fields = &.{
+            field.String("caption"),
+            field.Int("app_id"),
+            field.Int("file_id").Optional(),
+        },
+    });
+    const XjTagBase = schema("XjTag", .{
+        .fields = &.{ field.String("label"), field.Int("app_id") },
+    });
+    const XjPostBase = schema("XjPost", .{
+        .fields = &.{ field.String("title"), field.Int("app_id") },
+    });
+    const XjPostTag = schema("XjPostTag", .{
+        .fields = &.{
+            field.Int("xj_post_id"),
+            field.Int("xj_tag_id"),
+            field.Int("app_id"),
+        },
+        // An explicit through schema must declare its own uniqueness.
+        .indexes = &.{index.Fields(&.{ "xj_post_id", "xj_tag_id" }).Unique()},
+    });
+
+    const XjImage = struct {
+        pub const schema_name = XjImageBase.schema_name;
+        pub const fields = XjImageBase.fields;
+        pub const edges = &.{edge.From("file", XjFileBase).Field("file_id")};
+        pub const indexes = XjImageBase.indexes;
+    };
+    const XjTag = struct {
+        pub const schema_name = XjTagBase.schema_name;
+        pub const fields = XjTagBase.fields;
+        pub const edges = &.{edge.To("posts", XjPostBase).Through(XjPostTag)};
+        pub const indexes = XjTagBase.indexes;
+    };
+    const XjPost = struct {
+        pub const schema_name = XjPostBase.schema_name;
+        pub const fields = XjPostBase.fields;
+        pub const edges = &.{edge.To("tags", XjTagBase).Through(XjPostTag)};
+        pub const indexes = XjPostBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ XjFileBase, XjImage, XjTag, XjPost, XjPostTag });
+    const infos = graph.types;
+    const file_info = infos[0];
+    const image_info = infos[1];
+    const tag_info = infos[2];
+    const post_info = infos[3];
+
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("app_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    // Files: f1/app1, f2/app2, f3/app1. Images: i1/app1→f1, i2/app1→f2 (a
+    // cross-tenant reference), i3/app2→f3.
+    var file_ids: [3]i64 = undefined;
+    for (&file_ids, 0..) |*out, i| {
+        var b = try client.xj_file.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("path", if (i == 0) "f1" else if (i == 1) "f2" else "f3");
+        _ = try b.setFieldValue("app_id", @as(i64, if (i == 1) 2 else 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, file_info, &e, allocator);
+        out.* = e.id;
+    }
+    const image_seeds = [_]struct { caption: []const u8, app: i64, file: usize }{
+        .{ .caption = "i1", .app = 1, .file = 0 },
+        .{ .caption = "i2", .app = 1, .file = 1 },
+        .{ .caption = "i3", .app = 2, .file = 2 },
+    };
+    for (image_seeds) |s| {
+        var b = try client.xj_image.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("caption", s.caption);
+        _ = try b.setFieldValue("app_id", s.app);
+        _ = try b.setFieldValue("file_id", file_ids[s.file]);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, image_info, &e, allocator);
+    }
+
+    // m2o: the neighbour query joins the source table (`xj_image s`), which
+    // also owns `app_id`.
+    {
+        var q = client.xj_image.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("file");
+        const images = try q.All();
+        defer {
+            for (images.items) |*e| zent.codegen.deinitEntity(infos, image_info, e, allocator);
+            images.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), images.items.len);
+        // i1 → own-tenant file.
+        try testing.expectEqualStrings("f1", images.items[0].edges.file.?[0].path);
+        // i2 → the referenced file belongs to tenant 2, so the eager load
+        // must drop it rather than leak another tenant's row.
+        try testing.expect(images.items[1].edges.file == null);
+    }
+    tenant = 2;
+    {
+        var q = client.xj_image.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("file");
+        const images = try q.All();
+        defer {
+            for (images.items) |*e| zent.codegen.deinitEntity(infos, image_info, e, allocator);
+            images.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), images.items.len);
+        // i3's file (f3) belongs to tenant 1.
+        try testing.expect(images.items[0].edges.file == null);
+    }
+
+    // m2m: the neighbour query joins the junction (`j`), which carries its own
+    // `app_id` here.
+    var tag_ids: [3]i64 = undefined;
+    for (&tag_ids, 0..) |*out, i| {
+        var b = try client.xj_tag.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("label", if (i == 0) "t1" else if (i == 1) "t2" else "t3");
+        _ = try b.setFieldValue("app_id", @as(i64, if (i == 1) 2 else 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, tag_info, &e, allocator);
+        out.* = e.id;
+    }
+    var post_ids: [2]i64 = undefined;
+    for (&post_ids, 0..) |*out, i| {
+        var b = try client.xj_post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("title", if (i == 0) "p1" else "p2");
+        _ = try b.setFieldValue("app_id", @as(i64, @intCast(i + 1)));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, post_info, &e, allocator);
+        out.* = e.id;
+    }
+    const links = [_]struct { post: usize, tag: usize }{
+        .{ .post = 0, .tag = 0 }, // app1 ↔ app1
+        .{ .post = 0, .tag = 1 }, // app1 post linked to an app2 tag
+        .{ .post = 1, .tag = 2 }, // app2 post linked to an app1 tag
+    };
+    for (links) |l| {
+        const sql_text = "INSERT INTO xj_post_tag (xj_post_id, xj_tag_id, app_id) VALUES (?, ?, ?)";
+        _ = try drv.exec(sql_text, &.{
+            .{ .int = post_ids[l.post] },
+            .{ .int = tag_ids[l.tag] },
+            .{ .int = if (l.post == 0) 1 else 2 },
+        });
+    }
+
+    // Tenant 1: p1 only, and only its tenant-1 tag — the join must still work
+    // (a filter that broke the join would return zero tags instead of one).
+    tenant = 1;
+    {
+        var q = client.xj_post.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("tags");
+        const posts = try q.All();
+        defer {
+            for (posts.items) |*e| zent.codegen.deinitEntity(infos, post_info, e, allocator);
+            posts.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), posts.items.len);
+        try testing.expectEqualStrings("p1", posts.items[0].title);
+        const tags = posts.items[0].edges.tags.?;
+        try testing.expectEqual(@as(usize, 1), tags.len);
+        try testing.expectEqualStrings("t1", tags[0].label);
+    }
+    // Tenant 2: p2 only, and its only link points at a tenant-1 tag.
+    tenant = 2;
+    {
+        var q = client.xj_post.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("tags");
+        const posts = try q.All();
+        defer {
+            for (posts.items) |*e| zent.codegen.deinitEntity(infos, post_info, e, allocator);
+            posts.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), posts.items.len);
+        try testing.expectEqualStrings("p2", posts.items[0].title);
+        try testing.expect(posts.items[0].edges.tags == null);
+    }
+}
+
 test "SQLite: eager-loaded children respect privacy filters" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");

@@ -1922,6 +1922,216 @@ test "MySQL: eager-loaded children respect interceptor tenant scope" {
     }
 }
 
+test "MySQL: eager-load interceptor scope is unambiguous on JOIN edges (m2o + m2m)" {
+    // Companion to the o2m test above: the m2o neighbour query joins the
+    // source table and the m2m one joins the junction. When either carries the
+    // same tenant column as the target, an unqualified interceptor EQ fails
+    // with "Column 'app_id' in where clause is ambiguous" (the shape zmshop
+    // hit on the checkout path).
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const FileBase = schema("MyXjFile", .{
+        .fields = &.{ field.String("path"), field.Int("app_id") },
+    });
+    const ImageBase = schema("MyXjImage", .{
+        .fields = &.{
+            field.String("caption"),
+            field.Int("app_id"),
+            field.Int("file_id").Optional(),
+        },
+    });
+    const TagBase = schema("MyXjTag", .{
+        .fields = &.{ field.String("label"), field.Int("app_id") },
+    });
+    const PostBase = schema("MyXjPost", .{
+        .fields = &.{ field.String("title"), field.Int("app_id") },
+    });
+    const PostTag = schema("MyXjPostTag", .{
+        .fields = &.{
+            field.Int("my_xj_post_id"),
+            field.Int("my_xj_tag_id"),
+            field.Int("app_id"),
+        },
+        .indexes = &.{index.Fields(&.{ "my_xj_post_id", "my_xj_tag_id" }).Unique()},
+    });
+
+    const Image = struct {
+        pub const schema_name = ImageBase.schema_name;
+        pub const fields = ImageBase.fields;
+        pub const edges = &.{edge.From("file", FileBase).Field("file_id")};
+        pub const indexes = ImageBase.indexes;
+    };
+    const Tag = struct {
+        pub const schema_name = TagBase.schema_name;
+        pub const fields = TagBase.fields;
+        pub const edges = &.{edge.To("posts", PostBase).Through(PostTag)};
+        pub const indexes = TagBase.indexes;
+    };
+    const Post = struct {
+        pub const schema_name = PostBase.schema_name;
+        pub const fields = PostBase.fields;
+        pub const edges = &.{edge.To("tags", TagBase).Through(PostTag)};
+        pub const indexes = PostBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ FileBase, Image, Tag, Post, PostTag });
+    const infos = graph.types;
+    const file_info = infos[0];
+    const image_info = infos[1];
+    const tag_info = infos[2];
+    const post_info = infos[3];
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_xj_post_tag", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_xj_image", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_xj_tag", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_xj_post", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_xj_file", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    // Defer LIFO drops the junction and the FK holder before their targets.
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_xj_file", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_xj_post", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_xj_tag", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_xj_image", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_xj_post_tag", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("app_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    // f1/app1, f2/app2, f3/app1.
+    var file_ids: [3]i64 = undefined;
+    for (&file_ids, 0..) |*out, i| {
+        var b = try client.my_xj_file.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("path", if (i == 0) "f1" else if (i == 1) "f2" else "f3");
+        _ = try b.setFieldValue("app_id", @as(i64, if (i == 1) 2 else 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, file_info, &e, allocator);
+        out.* = e.id;
+    }
+    // i1/app1→f1, i2/app1→f2 (cross-tenant reference), i3/app2→f3.
+    for ([_]struct { caption: []const u8, app: i64, file: usize }{
+        .{ .caption = "i1", .app = 1, .file = 0 },
+        .{ .caption = "i2", .app = 1, .file = 1 },
+        .{ .caption = "i3", .app = 2, .file = 2 },
+    }) |s| {
+        var b = try client.my_xj_image.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("caption", s.caption);
+        _ = try b.setFieldValue("app_id", s.app);
+        _ = try b.setFieldValue("file_id", file_ids[s.file]);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, image_info, &e, allocator);
+    }
+
+    {
+        var q = client.my_xj_image.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("file");
+        const images = try q.All();
+        defer {
+            for (images.items) |*e| zent.codegen.deinitEntity(infos, image_info, e, allocator);
+            images.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), images.items.len);
+        try testing.expectEqualStrings("f1", images.items[0].edges.file.?[0].path);
+        try testing.expect(images.items[1].edges.file == null);
+    }
+    tenant = 2;
+    {
+        var q = client.my_xj_image.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("file");
+        const images = try q.All();
+        defer {
+            for (images.items) |*e| zent.codegen.deinitEntity(infos, image_info, e, allocator);
+            images.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), images.items.len);
+        try testing.expect(images.items[0].edges.file == null);
+    }
+
+    // t1/app1, t2/app2, t3/app1.
+    var tag_ids: [3]i64 = undefined;
+    for (&tag_ids, 0..) |*out, i| {
+        var b = try client.my_xj_tag.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("label", if (i == 0) "t1" else if (i == 1) "t2" else "t3");
+        _ = try b.setFieldValue("app_id", @as(i64, if (i == 1) 2 else 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, tag_info, &e, allocator);
+        out.* = e.id;
+    }
+    // p1/app1, p2/app2.
+    var post_ids: [2]i64 = undefined;
+    for (&post_ids, 0..) |*out, i| {
+        var b = try client.my_xj_post.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("title", if (i == 0) "p1" else "p2");
+        _ = try b.setFieldValue("app_id", @as(i64, @intCast(i + 1)));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, post_info, &e, allocator);
+        out.* = e.id;
+    }
+    for ([_]struct { post: usize, tag: usize }{
+        .{ .post = 0, .tag = 0 }, // app1 ↔ app1
+        .{ .post = 0, .tag = 1 }, // app1 post linked to an app2 tag
+        .{ .post = 1, .tag = 2 }, // app2 post linked to an app1 tag
+    }) |l| {
+        _ = try drv.exec(
+            "INSERT INTO my_xj_post_tag (my_xj_post_id, my_xj_tag_id, app_id) VALUES (?, ?, ?)",
+            &.{
+                .{ .int = post_ids[l.post] },
+                .{ .int = tag_ids[l.tag] },
+                .{ .int = if (l.post == 0) 1 else 2 },
+            },
+        );
+    }
+
+    tenant = 1;
+    {
+        var q = client.my_xj_post.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("tags");
+        const posts = try q.All();
+        defer {
+            for (posts.items) |*e| zent.codegen.deinitEntity(infos, post_info, e, allocator);
+            posts.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), posts.items.len);
+        try testing.expectEqualStrings("p1", posts.items[0].title);
+        const tags = posts.items[0].edges.tags.?;
+        try testing.expectEqual(@as(usize, 1), tags.len);
+        try testing.expectEqualStrings("t1", tags[0].label);
+    }
+    tenant = 2;
+    {
+        var q = client.my_xj_post.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("tags");
+        const posts = try q.All();
+        defer {
+            for (posts.items) |*e| zent.codegen.deinitEntity(infos, post_info, e, allocator);
+            posts.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), posts.items.len);
+        try testing.expectEqualStrings("p2", posts.items[0].title);
+        try testing.expect(posts.items[0].edges.tags == null);
+    }
+}
+
 test "MySQL: no-arg exec consumes a SELECT result set" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
