@@ -38,7 +38,7 @@ All notable changes to this project will be documented in this file.
   existing "an explicitly set field wins" rule, which is the documented
   contract of `fillAuditUser` too. That makes create-time injection a default
   filler, **not** an enforcement point — see the note in `BEST_PRACTICES`
-  §3e. Enforcement on writes belongs in a privacy policy (`Deny`), which the
+  §5d. Enforcement on writes belongs in a privacy policy (`Deny`), which the
   caller cannot override.
 
 - **`stmt_prepare` failures log the statement.** The MySQL driver reported
