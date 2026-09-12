@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.39.1] - 2026-09-12
+
+### Fixed
+- **Dead-code gate is clean again.** Routing the 16 edge-target lookups in
+  v0.39.0 through `graph.edgeTargetInfo` orphaned four private `findTypeInfo`
+  copies, which the CI dead-code gate flagged as new dead declarations —
+  v0.39.0's tag therefore points at a commit whose CI is red. They are
+  deleted in this release; the library behaves identically (nothing called
+  them). Cut as a patch rather than moving the published tag.
+
 ## [0.39.0] - 2026-09-12
 
 ### Added
