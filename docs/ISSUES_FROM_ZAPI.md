@@ -155,12 +155,12 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 | | |
 |--|--|
-| **Problem** | Z3 shipped the playbook (one graph per database, `WithEdge` cannot cross graphs) but the deferred "option b" is still open: edges whose target lives in another graph are not resolved, the `Client` type is not generic over a graph set, and a cross-graph `WithEdge` fails at runtime rather than at comptime. |
-| **Evidence** | Z3 in this file (option b marked deferred); `docs/BEST_PRACTICES.md` §8a is the discipline that carries the guarantee today; `src/graph/neighbors.zig` resolves `to_table` from the *current* graph's `TypeInfo` only. |
-| **Impact** | Silent scope creep risk rather than a hard failure: correctness depends on the consumer following §8a, and the compiler cannot help. This is the one remaining place where the library asks for discipline instead of enforcing a boundary. |
-| **Proposal** | **Open.** Make the graph set part of the type (`Client(infos_a, infos_b)`), so an edge whose target is not in scope becomes a compile error, and cross-graph traversal needs an explicit join API. Larger than it looks: `EntityGen`/`ClientGen` are already comptime-recursive, so the graph set has to be threaded without blowing the comptime budget (§7a). |
-| **Acceptance** | A cross-graph `WithEdge` fails to compile with a message naming both graphs, or the docs state explicitly that runtime discipline is the contract. |
-| **Status** | **Open** (deferred; design-sized, recorded here so it is not lost). |
+| **Problem** | Z3 shipped the playbook (one graph per database, `WithEdge` cannot cross graphs) but the deferred "option b" is still open: an edge whose target lives in another graph is not resolved, so a consumer that splits graphs must keep every edge inside one graph. |
+| **Evidence** | Z3 in this file (option b marked deferred); `docs/BEST_PRACTICES.md` §8a is the discipline that carries the guarantee today. **Corrected measurement (probe, 2026-09-12):** a cross-graph edge fails at **comptime, not at runtime** — and not at query time either. Generating the client alone is enough: `EntityClient(infos, info)` → `entity.zig:212` → `EdgesType` → `entity.zig:9` `error: TypeInfo not found: <Target>`, identically for `edge.From` and `edge.To`. So the failure is loud and early, and the acceptance criterion below is already half met. 14 call sites resolve a target through the *current* graph: `create.zig:472`, `predicate.zig:245,311,338`, `entity.zig:73,134,288,481`, `client.zig:81,547,573`, `query.zig:197,532`. |
+| **Impact** | Not a silent-wrong-results risk (the compile error prevents that), but a wall: a legitimately split application cannot express a bridge edge at all, and the error text does not say *why* (`TypeInfo not found: Payment`) or what to do. Correctness today rests on §8a discipline. |
+| **Proposal** | **Open, and smaller than it first looked.** A probe proved the resolution mechanism already works when the target's `TypeInfo` comes from its own graph: `buildEdgeStep` across graphs emits `SELECT "probe_b".*, "s"."id" AS __fk FROM "probe_b" INNER JOIN "probe_a" s ON "probe_b"."id" = s."b_id" WHERE s."id" IN (?)`, and `Entity(b_graph.types, b_info)` resolves the target's *nested* edges against `b_graph.types` automatically. `EdgeInfo` already carries `target: type` (graph.zig:45). So the work is plumbing, in stages: **(1)** turn `findTypeInfo`'s miss into an actionable error naming the edge, the source and the target type (zero risk, satisfies half the acceptance criterion); **(2)** add an explicit graph handle (`edge.InGraph(target_graph)`, additive/defaulted) and redirect the 14 sites; **(3)** `Client` generic over a graph set — mostly *not* needed, since Z9's `beginTxFromDriver` covers the transaction half and the shared graph's client types are identical by construction once the handle is the graph's `types`. Three real constraints for stage 2: graphs must be declared in dependency order (mutually-cross-referencing graphs need a two-phase declaration, the one genuinely hard part), a cross-graph `To` edge cannot auto-inject its FK into the target's table so the target must declare that column explicitly, and the comptime budget (§7a) needs re-measuring. Layering note: a `[]const TypeInfo` handle makes `core/edge.zig` depend on codegen's IR — either accept that or move `TypeInfo` to a neutral module. |
+| **Acceptance** | A cross-graph edge either works, or fails to compile with a message naming the edge, the source graph and the target type. |
+| **Status** | **Open** (stage 1 is a small self-contained change; recorded here so it is not lost). |
 
 ---
 
@@ -183,6 +183,6 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
 | Z14 | `Contains` semantics vs name | P2 | **Partially fixed** — docs+test done, naming **Open** |
 | Z15 | Edge writes on `From` edges | P2 | **Open** — deferred, design-sized |
-| Z16 | Multi-graph first-class | P2 | **Open** — deferred, design-sized |
+| Z16 | Multi-graph first-class | P2 | **Open** — stage 1 (actionable compile error) is small; mechanism proven |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.
