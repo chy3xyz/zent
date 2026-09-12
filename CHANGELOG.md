@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.39.2] - 2026-09-12
+
 ### Fixed
 - **Duplicate version heading in the previous CHANGELOG.** v0.39.1 declared
   `## [0.39.1]` twice — an empty one (the promoted `[Unreleased]`) above the
