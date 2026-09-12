@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-09-12
+
 ### Docs
 - **Which raw paths are scoped, and which are not.** `crud_helpers.queryRows`
   is a mapper over `driver.query` and runs your statement as written — the same
