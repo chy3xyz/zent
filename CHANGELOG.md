@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-09-12
+
 ### Fixed
 - **`setFieldValue`'s accepted set is decided in one place (Z18).** The contract
   lived in three — `canSetField` (the check), `toSqlValue` (the conversion) and
