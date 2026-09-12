@@ -242,6 +242,30 @@ pub fn Entity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     }
 }
 
+/// Free a whole page of entities and the list holding them, in one call:
+/// `deinitEntity` for every item, then the list's own buffer. The list is left
+/// empty and reusable, so calling this twice is a no-op rather than a
+/// double-free.
+///
+/// This is the shape every call site was spelling out by hand
+/// (`for (rows.items) |*e| deinitEntity(infos, info, e, alloc); rows.deinit();`)
+/// — see `ISSUES_FROM_ZAPI.md` Z17 for why it matters: the four-argument form
+/// was recursive enough that a helper nobody could reach went unused 607 times
+/// to zero.
+///
+/// Prefer the methods that carry the graph for you: `client.<entity>.deinitRows`
+/// and `QueryBuilder.deinitRows`.
+pub fn deinitEntityList(
+    comptime infos: []const TypeInfo,
+    comptime info: TypeInfo,
+    allocator: std.mem.Allocator,
+    rows: *std.array_list.Managed(Entity(infos, info)),
+) void {
+    for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+    rows.deinit();
+    rows.* = std.array_list.Managed(Entity(infos, info)).init(allocator);
+}
+
 /// Recursively free heap allocations owned by an entity (fields + eager-loaded
 /// edges). The caller still owns the entity itself and the outer `[]Entity` slice.
 pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, self: anytype, allocator: std.mem.Allocator) void {

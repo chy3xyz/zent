@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.39.2** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.40.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (322 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (323 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -62,7 +62,7 @@ fmt → build → unit tests → version consistency → integration tests
 
 Entities and queries are explicitly owned by the caller. See the contract:
 
-- `q.All()` etc. returns `std.array_list.Managed(Entity)`; caller MUST call `deinitEntity(infos, info, &entity, alloc)` per item, then `users.deinit()`.
+- `q.All()` etc. returns `std.array_list.Managed(Entity)`. Free a page with `q.deinitRows(&rows)` or `client.<entity>.deinitRows(&rows)` (page + list, one call, list comes back empty so a second call is a no-op), a single with `client.<entity>.deinitRow(&e)`, and a `QueryEdge` page with `client.<source>.deinitEdgeRows("edge", &rows)`. The explicit `deinitEntity(infos, info, &entity, alloc)` per item + `users.deinit()` remains valid for generic code that already holds the graph; all of the shortcuts funnel into `codegen.entity.deinitEntityList`.
 - `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) MUST be `deinit`'d.
 - `driver.Tx` MUST be `deinit`'d exactly once, regardless of `commit`/`rollback`.
 - `sql.QueryResult` (`{ sql, args }`) borrows from the builder; `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) transfers ownership and MUST be `deinit`'d.

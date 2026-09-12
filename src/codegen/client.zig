@@ -13,6 +13,8 @@ const intercept = @import("../runtime/intercept.zig");
 const privacy = @import("../privacy/policy.zig");
 
 const EntityGen = @import("entity.zig").Entity;
+const deinitEntity = @import("entity.zig").deinitEntity;
+const deinitEntityList = @import("entity.zig").deinitEntityList;
 const CreateGen = @import("create.zig").CreateBuilder;
 const BulkInsertGen = @import("create.zig").BulkInsertBuilder;
 const QueryGen = @import("query.zig").QueryBuilder;
@@ -217,6 +219,42 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         }
 
         const QueryEdgeError = sql_driver.Error || error{ TypeMismatch, ColumnCountMismatch, BuildFailed, PrivacyDenied, InterceptFailed };
+
+        /// Free one entity this client produced (`Create().Save()`,
+        /// `Query().First()`, `Only()`), in one call and without the caller
+        /// holding the graph:
+        ///
+        /// ```zig
+        /// var e = try client.user.Create().Save();
+        /// defer client.user.deinitRow(&e);
+        /// ```
+        pub fn deinitRow(self: Self, entity: *Entity) void {
+            deinitEntity(infos, info, entity, self.allocator);
+        }
+
+        /// Free every entity in a page this client produced (`Query().All()`),
+        /// plus the list itself. Safe to call twice; the list is left empty
+        /// and reusable.
+        pub fn deinitRows(self: Self, rows: *std.array_list.Managed(Entity)) void {
+            deinitEntityList(infos, info, self.allocator, rows);
+        }
+
+        /// Free rows returned by `QueryEdge(edge_name, …)`. They are the
+        /// *target* entity, not this client's, so they need the target's
+        /// `TypeInfo` — resolved here from the same graph through the same
+        /// edge, which is what makes this one call instead of four arguments.
+        pub fn deinitEdgeRows(
+            self: Self,
+            comptime edge_name: []const u8,
+            rows: *QueryTargetsResult(infos, info.name, edge_name),
+        ) void {
+            const edge = comptime findEdgeInfo(info, edge_name);
+            const target_info = comptime edgeTargetInfo(infos, info, edge);
+            const TargetEntity = comptime EntityGen(infos, target_info);
+            for (rows.items) |*e| deinitEntity(infos, target_info, e, self.allocator);
+            rows.deinit();
+            rows.* = std.array_list.Managed(TargetEntity).init(self.allocator);
+        }
 
         /// Query target entities via an edge.
         /// Example: user_client.QueryEdge("cars", &.{alice.id}) returns Car entities.
@@ -781,7 +819,6 @@ test "beginTx nested savepoint: inner rollback discards only inner writes" {
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
     const sqlite_driver = @import("../sql/sqlite.zig");
-    const deinitEntity = @import("entity.zig").deinitEntity;
 
     const Item = Schema("Item", .{
         .fields = &.{field.String("name")},
@@ -851,7 +888,6 @@ test "beginTxFromDriver opens a typed tx straight from a Driver" {
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
     const sqlite_driver = @import("../sql/sqlite.zig");
-    const deinitEntity = @import("entity.zig").deinitEntity;
 
     const Item = Schema("Item", .{
         .fields = &.{field.String("name")},
@@ -900,7 +936,6 @@ test "beginTx nested savepoint: inner commit releases to outer tx" {
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
     const sqlite_driver = @import("../sql/sqlite.zig");
-    const deinitEntity = @import("entity.zig").deinitEntity;
 
     const Item = Schema("Item2", .{
         .fields = &.{field.String("name")},
@@ -1047,7 +1082,6 @@ test "interceptor stays effective after a by-value Client copy" {
     const buildGraph = @import("graph.zig").buildGraph;
     const fromSchema = @import("graph.zig").fromSchema;
     const sqlite_driver = @import("../sql/sqlite.zig");
-    const deinitEntity = @import("entity.zig").deinitEntity;
 
     const Item = Schema("CopyItem", .{
         .fields = &.{ field.Int("tenant_id"), field.String("name") },
@@ -1101,6 +1135,87 @@ test "interceptor stays effective after a by-value Client copy" {
     try std.testing.expectEqual(@as(usize, 1), rows.items.len);
     try std.testing.expectEqualStrings("keep", rows.items[0].name);
     try std.testing.expect(Ctx.seen > 0);
+}
+
+test "deinitRow / deinitRows / deinitEdgeRows free a page in one call" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const edge = @import("../core/edge.zig");
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Car = Schema("DrCar", .{
+        .fields = &.{field.String("model")},
+    });
+    const UserBase = Schema("DrUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{edge.To("cars", Car)};
+        pub const indexes = UserBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ User, Car });
+    const infos = graph.types;
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    var client = makeClient(infos, allocator, driver.asDriver());
+
+    var user_id: i64 = 0;
+    {
+        var b = try client.dr_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "alice");
+        var row = try b.Save();
+        // The single-entity form: no graph, no allocator argument.
+        defer client.dr_user.deinitRow(&row);
+        user_id = row.id;
+    }
+    for ([_][]const u8{ "c1", "c2" }) |model| {
+        var b = try client.dr_car.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("model", model);
+        // The o2m edge injects a NOT NULL `dr_user_id` on the car table.
+        _ = try b.setFieldValue("dr_user_id", user_id);
+        var row = try b.Save();
+        defer client.dr_car.deinitRow(&row);
+    }
+
+    // A page, released with one call. `std.testing.allocator` fails the test
+    // on any leak, so this asserts the freeing rather than just the compiling.
+    {
+        var q = client.dr_user.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("cars");
+        var rows = try q.All();
+        q.deinitRows(&rows);
+        // Safe twice: the list is reset, so this cannot double-free.
+        q.deinitRows(&rows);
+        try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    }
+
+    // The same through the client, which is what a call site has left when the
+    // builder is already out of scope.
+    {
+        var q = client.dr_user.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        client.dr_user.deinitRows(&rows);
+    }
+
+    // `QueryEdge` hands back the *target* entity, so it needs the target's
+    // TypeInfo — which `deinitEdgeRows` resolves from the edge.
+    {
+        var rows = try client.dr_user.QueryEdge("cars", &.{user_id});
+        try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+        client.dr_user.deinitEdgeRows("cars", &rows);
+        try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    }
 }
 
 test "UseInterceptor heap-allocates once and DeinitClient frees it" {

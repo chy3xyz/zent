@@ -173,9 +173,9 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | **Problem** | Releasing a scanned entity takes `deinitEntity(infos, info, &entity, allocator)` — four arguments, one of which (`infos`) the caller has no other reason to hold. The ergonomic helper `managedEntity` (`row.deinit()`, one call, no arguments) exists and is unused. |
 | **Evidence** | Consumer count: `deinitEntity(...)` appears **607** times in zapi; `managedEntity`/`dupeEntityTo` appear **0** times. `ManagedEntity` already provides exactly the shape needed (`src/codegen/entity.zig:406`, `deinit(self)`), so the gap is not capability but **reachability**: nothing returns one. |
 | **Impact** | Not correctness — the explicit call is safe, just verbose enough that it is written by hand everywhere and cannot be reviewed for ownership at a glance. |
-| **Proposal** | **Open.** Add a query method that returns owning rows (`q.AllManaged()` → a list of `ManagedEntity` with one `deinit()` for the whole list), or at minimum a `q.deinitRows(&rows)` that pairs with `All()`. Design-sized only because it adds a public container type; the underlying `ManagedEntity` already exists. |
-| **Acceptance** | A consumer can free a page of entities in one call, and `deinitEntity`'s four-argument form stops being the only reachable option. |
-| **Status** | **Open** (recorded rather than rushed: it adds public surface, and the measurement above is what should drive the shape). |
+| **Proposal** | **Done** (v0.40.0) — the `deinitRows` shape, chosen by the consumer over `AllManaged()`: `q.deinitRows(&rows)` and `client.<entity>.deinitRows(&rows)` free the page and the list in one line, `client.<entity>.deinitRow(&e)` covers singles, and `client.<source>.deinitEdgeRows("edge", &rows)` covers `QueryEdge` results (whose type is the *target* entity, which is why it needs the edge name to resolve the right `TypeInfo`). All four delegate to one implementation, `codegen.entity.deinitEntityList`; the list is left empty and reusable, so a second call is a no-op. `crud_helpers.deinitRows(infos, info, rows, alloc)` stays as the explicit form and now goes through the same helper. |
+| **Acceptance** | Met: a consumer can free a page in one call without naming the graph or the allocator, and the four-argument `deinitEntity` form is no longer the only reachable option. |
+| **Status** | **Fixed** v0.40.0. Per-call-site adoption is the consumer's step; the API no longer requires the four-argument form. |
 
 ---
 
@@ -199,6 +199,6 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z14 | `Contains` semantics vs name | P2 | **Partially fixed** — docs+test done, naming **Open** |
 | Z15 | Edge writes on `From` edges | P2 | **Open** — deferred, design-sized |
 | Z16 | Multi-graph first-class | P2 | **Stage 1 done** v0.39.0 (actionable error); stages 2/3 **Open** per ROI |
-| Z17 | Entity release shape | P2 | **Open** — `deinitEntity` vs an owning container |
+| Z17 | Entity release shape | P2 | **Fixed** v0.40.0 — `deinitRow`/`deinitRows`/`deinitEdgeRows` |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.

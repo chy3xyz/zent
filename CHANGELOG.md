@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **One-call entity release: `deinitRows` / `deinitRow` / `deinitEdgeRows`.**
+  Freeing a page took `deinitEntity(infos, info, &e, alloc)` per item plus
+  `list.deinit()`; the ergonomic helper that existed (`managedEntity`) was never
+  reachable from a query, so consumers kept writing the long form — 607
+  hand-written calls against zero uses of the helper in the reporting
+  codebase (Z17). Now:
+
+  ```zig
+  var rows = try q.All();
+  defer q.deinitRows(&rows);              // page + list, one line
+  defer client.user.deinitRows(&rows);    // same, when the builder is gone
+  defer client.user.deinitRow(&e);        // a single First()/Save() result
+  defer client.user.deinitEdgeRows("cars", &rows);  // a QueryEdge page
+  ```
+
+  All four delegate to one implementation
+  (`codegen.entity.deinitEntityList`), which the pre-existing
+  `crud_helpers.deinitRows(infos, info, rows, alloc)` now also uses. The list
+  is left empty and reusable, so a second call is a no-op instead of a
+  double-free. `deinitEdgeRows` exists because a `QueryEdge` page holds the
+  *target* entity: it resolves that target's `TypeInfo` from the edge name, so
+  the caller does not have to hold it.
+
 ## [0.39.2] - 2026-09-12
 
 ### Fixed

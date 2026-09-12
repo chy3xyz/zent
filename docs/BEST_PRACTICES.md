@@ -60,11 +60,19 @@ shapes:
 
 | Result | Owner | Free with |
 |--------|-------|-----------|
-| `first` → `?Entity` | caller | `deinitEntity(infos, info, &e, alloc)` |
-| `create` → `Entity` | caller | `deinitEntity(infos, info, &created, alloc)` |
-| `q.All()` → `Managed(Entity)` | caller | `crud_helpers.deinitRows(infos, info, rows, alloc)` |
+| `first` → `?Entity` | caller | `client.<entity>.deinitRow(&e)` |
+| `create` → `Entity` | caller | `client.<entity>.deinitRow(&created)` |
+| `q.All()` → `Managed(Entity)` | caller | `q.deinitRows(&rows)` (or `client.<entity>.deinitRows(&rows)`) |
+| `QueryEdge` → `Managed(Target)` | caller | `client.<source>.deinitEdgeRows("edge", &rows)` |
 | raw `driver.query` → `Rows` | caller | `rows.deinit()` (iterator) |
 | `crud_helpers.Rows(T)` | caller | `rows.deinit()` (frees strings + slice) |
+
+The `client.<entity>.deinit*` / `q.deinitRows` forms are the ones to reach for:
+they carry the graph, so the call site names neither `infos` nor the allocator,
+and `deinitRows` frees the page **and** the list in one line (the list comes
+back empty and reusable, so calling it twice is a no-op). `deinitEntity` /
+`codegen.deinitEntityList` / `crud_helpers.deinitRows` remain as the explicit
+forms for generic code that already holds the graph.
 
 **Rules that prevent the classic bugs:**
 

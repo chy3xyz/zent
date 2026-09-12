@@ -91,6 +91,15 @@ chaining), and upsert syntax (`ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY
 UPDATE` / `INSERT OR REPLACE`). The library never forces C linkage — a
 consumer links its own sqlite/libpq/mariadb (see README "Consumer wiring").
 
+## Ownership shortcuts
+
+The explicit contract is `deinitEntity(infos, info, &entity, alloc)` per item;
+the ergonomic forms carry the graph so a call site does not have to:
+`q.deinitRows(&rows)` / `client.<entity>.deinitRows(&rows)` (page + list),
+`client.<entity>.deinitRow(&e)` (one), `client.<source>.deinitEdgeRows("edge",
+&rows)` (a `QueryEdge` page, whose target type comes from the edge). All of
+them funnel into `codegen/entity.zig`'s `deinitEntityList`.
+
 ## Extension points
 
 - **New field types**: extend `src/core/field.zig` descriptors + the scan

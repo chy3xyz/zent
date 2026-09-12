@@ -32,6 +32,7 @@ const client_mod = @import("codegen/client.zig");
 const sql_driver = @import("sql/driver.zig");
 const Value = @import("sql/builder.zig").Value;
 const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+const deinitEntityList = @import("codegen/entity.zig").deinitEntityList;
 
 /// Resolve the `QueryError!?Entity` result type of an entity accessor's
 /// `Query()` builder via its `First()` method signature.
@@ -840,17 +841,27 @@ pub fn batchSaveOrUpdate(
     return .{ .created_count = created_count, .updated_count = updated_count };
 }
 
-/// Free every row of an `All()` result plus the list itself. Centralizes the
-/// memory contract so persistence code is terse: map each `rows.items[i]`,
-/// then `deinitRows(infos, info, rows, alloc)` in one call.
+/// Free every row of an `All()` result plus the list itself.
+///
+/// Thin wrapper over `codegen.entity.deinitEntityList`, kept for the call
+/// sites that already pass the graph explicitly. The shorter form is preferred
+/// now that it exists: `q.deinitRows(&rows)` or
+/// `client.<entity>.deinitRows(&rows)` need neither graph nor allocator
+/// (`ISSUES_FROM_ZAPI.md` Z17).
+///
+/// Takes the list **by value** for compatibility, so the caller's copy is left
+/// pointing at freed memory exactly as before — pass the address to the method
+/// form if you want a reusable list back.
 pub fn deinitRows(
     comptime infos: []const graph_mod.TypeInfo,
     comptime info: graph_mod.TypeInfo,
     rows: anytype,
     allocator: std.mem.Allocator,
 ) void {
-    for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
-    rows.deinit();
+    // A mutable copy: the helper resets the list it is handed, and this
+    // wrapper must not mutate the caller's (possibly const) copy.
+    var list = rows;
+    deinitEntityList(infos, info, allocator, &list);
 }
 
 // ── Tests ────────────────────────────────────────────────────

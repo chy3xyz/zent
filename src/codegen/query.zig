@@ -69,6 +69,7 @@ const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;
 const deinitEntity = @import("entity.zig").deinitEntity;
+const deinitEntityList = @import("entity.zig").deinitEntityList;
 const EntityGen = @import("entity.zig").Entity;
 const graph_step = @import("../graph/step.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
@@ -705,6 +706,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             self.skip_locked = opts.skip_locked;
             self.nowait = opts.nowait;
             return self;
+        }
+
+        /// Free every entity `All()` / `First()` handed back, plus the list
+        /// itself — the one-call form of the loop every call site writes out:
+        ///
+        /// ```zig
+        /// var users = try q.All();
+        /// defer q.deinitRows(&users);
+        /// ```
+        ///
+        /// Safe to call twice (the list is left empty and reusable), and safe
+        /// after `q.deinit()` — the graph is comptime and the allocator is a
+        /// plain copy. `client.<entity>.deinitRows` is the same call when the
+        /// builder is already out of scope.
+        pub fn deinitRows(self: *Self, rows: *std.array_list.Managed(Entity)) void {
+            deinitEntityList(infos, info, self.allocator, rows);
         }
 
         /// Free all eagerly-loaded edge slices on the given entities.
