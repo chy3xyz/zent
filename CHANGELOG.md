@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-09-12
+
 ### Fixed
 - **`crud_helpers.deinitRows` accepts a pointer again (compile-blocking
   regression in v0.40.0).** Z17 turned the wrapper's body into
