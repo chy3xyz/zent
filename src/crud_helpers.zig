@@ -866,19 +866,38 @@ pub fn batchSaveOrUpdate(
 /// `client.<entity>.deinitRows(&rows)` need neither graph nor allocator
 /// (`ISSUES_FROM_ZAPI.md` Z17).
 ///
-/// Takes the list **by value** for compatibility, so the caller's copy is left
-/// pointing at freed memory exactly as before — pass the address to the method
-/// form if you want a reusable list back.
+/// Accepts the list **by value or by pointer**, because `rows: anytype` always
+/// did and both shapes are in use. Passing the address leaves the caller's list
+/// empty and reusable; passing the value frees the same memory and leaves the
+/// caller's copy stale, exactly as the pre-Z17 inline loop did.
 pub fn deinitRows(
     comptime infos: []const graph_mod.TypeInfo,
     comptime info: graph_mod.TypeInfo,
     rows: anytype,
     allocator: std.mem.Allocator,
 ) void {
-    // A mutable copy: the helper resets the list it is handed, and this
-    // wrapper must not mutate the caller's (possibly const) copy.
-    var list = rows;
-    deinitEntityList(infos, info, allocator, &list);
+    const RowsType = @TypeOf(rows);
+    switch (@typeInfo(RowsType)) {
+        // A mutable pointer: hand it straight through, so the reset reaches the
+        // caller's own list and it comes back empty and reusable.
+        .pointer => {
+            if (comptime @typeInfo(RowsType).pointer.attrs.@"const") {
+                // A `*const` cannot be reset in place, and casting the const
+                // away to try would be worse than a stale list. Free through a
+                // mutable copy, exactly as the by-value path below does.
+                var list = rows.*;
+                deinitEntityList(infos, info, allocator, &list);
+            } else {
+                deinitEntityList(infos, info, allocator, rows);
+            }
+        },
+        // A value: a mutable copy. Handing `&list` to the helper resets only
+        // this copy, which is the pre-Z17 behaviour.
+        else => {
+            var list = rows;
+            deinitEntityList(infos, info, allocator, &list);
+        },
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────
@@ -937,12 +956,33 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     const deleted = try delete(client.product, .{client.product.predicates.product_idEQ(.{ .int = created.product_id })});
     try std.testing.expectEqual(@as(usize, 1), deleted);
 
-    // deinitRows over an All() result frees items + list
-    var all_q = client.product.Query();
-    defer all_q.deinit();
-    const all_rows = try all_q.All();
-    defer deinitRows(infos, PRODUCT_INFO, all_rows, allocator);
-    _ = all_rows.items.len;
+    // deinitRows over an All() result frees items + list — by value (the
+    // historical shape) and by pointer (the shape a consumer layer forwards).
+    // Both must compile and free: `rows: anytype` always accepted both, and
+    // narrowing it to one of them broke every pointer call site in v0.40.0.
+    {
+        var qv = client.product.Query();
+        defer qv.deinit();
+        const by_value = try qv.All();
+        deinitRows(infos, PRODUCT_INFO, by_value, allocator);
+    }
+    {
+        var q = client.product.Query();
+        defer q.deinit();
+        var by_ptr = try q.All();
+        deinitRows(infos, PRODUCT_INFO, &by_ptr, allocator);
+        // Passed by pointer, so the caller's list comes back reusable.
+        try std.testing.expectEqual(@as(usize, 0), by_ptr.items.len);
+        by_ptr.deinit();
+    }
+    {
+        // A `*const` list has no reusable form to return, but it must still
+        // compile and free — `anytype` accepted it before Z17 too.
+        var q = client.product.Query();
+        defer q.deinit();
+        const const_list = try q.All();
+        deinitRows(infos, PRODUCT_INFO, &const_list, allocator);
+    }
 
     var gone = try first(client.product, .{client.product.predicates.product_idEQ(.{ .int = created.product_id })});
     defer if (gone) |*e| deinitEntity(infos, PRODUCT_INFO, e, allocator);

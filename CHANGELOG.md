@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`crud_helpers.deinitRows` accepts a pointer again (compile-blocking
+  regression in v0.40.0).** Z17 turned the wrapper's body into
+  `var list = rows; deinitEntityList(…, &list)`, which only type-checks when
+  `rows` is a value. Every caller passing `&rows` — the shape a consumer layer
+  forwards — stopped compiling:
+
+      src/crud_helpers.zig:864:46: error: expected type 'T', found '*T'
+
+  `rows: anytype` always accepted both shapes, so narrowing it to one was a
+  silent breaking change; the release note claiming it "keeps its by-value
+  signature" was wrong. The wrapper now normalises at comptime: a mutable
+  pointer is handed through (so the caller's list comes back empty and
+  reusable), a value or a `*const` is freed through a mutable copy. The
+  regression test covers all three shapes, and reverting the fix reproduces
+  the consumer's error verbatim.
+
 ## [0.41.0] - 2026-09-12
 
 ### Docs
