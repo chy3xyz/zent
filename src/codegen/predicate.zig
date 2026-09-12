@@ -1,4 +1,5 @@
 const std = @import("std");
+const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const buildEdgeStep = @import("graph.zig").buildEdgeStep;
@@ -259,7 +260,7 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
 
         // Edge-based predicates: Has{Edge}(), Has{Edge}With(preds), NotHas{Edge}()
         for (info.edges) |edge| {
-            const target_info = findTypeInfo(infos, edge.target_name);
+            const target_info = edgeTargetInfo(infos, info, edge);
             const step = buildEdgeStep(edge, info, target_info);
 
             const has_name = edgePredName("Has", edge.name);
@@ -325,7 +326,7 @@ pub fn lowerHasEdge(
             const edge_steps = comptime blk: {
                 var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step } = undefined;
                 for (info.edges, 0..) |e, i| {
-                    const target_info = findTypeInfo(infos, e.target_name);
+                    const target_info = edgeTargetInfo(infos, info, e);
                     steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info) };
                 }
                 break :blk steps;
@@ -352,7 +353,7 @@ pub fn lowerHasEdge(
             const edge_steps = comptime blk: {
                 var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step } = undefined;
                 for (info.edges, 0..) |e, i| {
-                    const target_info = findTypeInfo(infos, e.target_name);
+                    const target_info = edgeTargetInfo(infos, info, e);
                     steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info) };
                 }
                 break :blk steps;

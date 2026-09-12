@@ -1,4 +1,5 @@
 const std = @import("std");
+const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
@@ -469,7 +470,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             comptime {
                 for (info.edges) |edge| {
                     if (edge.relation == .m2m) {
-                        const target_info = findTypeInfo(infos, edge.target_name);
+                        const target_info = edgeTargetInfo(infos, info, edge);
                         const source_table = info.table_name;
                         const target_table = target_info.table_name;
 

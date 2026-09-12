@@ -4,6 +4,78 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`zent.scope`: the read contract for raw SQL.** Raw statements bypassed
+  privacy and the interceptor chain entirely, because an injected predicate
+  needs a builder-provided `QueryView` sink and there was no way to ask "what
+  may this table show?" from outside one — so tenant scoping was silently
+  skipped on every hand-written query. `zent.scope.forClient(infos, table,
+  &client.entity, opts)` renders the *same* contract the fluent path uses
+  (`appendTargetScopePreds`: soft-delete → privacy → interceptors) into a
+  fragment, and `withClause` / `writeClause` splice it into a statement you
+  wrote by hand. `table` is comptime, so a typo is a compile error rather than
+  an unscoped query; `.alias` qualifies every injected predicate so a JOIN
+  cannot make it ambiguous; a policy-bearing table without a `privacy_ctx`
+  returns `error.PrivacyDenied` instead of an unscoped fragment. Covered by an
+  end-to-end test that contrasts the unscoped statement (3 rows) with the
+  scoped one (1 row, and only the calling tenant's).
+
+- **`queryAllLenient` / `queryOneLenient`.** The v0.38 lenient scanners were
+  only reachable at the component layer; `queryAll`/`queryOne` called
+  `scanRowNamed` (strict), so callers needing the absent-value contract fell
+  back to hand-rolled `rows.next()` loops.
+
+- **`<col>Like`, the honest name for `<col>Contains`.** Same predicate, same
+  rendering; `Contains` did not wrap the value and did not say so. `Contains`
+  stays as an alias, so nothing breaks.
+
+- **`zent.version`,** mirroring `build.zig.zon`. A consumer that pinned a
+  dependency by tag was verifying its checkout's HEAD against the tag commit,
+  which raises a false alarm as soon as a docs commit follows the release.
+  Comparing `zent.version` decouples the check from git; `check-version.sh`
+  gates the mirror and the bump/release scripts update both.
+
+- **The qualification of injected predicates moved into one helper**
+  (`sql.appendQualifiedPred`), shared by the eager loader and `zent.scope`.
+  Two behaviours changed with it: soft-delete predicates are now qualified
+  too (a source and target that are both soft-deletable own `deleted_at` on
+  each side of an m2o join, so a bare one was ambiguous in exactly the way the
+  tenant column was), and the helper is the only place that knows how to
+  rewrite a predicate's column.
+
+### Fixed
+- **Out-of-bounds read in positional scanning.** `scanRow*` indexed the row
+  by field order with no `columnCount()` check, and the drivers do not all
+  bounds-check — MySQL reads its `null_indicators` array by index and libpq
+  indexes a null array, so a DTO with more fields than the result set read
+  past the end of the row. Both families now fail with
+  `error.ColumnCountMismatch`; trailing extra columns stay legal (`target.*`
+  projections append a computed `__fk`). Reverting the guard makes the new
+  test die with `index out of bounds: index 2, len 2`.
+
+- **Invalid free of a string default.** The lenient scanners wrote a declared
+  default (a comptime literal such as `"0.00"`) straight into the field, and
+  `freeDto` frees every string field — so a caller's cleanup freed a literal.
+  String defaults now come back owned, and `freeDto` length-guards so a
+  default that never allocated is harmless. Reverting the copy aborts the new
+  test inside the testing allocator's invalid-free detection.
+
+- **Lenient scanning aborted on a value that did not fit.** A column the
+  field cannot hold (DECIMAL text into an int — the common case in a
+  PHP-style port) returned `error.TypeMismatch` instead of falling back to the
+  default. Lenient mode now treats it like NULL, while the structural check
+  above and the strict scanners are unchanged: a wrong projection still fails,
+  only an absent value is tolerated. The trade-off is documented — lenient can
+  mask a wrong column mapping by design.
+
+- **A cross-graph edge now says what is wrong.** `TypeInfo not found: Payment`
+  became: *"edge 'payment' on 'Order' targets 'Payment', which is not in this
+  graph. Edges resolve only within a single graph (§8a): add the target schema
+  to the graph you pass to buildGraph, or read it through the raw driver with
+  zent.scope."* All 16 edge-target resolutions go through
+  `graph.edgeTargetInfo`. The limitation itself is unchanged (Z16): it is now
+  visible at the call site instead of inferred from a bare type name.
+
 ## [0.38.0] - 2026-09-12
 
 ### Changed

@@ -132,9 +132,9 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | **Problem** | Two related things. (a) `BEST_PRACTICES.md` §3a documented `xContains(v)` as `col LIKE '%v%'`, but the implementation binds `v` verbatim (`col LIKE ?`), so following the doc produces an exact match instead of a substring search. (b) The name itself invites that mistake: `Contains` is the only one of the five LIKE predicates that does **not** add the wildcards — `ContainsEscaped`, `HasPrefix`, `HasSuffix` and `ContainsFold` all do, and all escape the input. |
 | **Evidence** | `src/codegen/predicate.zig` (`Contains` → `sql.Like(col, v)`; the others → the escaped family); §3a now carries a corrected table; the new test `Predicates: Contains binds the pattern, ContainsEscaped wraps it` pins both renderings. |
 | **Impact** | Silently wrong results rather than an error: `xContains("foo")` matches only `foo`, and `%`/`_` in the argument stay live wildcards. zapi avoided this because it passes `%v%` explicitly (Z1 drove it to `Contains` for MySQL safety), so the consumer semantics are correct — but a new caller reading the docs would not be. |
-| **Proposal** | (a) **Done**: docs corrected and the behaviour pinned by a test. (b) **Open**: either rename `Contains` to `Like` (matches what it does; a renaming break) or keep the name and add a wrapping `ContainsLiteral` alias, so that every predicate whose name says "contains" actually wraps. Decide before the next consumer adopts it. |
-| **Acceptance** | Docs and tests agree with the implementation (done), and the naming question is settled so the next reader cannot be misled. |
-| **Status** | **Partially fixed** (docs + test in the release after v0.37.0); the rename/alias decision is **Open**. |
+| **Proposal** | (a) **Done**: docs corrected and the behaviour pinned by a test. (b) **Half done**: `<col>Like` was added as the honest name for the same predicate, so new code has a name that cannot mislead while `Contains` keeps working (nothing breaks; a test asserts both render `LIKE ?`). The remaining question is whether to *rename* `Contains` — left open on purpose, since that is the breaking half and the alias already removes the trap. |
+| **Acceptance** | Docs and tests agree with the implementation (done), and new code has a non-misleading name (done: `Like`). |
+| **Status** | **Substantially fixed** — `Like` alias + docs + tests; only the `Contains` rename itself is **Open**. |
 
 ---
 
@@ -162,7 +162,20 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | **Revisit when** | A consumer shows all four: one process, one physical database, >400 tables, and edges crossing the split — plus a merged single graph whose build time is unacceptable. Then stage 2 is ~1–2 days of plumbing against a proven mechanism, and the case is real. |
 | **Proposal** | **Open, and smaller than it first looked.** A probe proved the resolution mechanism already works when the target's `TypeInfo` comes from its own graph: `buildEdgeStep` across graphs emits `SELECT "probe_b".*, "s"."id" AS __fk FROM "probe_b" INNER JOIN "probe_a" s ON "probe_b"."id" = s."b_id" WHERE s."id" IN (?)`, and `Entity(b_graph.types, b_info)` resolves the target's *nested* edges against `b_graph.types` automatically. `EdgeInfo` already carries `target: type` (graph.zig:45). So the work is plumbing, in stages: **(1)** turn `findTypeInfo`'s miss into an actionable error naming the edge, the source and the target type (zero risk, satisfies half the acceptance criterion); **(2)** add an explicit graph handle (`edge.InGraph(target_graph)`, additive/defaulted) and redirect the 14 sites; **(3)** `Client` generic over a graph set — mostly *not* needed, since Z9's `beginTxFromDriver` covers the transaction half and the shared graph's client types are identical by construction once the handle is the graph's `types`. Three real constraints for stage 2: graphs must be declared in dependency order (mutually-cross-referencing graphs need a two-phase declaration, the one genuinely hard part), a cross-graph `To` edge cannot auto-inject its FK into the target's table so the target must declare that column explicitly, and the comptime budget (§7a) needs re-measuring. Layering note: a `[]const TypeInfo` handle makes `core/edge.zig` depend on codegen's IR — either accept that or move `TypeInfo` to a neutral module. |
 | **Acceptance** | A cross-graph edge either works, or fails to compile with a message naming the edge, the source graph and the target type. |
-| **Status** | **Open** (stage 1 is a small self-contained change; recorded here so it is not lost). |
+| **Status** | **Stage 1 done** (v0.39.0): all 16 edge-target resolutions go through `graph.edgeTargetInfo`, which fails with *"edge 'payment' on 'Order' targets 'Payment', which is not in this graph … add the target schema to the graph you pass to buildGraph, or read it through the raw driver with zent.scope"* — verified by probing a cross-graph edge. Stages 2/3 stay **Open** per the ROI row above. |
+
+---
+
+### Z17 — Entity release is a 4-argument call nobody wraps
+
+| | |
+|--|--|
+| **Problem** | Releasing a scanned entity takes `deinitEntity(infos, info, &entity, allocator)` — four arguments, one of which (`infos`) the caller has no other reason to hold. The ergonomic helper `managedEntity` (`row.deinit()`, one call, no arguments) exists and is unused. |
+| **Evidence** | Consumer count: `deinitEntity(...)` appears **607** times in zapi; `managedEntity`/`dupeEntityTo` appear **0** times. `ManagedEntity` already provides exactly the shape needed (`src/codegen/entity.zig:406`, `deinit(self)`), so the gap is not capability but **reachability**: nothing returns one. |
+| **Impact** | Not correctness — the explicit call is safe, just verbose enough that it is written by hand everywhere and cannot be reviewed for ownership at a glance. |
+| **Proposal** | **Open.** Add a query method that returns owning rows (`q.AllManaged()` → a list of `ManagedEntity` with one `deinit()` for the whole list), or at minimum a `q.deinitRows(&rows)` that pairs with `All()`. Design-sized only because it adds a public container type; the underlying `ManagedEntity` already exists. |
+| **Acceptance** | A consumer can free a page of entities in one call, and `deinitEntity`'s four-argument form stops being the only reachable option. |
+| **Status** | **Open** (recorded rather than rushed: it adds public surface, and the measurement above is what should drive the shape). |
 
 ---
 
@@ -185,6 +198,7 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
 | Z14 | `Contains` semantics vs name | P2 | **Partially fixed** — docs+test done, naming **Open** |
 | Z15 | Edge writes on `From` edges | P2 | **Open** — deferred, design-sized |
-| Z16 | Multi-graph first-class | P2 | **Open** — ROI: stage 1 yes, stage 2 deferred (see row) |
+| Z16 | Multi-graph first-class | P2 | **Stage 1 done** v0.39.0 (actionable error); stages 2/3 **Open** per ROI |
+| Z17 | Entity release shape | P2 | **Open** — `deinitEntity` vs an owning container |
 
 When filing GitHub issues, title prefix `[zapi]` and link this file + the consumer path cited above.

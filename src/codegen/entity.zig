@@ -1,4 +1,5 @@
 const std = @import("std");
+const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
 
@@ -70,7 +71,7 @@ fn EdgesTypeShallow(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         var field_types: [info.edges.len]type = undefined;
         var field_attrs: [info.edges.len]std.builtin.Type.Struct.FieldAttributes = undefined;
         for (info.edges, 0..) |e, i| {
-            const target_info = findTypeInfo(infos, e.target_name);
+            const target_info = edgeTargetInfo(infos, info, e);
             const TargetEntity = PlainFields(infos, target_info);
             const FieldType = ?[]TargetEntity;
             const default_val: FieldType = null;
@@ -131,7 +132,7 @@ fn EdgesType(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
         var field_types: [info.edges.len]type = undefined;
         var field_attrs: [info.edges.len]std.builtin.Type.Struct.FieldAttributes = undefined;
         for (info.edges, 0..) |e, i| {
-            const target_info = findTypeInfo(infos, e.target_name);
+            const target_info = edgeTargetInfo(infos, info, e);
             const TargetEntity = LightEntity(infos, target_info);
             const FieldType = ?[]TargetEntity;
             const default_val: FieldType = null;
@@ -285,7 +286,7 @@ pub fn deinitEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo, s
 fn deinitEntityEdges(comptime infos: []const TypeInfo, comptime info: TypeInfo, self: anytype, allocator: std.mem.Allocator) void {
     if (comptime info.edges.len == 0) return;
     inline for (info.edges) |e| {
-        const target_info = comptime findTypeInfo(infos, e.target_name);
+        const target_info = comptime edgeTargetInfo(infos, info, e);
         const EdgeFieldType = @TypeOf(@field(self.edges, e.name));
         const EdgeArrType = @typeInfo(EdgeFieldType).optional.child;
         const ItemType = @typeInfo(EdgeArrType).pointer.child;
@@ -478,7 +479,7 @@ fn dupeItem(
     }
     if (comptime @hasField(T, "edges") and info.edges.len > 0) {
         inline for (info.edges) |e| {
-            const target_info = comptime findTypeInfo(infos, e.target_name);
+            const target_info = comptime edgeTargetInfo(infos, info, e);
             const EdgeFieldType = @TypeOf(@field(out.edges, e.name));
             const ArrType = @typeInfo(EdgeFieldType).optional.child;
             const ItemType = @typeInfo(ArrType).pointer.child;

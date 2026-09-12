@@ -1,4 +1,5 @@
 const std = @import("std");
+const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
@@ -47,6 +48,21 @@ fn scanEntityNamed(comptime info: TypeInfo, comptime T: type, allocator: std.mem
 }
 const Dialect = @import("../sql/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
+const intercept_op = @import("../runtime/hook.zig");
+const privacy_op = @import("../runtime/privacy.zig");
+
+/// `PrivacyContext.op` and `QueryView.op` are the same four operations as two
+/// distinct enums. Mapped explicitly rather than by ordinal, so adding a
+/// member to either one is a compile error instead of a silent
+/// reinterpretation.
+fn toPrivacyOp(op: intercept_op.Op) privacy_op.Op {
+    return switch (op) {
+        .create => .create,
+        .update => .update,
+        .delete => .delete,
+        .query => .query,
+    };
+}
 const hook = @import("../runtime/hook.zig");
 const intercept = @import("../runtime/intercept.zig");
 const Logger = @import("../sql/logger.zig").Logger;
@@ -109,6 +125,10 @@ pub fn EdgeInterceptorSink(comptime tinfo: TypeInfo) type {
 /// postures again — the divergence that previously left `queryTargets`
 /// fail-open while eager loading was fail-closed.
 ///
+/// `op` is what the privacy policy and the interceptors see, so a raw
+/// UPDATE/DELETE can scope itself with the same fragment a SELECT uses
+/// (`zent.scope`).
+///
 /// Errors: `PrivacyDenied` when the target carries a policy but no context
 /// was supplied (fail-closed), `InterceptFailed` when the chain rejects.
 pub fn appendTargetScopePreds(
@@ -118,6 +138,7 @@ pub fn appendTargetScopePreds(
     privacy_ctx: ?privacy.PrivacyContext,
     interceptors: ?*intercept.InterceptorChain,
     with_trashed: bool,
+    op: intercept_op.Op,
 ) !void {
     if (target_info.soft_delete and !with_trashed) {
         try preds.append(allocator, sql.IsNull("deleted_at"));
@@ -125,7 +146,7 @@ pub fn appendTargetScopePreds(
 
     if (target_info.policy) |policy| {
         var ctx = privacy_ctx orelse return error.PrivacyDenied;
-        ctx.op = .query;
+        ctx.op = toPrivacyOp(op);
         const decision_set = policy.eval(ctx);
         if (decision_set.decision == .deny) return error.PrivacyDenied;
         for (decision_set.getFilters()) |opaque_ptr| {
@@ -138,7 +159,7 @@ pub fn appendTargetScopePreds(
         const Sink = EdgeInterceptorSink(target_info);
         var sink = Sink{ .preds = preds, .allocator = allocator };
         var view = intercept.QueryView{
-            .op = .query,
+            .op = op,
             .table_name = target_info.table_name,
             .sink = &sink,
             .add_eq_fn = Sink.addEq,
@@ -194,7 +215,7 @@ fn loadEdgePath(
 
     inline for (ParentInfo.edges) |edge| {
         if (std.mem.eql(u8, edge.name, split.head)) {
-            const target_info = comptime findTypeInfo(infos, edge.target_name);
+            const target_info = comptime edgeTargetInfo(infos, ParentInfo, edge);
             // Target type mirrors the parent's edges field: LightEntity for
             // the first level (so nesting can continue), PlainFields for the
             // terminal level.
@@ -226,7 +247,7 @@ fn loadEdgePath(
             // `client.queryTargets*` applies the identical set.
             var extra_preds = std.ArrayListUnmanaged(sql.Predicate).empty;
             defer extra_preds.deinit(allocator);
-            try appendTargetScopePreds(target_info, &extra_preds, allocator, privacy_ctx, interceptors, with_trashed);
+            try appendTargetScopePreds(target_info, &extra_preds, allocator, privacy_ctx, interceptors, with_trashed, .query);
 
             graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_id_values, extra_preds.items) catch |err| {
                 return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
@@ -529,7 +550,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         ///   ORDER BY (SELECT COUNT(*) FROM "car" WHERE "car"."owner_id" = "user"."id") DESC
         pub fn OrderByEdgeCount(self: *Self, comptime edge_name: []const u8, comptime desc: bool) !*Self {
             const edge = comptime findEdgeInfo(info, edge_name);
-            const target_info = comptime findTypeInfo(infos, edge.target_name);
+            const target_info = comptime edgeTargetInfo(infos, info, edge);
             const step = comptime buildEdgeStep(edge, info, target_info);
             const order = sql.OrderExpr(struct {
                 fn gen(b: *sql.Builder) anyerror!void {

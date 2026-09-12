@@ -206,18 +206,24 @@ Every field gets these (`client.<entity>.predicates.<field><Suffix>`):
 
 | Suffix | Renders |
 |---|---|
-| `Contains` | `col LIKE ?` — `v` is bound **verbatim**, so **you supply the wildcards**: `xContains("%foo%")` matches a substring, `xContains("foo")` is an exact match. Parameterised, so it is the MySQL-safe one. |
+| `Like` | `col LIKE ?` — `v` is bound **verbatim**, so **you supply the wildcards**: `xLike("%foo%")` matches a substring, `xLike("foo")` is an exact match. Parameterised, so it is the MySQL-safe one. |
+| `Contains` | Identical to `Like` (an alias kept for compatibility). **The name is misleading** — it does not wrap the value, so `xContains("foo")` is an exact match. Prefer `Like` in new code. |
 | `ContainsEscaped` | `col LIKE '%v%' ESCAPE …` — `%` is added for you and any `%`/`_` in `v` is escaped, so `v` is a **literal substring** |
 | `HasPrefix` `HasSuffix` | `col LIKE 'v%'` / `col LIKE '%v'`, escaped like `ContainsEscaped` |
 | `ContainsFold` | `LOWER(col) LIKE LOWER('%v%')` — non-sargable |
 | `EQFold` | `LOWER(col) = LOWER(?)` |
 
-`Contains` is the odd one out: it does **not** wrap the value, because it
-binds it as a parameter (which is what makes it safe on MySQL — see
-`ISSUES_FROM_ZAPI.md` Z1). `ContainsEscaped`, `HasPrefix`, `HasSuffix` and
-`ContainsFold` all add the wildcards themselves and escape the user input, so
-they take a literal substring. Passing an unescaped `%foo%` to
+`Like` (and its alias `Contains`) is the odd one out: it does **not** wrap the
+value, because it binds it as a parameter (which is what makes it safe on
+MySQL — see `ISSUES_FROM_ZAPI.md` Z1). `ContainsEscaped`, `HasPrefix`,
+`HasSuffix` and `ContainsFold` all add the wildcards themselves and escape the
+user input, so they take a literal substring. Passing an unescaped `%foo%` to
 `ContainsEscaped` would therefore search for a literal `%`.
+
+Historical note: the predicate was called `Contains` only, and both the name
+and the docs read as "substring search". `Like` was added as the honest name —
+it is the same predicate, so nothing breaks; a rename of `Contains` is still
+open (Z14).
 
 Edges get `Has<Edge>()`, `NotHas<Edge>()`, and `Has<Edge>With(preds)`. The
 `With` form takes the **target entity's own typed predicates**, so a
@@ -289,6 +295,51 @@ while (rows.next()) |row| {
 **Collect rows generically** with `crud_helpers.queryRows(T, driver, sql, args,
 alloc, mapRow)` — it returns an owned `Rows(T)` that frees strings + slice in
 one `deinit()`.
+
+### Scoping raw SQL (`zent.scope`)
+
+Raw SQL bypasses the builders, and the builders are where privacy and the
+interceptor chain live — so a hand-written statement is **unscoped by
+default**. `zent.scope` renders the same contract (`appendTargetScopePreds`:
+soft-delete → privacy → interceptors) into a fragment you splice in, so the
+two paths cannot disagree:
+
+```zig
+var scope = try zent.scope.forClient(infos, "order", &client.order, .{});
+defer scope.deinit(); // owns the fragment + its bound args
+
+const stmt = try zent.scope.withClause(
+    scope,
+    alloc,
+    "SELECT o.id FROM order o WHERE o.amount > ?",
+    true, // this head already has a WHERE → the fragment ANDs into it
+);
+defer alloc.free(stmt);
+
+var rows = try client.driver.query(stmt, scope.args);
+```
+
+- `forClient(infos, table, &entity_client, opts)` takes the allocator, driver,
+  `privacy_ctx` and interceptor chain from the entity client — pass the client
+  whose entity the statement is about. `forTable(...)` is the same thing with
+  the four inputs spelled out.
+- `table` is a **comptime** string, resolved against the graph at compile time
+  — a typo is a compile error, not an unscoped query. Either the physical
+  table name (`"order"`) or the entity name (`"Order"`) works.
+- `.alias = "o"` renders every injected predicate qualified
+  (`"o"."app_id" = ?`). **Set it whenever the statement joins anything**: a
+  bare column is rejected as ambiguous the moment a second table owns the same
+  column, which is a fail-loud description of the bug this prevents.
+- `.with_trashed = true` drops the soft-delete half; `.op = .update` / `.delete`
+  is what the privacy policy and interceptors see for a statement that writes.
+- The fragment is empty (`scope.sql.len == 0`) when the table contributes no
+  scope at all, and `withClause` / `writeClause` then append nothing — so it is
+  safe to call unconditionally for every statement on that table.
+- Fail-closed: a table with a privacy policy and no `privacy_ctx` returns
+  `error.PrivacyDenied` rather than an unscoped fragment.
+- Predicate shapes that cannot be rewritten safely (a policy filter carrying
+  its own SQL, raw fragments, subqueries) are appended verbatim. `eq`,
+  `is_null` and `is_not_null` are the ones that get qualified.
 
 ## 5a. Upserts (INSERT ... ON CONFLICT / ODKU)
 

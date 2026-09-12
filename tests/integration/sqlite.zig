@@ -3210,6 +3210,137 @@ test "SQLite: QueryEdge applies the target read contract (interceptor + privacy)
     }
 }
 
+test "SQLite: zent.scope scopes a raw SELECT that bypasses the builders" {
+    // End-to-end proof of the raw-SQL scope entry point: the statement is
+    // written by hand, so nothing in the fluent path is involved. Without the
+    // fragment the same statement returns every tenant's rows (asserted
+    // below), which is the shape of the cross-tenant reads zapi reported.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const OrderBase = schema("ScopeRawOrder", .{
+        .fields = &.{
+            field.String("code"),
+            field.Int("app_id"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    const graph = comptime buildGraph(&.{OrderBase});
+    const infos = graph.types;
+    const info = infos[0];
+
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("app_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    var ids: [3]i64 = undefined;
+    for (&ids, 0..) |*out, i| {
+        var b = try client.scope_raw_order.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", if (i == 0) "o1" else if (i == 1) "o2" else "o3");
+        _ = try b.setFieldValue("app_id", @as(i64, if (i == 1) 2 else 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, info, &e, allocator);
+        out.* = e.id;
+    }
+    // Soft-delete the third order: the raw scope must hide it the way the
+    // builders do.
+    {
+        var d = client.scope_raw_order.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{client.scope_raw_order.predicates.idEQ(.{ .int = ids[2] })});
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    // The hand-written statement, unscoped — the leak, for contrast.
+    {
+        var rows = try drv.query("SELECT code FROM scope_raw_order", &.{});
+        defer rows.deinit();
+        var n: usize = 0;
+        while (rows.next()) |_| n += 1;
+        try testing.expectEqual(@as(usize, 3), n);
+    }
+
+    // The same statement with the fragment spliced in.
+    {
+        var scope = try zent.scope.forClient(infos, "scope_raw_order", &client.scope_raw_order, .{});
+        defer scope.deinit();
+
+        const stmt = try zent.scope.withClause(scope, allocator, "SELECT code FROM scope_raw_order", false);
+        defer allocator.free(stmt);
+
+        var rows = try drv.query(stmt, scope.args);
+        defer rows.deinit();
+        var n: usize = 0;
+        var saw_o1 = false;
+        while (rows.next()) |row| {
+            n += 1;
+            if (std.mem.eql(u8, row.getText(0).?, "o1")) saw_o1 = true;
+        }
+        // Only tenant 1's live row survives: `o2` belongs to tenant 2 and
+        // `o3` is soft-deleted.
+        try testing.expectEqual(@as(usize, 1), n);
+        try testing.expect(saw_o1);
+    }
+
+    // Tenant 2 sees its own row, which is what makes this a scope rather than
+    // a hardcoded filter.
+    tenant = 2;
+    {
+        var scope = try zent.scope.forClient(infos, "scope_raw_order", &client.scope_raw_order, .{});
+        defer scope.deinit();
+
+        const stmt = try zent.scope.withClause(scope, allocator, "SELECT code FROM scope_raw_order WHERE 1 = 1", true);
+        defer allocator.free(stmt);
+
+        var rows = try drv.query(stmt, scope.args);
+        defer rows.deinit();
+        var n: usize = 0;
+        while (rows.next()) |row| {
+            n += 1;
+            try testing.expectEqualStrings("o2", row.getText(0).?);
+        }
+        try testing.expectEqual(@as(usize, 1), n);
+    }
+
+    // `WithTrashed` mirrors the fluent flag: tenant 1 gets its soft-deleted
+    // order back (2 rows instead of the 1 asserted above), and still not
+    // tenant 2's.
+    tenant = 1;
+    {
+        var scope = try zent.scope.forClient(infos, "scope_raw_order", &client.scope_raw_order, .{ .with_trashed = true });
+        defer scope.deinit();
+
+        const stmt = try zent.scope.withClause(scope, allocator, "SELECT code FROM scope_raw_order", false);
+        defer allocator.free(stmt);
+
+        var rows = try drv.query(stmt, scope.args);
+        defer rows.deinit();
+        var n: usize = 0;
+        while (rows.next()) |row| {
+            // `getText` borrows the driver's row buffer, so assert per row
+            // instead of keeping the slice.
+            try testing.expectEqualStrings(if (n == 0) "o1" else "o3", row.getText(0).?);
+            n += 1;
+        }
+        try testing.expectEqual(@as(usize, 2), n);
+    }
+}
+
 test "SQLite: Update edge writes maintain M2M and O2M associations" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");

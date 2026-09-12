@@ -559,6 +559,47 @@ pub fn appendEqUnlessPresent(list: *std.array_list.Managed(Predicate), column: [
     try list.append(EQ(column, value));
 }
 
+/// Append `pred`, qualifying a bare column with `qualifier` when the predicate
+/// has one. Used wherever a predicate is emitted into a statement that may
+/// join another table owning the same column — an unqualified tenant column is
+/// then rejected by the database as ambiguous, which is how a scoping
+/// predicate fails *loudly* instead of silently filtering the wrong table.
+///
+/// Only the shapes whose column is a plain name are rewritten (`eq`,
+/// `is_null`, `is_not_null`); everything else — raw fragments, subqueries,
+/// policy filters carrying their own SQL — is appended verbatim, because
+/// rewriting arbitrary SQL text is not something this library can do safely.
+/// Predicates that already carry a qualifier (`t.col`) are left alone.
+///
+/// `qualifier == null` is the identity: the predicate is appended as-is.
+pub fn appendQualifiedPred(b: *Builder, pred: Predicate, qualifier: ?[]const u8) !void {
+    const q = qualifier orelse return pred.appendTo(b);
+    switch (pred) {
+        .eq => |p| {
+            try writeQualifiedColumn(b, q, p.column);
+            try b.writeString(" = ");
+            try b.arg(p.value);
+        },
+        .is_null => |column| {
+            try writeQualifiedColumn(b, q, column);
+            try b.writeString(" IS NULL");
+        },
+        .is_not_null => |column| {
+            try writeQualifiedColumn(b, q, column);
+            try b.writeString(" IS NOT NULL");
+        },
+        else => try pred.appendTo(b),
+    }
+}
+
+fn writeQualifiedColumn(b: *Builder, qualifier: []const u8, column: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, column, '.') == null) {
+        try b.ident(qualifier);
+        try b.writeByte('.');
+    }
+    try b.qualifiedIdent(column);
+}
+
 pub fn Like(column: []const u8, value: Value) Predicate {
     return .{ .like = .{ .column = column, .value = value } };
 }

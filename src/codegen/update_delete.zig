@@ -1,4 +1,5 @@
 const std = @import("std");
+const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
@@ -562,7 +563,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
 
         /// Compile-time guard: detaching targets needs a nullable FK column.
         fn checkDetachableFK(comptime edge: EdgeInfo) void {
-            const target_info = comptime findTypeInfo(infos, edge.target_name);
+            const target_info = comptime edgeTargetInfo(infos, info, edge);
             const step = comptime buildEdgeStep(edge, info, target_info);
             const fk_col = step.edge_columns[0];
             if (comptime findField(target_info, fk_col)) |f| {
@@ -582,7 +583,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             const dialect = self.driver.dialect();
             inline for (info.edges) |edge| {
                 if (comptime edge.relation == .m2m) {
-                    const target_info = comptime findTypeInfo(infos, edge.target_name);
+                    const target_info = comptime edgeTargetInfo(infos, info, edge);
                     const step = comptime buildEdgeStep(edge, info, target_info);
                     for (self.edge_actions.items) |action| {
                         if (!std.mem.eql(u8, action.edge_name, edge.name)) continue;
@@ -610,7 +611,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                         }
                     }
                 } else if (comptime edge.kind == .to and (edge.relation == .o2m or edge.relation == .o2o)) {
-                    const target_info = comptime findTypeInfo(infos, edge.target_name);
+                    const target_info = comptime edgeTargetInfo(infos, info, edge);
                     const step = comptime buildEdgeStep(edge, info, target_info);
                     const target_soft_delete = target_info.soft_delete;
                     for (self.edge_actions.items) |action| {

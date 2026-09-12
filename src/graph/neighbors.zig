@@ -171,25 +171,13 @@ pub fn appendSetNeighborsFiltered(
 
     for (extra_preds) |pred| {
         try b.writeString(" AND ");
-        switch (pred) {
-            // Interceptor-injected tenant scoping (`QueryView.whereEq`) arrives
-            // as a bare-column EQ. This query joins the source table, which may
-            // own the same column (e.g. `app_id` on both sides), so qualify the
-            // reference with the eager-loaded target table — otherwise the
-            // prepared statement fails with "Column 'app_id' in where clause is
-            // ambiguous". Predicates that already carry a qualifier are left
-            // alone.
-            .eq => |p| {
-                if (std.mem.indexOfScalar(u8, p.column, '.') == null) {
-                    try b.ident(step.to_table);
-                    try b.writeByte('.');
-                }
-                try b.qualifiedIdent(p.column);
-                try b.writeString(" = ");
-                try b.arg(p.value);
-            },
-            else => try pred.appendTo(b),
-        }
+        // Interceptor-injected tenant scoping (`QueryView.whereEq`) arrives as
+        // a bare-column EQ, and this query joins the source table, which may
+        // own the same column (e.g. `app_id` on both sides). `appendQualifiedPred`
+        // qualifies it with the eager-loaded target — otherwise the prepared
+        // statement fails with "ambiguous column". Policy filters and raw
+        // fragments pass through untouched.
+        try sql.appendQualifiedPred(b, pred, step.to_table);
     }
 
     if (use_window) {
@@ -493,6 +481,40 @@ test "appendSetNeighborsFiltered qualifies interceptor EQ with the target table 
     try testing.expect(std.mem.indexOf(u8, result.sql, "AND `upload_file`.`app_id` = ?") != null);
 }
 
+test "appendSetNeighborsFiltered qualifies a soft-delete filter on the m2o join" {
+    // Same shape as the tenant EQ above, for the other predicate the read
+    // contract injects by itself: a source and target that are both
+    // soft-deletable own `deleted_at` on each side of the join.
+    const step = Step{
+        .from_table = "product_image",
+        .from_column = "id",
+        .to_table = "upload_file",
+        .to_column = "file_id",
+        .edge_rel = .m2o,
+        .edge_table = "upload_file",
+        .edge_columns = &[_][]const u8{"image_id"},
+        .inverse = false,
+        .order_by = null,
+        .desc = false,
+        .limit = null,
+    };
+    var b = sql.Builder.init(testing.allocator, .{ .name = "postgres" });
+    defer b.deinit();
+    const extra = [_]sql.Predicate{sql.IsNull("deleted_at")};
+    try appendSetNeighborsFiltered(&b, step, &[_]sql.Value{.{ .int = 5 }}, &extra);
+    const result = b.query();
+    try testing.expect(std.mem.indexOf(u8, result.sql, "AND \"upload_file\".\"deleted_at\" IS NULL") != null);
+
+    // A predicate that already carries a qualifier is left alone.
+    var b2 = sql.Builder.init(testing.allocator, .{ .name = "postgres" });
+    defer b2.deinit();
+    const extra2 = [_]sql.Predicate{sql.IsNull("s.deleted_at")};
+    try appendSetNeighborsFiltered(&b2, step, &[_]sql.Value{.{ .int = 5 }}, &extra2);
+    const result2 = b2.query();
+    try testing.expect(std.mem.indexOf(u8, result2.sql, "AND \"s\".\"deleted_at\" IS NULL") != null);
+    try testing.expect(std.mem.indexOf(u8, result2.sql, "\"upload_file\".\"s\"") == null);
+}
+
 test "appendSetNeighborsFiltered applies extra predicates before the window rank" {
     const step = Step{
         .from_table = "user",
@@ -513,7 +535,10 @@ test "appendSetNeighborsFiltered applies extra predicates before the window rank
     try appendSetNeighborsFiltered(&b, step, &[_]sql.Value{.{ .int = 1 }}, &extra);
     const result = b.query();
 
-    const filter_idx = std.mem.indexOf(u8, result.sql, "AND \"deleted_at\" IS NULL");
+    // Qualified with the target table like every other injected predicate:
+    // when both sides of the join are soft-deletable, a bare `deleted_at`
+    // is exactly as ambiguous as a bare tenant column.
+    const filter_idx = std.mem.indexOf(u8, result.sql, "AND \"post\".\"deleted_at\" IS NULL");
     const rank_idx = std.mem.indexOf(u8, result.sql, ") WHERE __rn <=");
     try testing.expect(filter_idx != null);
     try testing.expect(rank_idx != null);

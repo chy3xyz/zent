@@ -98,6 +98,25 @@ pub fn pkColumn(comptime info: TypeInfo) []const u8 {
     return columnName(info, info.pk_field);
 }
 
+/// Resolve an edge's target inside this graph, or fail with a message that
+/// names the edge, the source type and the target type.
+///
+/// The plain `TypeInfo not found: Payment` that a missing target used to
+/// produce left the caller to work out *which* edge was at fault and why the
+/// type was not in scope. A cross-graph edge is the common cause and it is a
+/// hard wall, not an oversight: an entity whose edge leaves its graph cannot
+/// even build its client. See `docs/BEST_PRACTICES.md` §8a for the supported
+/// shapes and `docs/ISSUES_FROM_ZAPI.md` Z16 for the deliberate limitation.
+pub fn edgeTargetInfo(comptime infos: []const TypeInfo, comptime source: TypeInfo, comptime edge: EdgeInfo) TypeInfo {
+    for (infos) |ti| {
+        if (std.mem.eql(u8, ti.name, edge.target_name)) return ti;
+    }
+    @compileError("zent: edge '" ++ edge.name ++ "' on '" ++ source.name ++ "' targets '" ++ edge.target_name ++
+        "', which is not in this graph. Edges resolve only within a single graph (see docs/BEST_PRACTICES.md 8a):" ++
+        " add the target schema to the graph you pass to buildGraph, or read it through the raw driver with" ++
+        " zent.scope. Cross-graph edges are tracked as Z16 in docs/ISSUES_FROM_ZAPI.md.");
+}
+
 /// Build a TypeInfo from a schema type at comptime.
 /// Build a TypeInfo from a schema type at comptime with the default (SQLite) dialect.
 pub fn fromSchema(comptime S: type) TypeInfo {

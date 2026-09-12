@@ -9,6 +9,10 @@ pub const sql_scan = @import("sql/scan.zig");
 /// `build.zig.zon`; both are gated by `scripts/check-version.sh`. Use it to
 /// check a dependency pin without consulting git.
 pub const version = @import("version.zig").version;
+/// Read-contract fragments for raw SQL: `zent.scope.forTable` /
+/// `forClient` render the same soft-delete → privacy → interceptor scope the
+/// fluent builders apply, for a statement you write yourself.
+pub const scope = @import("codegen/scope.zig");
 pub const sql_sqlite = @import("sql/sqlite.zig");
 pub const sql_postgres = @import("sql/postgres.zig");
 pub const sql_mysql = @import("sql/mysql.zig");

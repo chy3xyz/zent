@@ -1,4 +1,5 @@
 const std = @import("std");
+const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
 const sql_driver = @import("../sql/driver.zig");
@@ -78,7 +79,7 @@ fn makeEdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo)
     comptime {
         var result: EdgeOrderTerms(infos, info) = undefined;
         for (info.edges) |edge| {
-            const target_info = findTypeInfo(infos, edge.target_name);
+            const target_info = edgeTargetInfo(infos, info, edge);
             const step = buildEdgeStep(edge, info, target_info);
 
             const name = byEdgeName(edge.name);
@@ -544,7 +545,7 @@ fn QueryTargetsResult(
 ) type {
     const source_info = findTypeInfo(infos, source_name);
     const edge = findEdgeInfo(source_info, edge_name);
-    const target_info = findTypeInfo(infos, edge.target_name);
+    const target_info = comptime edgeTargetInfo(infos, source_info, edge);
     return std.array_list.Managed(EntityGen(infos, target_info));
 }
 
@@ -570,7 +571,7 @@ fn queryTargetsImpl(
 ) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
     const source_info = comptime findTypeInfo(infos, source_name);
     const edge = comptime findEdgeInfo(source_info, edge_name);
-    const target_info = comptime findTypeInfo(infos, edge.target_name);
+    const target_info = comptime edgeTargetInfo(infos, source_info, edge);
     const TargetEntity = comptime EntityGen(infos, target_info);
     const step = comptime buildEdgeStep(edge, source_info, target_info);
 
@@ -586,7 +587,7 @@ fn queryTargetsImpl(
     defer extra_preds.deinit(allocator);
 
     if (scope == .scoped) {
-        try @import("query.zig").appendTargetScopePreds(target_info, &extra_preds, allocator, privacy_ctx, interceptors, false);
+        try @import("query.zig").appendTargetScopePreds(target_info, &extra_preds, allocator, privacy_ctx, interceptors, false, .query);
     } else if (target_info.soft_delete) {
         try extra_preds.append(allocator, sql.IsNull("deleted_at"));
     }
