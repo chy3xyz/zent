@@ -3093,7 +3093,7 @@ test "MySQL: queryTargetsByValue traverses UUID-keyed parents" {
     }
 
     {
-        var rows = try Client.queryTargetsByValue(infos, "MyUqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
+        var rows = try Client.queryTargetsByValueUnscoped(infos, "MyUqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
         defer {
             for (rows.items) |*r| zent.codegen.deinitEntity(infos, item_info, r, allocator);
             rows.deinit();
@@ -3101,7 +3101,7 @@ test "MySQL: queryTargetsByValue traverses UUID-keyed parents" {
         try testing.expectEqual(@as(usize, 2), rows.items.len);
     }
     {
-        var rows = try Client.queryTargetsByValue(infos, "MyUqvUser", "items", &.{
+        var rows = try Client.queryTargetsByValueUnscoped(infos, "MyUqvUser", "items", &.{
             .{ .string = alice_id },
             .{ .string = bob_id },
         }, allocator, drv.asDriver());

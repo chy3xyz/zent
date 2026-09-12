@@ -526,10 +526,17 @@ const owners = try q.All();
   soft-delete filtering, privacy policy/row filters and the interceptor chain —
   before any per-parent `LIMIT` ranking, so a filtered row cannot consume a
   per-parent limit slot. `WithTrashed()` includes soft-deleted targets too.
-- `QueryEdge`/`queryTargets(ById)`, the traversal helper used outside a
-  builder, applies the target's soft-delete scope only. It takes no
-  `privacy_ctx`/`interceptors`, so it is **not** tenant-scoped — use `WithEdge`
-  when you need that, or call it with ids you have already scoped yourself.
+- `QueryEdge` / `queryTargets(ById)` apply **the same contract**: they route
+  through `codegen.query.appendTargetScopePreds`, the one implementation the
+  eager loader uses, so an edge read is scoped identically whether you take it
+  inside a builder or outside one. `QueryEdge` forwards the client's own
+  `privacy_ctx`/`interceptors` and needs no extra arguments; a target carrying
+  a policy denies the traversal (`error.PrivacyDenied`) unless the client has a
+  context.
+- `queryTargetsUnscoped` / `queryTargetsByValueUnscoped` are the deliberate
+  escape hatch: soft-delete only, no policy, no interceptor. They return a
+  foreign tenant's row if you hand them that tenant's parent id, so treat a
+  call site as an audited decision that the ids were scoped elsewhere.
 
 ## 6. Transactions
 

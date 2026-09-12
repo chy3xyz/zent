@@ -35,6 +35,29 @@ All notable changes to this project will be documented in this file.
   invisible (the query never reaches the success-path query log). It now also
   emits the statement at `debug` level.
 
+- **`queryTargets` / `QueryEdge` no longer fail open.** The two bulk neighbour
+  readers disagreed on tenant isolation: `WithEdge` scoped eager-loaded
+  targets (soft-delete → privacy → interceptors), while
+  `queryTargets`/`queryTargetsByValue`/`QueryEdge` applied soft-delete only and
+  documented the gap as a "known boundary". The target read contract now lives
+  in one place (`codegen.query.appendTargetScopePreds`) and both readers call
+  it, so the posture cannot drift again. `EntityClient.QueryEdge` forwards the
+  client's `privacy_ctx`/`interceptors` and keeps its signature; the free
+  functions gained the two arguments, and the previous soft-delete-only
+  behaviour is preserved under the explicit names
+  `queryTargetsUnscoped`/`queryTargetsByValueUnscoped`. A policy-bearing target
+  now returns `error.PrivacyDenied` from a context-less traversal instead of
+  silently skipping the policy (breaking, and intended — see
+  `UPGRADING.md` §11).
+
+- **Eager-load × interceptor coverage for the JOIN-shaped edges.** The
+  qualification fix above shipped with only an `o2m` regression test, whose
+  neighbour query joins nothing — so it could not have caught the bug. The
+  same scenario is now covered for `m2o` (joins the source) and `m2m` (joins
+  the junction) with the tenant column on both sides, on SQLite, PostgreSQL
+  and MySQL. Reverting the qualification makes all three fail with the
+  dialect's own ambiguity error, which pins the fix end to end.
+
 
 ### Docs
 - Corrected the `Contains` row in the predicate catalogue (`BEST_PRACTICES`

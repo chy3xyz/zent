@@ -215,13 +215,19 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             return bdb;
         }
 
-        const QueryEdgeError = sql_driver.Error || error{ TypeMismatch, BuildFailed };
+        const QueryEdgeError = sql_driver.Error || error{ TypeMismatch, BuildFailed, PrivacyDenied, InterceptFailed };
 
         /// Query target entities via an edge.
         /// Example: user_client.QueryEdge("cars", &.{alice.id}) returns Car entities.
+        ///
+        /// Applies the same target read contract as `Query()...WithEdge()`:
+        /// soft-delete scope, the target's privacy policy, and this client's
+        /// interceptor chain. Callers that need the raw traversal
+        /// (soft-delete only, no tenant scoping) use
+        /// `client_mod.queryTargetsUnscoped` with the client's driver.
         pub fn QueryEdge(self: Self, comptime edge_name: []const u8, parent_ids: []const i64) QueryEdgeError!QueryTargetsResult(infos, info.name, edge_name) {
             if (info.is_view) @compileError("QueryEdge is not supported for view entities");
-            return queryTargets(infos, info.name, edge_name, parent_ids, self.allocator, self.driver);
+            return queryTargets(infos, info.name, edge_name, parent_ids, self.allocator, self.driver, self.privacy_ctx, self.interceptors);
         }
 
         pub const EntityType = Entity;
@@ -542,32 +548,25 @@ fn QueryTargetsResult(
     return std.array_list.Managed(EntityGen(infos, target_info));
 }
 
-const QueryTargetsError = sql_driver.Error || error{ TypeMismatch, BuildFailed };
+const QueryTargetsError = sql_driver.Error || error{ TypeMismatch, BuildFailed, PrivacyDenied, InterceptFailed };
 
-/// Value-typed traversal: accepts any primary key type — `.int` for integer
-/// PKs, `.string` for UUID/textual PKs. `queryTargets` delegates here.
-/// For example: queryTargetsByValue(infos, "User", "cars", &.{.{ .int = 1 }}, allocator, driver) returns Car entities for user 1,
-/// and queryTargetsByValue(infos, "User", "cars", &.{.{ .string = "0192..." }}, allocator, driver) does the same for a UUID-keyed User.
-///
-/// The traversal is rebuilt through `buildEdgeStep` +
-/// `graph_neighbors.appendSetNeighborsFiltered`, so placeholders and
-/// identifier quoting follow the driver dialect (`$n` on PostgreSQL,
-/// backticks on MySQL) instead of the hardcoded `?`/`"…"` this helper used
-/// to emit. Soft-deleted target rows are excluded, matching the eager-load
-/// read contract.
-///
-/// Known boundary: this helper takes no privacy_ctx/interceptors, so it
-/// applies only the target's soft-delete scope — it does **not** run the
-/// target's privacy policy or the interceptor chain. Callers that need
-/// tenant isolation (or any other policy/interceptor scoping) must use
-/// `WithEdge`/eager loading instead.
-pub fn queryTargetsByValue(
+/// Which predicates a neighbour traversal applies to the target rows.
+/// `scoped` matches the eager-load read contract; `soft_delete_only` is the
+/// legacy escape hatch and exists solely for callers that have already scoped
+/// their ids themselves.
+const QueryTargetsScope = enum { scoped, soft_delete_only };
+
+/// Shared implementation for every `queryTargets*` entry point below.
+fn queryTargetsImpl(
+    comptime scope: QueryTargetsScope,
     comptime infos: []const TypeInfo,
     comptime source_name: []const u8,
     comptime edge_name: []const u8,
     parent_ids: []const sql.Value,
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
+    privacy_ctx: ?privacy.PrivacyContext,
+    interceptors: ?*intercept.InterceptorChain,
 ) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
     const source_info = comptime findTypeInfo(infos, source_name);
     const edge = comptime findEdgeInfo(source_info, edge_name);
@@ -579,16 +578,22 @@ pub fn queryTargetsByValue(
         return std.array_list.Managed(TargetEntity).init(allocator);
     }
 
-    var extra_preds_buf: [1]sql.Predicate = undefined;
-    var extra_preds: []const sql.Predicate = &.{};
-    if (target_info.soft_delete) {
-        extra_preds_buf[0] = sql.IsNull("deleted_at");
-        extra_preds = extra_preds_buf[0..1];
+    // Extra predicates ANDed into the neighbour WHERE. The scoped path uses
+    // the shared target read contract (soft-delete → privacy → interceptors)
+    // so it matches `WithEdge` exactly; the unscoped path is the legacy
+    // soft-delete-only behaviour under an explicit name.
+    var extra_preds = std.ArrayListUnmanaged(sql.Predicate).empty;
+    defer extra_preds.deinit(allocator);
+
+    if (scope == .scoped) {
+        try @import("query.zig").appendTargetScopePreds(target_info, &extra_preds, allocator, privacy_ctx, interceptors, false);
+    } else if (target_info.soft_delete) {
+        try extra_preds.append(allocator, sql.IsNull("deleted_at"));
     }
 
     var b = sql.Builder.init(allocator, driver.dialect());
     defer b.deinit();
-    graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_ids, extra_preds) catch |err| {
+    graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_ids, extra_preds.items) catch |err| {
         return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;
     };
 
@@ -609,11 +614,75 @@ pub fn queryTargetsByValue(
     return result;
 }
 
+/// Value-typed traversal: accepts any primary key type — `.int` for integer
+/// PKs, `.string` for UUID/textual PKs. `queryTargets` delegates here.
+/// For example: queryTargetsByValue(infos, "User", "cars", &.{.{ .int = 1 }}, allocator, driver, null, null) returns Car entities for user 1,
+/// and queryTargetsByValue(infos, "User", "cars", &.{.{ .string = "0192..." }}, allocator, driver, null, null) does the same for a UUID-keyed User.
+///
+/// The traversal is rebuilt through `buildEdgeStep` +
+/// `graph_neighbors.appendSetNeighborsFiltered`, so placeholders and
+/// identifier quoting follow the driver dialect (`$n` on PostgreSQL,
+/// backticks on MySQL) instead of the hardcoded `?`/`"…"` this helper used
+/// to emit.
+///
+/// Applies the **same target read contract as `WithEdge`**: soft-delete
+/// scope, the target's privacy policy, and the interceptor chain (e.g.
+/// multi-tenant rewriting). A target carrying a policy denies the traversal
+/// unless `privacy_ctx` is supplied, so this is fail-closed like the eager
+/// loader. Prefer `EntityClient.QueryEdge`, which passes the client's own
+/// `privacy_ctx`/`interceptors` for you; reach for
+/// `queryTargetsByValueUnscoped` only when the ids are already scoped.
+pub fn queryTargetsByValue(
+    comptime infos: []const TypeInfo,
+    comptime source_name: []const u8,
+    comptime edge_name: []const u8,
+    parent_ids: []const sql.Value,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    privacy_ctx: ?privacy.PrivacyContext,
+    interceptors: ?*intercept.InterceptorChain,
+) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
+    return queryTargetsImpl(.scoped, infos, source_name, edge_name, parent_ids, allocator, driver, privacy_ctx, interceptors);
+}
+
+/// Soft-delete-only traversal. Unlike the fail-closed default above, this
+/// applies **no** privacy policy and **no** interceptor scoping: a row of a
+/// foreign tenant is returned if you pass its parent's id. The explicit name
+/// is the point — every call site is an audited decision that the ids were
+/// scoped elsewhere (typically by the same transaction that produced them).
+pub fn queryTargetsByValueUnscoped(
+    comptime infos: []const TypeInfo,
+    comptime source_name: []const u8,
+    comptime edge_name: []const u8,
+    parent_ids: []const sql.Value,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
+    return queryTargetsImpl(.soft_delete_only, infos, source_name, edge_name, parent_ids, allocator, driver, null, null);
+}
+
 /// Integer-key convenience wrapper over `queryTargetsByValue`.
-/// For example: queryTargets(infos, "User", "cars", &[1], allocator, driver) returns Car entities for user 1.
+/// For example: queryTargets(infos, "User", "cars", &[1], allocator, driver, null, null) returns Car entities for user 1.
 /// Callers whose primary keys are UUID/textual call `queryTargetsByValue`
 /// directly with `.{ .string = ... }` values.
 pub fn queryTargets(
+    comptime infos: []const TypeInfo,
+    comptime source_name: []const u8,
+    comptime edge_name: []const u8,
+    parent_ids: []const i64,
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    privacy_ctx: ?privacy.PrivacyContext,
+    interceptors: ?*intercept.InterceptorChain,
+) QueryTargetsError!QueryTargetsResult(infos, source_name, edge_name) {
+    const values = try allocator.alloc(sql.Value, parent_ids.len);
+    defer allocator.free(values);
+    for (parent_ids, 0..) |id, i| values[i] = .{ .int = id };
+    return queryTargetsByValue(infos, source_name, edge_name, values, allocator, driver, privacy_ctx, interceptors);
+}
+
+/// Integer-key wrapper over `queryTargetsByValueUnscoped`.
+pub fn queryTargetsUnscoped(
     comptime infos: []const TypeInfo,
     comptime source_name: []const u8,
     comptime edge_name: []const u8,
@@ -624,7 +693,7 @@ pub fn queryTargets(
     const values = try allocator.alloc(sql.Value, parent_ids.len);
     defer allocator.free(values);
     for (parent_ids, 0..) |id, i| values[i] = .{ .int = id };
-    return queryTargetsByValue(infos, source_name, edge_name, values, allocator, driver);
+    return queryTargetsImpl(.soft_delete_only, infos, source_name, edge_name, values, allocator, driver, null, null);
 }
 
 // ------------------------------------------------------------------

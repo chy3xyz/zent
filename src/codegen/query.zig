@@ -76,7 +76,10 @@ fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
 /// target schema and collects `field = value` predicates to AND into the
 /// neighbor WHERE. `tinfo` is comptime so the field list can be scanned with
 /// `inline for` (FieldInfo carries a `type` and cannot be read at runtime).
-fn EdgeInterceptorSink(comptime tinfo: TypeInfo) type {
+///
+/// Shared by `QueryBuilder.WithEdge` and `client.queryTargets*` so both
+/// neighbour readers accept exactly the same interceptor fields.
+pub fn EdgeInterceptorSink(comptime tinfo: TypeInfo) type {
     return struct {
         preds: *std.ArrayListUnmanaged(sql.Predicate),
         allocator: std.mem.Allocator,
@@ -94,6 +97,54 @@ fn EdgeInterceptorSink(comptime tinfo: TypeInfo) type {
             try self.preds.append(self.allocator, sql.EQ(columnName(tinfo, field_name), value));
         }
     };
+}
+
+/// Append the read-contract predicates that scope a batch of neighbour rows
+/// addressed by parent id: soft-delete scope, then the target's privacy
+/// policy, then the interceptor chain (multi-tenant rewriting and friends).
+///
+/// This is the single implementation of "what may an edge-loaded target
+/// show?". `QueryBuilder.WithEdge` and `client.queryTargets*` both call it so
+/// the two bulk-neighbour readers cannot drift into different security
+/// postures again — the divergence that previously left `queryTargets`
+/// fail-open while eager loading was fail-closed.
+///
+/// Errors: `PrivacyDenied` when the target carries a policy but no context
+/// was supplied (fail-closed), `InterceptFailed` when the chain rejects.
+pub fn appendTargetScopePreds(
+    comptime target_info: TypeInfo,
+    preds: *std.ArrayListUnmanaged(sql.Predicate),
+    allocator: std.mem.Allocator,
+    privacy_ctx: ?privacy.PrivacyContext,
+    interceptors: ?*intercept.InterceptorChain,
+    with_trashed: bool,
+) !void {
+    if (target_info.soft_delete and !with_trashed) {
+        try preds.append(allocator, sql.IsNull("deleted_at"));
+    }
+
+    if (target_info.policy) |policy| {
+        var ctx = privacy_ctx orelse return error.PrivacyDenied;
+        ctx.op = .query;
+        const decision_set = policy.eval(ctx);
+        if (decision_set.decision == .deny) return error.PrivacyDenied;
+        for (decision_set.getFilters()) |opaque_ptr| {
+            const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+            try preds.append(allocator, pred.*);
+        }
+    }
+
+    if (interceptors) |chain| {
+        const Sink = EdgeInterceptorSink(target_info);
+        var sink = Sink{ .preds = preds, .allocator = allocator };
+        var view = intercept.QueryView{
+            .op = .query,
+            .table_name = target_info.table_name,
+            .sink = &sink,
+            .add_eq_fn = Sink.addEq,
+        };
+        chain.run(&view) catch return error.InterceptFailed;
+    }
 }
 
 fn splitEdgePath(path: []const u8) struct { head: []const u8, rest: []const u8 } {
@@ -171,35 +222,11 @@ fn loadEdgePath(
             // registered interceptors (e.g. multi-tenant rewriting). They are
             // ANDed into the neighbor WHERE before any per-parent limit, so a
             // trashed or foreign-tenant row cannot consume a limit slot.
+            // The contract itself lives in `appendTargetScopePreds` so
+            // `client.queryTargets*` applies the identical set.
             var extra_preds = std.ArrayListUnmanaged(sql.Predicate).empty;
             defer extra_preds.deinit(allocator);
-
-            if (target_info.soft_delete and !with_trashed) {
-                try extra_preds.append(allocator, sql.IsNull("deleted_at"));
-            }
-
-            if (target_info.policy) |policy| {
-                var ctx = privacy_ctx orelse return error.PrivacyDenied;
-                ctx.op = .query;
-                const decision_set = policy.eval(ctx);
-                if (decision_set.decision == .deny) return error.PrivacyDenied;
-                for (decision_set.getFilters()) |opaque_ptr| {
-                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
-                    try extra_preds.append(allocator, pred.*);
-                }
-            }
-
-            if (interceptors) |chain| {
-                const Sink = EdgeInterceptorSink(target_info);
-                var sink = Sink{ .preds = &extra_preds, .allocator = allocator };
-                var view = intercept.QueryView{
-                    .op = .query,
-                    .table_name = target_info.table_name,
-                    .sink = &sink,
-                    .add_eq_fn = Sink.addEq,
-                };
-                chain.run(&view) catch return error.InterceptFailed;
-            }
+            try appendTargetScopePreds(target_info, &extra_preds, allocator, privacy_ctx, interceptors, with_trashed);
 
             graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_id_values, extra_preds.items) catch |err| {
                 return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;

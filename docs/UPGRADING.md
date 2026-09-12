@@ -168,3 +168,35 @@ Two smaller notes: `FieldInfo` gained `column_name` alongside `name` (only
 relevant if you construct `TypeInfo` values yourself — `fromSchema` fills it),
 and `queryTargetsByValue` accepts `.string` primary keys for UUID-keyed
 entities, with `queryTargets` unchanged as the integer-only wrapper.
+
+## 11. `queryTargets*` is now fail-closed
+
+`queryTargets` and `queryTargetsByValue` used to apply only the target's
+soft-delete scope, while the eager loader (`WithEdge`) additionally ran the
+target's privacy policy and the client's interceptor chain. That made the two
+bulk neighbour readers disagree on tenant isolation: the same edge read
+fail-closed through `WithEdge` and fail-open through `QueryEdge`.
+
+The scoped contract is now the default and is implemented once, in
+`codegen.query.appendTargetScopePreds`, for both readers.
+
+```zig
+// before — 6 arguments, soft-delete only
+try client_mod.queryTargets(infos, "User", "cars", ids, alloc, driver);
+// after — 8 arguments; pass the client's own context and chain
+try client_mod.queryTargets(infos, "User", "cars", ids, alloc, driver, privacy_ctx, interceptors);
+```
+
+`EntityClient.QueryEdge` needs no call-site change: it now forwards the
+client's `privacy_ctx`/`interceptors`, so it scopes exactly like
+`Query()...WithEdge()`. Two consequences to check on upgrade:
+
+- An entity that carries a privacy policy makes `QueryEdge` return
+  `error.PrivacyDenied` unless the client has a context. That is the intended
+  fail-closed behaviour; previously the policy was silently skipped on this
+  path.
+- Callers that deliberately want the old soft-delete-only traversal use the
+  renamed `queryTargetsUnscoped` / `queryTargetsByValueUnscoped`, which keep
+  the original six-argument signature. The explicit name is the point: it is
+  now visible at the call site that the ids were scoped elsewhere.
+

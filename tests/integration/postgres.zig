@@ -2877,7 +2877,7 @@ test "Postgres: queryTargetsByValue traverses UUID-keyed parents" {
     // column: PostgreSQL infers the parameter type from the comparison, so no
     // explicit `::uuid` cast is needed.
     {
-        var rows = try Client.queryTargetsByValue(infos, "PgUqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
+        var rows = try Client.queryTargetsByValueUnscoped(infos, "PgUqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
         defer {
             for (rows.items) |*r| zent.codegen.deinitEntity(infos, item_info, r, allocator);
             rows.deinit();
@@ -2885,7 +2885,7 @@ test "Postgres: queryTargetsByValue traverses UUID-keyed parents" {
         try testing.expectEqual(@as(usize, 2), rows.items.len);
     }
     {
-        var rows = try Client.queryTargetsByValue(infos, "PgUqvUser", "items", &.{
+        var rows = try Client.queryTargetsByValueUnscoped(infos, "PgUqvUser", "items", &.{
             .{ .string = alice_id },
             .{ .string = bob_id },
         }, allocator, drv.asDriver());

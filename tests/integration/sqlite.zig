@@ -2990,7 +2990,7 @@ test "SQLite: queryTargetsByValue traverses UUID-keyed parents" {
 
     // UUID/textual parents travel as `.string` values.
     {
-        var rows = try Client.queryTargetsByValue(infos, "UqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
+        var rows = try Client.queryTargetsByValueUnscoped(infos, "UqvUser", "items", &.{.{ .string = alice_id }}, allocator, drv.asDriver());
         defer {
             for (rows.items) |*r| zent.codegen.deinitEntity(infos, item_info, r, allocator);
             rows.deinit();
@@ -3007,7 +3007,7 @@ test "SQLite: queryTargetsByValue traverses UUID-keyed parents" {
 
     // Multi-parent IN list spans both UUID keys.
     {
-        var rows = try Client.queryTargetsByValue(infos, "UqvUser", "items", &.{
+        var rows = try Client.queryTargetsByValueUnscoped(infos, "UqvUser", "items", &.{
             .{ .string = alice_id },
             .{ .string = bob_id },
         }, allocator, drv.asDriver());
@@ -3020,7 +3020,7 @@ test "SQLite: queryTargetsByValue traverses UUID-keyed parents" {
 
     // Empty parent list short-circuits without touching the database.
     {
-        var rows = try Client.queryTargetsByValue(infos, "UqvUser", "items", &[_]zent.sql.Value{}, allocator, drv.asDriver());
+        var rows = try Client.queryTargetsByValueUnscoped(infos, "UqvUser", "items", &[_]zent.sql.Value{}, allocator, drv.asDriver());
         defer rows.deinit();
         try testing.expectEqual(@as(usize, 0), rows.items.len);
     }
@@ -3030,9 +3030,180 @@ test "SQLite: queryTargetsByValue traverses UUID-keyed parents" {
     _ = try drv.exec("INSERT INTO uqv_budget (id, amount, uqv_owner_id) VALUES (1, 10, 1)", &.{});
     _ = try drv.exec("INSERT INTO uqv_budget (id, amount, uqv_owner_id) VALUES (2, 20, 1)", &.{});
     {
-        var rows = try Client.queryTargets(infos, "UqvOwner", "budgets", &.{1}, allocator, drv.asDriver());
+        var rows = try Client.queryTargetsUnscoped(infos, "UqvOwner", "budgets", &.{1}, allocator, drv.asDriver());
         defer {
             for (rows.items) |*r| zent.codegen.deinitEntity(infos, budget_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+    }
+}
+
+test "SQLite: QueryEdge applies the target read contract (interceptor + privacy)" {
+    // Regression guard for the fail-open/fail-closed split between the two
+    // bulk neighbour readers: `WithEdge` scoped eager-loaded targets while
+    // `queryTargets`/`QueryEdge` returned every target row. Both now funnel
+    // through `codegen.query.appendTargetScopePreds`.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ScChildBase = schema("ScChild", .{
+        .fields = &.{
+            field.Int("parent_id"),
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+    });
+    const ScParentBase = schema("ScParent", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("tenant_id"),
+        },
+        .edges = &.{edge.To("children", ScChildBase).Field("parent_id")},
+    });
+    // A second edge whose target carries a policy, so the deny path is
+    // exercised by an entity that is otherwise reachable.
+    const ScSecretBase = schema("ScSecret", .{
+        .fields = &.{
+            field.Int("parent_id"),
+            field.String("body"),
+            field.Int("owner_id"),
+            // The interceptor injects `tenant_id` into every statement the
+            // client runs, including this schema's writes, so the column has
+            // to exist here too.
+            field.Int("tenant_id"),
+        },
+        .policy = zent.privacy.Policy{
+            .rules = &.{
+                zent.privacy.Allow,
+                zent.privacy.Filter(ownerFilter),
+            },
+        },
+    });
+    const ScParent = struct {
+        pub const schema_name = ScParentBase.schema_name;
+        pub const fields = ScParentBase.fields;
+        pub const edges = &.{
+            edge.To("children", ScChildBase).Field("parent_id"),
+            edge.To("secrets", ScSecretBase).Field("parent_id"),
+        };
+        pub const indexes = ScParentBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ ScParent, ScChildBase, ScSecretBase });
+    const infos = graph.types;
+    const parent_info = infos[0];
+    const child_info = infos[1];
+    const secret_info = infos[2];
+
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("tenant_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    var parent_id: i64 = 0;
+    {
+        var b = try client.sc_parent.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "p1");
+        _ = try b.setFieldValue("tenant_id", @as(i64, 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, parent_info, &e, allocator);
+        parent_id = e.id;
+    }
+    for ([_]struct { name: []const u8, t: i64 }{
+        .{ .name = "c-t1", .t = 1 },
+        .{ .name = "c-t2", .t = 2 },
+    }) |s| {
+        var b = try client.sc_child.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", parent_id);
+        _ = try b.setFieldValue("name", s.name);
+        _ = try b.setFieldValue("tenant_id", s.t);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, child_info, &e, allocator);
+    }
+    for ([_]struct { body: []const u8, owner: i64 }{
+        .{ .body = "mine", .owner = 7 },
+        .{ .body = "theirs", .owner = 8 },
+    }) |s| {
+        // The policy also gates writes, so the seeding client needs a context.
+        client.sc_secret = client.sc_secret.withContext(zent.privacy.PrivacyContext{ .user_id = s.owner });
+        var b = try client.sc_secret.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", parent_id);
+        _ = try b.setFieldValue("body", s.body);
+        _ = try b.setFieldValue("owner_id", s.owner);
+        _ = try b.setFieldValue("tenant_id", @as(i64, 1));
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, secret_info, &e, allocator);
+    }
+
+    // QueryEdge now honors the interceptor: only the tenant-1 child.
+    {
+        var rows = try client.sc_parent.QueryEdge("children", &.{parent_id});
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, child_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("c-t1", rows.items[0].name);
+    }
+
+    // The raw helper is still available, and still soft-delete-only: it
+    // returns both tenants. This is the documented escape hatch, not an
+    // accident — the name is the audit marker.
+    {
+        var rows = try Client.queryTargetsUnscoped(infos, "ScParent", "children", &.{parent_id}, allocator, drv.asDriver());
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, child_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+    }
+
+    // A policy-bearing target denies traversal without a privacy context
+    // instead of silently returning rows the policy would filter.
+    try testing.expectError(error.PrivacyDenied, Client.queryTargets(
+        infos,
+        "ScParent",
+        "secrets",
+        &.{parent_id},
+        allocator,
+        drv.asDriver(),
+        null,
+        null,
+    ));
+
+    // With a context the policy filter is applied to the target rows.
+    {
+        const ctx = zent.privacy.PrivacyContext{ .user_id = 7 };
+        var rows = try Client.queryTargets(infos, "ScParent", "secrets", &.{parent_id}, allocator, drv.asDriver(), ctx, null);
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, secret_info, r, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("mine", rows.items[0].body);
+    }
+
+    // The unscoped helper bypasses the policy as well — spelled out here so
+    // the difference between the two helpers is pinned by a test.
+    {
+        var rows = try Client.queryTargetsUnscoped(infos, "ScParent", "secrets", &.{parent_id}, allocator, drv.asDriver());
+        defer {
+            for (rows.items) |*r| zent.codegen.deinitEntity(infos, secret_info, r, allocator);
             rows.deinit();
         }
         try testing.expectEqual(@as(usize, 2), rows.items.len);
