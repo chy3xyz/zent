@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-09-12
+
 ### Fixed
 - **An edge-only update works, and an empty update says why (Z19).** With no
   `setFieldValue` and only an edge write registered, `Save()` emitted
