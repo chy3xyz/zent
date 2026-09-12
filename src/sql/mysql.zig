@@ -1144,6 +1144,7 @@ fn prepareMySQLStmt(drv: *MySQLDriver, sql: []const u8) !*c.MYSQL_STMT {
 
     if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
         MySQLDriver.logMySQLError(drv, drv.conn, "stmt_prepare");
+        std.log.debug("mysql stmt_prepare sql: {s}", .{sql});
         return error.MySQLStmtFailed;
     }
     return stmt;

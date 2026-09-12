@@ -171,7 +171,25 @@ pub fn appendSetNeighborsFiltered(
 
     for (extra_preds) |pred| {
         try b.writeString(" AND ");
-        try pred.appendTo(b);
+        switch (pred) {
+            // Interceptor-injected tenant scoping (`QueryView.whereEq`) arrives
+            // as a bare-column EQ. This query joins the source table, which may
+            // own the same column (e.g. `app_id` on both sides), so qualify the
+            // reference with the eager-loaded target table — otherwise the
+            // prepared statement fails with "Column 'app_id' in where clause is
+            // ambiguous". Predicates that already carry a qualifier are left
+            // alone.
+            .eq => |p| {
+                if (std.mem.indexOfScalar(u8, p.column, '.') == null) {
+                    try b.ident(step.to_table);
+                    try b.writeByte('.');
+                }
+                try b.qualifiedIdent(p.column);
+                try b.writeString(" = ");
+                try b.arg(p.value);
+            },
+            else => try pred.appendTo(b),
+        }
     }
 
     if (use_window) {
@@ -447,6 +465,32 @@ test "appendSetNeighbors order + per-parent limit uses window function" {
     try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT * FROM (SELECT") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, "ROW_NUMBER() OVER (PARTITION BY \"author_id\" ORDER BY \"post\".\"created_at\" DESC) AS __rn") != null);
     try testing.expect(std.mem.indexOf(u8, result.sql, ") WHERE __rn <= 2") != null);
+}
+
+test "appendSetNeighborsFiltered qualifies interceptor EQ with the target table (m2o join)" {
+    // Regression: v0.35 started running the interceptor chain on eager-loaded
+    // targets. The m2o neighbour query joins the source table, so an
+    // unqualified tenant column (`app_id`) made the prepared statement
+    // ambiguous. The injected EQ must be qualified with the target table.
+    const step = Step{
+        .from_table = "product_image",
+        .from_column = "id",
+        .to_table = "upload_file",
+        .to_column = "file_id",
+        .edge_rel = .m2o,
+        .edge_table = "upload_file",
+        .edge_columns = &[_][]const u8{"image_id"},
+        .inverse = false,
+        .order_by = null,
+        .desc = false,
+        .limit = null,
+    };
+    var b = sql.Builder.init(testing.allocator, .{ .name = "mysql" });
+    defer b.deinit();
+    const extra = [_]sql.Predicate{sql.EQ("app_id", .{ .int = 1 })};
+    try appendSetNeighborsFiltered(&b, step, &[_]sql.Value{.{ .int = 5 }}, &extra);
+    const result = b.query();
+    try testing.expect(std.mem.indexOf(u8, result.sql, "AND `upload_file`.`app_id` = ?") != null);
 }
 
 test "appendSetNeighborsFiltered applies extra predicates before the window rank" {
