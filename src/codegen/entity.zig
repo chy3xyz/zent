@@ -3,13 +3,6 @@ const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
 
-fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {
-    for (infos) |info| {
-        if (std.mem.eql(u8, info.name, name)) return info;
-    }
-    @compileError("TypeInfo not found: " ++ name);
-}
-
 fn toSnakeCase(name: []const u8) []const u8 {
     comptime {
         var result: []const u8 = "";

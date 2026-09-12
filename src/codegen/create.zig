@@ -32,13 +32,6 @@ pub const FieldValue = struct {
     value: sql.Value,
 };
 
-fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {
-    for (infos) |ti| {
-        if (std.mem.eql(u8, ti.name, name)) return ti;
-    }
-    @compileError("TypeInfo not found: " ++ name);
-}
-
 fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
     for (info.edges) |e| {
         if (std.mem.eql(u8, e.name, name)) return e;

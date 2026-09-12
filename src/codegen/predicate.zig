@@ -297,13 +297,6 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
     }
 }
 
-fn findTypeInfo(comptime infos: []const TypeInfo, comptime name: []const u8) TypeInfo {
-    for (infos) |ti| {
-        if (std.mem.eql(u8, ti.name, name)) return ti;
-    }
-    @compileError("TypeInfo not found: " ++ name);
-}
-
 /// Lower schema-unaware `.has_edge` / `.not_has_edge` placeholders produced by
 /// the EntQL parser into schema-aware EXISTS predicates, reusing the same
 /// machinery as the generated `Has{Edge}()` / `Has{Edge}With()` functions.
