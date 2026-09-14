@@ -331,19 +331,30 @@ soft-delete → privacy → interceptors) into a fragment you splice in, so the
 two paths cannot disagree:
 
 ```zig
-var scope = try zent.scope.forClient(infos, "order", &client.order, .{});
+// The head binds one argument of its own, so the fragment must start at $2.
+// (SQLite/MySQL heads use `?`, where `arg_index` has no effect.)
+var scope = try zent.scope.forClient(infos, "order", &client.order, .{
+    .alias = "o",
+    .arg_index = 2, // = head_arg_count + 1
+});
 defer scope.deinit(); // owns the fragment + its bound args
 
 const stmt = try zent.scope.withClause(
     scope,
     alloc,
-    "SELECT o.id FROM order o WHERE o.amount > ?",
+    "SELECT o.id FROM order o WHERE o.amount > $1",
     true, // this head already has a WHERE → the fragment ANDs into it
 );
 defer alloc.free(stmt);
 
-var rows = try client.driver.query(stmt, scope.args);
+// Your own arguments first, then the fragment's.
+var rows = try client.driver.query(stmt, &.{ .{ .float = amount }, .{ .int = tenant } });
 ```
+
+Placeholders are the dialect's, so a head written for PostgreSQL must use `$N`
+(§5) — a `?` head is not translated by the driver. If you would rather renumber
+the statement yourself, `.marker = .question` renders the fragment with `?`
+placeholders regardless of dialect, and then nothing can collide.
 
 - `forClient(infos, table, &entity_client, opts)` takes the allocator, driver,
   `privacy_ctx` and interceptor chain from the entity client — pass the client
@@ -358,6 +369,10 @@ var rows = try client.driver.query(stmt, scope.args);
   column, which is a fail-loud description of the bug this prevents.
 - `.with_trashed = true` drops the soft-delete half; `.op = .update` / `.delete`
   is what the privacy policy and interceptors see for a statement that writes.
+- `.arg_index` (default `1`) is where the fragment's first placeholder number
+  starts — the head's `$1` and the fragment's `$1` are the same parameter, so a
+  head that binds anything needs `head_arg_count + 1`. `.marker = .question`
+  forces `?` placeholders for a caller that renumbers the statement itself.
 - The fragment is empty (`scope.sql.len == 0`) when the table contributes no
   scope at all, and `withClause` / `writeClause` then append nothing — so it is
   safe to call unconditionally for every statement on that table.

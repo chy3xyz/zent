@@ -31,6 +31,15 @@ pub const Builder = struct {
     buffer: std.array_list.Managed(u8),
     args: std.array_list.Managed(Value),
     dialect: Dialect,
+    /// How many arguments were already bound by whatever this builder's output
+    /// will be spliced into. `$N` numbering then starts after them, which is
+    /// what a **fragment** needs: numbering from 1 while the statement around it
+    /// already uses `$1` makes the database reuse one parameter for two
+    /// predicates — a wrong query, not an error.
+    ///
+    /// A plain `?` dialect ignores this (its placeholders carry no number), and
+    /// the default of 0 keeps every existing output byte-identical.
+    arg_base: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect) Builder {
         return initCapacity(allocator, 256, 8, dialect) catch Builder{
@@ -124,7 +133,7 @@ pub const Builder = struct {
 
     pub fn arg(b: *Builder, value: Value) !void {
         try b.args.append(value);
-        const idx = b.args.items.len;
+        const idx = b.arg_base + b.args.items.len;
         var buf: [16]u8 = undefined;
         const ph = try b.dialect.placeholder(&buf, idx);
         try b.buffer.appendSlice(ph);

@@ -74,9 +74,20 @@ pub const Field = struct {
         return f;
     }
 
+    /// A nullable column **and** a nullable Zig field — the same thing as
+    /// `Optional()`, plus the flag ent uses.
+    ///
+    /// `nillable` alone used to leave the generated field non-optional while the
+    /// DDL made the column nullable, so a NULL in that column failed to scan
+    /// with `error.TypeMismatch` and `setFieldValue("x", null)` did not compile.
+    /// Ten places decide nullability, and only some of them looked at
+    /// `nillable`; setting both flags fixes all of them at once and cannot make
+    /// an existing column NOT NULL (`not_null = !optional and !nillable` is
+    /// unchanged). Aligned with ent, where `Nillable()` implies `Optional()`.
     pub fn Nillable(self: Field) Field {
         var f = self;
         f.nillable = true;
+        f.optional = true;
         return f;
     }
 

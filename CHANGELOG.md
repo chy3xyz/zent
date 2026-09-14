@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`scope.Options.arg_index` and `.marker`, and `sql.Builder.arg_base`**
+  (Z22/T1). A `zent.scope` fragment rendered its placeholders from `$1`
+  regardless of the statement it was spliced into. On PostgreSQL that is not a
+  syntax error but a **wrong query**: a head binding `$1` plus a fragment
+  binding `$1` makes both predicates share one parameter, so the tenant value is
+  bound to whatever the head's first argument was — and the caller sees another
+  tenant's rows with no error at all. `arg_index` (default `1`, i.e. today's
+  behaviour) says where the fragment's numbering starts:
+  `head_arg_count + 1` for a head that binds anything. `.marker = .question`
+  renders `?` placeholders regardless of dialect, for a caller that renumbers
+  the statement itself. `0` is `error.InvalidArgIndex` rather than a silent
+  underflow. `sql.Builder.arg_base` defaults to 0, so every existing output is
+  byte-identical. Covered by a PostgreSQL integration test that asserts the
+  *rows* (two tenants sharing an `amount`), and by unit tests for the shift, the
+  marker and the `?`-dialect no-op; falsified by dropping `arg_index`, which
+  renders `$1`.
+
+### Fixed
+- **`field.Nillable()` now means what it says** (Z21/T2). It set only
+  `f.nillable`, while ten places decide nullability and several looked at
+  `f.optional` alone — so `field.Int("x").Nillable()` produced a **nullable
+  column with a non-optional Zig field**: a NULL failed to scan with
+  `error.TypeMismatch`, and `setFieldValue("x", null)` did not compile. The
+  library's own guidance (`BEST_PRACTICES`, and the scan diagnostic added in
+  v0.46.0) recommends `Optional()/Nillable()`, which made this a trap rather
+  than a corner. `Nillable()` now sets both flags, matching ent, which fixes all
+  ten sites at once and cannot make an existing column NOT NULL
+  (`not_null = !optional and !nillable` is unchanged). It had **zero** call
+  sites in the repository, so nothing could break; the new nullability-matrix
+  test is now its first user.
+
+### Docs
+- The `zent.scope` example showed a `$N` fragment appended to a `?` head, which
+  cannot work on PostgreSQL — the driver passes SQL through to `PQprepare`
+  untranslated. Both examples (module doc and `BEST_PRACTICES` §5) now use the
+  dialect's placeholders and state the two contracts the API relies on: the
+  caller's arguments come first and `scope.args` after them, and the head's own
+  numbering is the caller's to get right.
+
 ## [0.46.0] - 2026-09-14
 
 ### Added

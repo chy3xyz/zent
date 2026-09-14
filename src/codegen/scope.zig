@@ -36,7 +36,17 @@ const privacy = @import("../privacy/policy.zig");
 const intercept = @import("../runtime/intercept.zig");
 const appendTargetScopePreds = @import("query.zig").appendTargetScopePreds;
 
-pub const Error = error{ BuildFailed, PrivacyDenied, InterceptFailed, OutOfMemory };
+pub const Error = error{ BuildFailed, PrivacyDenied, InterceptFailed, OutOfMemory, InvalidArgIndex };
+
+/// Placeholder style for the fragment.
+pub const Marker = enum {
+    /// Follow the dialect: `$N` on PostgreSQL, `?` on SQLite/MySQL.
+    dialect,
+    /// Force `?` regardless of dialect, for a caller that renumbers the whole
+    /// statement itself (a `?` placeholder carries no number, so nothing can
+    /// collide). Identifiers are still quoted in the standard `"…"` style.
+    question,
+};
 
 /// The operation enums are what the caller sees; re-exported so a call site
 /// does not have to name the runtime module.
@@ -58,6 +68,23 @@ pub const Options = struct {
     /// SELECT, `.update`/`.delete` for the mutation you are about to run — the
     /// scope of a statement that writes is not the scope of one that reads.
     op: Op = .query,
+
+    /// The placeholder number the fragment's **first** argument should get:
+    /// `head_arg_count + 1` for a statement that already binds arguments
+    /// (`1` when the head binds none, which is the default).
+    ///
+    /// PostgreSQL numbers its placeholders, so a fragment rendered from `$1`
+    /// and spliced into `… WHERE amount > $1` produces two predicates sharing
+    /// one parameter — the database accepts it and binds the tenant value to
+    /// `amount`. Splicing only happens for a head that binds nothing, or with
+    /// this offset. `?` dialects ignore it.
+    ///
+    /// Must be at least 1; `0` is `error.InvalidArgIndex` rather than a silent
+    /// underflow.
+    arg_index: usize = 1,
+
+    /// Placeholder style; see `Marker`.
+    marker: Marker = .dialect,
 };
 
 /// `forTable` by physical **table name** (`"order"`) or entity name
@@ -83,7 +110,15 @@ pub fn forTable(
     defer preds.deinit(allocator);
     try appendTargetScopePreds(info, &preds, allocator, privacy_ctx, interceptors, opts.with_trashed, opts.op);
 
-    var b = sql.Builder.init(allocator, dialect);
+    if (opts.arg_index == 0) return error.InvalidArgIndex;
+    // Force `?` when asked: the fragment then cannot collide with any numbered
+    // placeholder, and renumbering is the caller's explicit responsibility.
+    const render_dialect: Dialect = if (opts.marker == .question)
+        .{ .name = "sqlite3" }
+    else
+        dialect;
+    var b = sql.Builder.init(allocator, render_dialect);
+    b.arg_base = opts.arg_index - 1;
     defer b.deinit();
     if (preds.items.len > 0) {
         try b.writeByte('(');
@@ -146,7 +181,20 @@ pub fn writeClause(fragment: sql.OwnedQuery, writer: anytype, has_where: bool) !
 }
 
 /// `head` with the scope clause appended, as one owned statement ready to
-/// hand to `driver.query(statement, fragment.args)`. The caller keeps writing
+/// hand to `driver.query(statement, args)`.
+///
+/// **Argument order.** The caller's own arguments come first, then
+/// `fragment.args`; on PostgreSQL that is what `$N` resolves against, since
+/// placeholders are read by number rather than by position. If the head binds
+/// anything numbered, set `Options.arg_index` to `head_arg_count + 1` — a
+/// fragment rendered from `$1` and appended to a head that already uses `$1`
+/// makes both predicates share one parameter, and the database accepts it: the
+/// tenant value is bound to whatever the head's first argument was. The head's
+/// own numbering is the caller's to get right; this library does not rewrite SQL
+/// text it did not write (a string literal may contain `$`).
+///
+/// On a `?` dialect there is nothing to number, so `arg_index` has no effect
+/// there and the argument *order* is all that matters. The caller keeps writing
 /// the part they know (tables, joins, their own predicates) and this decides
 /// the `WHERE` / `AND` placement for them:
 ///
@@ -255,6 +303,45 @@ test "scope.forTable renders the tenant and soft-delete contract" {
         var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{ .with_trashed = true });
         defer fragment.deinit();
         try testing.expectEqualStrings("(\"app_id\" = ?)", fragment.sql);
+    }
+
+    // `arg_index` shifts the numbering: a fragment spliced into a statement that
+    // already bound one argument must start at `$2`, or the two predicates share
+    // `$1` and the database binds the tenant value to the caller's argument.
+    {
+        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "postgres" }, null, &chain, .{ .alias = "o", .arg_index = 2 });
+        defer fragment.deinit();
+        try testing.expectEqualStrings("(\"o\".\"deleted_at\" IS NULL AND \"o\".\"app_id\" = $2)", fragment.sql);
+
+        // The shift moves the whole fragment, and the bound args stay in SQL
+        // order, so the caller appends `scope.args` after its own.
+        var shifted = try forTable(infos, "scope_order", testing.allocator, .{ .name = "postgres" }, null, &chain, .{ .arg_index = 4 });
+        defer shifted.deinit();
+        try testing.expectEqualStrings("(\"deleted_at\" IS NULL AND \"app_id\" = $4)", shifted.sql);
+        try testing.expectEqual(@as(usize, 1), shifted.args.len);
+    }
+
+    // `0` is not a placeholder number: rejected rather than underflowing into a
+    // silently wrong statement.
+    try testing.expectError(
+        error.InvalidArgIndex,
+        forTable(infos, "scope_order", testing.allocator, .{ .name = "postgres" }, null, &chain, .{ .arg_index = 0 }),
+    );
+
+    // `.marker = .question` forces `?` whatever the dialect, for a caller that
+    // renumbers the whole statement itself.
+    {
+        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "postgres" }, null, &chain, .{ .alias = "o", .marker = .question });
+        defer fragment.deinit();
+        try testing.expectEqualStrings("(\"o\".\"deleted_at\" IS NULL AND \"o\".\"app_id\" = ?)", fragment.sql);
+    }
+
+    // `arg_index` is a no-op on a `?` dialect, where placeholders carry no
+    // number at all.
+    {
+        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{ .arg_index = 7 });
+        defer fragment.deinit();
+        try testing.expectEqualStrings("(\"deleted_at\" IS NULL AND \"app_id\" = ?)", fragment.sql);
     }
 
     // PostgreSQL placeholders follow the dialect, so the fragment is

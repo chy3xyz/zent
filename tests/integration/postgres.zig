@@ -2108,6 +2108,100 @@ test "Postgres: eager-load interceptor scope is unambiguous on JOIN edges (m2o +
     }
 }
 
+test "Postgres: a scope fragment numbers its placeholders after the head's args" {
+    // The combination that was never tested, and was broken: a head that binds
+    // its own `$1`, with the scope fragment spliced in after it. Numbering the
+    // fragment from `$1` makes both predicates share one parameter — the
+    // database accepts it and binds the tenant value to `amount`, so the query
+    // returns another tenant's rows without any error. `arg_index` fixes it, and
+    // this test asserts the *rows*, not the SQL text.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const OrderBase = schema("PgScopeNumOrder", .{
+        .fields = &.{
+            field.String("code"),
+            field.Int("app_id"),
+            field.Float("amount"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    const graph = comptime buildGraph(&.{OrderBase});
+    const infos = graph.types;
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_scope_num_order CASCADE", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_scope_num_order CASCADE", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("app_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    // Two tenants, the same `amount`, so a mis-bound parameter cannot be told
+    // apart by the amount alone — only by which tenant's row comes back.
+    for ([_]struct { code: []const u8, app: i64 }{
+        .{ .code = "t1-order", .app = 1 },
+        .{ .code = "t2-order", .app = 2 },
+    }) |seed| {
+        var b = try client.pg_scope_num_order.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", seed.code);
+        _ = try b.setFieldValue("app_id", seed.app);
+        _ = try b.setFieldValue("amount", @as(f64, 100.0));
+        var e = try b.Save();
+        defer client.pg_scope_num_order.deinitRow(&e);
+    }
+
+    // Head binds `$1` (amount), so the fragment must start at `$2`.
+    {
+        var scope = try zent.scope.forClient(infos, "pg_scope_num_order", &client.pg_scope_num_order, .{ .alias = "o", .arg_index = 2 });
+        defer scope.deinit();
+        try testing.expectEqualStrings("(\"o\".\"deleted_at\" IS NULL AND \"o\".\"app_id\" = $2)", scope.sql);
+
+        const stmt = try zent.scope.withClause(scope, allocator, "SELECT o.app_id, o.code FROM pg_scope_num_order o WHERE o.amount > $1", true);
+        defer allocator.free(stmt);
+
+        // The caller's own arguments first, then the fragment's — PostgreSQL
+        // reads them by `$N`, not by position.
+        var rows = try drv.query(stmt, &.{ .{ .float = 1.0 }, .{ .int = tenant } });
+        defer rows.deinit();
+        var seen: usize = 0;
+        while (rows.next()) |row| {
+            seen += 1;
+            try testing.expectEqual(tenant, row.getInt(0).?);
+            try testing.expectEqualStrings("t1-order", row.getText(1).?);
+        }
+        try testing.expectEqual(@as(usize, 1), seen);
+    }
+
+    // The other tenant gets its own row, so this is a scope and not a constant.
+    tenant = 2;
+    {
+        var scope = try zent.scope.forClient(infos, "pg_scope_num_order", &client.pg_scope_num_order, .{ .alias = "o", .arg_index = 2 });
+        defer scope.deinit();
+        const stmt = try zent.scope.withClause(scope, allocator, "SELECT o.app_id FROM pg_scope_num_order o WHERE o.amount > $1", true);
+        defer allocator.free(stmt);
+        var rows = try drv.query(stmt, &.{ .{ .float = 1.0 }, .{ .int = tenant } });
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 2), row.getInt(0).?);
+        try testing.expect(rows.next() == null);
+    }
+}
+
 test "Postgres: QueryEdge edge traversal uses dialect placeholders and quoting" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

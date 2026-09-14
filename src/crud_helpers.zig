@@ -1575,6 +1575,10 @@ test "nullable fields: Optional survives Default, and NULL round-trips" {
             field.Int("n").Default(5).Optional(),
             field.Text("t2").Default("x").Optional(),
             field.Int("required_n").Default(7),
+            // No `Optional()`: `Nillable()` must mean the same thing. It used to
+            // set only `f.nillable`, leaving a non-optional Zig field on a
+            // nullable column — the worst of both (see Z21).
+            field.Int("nill_by_name").Nillable(),
         },
     });
     const info = comptime fromSchema(Nullable);
@@ -1584,6 +1588,7 @@ test "nullable fields: Optional survives Default, and NULL round-trips" {
     // default.
     try std.testing.expectEqual(?[]const u8, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).body));
     try std.testing.expectEqual(?i64, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).n));
+    try std.testing.expectEqual(?i64, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).nill_by_name));
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -1602,7 +1607,7 @@ test "nullable fields: Optional survives Default, and NULL round-trips" {
             const expect_nullable = !std.mem.eql(u8, name, "required_n");
             try std.testing.expectEqual(!expect_nullable, not_null != 0);
         }
-        try std.testing.expectEqual(@as(usize, 4), seen);
+        try std.testing.expectEqual(@as(usize, 5), seen);
     }
 
     var client = client_mod.makeClient(infos, allocator, drv.asDriver());
@@ -1620,6 +1625,7 @@ test "nullable fields: Optional survives Default, and NULL round-trips" {
         _ = try b.setFieldValue("n", null);
         _ = try b.setFieldValue("t2", @as(?[]const u8, null)); // the explicit form still works
         _ = try b.setFieldValue("required_n", @as(i64, 1));
+        _ = try b.setFieldValue("nill_by_name", null); // Nillable() takes a bare null too
         var e = try b.Save();
         created_id = e.id;
         client.nullable_row.deinitRow(&e);
@@ -1636,6 +1642,7 @@ test "nullable fields: Optional survives Default, and NULL round-trips" {
         try std.testing.expectEqual(@as(?i64, null), row.n);
         try std.testing.expectEqual(@as(?[]const u8, null), row.t2);
         try std.testing.expectEqual(@as(i64, 1), row.required_n);
+        try std.testing.expectEqual(@as(?i64, null), row.nill_by_name);
     }
 }
 

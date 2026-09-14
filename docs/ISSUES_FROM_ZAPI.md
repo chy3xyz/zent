@@ -218,6 +218,28 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 ---
 
+### Z21–Z26 — The zmshop_zent report (13 items, v0.46.0 baseline)
+
+A multi-tenant e-commerce backend that has moved all persistence onto zent
+reported thirteen items, four of them line-verified by its author. Two were
+written up as ready-to-execute work orders; both shipped in v0.47.0.
+
+| # | Item | Verdict |
+|---|---|---|
+| 1 | `Nillable()` produces a nullable column with a non-optional field | **Confirmed and fixed** (Z21). `Nillable()` set only `f.nillable`; `entity.zig` and `field_value.zig` read `f.optional` alone, so a NULL failed to scan and `setFieldValue(…, null)` did not compile — while `BEST_PRACTICES` and the scan diagnostic both recommend `Nillable()`. Zero call sites, so the one-line fix (set both flags, as ent does) could not break anyone. |
+| 2 | `zent.scope` fragments always number from `$1` | **Confirmed and fixed** (Z22). On PostgreSQL a head binding `$1` plus a fragment binding `$1` share one parameter: the tenant value is bound to the head's argument and foreign rows come back with no error. `arg_index`/`marker` + `Builder.arg_base`; the PG test asserts rows, not text, and dropping the offset renders `$1`. |
+| 3 | `PoolExhausted` flattens every failure; no request-level borrow budget | **Confirmed** (Z24), not fixed. `openConnection() catch return null` discards the driver's own error (bad credentials, `too many clients`), `pool.zig` contains no `std.log` at all, and `max_wait_ms` is not an upper bound (it falls back to `max_retries × retry_backoff_ms`). Their 120-concurrent measurement (114/120 hard 500 at pool=10, then 24×200 + 96×503 at 32) shows the failure moving rather than disappearing. |
+| 4 | PostgreSQL has no `dead` flag, and the only health check runs under the pool mutex | **Confirmed** (Z23), not fixed. `postgres.zig` has no `dead` field (the `grep` hits are `deadline`), while `mysql.zig` has one with a documented fail-fast guard; `pool.zig`'s eviction test is `@hasField(D, "dead")`, so on PG a connection that returned `ConnectionFailed` goes straight back into `available`. Production impact: one PG restart keeps handing the same corpse to successive requests. |
+| 5–13 | Arena scanning, public introspection, callable drift gate, migration self-drift, `CrudService` tenant column, sub-query scope, unparenthesised raw predicates, error classification, pool observability | **Read, not re-verified line by line.** The ones with a security reading (10, 11) are plausible from the cited code; the arena request (5) is the largest engineering ask in the list. |
+
+**What this report got right that matters:** it is the second time a consumer
+found a defect in something this project had just shipped or documented (v0.46.0
+had just documented `Nillable()` as the fix for nullability). Two of the four
+claims I was handed in Z20 did not reproduce; these did. Both of the ones fixed
+here were reachable only through documentation this project wrote.
+
+---
+
 ## Tracking
 
 | ID | Title | P | Status |
