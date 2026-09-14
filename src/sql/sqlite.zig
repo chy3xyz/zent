@@ -51,7 +51,13 @@ pub const SQLiteDriver = struct {
 
     fn logSqliteError(db: *c.sqlite3, context: []const u8) void {
         const msg = c.sqlite3_errmsg(db);
-        std.log.err("SQLite error ({s}): {s}", .{ context, std.mem.span(msg) });
+        // `warn`, not `err`: a failed statement is the caller's to handle (a
+        // constraint violation, a deadlock, an expected 4xx), and the caller already
+        // receives the error. Error level would mean double-reporting into whatever
+        // alerts on it — and, concretely, a test could not exercise a failure path at
+        // all, because Zig's test runner treats a logged error as a test failure.
+        // `connect` failures have been `warn` for the same reason.
+        std.log.warn("SQLite error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
     fn toDriverError(err: anyerror) driver.Error {

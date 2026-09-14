@@ -32,6 +32,21 @@ pub const PostgresDriver = struct {
     cache: ?PreparedCache(16, *c.PGresult) = null,
     /// SSL/TLS mode for connections.
     ssl_mode: SslMode = .prefer,
+    /// Set once libpq reports the connection is gone, so the pool can discard it
+    /// instead of handing it to the next borrower.
+    ///
+    /// `ConnPool` already evicts a released connection whose type has a `dead`
+    /// field (it is how the MySQL driver works); PostgreSQL had no such field, so
+    /// a connection that failed with `ConnectionFailed` — a server restart, a
+    /// `pg_terminate_backend`, an idle-timeout kill — went straight back into the
+    /// pool and kept failing for whoever borrowed it next.
+    ///
+    /// Marked from `PQstatus`, i.e. lazily: libpq learns the connection is gone
+    /// when an I/O attempt fails, so the *failing* call marks it (via `noteError`)
+    /// and the next borrower fails fast instead of talking to a corpse. At most
+    /// one request pays for a break.
+    dead: bool = false,
+
     /// Statement timeout currently set on this connection, in milliseconds.
     /// `null` means the server DEFAULT (no timeout). Tracked so a statement
     /// only pays a `SET statement_timeout` round trip when the desired value
@@ -39,6 +54,23 @@ pub const PostgresDriver = struct {
     current_statement_timeout_ms: ?u32 = null,
 
     pub const SslMode = enum { disable, require, prefer, verify_full };
+
+    /// Fail fast on a connection that is already known to be gone: every
+    /// operation would fail anyway, and the caller (the pool) is about to
+    /// discard it.
+    fn ensureAlive(self: *PostgresDriver) driver.Error!void {
+        if (self.dead or c.PQstatus(self.conn) != c.CONNECTION_OK) {
+            self.dead = true;
+            return error.ConnectionFailed;
+        }
+    }
+
+    /// Route an error through the connection's health: a `ConnectionFailed` means
+    /// the socket is unusable, so the pool must not see this connection again.
+    fn noteError(self: *PostgresDriver, err: driver.Error) driver.Error {
+        if (err == error.ConnectionFailed or c.PQstatus(self.conn) != c.CONNECTION_OK) self.dead = true;
+        return err;
+    }
 
     pub fn connect(allocator: std.mem.Allocator, conninfo: []const u8) !PostgresDriver {
         // libpq expects a null-terminated string
@@ -87,7 +119,13 @@ pub const PostgresDriver = struct {
 
     fn logPgError(conn: *c.PGconn, context: []const u8) void {
         const msg = c.PQerrorMessage(conn);
-        std.log.err("postgres error ({s}): {s}", .{ context, std.mem.span(msg) });
+        // `warn`, not `err`: a failed statement is the caller's to handle (a
+        // constraint violation, a deadlock, an expected 4xx), and the caller already
+        // receives the error. Error level would mean double-reporting into whatever
+        // alerts on it — and, concretely, a test could not exercise a failure path at
+        // all, because Zig's test runner treats a logged error as a test failure.
+        // `connect` failures have been `warn` for the same reason.
+        std.log.warn("postgres error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
     /// Extract diagnostic detail from a PGresult for richer error logging.
@@ -97,7 +135,7 @@ pub const PostgresDriver = struct {
         const detail = if (result) |r| c.PQresultErrorField(r, c.PG_DIAG_MESSAGE_DETAIL) else null;
         if (table != null or column != null) {
             if (detail) |d| {
-                std.log.err("postgres ({s}) table={s} col={s}: {s}", .{
+                std.log.warn("postgres ({s}) table={s} col={s}: {s}", .{
                     context,
                     if (table) |t| std.mem.span(t) else "?",
                     if (column) |col| std.mem.span(col) else "?",
@@ -139,10 +177,10 @@ pub const PostgresDriver = struct {
         defer self.allocator.free(sql_z);
 
         const res = c.PQexecParams(self.conn, sql_z.ptr, 0, null, null, null, null, 0);
-        if (res == null) return error.ConnectionFailed;
+        if (res == null) return self.noteError(error.ConnectionFailed);
         defer c.PQclear(res);
         const status = c.PQresultStatus(res);
-        if (status != c.PGRES_COMMAND_OK) return sqlstateToError(res.?);
+        if (status != c.PGRES_COMMAND_OK) return self.noteError(sqlstateToError(res.?));
         self.current_statement_timeout_ms = desired;
     }
 
@@ -271,6 +309,7 @@ pub const PostgresDriver = struct {
     }
 
     pub fn exec(self: *PostgresDriver, sql: []const u8, args: []const Value) driver.Error!driver.Result {
+        try self.ensureAlive();
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
@@ -323,7 +362,7 @@ pub const PostgresDriver = struct {
                 .nParams = @intCast(args.len),
             };
 
-            _ = try cch.getOrPrepare(sql, pctx, struct {
+            _ = cch.getOrPrepare(sql, pctx, struct {
                 fn f(ctx: PrepareCtx, s: []const u8) !*c.PGresult {
                     _ = s;
                     const res = c.PQprepare(ctx.conn, ctx.name, ctx.sql, ctx.nParams, null) orelse {
@@ -341,7 +380,7 @@ pub const PostgresDriver = struct {
                     _ = ctx;
                     c.PQclear(h);
                 }
-            }.f);
+            }.f) catch |err| return self.noteError(if (err == error.OutOfMemory) error.OutOfMemory else error.DriverFailed);
 
             const res = c.PQexecPrepared(
                 self.conn,
@@ -361,7 +400,7 @@ pub const PostgresDriver = struct {
             const status = c.PQresultStatus(res);
             if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
                 logPgResultError(self.conn, res, "exec-prepared");
-                return sqlstateToError(res.?);
+                return self.noteError(sqlstateToError(res.?));
             }
 
             const affected = c.PQcmdTuples(res);
@@ -404,7 +443,7 @@ pub const PostgresDriver = struct {
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_COMMAND_OK and status != c.PGRES_TUPLES_OK) {
             logPgResultError(self.conn, res, "exec");
-            return sqlstateToError(res.?);
+            return self.noteError(sqlstateToError(res.?));
         }
 
         const affected = c.PQcmdTuples(res);
@@ -429,6 +468,7 @@ pub const PostgresDriver = struct {
     }
 
     pub fn query(self: *PostgresDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
+        try self.ensureAlive();
         const sql_z = try self.allocator.dupeSentinel(u8, query_sql, 0);
         defer self.allocator.free(sql_z);
 
@@ -463,7 +503,7 @@ pub const PostgresDriver = struct {
 
         const status = c.PQresultStatus(res);
         if (status != c.PGRES_TUPLES_OK) {
-            const err = sqlstateToError(res.?);
+            const err = self.noteError(sqlstateToError(res.?));
             // A statement timeout is the intended outcome of withTimeout,
             // not a fault — don't log it as an error.
             // Timeouts and constraint violations are intended outcomes
@@ -511,6 +551,7 @@ pub const PostgresDriver = struct {
     }
 
     pub fn beginTx(self: *PostgresDriver) !driver.Tx {
+        try self.ensureAlive();
         _ = try self.exec("BEGIN", &.{});
 
         const tx_ptr = try self.allocator.create(PostgresTx);

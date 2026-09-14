@@ -253,7 +253,13 @@ pub const MySQLDriver = struct {
         if (drv.dead) return;
         const msg = c.mysql_error(conn);
         const errno = c.mysql_errno(conn);
-        std.log.err("mysql error ({s}) [errno={d}]: {s}", .{ context, errno, std.mem.span(msg) });
+        // `warn`, not `err`: a failed statement is the caller's to handle (a
+        // constraint violation, a deadlock, an expected 4xx), and the caller already
+        // receives the error. Error level would mean double-reporting into whatever
+        // alerts on it — and, concretely, a test could not exercise a failure path at
+        // all, because Zig's test runner treats a logged error as a test failure.
+        // `connect` failures have been `warn` for the same reason.
+        std.log.warn("mysql error ({s}) [errno={d}]: {s}", .{ context, errno, std.mem.span(msg) });
     }
 
     const SavedTimeouts = struct {

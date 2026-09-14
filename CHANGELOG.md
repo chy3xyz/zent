@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A lost PostgreSQL connection is discarded instead of returned to the pool**
+  (Z23). `ConnPool` evicts a released connection whose type has a `dead` field —
+  that is how the MySQL driver has always worked — but `PostgresDriver` had no
+  such field, so a connection lost to a server restart, a `pg_terminate_backend`
+  or an idle-timeout kill went straight back into `available` and kept failing
+  for whoever borrowed it next, one request at a time.
+
+  `PostgresDriver` now carries `dead`, marked from `PQstatus` (libpq learns the
+  socket is gone when an I/O attempt fails, so the failing call marks it and the
+  next borrower fails fast), and every operation checks it before touching the
+  connection. Proven against a real server: the test terminates its own backend
+  and asserts the flag, then that `exec`/`query`/`beginTx` all fail with
+  `ConnectionFailed` without another round trip. Falsified by making `noteError`
+  a no-op, which fails that assertion.
+
+### Changed
+- **A failed statement is logged at `warn`, not `err`, in all three drivers.**
+  The caller receives the error and decides what it means (a constraint
+  violation is an expected 4xx, a deadlock is retryable); logging it at error
+  level double-reports it into whatever alerts on that, and — concretely — made
+  any failure path untestable, because Zig's test runner treats a logged error
+  as a test failure. `connect` failures have been `warn` for exactly this reason
+  since the beginning; this brings the per-statement path in line. Connection
+  setup failures (`sqlite3_open`, `mysql_options`) stay at `err`: those are
+  configuration faults, not outcomes.
+
 ## [0.48.0] - 2026-09-15
 
 ### Fixed

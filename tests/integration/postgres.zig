@@ -47,6 +47,31 @@ fn skipIfNoServer(e: anyerror) anyerror!void {
     }
 }
 
+test "Postgres: a lost connection is marked dead instead of returned to the pool" {
+    // The scenario from the report: a server restart (or `pg_terminate_backend`)
+    // leaves a socket that fails on every use. The pool discards a *released*
+    // connection whose type has `dead` set — that field existed on the MySQL
+    // driver only, so on PostgreSQL the corpse went straight back into
+    // `available` and kept failing for whoever borrowed it next.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    try testing.expect(!drv.dead);
+
+    // Killing our own backend makes this statement itself fail — that is exactly
+    // the connection loss being reproduced. The SQLSTATE for it is 57P01
+    // (`admin_shutdown`), which classifies as a generic failure, so the flag is
+    // set from `PQstatus` rather than from the error code alone.
+    _ = drv.exec("SELECT pg_terminate_backend(pg_backend_pid())", &.{}) catch {};
+    try testing.expect(drv.dead);
+
+    // And the next caller fails fast instead of talking to a dead socket.
+    try testing.expectError(error.ConnectionFailed, drv.exec("SELECT 1", &.{}));
+    try testing.expectError(error.ConnectionFailed, drv.query("SELECT 1", &.{}));
+    try testing.expectError(error.ConnectionFailed, drv.beginTx());
+}
+
 test "Postgres: ping and basic CRUD" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

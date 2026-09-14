@@ -575,6 +575,20 @@ Semantics per edge kind:
 - Prefer them over raw junction SQL: table and column names come from the
   schema, so quoting and placeholders follow the dialect.
 
+### Connection health in the pool
+
+Drivers expose a `dead` flag (`PostgresDriver` and `MySQLDriver` both), which the
+pool consults when a connection is released: a connection that failed with
+`ConnectionFailed` — a server restart, a `pg_terminate_backend`, an idle-timeout
+kill — is closed instead of going back into `available`. PostgreSQL marks it
+lazily from `PQstatus`, so the *failing* call sets it and the next borrower fails
+fast; at most one request pays for a break.
+
+Whether that health check runs on *borrow* is a separate knob:
+`health_check_on_borrow` pings under the pool mutex, which serialises concurrent
+borrows (and deadlocks against a fiber-based IO runtime), so it is off by
+default. The `dead` flag is what makes turning it off safe.
+
 ### `rows_affected` is not portable
 
 MySQL reports **changed** rows; SQLite and PostgreSQL report **matched** rows.
