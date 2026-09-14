@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-09-14
+
 ### Added
 - **`sql_schema.checkNullability`: the schema and the database, compared on
   NULL.** `migrateSchema` adds what is missing but never touches an existing
