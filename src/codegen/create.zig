@@ -109,7 +109,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         /// `Float` ← `f64`/`comptime_float`, `Bool` ← `bool`, string-ish fields
         /// ← `[]const u8` or a string literal, `JSON` ← the field's own Zig
         /// type (or `std.json.Value` for `field.JSONValue`), `Optional(T)` ← a
-        /// bare value for `T` or an `?T`. A wrong pair is a `@compileError`
+        /// bare value for `T`, an `?T`, or a bare `null` literal. A wrong pair is a `@compileError`
         /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
@@ -987,7 +987,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         /// `Float` ← `f64`/`comptime_float`, `Bool` ← `bool`, string-ish fields
         /// ← `[]const u8` or a string literal, `JSON` ← the field's own Zig
         /// type (or `std.json.Value` for `field.JSONValue`), `Optional(T)` ← a
-        /// bare value for `T` or an `?T`. A wrong pair is a `@compileError`
+        /// bare value for `T`, an `?T`, or a bare `null` literal. A wrong pair is a `@compileError`
         /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;

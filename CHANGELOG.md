@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`sql_schema.checkNullability`: the schema and the database, compared on
+  NULL.** `migrateSchema` adds what is missing but never touches an existing
+  column's nullability, so a database that predates the schema (a ported app,
+  hand-managed DDL) can disagree silently — until a read hits a NULL and fails
+  with `error.TypeMismatch`. The check returns every differing column, with
+  `NullabilityDrift.breaksReads()` marking the direction that hurts (database
+  allows NULL, schema declares a non-optional field). `migrateSchema` runs it at
+  the end — the moment the two are known to meet — as **one** summary line at
+  `warn` with per-column detail at `debug`, because a legacy database can
+  disagree about hundreds of columns. `MigrateOptions.check_nullability`
+  (default `true`) disables it. The introspection already read `not_null` for
+  all three dialects; it had simply never been compared.
+
+### Changed
+- **A bare `null` literal is accepted for optional fields.**
+  `setFieldValue("body", null)` now works; `@as(?[]const u8, null)` still does.
+  It was a compile error — *"expected ?[]const u8, got @TypeOf(null)"* — which
+  reads as "null is not supported" and is what a consumer reported as
+  "`Optional` does not resolve NULL". A bare `null` for a **non-optional** field
+  stays a compile error.
+
+### Fixed
+- **A scan failure now names the table and the column.** `error.TypeMismatch`
+  carried no context at all, in a library whose central hazard is exactly this
+  (the database allowing NULL where the schema does not). The diagnosis runs
+  **only on the failure path** — a successful read pays nothing — and says which
+  column is NULL against a non-optional field, or reports that no NULL was found
+  so the value itself does not fit. Logged at `warn`, not `err`: the error is
+  already returned to the caller, and Zig's test runner treats a logged error as
+  a test failure, which would make the diagnostic untestable.
+
 ## [0.45.0] - 2026-09-12
 
 ### Fixed

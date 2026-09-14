@@ -643,6 +643,43 @@ const owners = try q.All();
   foreign tenant's row if you hand them that tenant's parent id, so treat a
   call site as an audited decision that the ids were scoped elsewhere.
 
+## 5h. Nullability: schema vs database
+
+zent's DDL says `NOT NULL` unless a field is `Optional()`/`Nillable()`, and the
+scanners fail a non-optional field on NULL with `error.TypeMismatch`. A database
+that predates the schema — a ported PHP app, a hand-managed DDL — can disagree,
+and the disagreement is silent until a read hits a NULL.
+
+`migrateSchema` reports it (one summary line at `warn`, per-column detail at
+`debug`), because that is the moment the two are known to meet. The full list is
+one call:
+
+```zig
+const drifts = try zent.sql_schema.checkNullability(allocator, client.driver, infos);
+defer zent.sql_schema.freeNullabilityDrift(allocator, drifts);
+for (drifts) |d| {
+    if (d.breaksReads()) // database allows NULL, schema does not
+        std.log.err("{s}.{s}", .{ d.table, d.column });
+}
+```
+
+`d.breaksReads()` is the direction that hurts: the database allows NULL where
+the schema declares a non-optional field, so rows already in the table fail to
+scan. The other direction (schema optional, database NOT NULL) rejects a NULL
+insert instead.
+
+When a scan does fail, the message names the table and the column — the
+diagnosis runs on the failure path only, so a successful read pays nothing:
+
+```
+zent: table 'xdaofood_order' column 'remark' is NULL, but field 'remark'
+      ([]const u8) is not optional — the database allows NULL where the schema
+      does not; make the field Optional()/Nillable(), or fix the column
+```
+
+`migrateSchema` never alters an existing column's nullability: that is a data
+decision (existing NULLs have to go somewhere), so it is reported, not applied.
+
 ## 6. Transactions
 
 ```zig

@@ -79,7 +79,117 @@ pub const MigrateOptions = struct {
     /// with `error.MigrationLockTimeout`. `0` disables locking entirely.
     /// SQLite ignores this (single-writer database, see `lockMigration`).
     lock_timeout_ms: u32 = 10_000,
+
+    /// After migrating, compare every column's **nullability** between the
+    /// schema and the live database and log a warning per difference
+    /// (`checkNullability` is the same check, callable directly).
+    ///
+    /// Migrations only add what is missing; a column that already exists with
+    /// different nullability is left alone — silently, until a read fails with
+    /// `error.TypeMismatch` on a NULL the schema did not expect. This is the
+    /// moment the two are known to meet, so the mismatch is reported here.
+    check_nullability: bool = true,
 };
+
+/// A column whose nullability differs between the schema and the database.
+pub const NullabilityDrift = struct {
+    /// Table and column names, borrowed from `infos` (no ownership).
+    table: []const u8,
+    column: []const u8,
+    schema_optional: bool,
+    db_nullable: bool,
+
+    /// The direction that breaks reads: the database allows NULL where the
+    /// schema declares a non-optional field, so a scan fails at runtime with
+    /// `error.TypeMismatch` and no hint about which column.
+    pub fn breaksReads(self: NullabilityDrift) bool {
+        return !self.schema_optional and self.db_nullable;
+    }
+};
+
+/// Compare every column's nullability between `infos` and the live database.
+///
+/// Returns a caller-owned slice (free with `freeNullabilityDrift`) of the
+/// differences; empty means they agree. Columns named in the schema but absent
+/// from the database are not reported — that is `migrateSchema`'s job — so this
+/// answers exactly one question: *where do the two disagree about NULL?*
+pub fn checkNullability(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+) ![]NullabilityDrift {
+    var drifts = std.array_list.Managed(NullabilityDrift).init(allocator);
+    errdefer drifts.deinit();
+
+    inline for (infos) |info| {
+        if (comptime !info.is_view) {
+            const table = comptime tableFromTypeInfoCrossRef(info, infos);
+            var existing = try getExistingColumns(allocator, driver, table.name);
+            defer freeExistingColumns(allocator, &existing);
+
+            inline for (table.columns) |col| {
+                if (getExistingColumnByName(existing.items, col.name)) |db_col| {
+                    const schema_optional = !col.not_null;
+                    if (schema_optional != db_nullableOf(db_col)) {
+                        try drifts.append(.{
+                            .table = table.name,
+                            .column = col.name,
+                            .schema_optional = schema_optional,
+                            .db_nullable = db_nullableOf(db_col),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    return drifts.toOwnedSlice();
+}
+
+/// `db_nullable = NOT not_null`, spelled out because `pk` counts as non-nullable
+/// on SQLite even though `PRAGMA table_info` may report otherwise.
+fn db_nullableOf(col: ExistingColumn) bool {
+    return !col.not_null and !col.pk;
+}
+
+pub fn freeNullabilityDrift(allocator: std.mem.Allocator, drifts: []NullabilityDrift) void {
+    allocator.free(drifts);
+}
+
+/// Report nullability drift without flooding a startup log.
+///
+/// One summary line at `warn` — enough to notice that the database and the
+/// schema disagree — and the per-column detail at `debug`, because a legacy
+/// database can disagree about hundreds of columns and a wall of warnings is
+/// read by nobody. `checkNullability` is the API for the full list.
+///
+/// The count that matters is `breaksReads`: those are the columns that turn
+/// into a runtime `error.TypeMismatch` when a NULL turns up.
+fn reportNullabilityDrift(drifts: []const NullabilityDrift) void {
+    if (drifts.len == 0) return;
+    var breaking: usize = 0;
+    for (drifts) |d| {
+        if (d.breaksReads()) breaking += 1;
+        std.log.debug(
+            "zent: nullability drift on {s}.{s}: schema says {s}, database says {s}",
+            .{
+                d.table,
+                d.column,
+                if (d.schema_optional) "NULL allowed" else "NOT NULL",
+                if (d.db_nullable) "NULL allowed" else "NOT NULL",
+            },
+        );
+    }
+    std.log.warn(
+        "zent: {d} column(s) differ in nullability between the schema and the database{s}; call sql_schema.checkNullability for the list",
+        .{
+            drifts.len,
+            if (breaking > 0)
+                ", and reads will fail on existing NULLs in some of them"
+            else
+                "",
+        },
+    );
+}
 
 /// CREATE TABLE statement for the migration history table.
 /// Works on SQLite, PostgreSQL, and MySQL.
@@ -1538,6 +1648,12 @@ pub fn migrateSchemaWithOptions(
 
     try tx.commit();
     tx.deinit();
+
+    if (opts.check_nullability) {
+        const drifts = try checkNullability(allocator, driver, infos);
+        defer freeNullabilityDrift(allocator, drifts);
+        reportNullabilityDrift(drifts);
+    }
 }
 
 /// Backward-compatible entry point: calls `migrateSchemaWithOptions` with

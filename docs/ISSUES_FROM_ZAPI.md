@@ -205,6 +205,19 @@ Align official docs with ODKU reality; add “Multi-graph” section; escape tem
 
 ---
 
+### Z20 — Four reports about Optional, NULL and nullability
+
+| | |
+|--|--|
+| **Problem** | Four claims from a consumer: (1) `field.Text(...).Optional()` does not resolve NULL; (2) `Default(x).Optional()` cancels the `Optional`; (3) `error.TypeMismatch` should name the table and the column; (4) zent should self-check schema-vs-DDL nullability. |
+| **Verification** | (1) and (2) **did not reproduce** as stated: `field.Text("body").Optional()` yields `?[]const u8` and a nullable column, `Default(5).Optional()` still yields `?i64` and a nullable column (`Default` touches `f.default`, `Optional` touches `f.optional`; nothing cancels anything), and NULL round-trips through create and read. Both are now pinned by `nullable fields: Optional survives Default, and NULL round-trips`, which checks the entity types, `PRAGMA table_info`'s `notnull`, and a real NULL round-trip. The **actual** defect behind the report is narrower and was real: a bare `null` literal in `setFieldValue` was rejected at compile time — `expected ?[]const u8, got @TypeOf(null)` — so the natural spelling `setFieldValue("body", null)` failed with a message that reads as "null is not supported". Fixed in `field_value.accepts`/`toSqlValue`. (3) and (4) reproduced; details below. |
+| **Fix for (3)** | An entity scan that fails with `TypeMismatch` now walks the struct against the row and logs *which* column: `zent: table 'x' column 'y' is NULL, but field 'y' ([]const u8) is not optional …`, or "no NULL found, so a value does not fit its field's type" when that is the case. Emitted at `warn` — the error itself is already returned; this is the context it lacks — and only on the failure path, so a successful read pays nothing. A logged `err` would be a test failure in Zig, hence `warn`. |
+| **Fix for (4)** | `sql_schema.checkNullability(allocator, driver, infos)` returns every column whose nullability differs (`NullabilityDrift.breaksReads()` marks the dangerous direction). `migrateSchema` runs it at the end and reports one summary line at `warn` with the per-column detail at `debug` — a legacy database can disagree about hundreds of columns, and a wall of warnings is read by nobody. `MigrateOptions.check_nullability` (default `true`) turns it off. The introspection already existed and carried `not_null`; it had simply never been compared. |
+| **Acceptance** | All four resolved: two by pinning the behaviour and fixing the bare-`null` spelling, one by naming the column in the diagnosis, one by shipping the check. |
+| **Status** | **Fixed** v0.46.0. |
+
+---
+
 ## Tracking
 
 | ID | Title | P | Status |

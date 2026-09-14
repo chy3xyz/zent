@@ -3210,6 +3210,109 @@ test "SQLite: QueryEdge applies the target read contract (interceptor + privacy)
     }
 }
 
+test "SQLite: the nullability self-check reports schema/DDL drift" {
+    // The fourth consumer report: the database and the schema can disagree about
+    // NULL, silently, until a read fails. `migrateSchema` adds what is missing
+    // but never touches an existing column's nullability, and this is the moment
+    // the two are known to meet — so the check runs there and is callable
+    // directly (this test uses the direct form, since a logged warning is not
+    // assertable).
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const DriftBase = schema("NullDriftRow", .{
+        .fields = &.{
+            field.String("strict_col"),
+            field.String("loose_col").Optional(),
+        },
+    });
+    const graph = comptime buildGraph(&.{DriftBase});
+    const infos = graph.types;
+
+    // A legacy table: the column the schema declares NOT NULL is nullable here,
+    // and the one the schema declares optional is NOT NULL.
+    _ = try drv.exec(
+        "CREATE TABLE null_drift_row (id INTEGER PRIMARY KEY AUTOINCREMENT, strict_col TEXT, loose_col TEXT NOT NULL)",
+        &.{},
+    );
+
+    const drifts = try migrate.checkNullability(allocator, drv.asDriver(), infos);
+    defer migrate.freeNullabilityDrift(allocator, drifts);
+
+    try testing.expectEqual(@as(usize, 2), drifts.len);
+    var saw_strict = false;
+    var saw_loose = false;
+    for (drifts) |d| {
+        try testing.expectEqualStrings("null_drift_row", d.table);
+        if (std.mem.eql(u8, d.column, "strict_col")) {
+            saw_strict = true;
+            try testing.expect(!d.schema_optional);
+            try testing.expect(d.db_nullable);
+            // This is the direction that fails at read time.
+            try testing.expect(d.breaksReads());
+        } else if (std.mem.eql(u8, d.column, "loose_col")) {
+            saw_loose = true;
+            try testing.expect(d.schema_optional);
+            try testing.expect(!d.db_nullable);
+            try testing.expect(!d.breaksReads());
+        }
+    }
+    try testing.expect(saw_strict and saw_loose);
+
+    // The same check also runs inside `migrateSchema` (that is the point: it is
+    // the moment the schema and the database are known to meet), reported as a
+    // warning rather than a return value.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // An agreed schema reports nothing.
+    _ = try drv.exec("DROP TABLE null_drift_row", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    const clean = try migrate.checkNullability(allocator, drv.asDriver(), infos);
+    defer migrate.freeNullabilityDrift(allocator, clean);
+    try testing.expectEqual(@as(usize, 0), clean.len);
+}
+
+test "SQLite: a scan failure names the table and the offending column" {
+    // `error.TypeMismatch` on its own names neither, which is the third of four
+    // consumer reports in this batch. The diagnosis is emitted through
+    // `std.log` on the failure path only (the happy path does no extra work),
+    // so this test asserts the error and the build log carries the message.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ReportBase = schema("ScanDiagRow", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("count"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{ReportBase});
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // A legacy database that allows NULL where the schema does not — the shape
+    // this diagnosis exists for. (The schema's own DDL is NOT NULL, so writing
+    // it through raw SQL is the only way to produce it.)
+    _ = try drv.exec("PRAGMA writable_schema = ON", &.{});
+    _ = try drv.exec("DROP TABLE scan_diag_row", &.{});
+    _ = try drv.exec("CREATE TABLE scan_diag_row (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, count INTEGER NOT NULL)", &.{});
+    _ = try drv.exec("INSERT INTO scan_diag_row (name, count) VALUES (NULL, 1)", &.{});
+
+    var q = client.scan_diag_row.Query();
+    defer q.deinit();
+    var rows = q.All() catch |err| {
+        // The message itself is in the log; the contract is the error type.
+        try testing.expectEqual(error.TypeMismatch, err);
+        return;
+    };
+    defer client.scan_diag_row.deinitRows(&rows);
+    return error.ExpectedScanFailure;
+}
+
 test "SQLite: zent.scope scopes a raw SELECT that bypasses the builders" {
     // End-to-end proof of the raw-SQL scope entry point: the statement is
     // written by hand, so nothing in the fluent path is involved. Without the

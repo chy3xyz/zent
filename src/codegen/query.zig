@@ -13,7 +13,7 @@ const sql_scan = @import("../sql/scan.zig");
 /// Scan an entity row, routing JSON struct fields into a per-entity arena
 /// that deinitEntity releases — the same ownership contract as the Create
 /// path. Bare (non-entity) scans keep the caller-owned behavior.
-fn scanEntity(comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Row) !T {
+fn scanEntity(comptime info: TypeInfo, comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Row) !T {
     if (comptime @hasField(T, "json_arena")) {
         const arena = try allocator.create(std.heap.ArenaAllocator);
         arena.* = std.heap.ArenaAllocator.init(allocator);
@@ -21,9 +21,49 @@ fn scanEntity(comptime T: type, allocator: std.mem.Allocator, row: sql_driver.Ro
             arena.deinit();
             allocator.destroy(arena);
         }
-        return try sql_scan.scanRowWithArena(T, allocator, row, arena);
+        return sql_scan.scanRowWithArena(T, allocator, row, arena) catch |err| {
+            if (err == error.TypeMismatch) explainScanFailure(info, T, row);
+            return err;
+        };
     }
-    return sql_scan.scanRow(T, allocator, row);
+    return sql_scan.scanRow(T, allocator, row) catch |err| {
+        if (err == error.TypeMismatch) explainScanFailure(info, T, row);
+        return err;
+    };
+}
+
+/// Explain a failed row scan in terms of the schema, because `error.TypeMismatch`
+/// on its own names neither the table nor the column it came from.
+///
+/// Emitted at `warn` level, not `err`: the error itself is already returned to
+/// the caller, this is the context that error lacks, and the Zig test runner
+/// treats a logged error as a test failure (which would make the diagnostic
+/// untestable).
+///
+/// Runs **only on failure** — the happy path pays nothing — and walks the
+/// struct's fields against the row to say which one did not fit. The common
+/// cause in a schema-over-legacy-DB setup is a NULL in a column the schema
+/// declares non-optional, which is reported as exactly that rather than as a
+/// bare type mismatch.
+fn explainScanFailure(comptime info: TypeInfo, comptime T: type, row: sql_driver.Row) void {
+    const field_names = @typeInfo(T).@"struct".field_names;
+    const field_types = @typeInfo(T).@"struct".field_types;
+    var col: usize = 0;
+    inline for (field_names, field_types) |fname, ftype| {
+        if (comptime std.mem.eql(u8, fname, "edges") or std.mem.eql(u8, fname, "json_arena")) continue;
+        const idx = col;
+        col += 1;
+        if (idx >= row.columnCount()) {
+            std.log.warn("zent: scanning table '{s}' failed: the result set has {d} column(s) but field '{s}' needs column {d} ({s})", .{ info.table_name, row.columnCount(), fname, idx + 1, @typeName(ftype) });
+            return;
+        }
+        if (@typeInfo(ftype) == .optional) continue;
+        if (row.isNull(idx)) {
+            std.log.warn("zent: table '{s}' column '{s}' is NULL, but field '{s}' ({s}) is not optional — the database allows NULL where the schema does not; make the field Optional()/Nillable(), or fix the column", .{ info.table_name, row.columnName(idx), fname, @typeName(ftype) });
+            return;
+        }
+    }
+    std.log.warn("zent: scanning table '{s}' failed: no NULL found among the {d} projected column(s), so a value does not fit its field's type (check the SELECT projection order against the schema)", .{ info.table_name, row.columnCount() });
 }
 
 /// Like `scanEntity` for the name-based (partial projection) scanner. The
@@ -747,7 +787,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 const entity = if (self.select_cols != null)
                     try scanEntityNamed(info, Entity, self.allocator, row)
                 else
-                    try scanEntity(Entity, self.allocator, row);
+                    try scanEntity(info, Entity, self.allocator, row);
                 self.current = entity;
                 return entity;
             }
@@ -847,7 +887,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 var entity = if (self.select_cols != null)
                     try scanEntityNamed(info, Entity, self.allocator, row)
                 else
-                    try scanEntity(Entity, self.allocator, row);
+                    try scanEntity(info, Entity, self.allocator, row);
                 errdefer deinitEntity(infos, info, &entity, self.allocator);
                 try result.append(entity);
             }
@@ -923,7 +963,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var entity = if (self.select_cols != null)
                 try scanEntityNamed(info, Entity, self.allocator, row)
             else
-                try scanEntity(Entity, self.allocator, row);
+                try scanEntity(info, Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
 
             const duration_us: u64 = nowUs() - start;
@@ -962,7 +1002,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var entity = if (self.select_cols != null)
                 try scanEntityNamed(info, Entity, self.allocator, row)
             else
-                try scanEntity(Entity, self.allocator, row);
+                try scanEntity(info, Entity, self.allocator, row);
             errdefer deinitEntity(infos, info, &entity, self.allocator);
             if (rows.next()) |_| return error.NotSingular;
             if (rows.nextError()) |e| return e;

@@ -25,10 +25,13 @@
 //! | `JSON` | exactly the field's own Zig type (a struct, or `std.json.Value` for `field.JSONValue`) |
 //! | `Optional(T)` | anything accepted for `T`, or an `?T` value |
 //!
-//! Rejected: a bare `null` (write `@as(?T, null)`), any integer type other than
-//! `i64`/`comptime_int`, a `[N]u8` **array value** (pass a slice or a literal),
-//! a Zig `enum` value for an `Enum` field (its Zig type is `[]const u8`, so pass
-//! the tag string), and a plain `struct` for a non-JSON field.
+//! A bare `null` is accepted for an optional field (no `@as(?T, null)` needed)
+//! and rejected for a non-optional one.
+//!
+//! Rejected: any integer type other than `i64`/`comptime_int`, a `[N]u8`
+//! **array value** (pass a slice or a literal), a Zig `enum` value for an
+//! `Enum` field (its Zig type is `[]const u8`, so pass the tag string), and a
+//! plain `struct` for a non-JSON field.
 //!
 //! A rejection is a `@compileError` at the `setFieldValue` call site, naming
 //! the field and both types.
@@ -43,6 +46,13 @@ pub fn accepts(comptime Expected: type, comptime Actual: type) bool {
         @typeInfo(Expected).optional.child
     else
         Expected;
+
+    // A bare `null` literal: only for an optional field, but allowed without the
+    // `@as(?T, null)` spelling. `@TypeOf(null)` is its own type, so it never
+    // matches the cases below, and the compile error it used to produce
+    // ("expected ?[]const u8, got @TypeOf(null)") read as "null is not
+    // supported" to more than one reader.
+    if (Actual == @TypeOf(null)) return @typeInfo(Expected) == .optional;
 
     if (Expected == Actual) return true;
     if (Unwrapped == Actual) return true; // optional field accepts a bare value
@@ -77,6 +87,7 @@ pub fn toSqlValue(v: anytype) sql.Value {
     const T = @TypeOf(v);
     if (T == comptime_int) return .{ .int = v };
     if (T == comptime_float) return .{ .float = v };
+    if (T == @TypeOf(null)) return .null;
 
     switch (@typeInfo(T)) {
         .optional => {
@@ -131,6 +142,12 @@ test "field_value.accepts pins the accepted shapes" {
     try testing.expect(accepts(?i64, @TypeOf(7)));
     try testing.expect(accepts(?[]const u8, *const [4:0]u8));
     try testing.expect(!accepts(?[]const u8, [4:0]u8));
+    // A bare `null` literal, for optional fields only.
+    try testing.expect(accepts(?i64, @TypeOf(null)));
+    try testing.expect(accepts(?[]const u8, @TypeOf(null)));
+    try testing.expect(!accepts(i64, @TypeOf(null)));
+    try testing.expect(!accepts([]const u8, @TypeOf(null)));
+    try testing.expect(!accepts(bool, @TypeOf(null)));
     // JSON: the field's own type only — the two JSON flavours do not mix.
     try testing.expect(accepts(Payload, Payload));
     try testing.expect(!accepts(Payload, std.json.Value));
@@ -160,4 +177,5 @@ test "field_value.toSqlValue converts every accepted shape" {
     try testing.expectEqualStrings("owned", toSqlValue(@as(?[]const u8, "owned")).string);
     const null_int: ?i64 = null;
     try testing.expect(toSqlValue(null_int) == .null);
+    try testing.expect(toSqlValue(null) == .null);
 }

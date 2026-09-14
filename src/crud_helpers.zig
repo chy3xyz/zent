@@ -1556,6 +1556,89 @@ test "crud_helpers: updateWithVersion optimistic locking and batchSaveOrUpdate" 
     try std.testing.expectEqual(@as(usize, 1), res.updated_count);
 }
 
+test "nullable fields: Optional survives Default, and NULL round-trips" {
+    // Two consumer reports to check: `field.Text(...).Optional()` should scan
+    // NULL, and `Default(x).Optional()` should not cancel the Optional. Both
+    // paths are decided by `f.optional` (the DDL's NOT NULL and the entity's
+    // `?T`), which `Default` does not touch — this pins that, at the DDL level
+    // *and* by round-tripping a NULL.
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Nullable = Schema("NullableRow", .{
+        .fields = &.{
+            field.Text("body").Optional(),
+            field.Int("n").Default(5).Optional(),
+            field.Text("t2").Default("x").Optional(),
+            field.Int("required_n").Default(7),
+        },
+    });
+    const info = comptime fromSchema(Nullable);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    // The entity's Zig types: an Optional field is `?T`, with or without a
+    // default.
+    try std.testing.expectEqual(?[]const u8, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).body));
+    try std.testing.expectEqual(?i64, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).n));
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // DDL: every Optional column is nullable, the plain Int is not.
+    {
+        var rows = try drv.query("PRAGMA table_info(nullable_row)", &.{});
+        defer rows.deinit();
+        var seen: usize = 0;
+        while (rows.next()) |row| {
+            const name = row.getText(1) orelse continue;
+            const not_null = row.getInt(3) orelse 0;
+            if (std.mem.eql(u8, name, "id")) continue;
+            seen += 1;
+            const expect_nullable = !std.mem.eql(u8, name, "required_n");
+            try std.testing.expectEqual(!expect_nullable, not_null != 0);
+        }
+        try std.testing.expectEqual(@as(usize, 4), seen);
+    }
+
+    var client = client_mod.makeClient(infos, allocator, drv.asDriver());
+
+    // A row with every Optional column NULL.
+    var created_id: i64 = 0;
+    {
+        var b = try client.nullable_row.Create();
+        defer b.deinit();
+        // A bare `null` literal, not `@as(?T, null)`: the natural spelling, and
+        // the one that used to fail to compile with a message naming
+        // `@TypeOf(null)` — which is what "Optional does not resolve NULL"
+        // turned out to be.
+        _ = try b.setFieldValue("body", null);
+        _ = try b.setFieldValue("n", null);
+        _ = try b.setFieldValue("t2", @as(?[]const u8, null)); // the explicit form still works
+        _ = try b.setFieldValue("required_n", @as(i64, 1));
+        var e = try b.Save();
+        created_id = e.id;
+        client.nullable_row.deinitRow(&e);
+    }
+    {
+        var q = client.nullable_row.Query();
+        defer q.deinit();
+        _ = try q.Where(.{client.nullable_row.predicates.idEQ(.{ .int = created_id })});
+        var row = (try q.First()) orelse return error.NoRow;
+        defer client.nullable_row.deinitRow(&row);
+        // The three Optional columns came back as NULL, not as the default and
+        // not as an error.
+        try std.testing.expectEqual(@as(?[]const u8, null), row.body);
+        try std.testing.expectEqual(@as(?i64, null), row.n);
+        try std.testing.expectEqual(@as(?[]const u8, null), row.t2);
+        try std.testing.expectEqual(@as(i64, 1), row.required_n);
+    }
+}
+
 test "setFieldValue accepts the documented value shapes" {
     // The accepted set was undocumented and only partly exercised: no test in
     // `zig build test` ever set a float field (only an example compiled one),
