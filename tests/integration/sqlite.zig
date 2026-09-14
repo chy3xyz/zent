@@ -3420,6 +3420,114 @@ test "SQLite: a scan failure names the table and the offending column" {
     return error.ExpectedScanFailure;
 }
 
+test "SQLite: Has{Edge}() cannot be satisfied by a soft-deleted neighbor" {
+    // `Has{Edge}()`, `NotHas{Edge}()` and `Has{Edge}With()` are EXISTS
+    // subqueries over the target table, and they used to ignore the target's
+    // soft-delete scope — so a trashed row satisfied an existence filter. That is
+    // the same leak the eager-loading path closed in v0.35, in the one place that
+    // went around it. ent scopes `Has*` the same way.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ChildBase = schema("HasScopeChild", .{
+        .fields = &.{ field.Int("parent_id"), field.String("name") },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const ParentBase = schema("HasScopeParent", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("children", ChildBase).Field("parent_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ ParentBase, ChildBase });
+    const infos = graph.types;
+    const parent_info = infos[0];
+    const child_info = infos[1];
+
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    // Two parents: one with a trashed child only, one with a live child.
+    var trashed_parent: i64 = 0;
+    var live_parent: i64 = 0;
+    for ([_][]const u8{ "trashed-only", "live" }) |name| {
+        var b = try client.has_scope_parent.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", name);
+        var e = try b.Save();
+        defer client.has_scope_parent.deinitRow(&e);
+        if (std.mem.eql(u8, name, "trashed-only")) trashed_parent = e.id else live_parent = e.id;
+    }
+    var trashed_child: i64 = 0;
+    {
+        var b = try client.has_scope_child.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", trashed_parent);
+        _ = try b.setFieldValue("name", "gone");
+        var e = try b.Save();
+        defer client.has_scope_child.deinitRow(&e);
+        trashed_child = e.id;
+    }
+    {
+        var b = try client.has_scope_child.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", live_parent);
+        _ = try b.setFieldValue("name", "here");
+        var e = try b.Save();
+        defer client.has_scope_child.deinitRow(&e);
+    }
+    {
+        var d = client.has_scope_child.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{client.has_scope_child.predicates.idEQ(.{ .int = trashed_child })});
+        try testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    const preds = client.has_scope_parent.predicates;
+
+    // `Has`: the trashed-only parent does not have children any more.
+    {
+        var q = client.has_scope_parent.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.HasChildren()});
+        var rows = try q.All();
+        defer client.has_scope_parent.deinitRows(&rows);
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("live", rows.items[0].name);
+    }
+    // `NotHas`: and it is the one that has none.
+    {
+        var q = client.has_scope_parent.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.NotHasChildren()});
+        var rows = try q.All();
+        defer client.has_scope_parent.deinitRows(&rows);
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("trashed-only", rows.items[0].name);
+    }
+    // `Has…With`: the caller's predicate is ANDed to the scope, not instead of it.
+    {
+        var q = client.has_scope_parent.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.HasChildrenWith(&.{client.has_scope_child.predicates.nameEQ(.{ .string = "gone" })})});
+        var rows = try q.All();
+        defer client.has_scope_parent.deinitRows(&rows);
+        try testing.expectEqual(@as(usize, 0), rows.items.len);
+    }
+    {
+        var q = client.has_scope_parent.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.HasChildrenWith(&.{client.has_scope_child.predicates.nameEQ(.{ .string = "here" })})});
+        var rows = try q.All();
+        defer client.has_scope_parent.deinitRows(&rows);
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+    }
+    _ = parent_info;
+    _ = child_info;
+}
+
 test "SQLite: zent.scope scopes a raw SELECT that bypasses the builders" {
     // End-to-end proof of the raw-SQL scope entry point: the statement is
     // written by hand, so nothing in the fluent path is involved. Without the

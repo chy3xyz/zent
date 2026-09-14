@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`Has{Edge}()`, `NotHas{Edge}()` and `Has{Edge}With(…)` are satisfied
+  correctly again — a soft-deleted neighbor no longer counts** (Z25). They are
+  `EXISTS` subqueries over the target table, and they ignored its soft-delete
+  scope, so a trashed row satisfied an existence filter. That is the same leak
+  the eager-loading path closed in v0.35, in the one place that went around it;
+  ent scopes `Has*` the same way this now does. The M2M branch qualifies the
+  column (`t."deleted_at"`), since its subquery joins the junction table.
+
+  The reason it was only half-fixed at first is worth recording: the `EXISTS`
+  body existed **twice** — once in `graph_neighbors.appendHasNeighborsWith` and
+  once inline in `sql/builder.zig`'s `.has_neighbors_with` prong — and the
+  predicate used the inline copy, so a change to the graph helper had no effect
+  on it. The prong now delegates, so there is one implementation. Threading that
+  call back through `Predicate.appendTo` also surfaced an inference cycle, which
+  is why `appendTo` (and the two helpers) now declare `anyerror` explicitly
+  rather than inferring it: `.exists_fn` carries a caller-supplied generator, so
+  the set was never this module's to know.
+
+### Docs
+- **Which predicates carry a scope, and which cannot.** A bare predicate has no
+  runtime context, so `Has{Edge}()`/`NotHas{Edge}()`/`Has{Edge}With(…)` apply the
+  target's soft-delete scope but **not** its privacy filters or the interceptor
+  chain — a tenant-scoped existence check passes its tenant predicate through
+  `Has{Edge}With(…)` explicitly. Likewise `sql.InSelect`,
+  `sql.InSubquery`/`ExistsSubquery` render exactly what they are given: the `sql`
+  layer has no graph, so the inner table's scope is the caller's to add.
+  `BEST_PRACTICES` §3a states both.
+
 ## [0.49.0] - 2026-09-15
 
 ### Fixed

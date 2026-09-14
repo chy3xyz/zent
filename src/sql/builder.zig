@@ -268,7 +268,7 @@ pub const Predicate = union(enum) {
     /// EXISTS subquery with additional predicates on the neighbor side.
     /// The step describes the edge to traverse; preds are applied as AND
     /// conditions inside the subquery.
-    has_neighbors_with: struct { step: Step, preds: []const Predicate },
+    has_neighbors_with: struct { step: Step, preds: []const Predicate, soft_delete: bool = false },
     /// EntQL `has(edge)` / `not_has(edge)` placeholders. Emission fails with
     /// `error.UnimplementedHasEdge` until schema-aware lowering resolves edge
     /// tables, foreign-key columns, and correlation semantics.
@@ -296,7 +296,12 @@ pub const Predicate = union(enum) {
     pub const LikeMode = enum { contains, prefix, suffix };
     pub const RawArgsOp = struct { sql: []const u8, args: []const Value };
 
-    pub fn appendTo(self: Predicate, b: *Builder) !void {
+    /// `anyerror` on purpose: `.exists_fn` / `.not_exists_fn` carry a
+    /// caller-supplied generator, so the set is not this module's to know. It is
+    /// also what breaks the inference cycle with the graph helpers this calls
+    /// back into (`appendHasNeighborsWith`), which would otherwise each be
+    /// inferring the other's error set.
+    pub fn appendTo(self: Predicate, b: *Builder) anyerror!void {
         switch (self) {
             .eq => |p| {
                 try b.qualifiedIdent(p.column);
@@ -466,52 +471,14 @@ pub const Predicate = union(enum) {
                 try b.writeByte(')');
             },
             .has_neighbors_with => |h| {
-                try b.writeString("EXISTS (SELECT 1 FROM ");
-                switch (h.step.edge_rel) {
-                    .o2m, .o2o => {
-                        try b.ident(h.step.edge_table);
-                        try b.writeString(" WHERE ");
-                        try b.ident(h.step.edge_columns[0]);
-                        try b.writeString(" = ");
-                        try b.ident(h.step.from_table);
-                        try b.writeByte('.');
-                        try b.ident(h.step.from_column);
-                    },
-                    .m2o => {
-                        try b.ident(h.step.to_table);
-                        try b.writeString(" WHERE ");
-                        try b.ident(h.step.to_table);
-                        try b.writeByte('.');
-                        try b.ident(h.step.to_column);
-                        try b.writeString(" = ");
-                        try b.ident(h.step.from_table);
-                        try b.writeByte('.');
-                        try b.ident(h.step.edge_columns[0]);
-                    },
-                    .m2m => {
-                        try b.ident(h.step.edge_table);
-                        try b.writeString(" j INNER JOIN ");
-                        try b.ident(h.step.to_table);
-                        try b.writeString(" t ON j.");
-                        try b.ident(h.step.targetPK());
-                        try b.writeString(" = t.");
-                        try b.ident(h.step.to_column);
-                        try b.writeString(" WHERE j.");
-                        try b.ident(h.step.sourcePK());
-                        try b.writeString(" = ");
-                        try b.ident(h.step.from_table);
-                        try b.writeByte('.');
-                        try b.ident(h.step.from_column);
-                    },
-                }
-                if (h.preds.len > 0) {
-                    try b.writeString(" AND (");
-                    for (h.preds, 0..) |pred, i| {
-                        if (i > 0) try b.writeString(" AND ");
-                        try pred.appendTo(b);
-                    }
-                    try b.writeByte(')');
-                }
+                // Rendered by the graph layer: the EXISTS body is also emitted by
+                // `graph_neighbors.appendHasNeighborsWith`, and keeping a second
+                // inline copy here is how this prong silently ignored the
+                // target's soft-delete scope (`h.soft_delete`), while its sibling
+                // honoured it. One implementation, one place to change.
+                const graph_neighbors = @import("../graph/neighbors.zig");
+                try b.writeString("EXISTS (");
+                try graph_neighbors.appendHasNeighborsWith(b, h.step, h.preds, h.soft_delete);
                 try b.writeByte(')');
             },
             .has_edge, .not_has_edge => return error.UnimplementedHasEdge,

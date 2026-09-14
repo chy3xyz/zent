@@ -248,6 +248,26 @@ Prefer these over `sql.Raw`/`sql.Like` + hand-written column names: the typed
 forms validate the column against the schema and pick the right quoting and
 placeholder style per dialect.
 
+**What a subquery predicate carries, and what it cannot.** `Has<Edge>()`,
+`NotHas<Edge>()` and `Has<Edge>With(…)` are `EXISTS` subqueries over the target
+table, and they apply the target's **soft-delete** scope — a trashed row does
+not satisfy them (ent behaves the same way). They do **not** apply the target's
+privacy filters or the interceptor chain: a bare predicate is a value with no
+runtime context, so there is nothing to consult. A tenant-scoped existence check
+passes its tenant predicate through the `With` form:
+
+```zig
+_ = try q.Where(.{client.user.predicates.HasCarsWith(&.{
+    client.car.predicates.app_idEQ(.{ .int = tenant }),
+})});
+```
+
+The same boundary applies to the raw subquery predicates — `sql.InSelect`,
+`sql.InSubquery`, `sql.ExistsSubquery` render exactly what they are given, and
+the `sql` layer has no graph to widen that. Add the inner table's scope
+yourself, or express the traversal through an edge so the schema-aware path
+builds it for you.
+
 ## 4. Aggregates
 
 ```zig

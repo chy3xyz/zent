@@ -262,13 +262,20 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
         for (info.edges) |edge| {
             const target_info = edgeTargetInfo(infos, info, edge);
             const step = buildEdgeStep(edge, info, target_info);
+            // `Has{Edge}()` / `NotHas{Edge}()` / `Has{Edge}With()` are EXISTS
+            // subqueries over the target table, so they carry the target's
+            // soft-delete scope (ent does the same). Privacy filters and the
+            // interceptor chain cannot be applied here — a bare predicate has no
+            // runtime context — so a tenant-scoped existence check passes its
+            // tenant predicate through `Has{Edge}With(…)` explicitly.
+            const target_soft_delete = target_info.soft_delete;
 
             const has_name = edgePredName("Has", edge.name);
             @field(result, has_name) = struct {
                 fn hasFn() sql.Predicate {
                     return .{ .exists_fn = &struct {
                         fn gen(b: *sql.Builder) anyerror!void {
-                            try graph_neighbors.appendHasNeighbors(b, step);
+                            try graph_neighbors.appendHasNeighbors(b, step, target_soft_delete);
                         }
                     }.gen };
                 }
@@ -277,7 +284,11 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
             const has_with_name = fieldName(edgePredName("Has", edge.name), "With");
             @field(result, has_with_name) = struct {
                 fn hasWithFn(preds: []const sql.Predicate) sql.Predicate {
-                    return .{ .has_neighbors_with = .{ .step = step, .preds = preds } };
+                    return .{ .has_neighbors_with = .{
+                        .step = step,
+                        .preds = preds,
+                        .soft_delete = target_soft_delete,
+                    } };
                 }
             }.hasWithFn;
 
@@ -286,7 +297,7 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
                 fn notHasFn() sql.Predicate {
                     return .{ .not_exists_fn = &struct {
                         fn gen(b: *sql.Builder) anyerror!void {
-                            try graph_neighbors.appendHasNeighbors(b, step);
+                            try graph_neighbors.appendHasNeighbors(b, step, target_soft_delete);
                         }
                     }.gen };
                 }

@@ -208,7 +208,13 @@ pub fn appendNeighbors(b: *sql.Builder, step: Step, parent_id: sql.Value) !void 
 ///   O2M:  SELECT 1 FROM target WHERE fk = source.id
 ///   M2O:  SELECT 1 FROM target   WHERE target.pk = source.fk
 ///   M2M:  SELECT 1 FROM junction WHERE junction.source_pk = source.id
-pub fn appendHasNeighbors(b: *sql.Builder, step: Step) !void {
+///
+/// `soft_delete` adds the target's `deleted_at IS NULL` to the subquery, so a
+/// trashed row cannot satisfy an existence filter — the same leak the
+/// eager-loading path closed in v0.35. It is a `bool` rather than a `TypeInfo`
+/// because it must be known at comptime and the caller already has the target.
+/// The column is qualified in the M2M branch, whose subquery joins two tables.
+pub fn appendHasNeighbors(b: *sql.Builder, step: Step, soft_delete: bool) anyerror!void {
     switch (step.edge_rel) {
         .o2m, .o2o => {
             try b.writeString("SELECT 1 FROM ");
@@ -245,13 +251,23 @@ pub fn appendHasNeighbors(b: *sql.Builder, step: Step) !void {
             try b.ident(step.from_column);
         },
     }
+    if (soft_delete) try writeHasSoftDelete(b, step);
+}
+
+/// ` AND <target>."deleted_at" IS NULL`, qualified only where the subquery joins
+/// more than one table (M2M, whose target is aliased `t`).
+fn writeHasSoftDelete(b: *sql.Builder, step: Step) !void {
+    try b.writeString(" AND ");
+    if (step.edge_rel == .m2m) try b.writeString("t.");
+    try b.ident("deleted_at");
+    try b.writeString(" IS NULL");
 }
 
 /// Append the body of an EXISTS subquery with additional filter predicates
 /// on the neighbor side.  The caller is responsible for wrapping with
 /// `EXISTS (...)`.  Prefer using `.has_neighbors_with` on `sql.Predicate`
 /// for new code.
-pub fn appendHasNeighborsWith(b: *sql.Builder, step: Step, preds: []const sql.Predicate) !void {
+pub fn appendHasNeighborsWith(b: *sql.Builder, step: Step, preds: []const sql.Predicate, soft_delete: bool) anyerror!void {
     try b.writeString("SELECT 1 FROM ");
     switch (step.edge_rel) {
         .o2m, .o2o => {
@@ -290,6 +306,7 @@ pub fn appendHasNeighborsWith(b: *sql.Builder, step: Step, preds: []const sql.Pr
             try b.ident(step.from_column);
         },
     }
+    if (soft_delete) try writeHasSoftDelete(b, step);
     if (preds.len > 0) {
         try b.writeString(" AND (");
         for (preds, 0..) |pred, i| {
@@ -634,7 +651,7 @@ test "appendHasNeighbors O2M" {
     };
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
     defer b.deinit();
-    try appendHasNeighbors(&b, step);
+    try appendHasNeighbors(&b, step, false);
     const result = b.query();
 
     try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT 1 FROM \"car\"") != null);
@@ -654,7 +671,7 @@ test "appendHasNeighbors M2M" {
     };
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
     defer b.deinit();
-    try appendHasNeighbors(&b, step);
+    try appendHasNeighbors(&b, step, false);
     const result = b.query();
 
     try testing.expect(std.mem.indexOf(u8, result.sql, "SELECT 1 FROM \"user_group\"") != null);
@@ -675,7 +692,7 @@ test "appendHasNeighborsWith M2M" {
     var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
     defer b.deinit();
     const pred = sql.EQ("group.name", .{ .string = "admins" });
-    try appendHasNeighborsWith(&b, step, &.{pred});
+    try appendHasNeighborsWith(&b, step, &.{pred}, false);
     const result = b.query();
 
     try testing.expect(std.mem.indexOf(u8, result.sql, "AND (") != null);
