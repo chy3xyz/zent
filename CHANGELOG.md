@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`error.PoolExhausted` now means capacity, and nothing else** (Z27).
+  `tryBorrowNoLock` folds every reason it cannot produce a connection into
+  `null` — a refused connection, bad credentials, an OOM, a failed health check —
+  and `borrow` reported the constant `PoolExhausted` for all of them. A consumer
+  mapping that to 503 (as the reporting one does) therefore retried a
+  configuration fault indefinitely, which is the "just moving the 500" their
+  120-concurrent measurement describes.
+
+  The pool now remembers *why* the last attempt produced nothing and returns
+  that: `ConnectionFailed`, `PingFailed`, `OutOfMemory`, `DriverFailed` and
+  `PoolClosed` stay distinguishable, everything else folds back into
+  `PoolExhausted` so `borrow`'s error set stays bounded
+  (`asDriver()`'s explicit sets depend on it). `Metrics.onError` receives the
+  real error instead of a constant, and the give-up path logs a `warn` — the
+  pool had **no** log statement at all before this.
+
+  Not included: a request-level borrow budget (`borrowWithTimeout`/`borrowCtx`)
+  and threading a context through `VTable.beginTx`. Those change the driver
+  interface and the pool's waiting logic, so they are the next slice rather than
+  a ride-along.
+
 ## [0.50.0] - 2026-09-15
 
 ### Fixed

@@ -156,6 +156,12 @@ pub fn ConnPool(comptime D: type) type {
         /// sorted). Best-effort fairness bookkeeping only — see `borrow`.
         wait_tickets: std.ArrayListUnmanaged(u64) = .empty,
         owned_io: ?*std.Io.Threaded = null,
+        /// Why the most recent borrow attempt produced nothing. `tryBorrowNoLock`
+        /// can fail for reasons that are *not* exhaustion — a refused connection,
+        /// bad credentials, OOM — and folding all of them into `PoolExhausted`
+        /// tells the caller to retry a configuration fault (consumers have mapped
+        /// it to 503). Written and read under the mutex.
+        last_attempt_error: ?anyerror = null,
 
         /// Create a thread-safe Io instance owned by the pool.
         fn createOwnedIo(allocator: std.mem.Allocator) !*std.Io.Threaded {
@@ -260,6 +266,24 @@ pub fn ConnPool(comptime D: type) type {
             try self.available.append(self.allocator, entry);
         }
 
+        /// Map a recorded failure onto the bounded set `borrow` returns. The
+        /// specific members a caller already switches on are preserved —
+        /// `PoolExhausted` (capacity) stays distinguishable from
+        /// `ConnectionFailed` (connectivity) — and anything else folds into
+        /// `PoolExhausted` rather than widening this signature to `anyerror`,
+        /// which would break `asDriver()`'s explicit error sets. The log line
+        /// above carries the unmapped name, so nothing is hidden from operators.
+        fn borrowErrorFor(err: anyerror) error{ ConnectionFailed, PingFailed, OutOfMemory, DriverFailed, PoolClosed, PoolExhausted } {
+            return switch (err) {
+                error.ConnectionFailed => error.ConnectionFailed,
+                error.PingFailed => error.PingFailed,
+                error.OutOfMemory => error.OutOfMemory,
+                error.DriverFailed => error.DriverFailed,
+                error.PoolClosed => error.PoolClosed,
+                else => error.PoolExhausted,
+            };
+        }
+
         /// Open a new connection honoring either factory (connectCtx wins).
         fn openConnection(self: *Self) !D {
             if (self.options.connectCtx) |f| return f(self.options.connect_ctx, self.allocator);
@@ -293,15 +317,22 @@ pub fn ConnPool(comptime D: type) type {
         }
 
         /// Non-blocking borrow attempt. Returns a pooled entry or null when
-        /// the pool is exhausted. The caller must hold `self.mutex`.
+        /// no connection could be produced. The caller must hold `self.mutex`.
         fn tryBorrowNoLock(self: *Self) ?*PooledEntry {
+            // Each attempt answers for itself; a later success means the earlier
+            // reason no longer matters.
+            self.last_attempt_error = null;
             while (true) {
                 const entry = self.available.pop() orelse {
                     if (self.all.items.len < self.options.max_connections) {
                         // Open a new connection.
-                        var new_conn = self.openConnection() catch return null;
+                        var new_conn = self.openConnection() catch |err| {
+                            self.last_attempt_error = err;
+                            return null;
+                        };
                         const entry = self.allocator.create(PooledEntry) catch {
                             new_conn.close();
+                            self.last_attempt_error = error.OutOfMemory;
                             return null;
                         };
                         entry.* = .{
@@ -527,8 +558,19 @@ pub fn ConnPool(comptime D: type) type {
                 io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
             }
 
-            if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, error.PoolExhausted);
-            return error.PoolExhausted;
+            // `PoolExhausted` only when the pool really is at its ceiling with
+            // everything lent out; otherwise the failure that actually happened
+            // travels to the caller, and a consumer can tell "capacity" from
+            // "misconfiguration" (see `ZENT_IMPROVEMENTS.md` item 3).
+            const reason: anyerror = self.last_attempt_error orelse error.PoolExhausted;
+            if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, reason);
+            // Silent exhaustion was the other half of that report: the pool had
+            // no log line at all.
+            std.log.warn(
+                "zent pool: no connection could be handed out after {d} attempt(s): {s}",
+                .{ attempt + 1, @errorName(reason) },
+            );
+            return borrowErrorFor(reason);
         }
 
         /// Return a borrowed connection to the pool.
@@ -1902,4 +1944,53 @@ test "ConnPool wait budget expiry returns PoolExhausted" {
     // The timed-out waiter must not leave a phantom ticket behind, or later
     // waiters would defer to a borrower that is no longer there.
     try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
+}
+
+test "an unusable factory reports its own error instead of PoolExhausted" {
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    // `PoolExhausted` means "at the ceiling with everything lent out". A refused
+    // connection or a bad password is not that, and consumers act on the
+    // difference (one mapped `PoolExhausted` to 503 and retried a configuration
+    // fault forever). The cause must survive, and the metrics callback must see
+    // it rather than a constant.
+    const allocator = std.testing.allocator;
+
+    // Succeeds once (so `init` can warm up), then refuses: the second borrow has
+    // to open a connection, which is the path being tested.
+    const Factory = struct {
+        opened: usize = 0,
+
+        fn f(ctx: ?*anyopaque, a: std.mem.Allocator) anyerror!SQLiteDriver {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.opened += 1;
+            if (self.opened == 1) return SQLiteDriver.open(a, ":memory:");
+            return error.ConnectionFailed;
+        }
+    };
+    const OnError = struct {
+        fn f(ctx: ?*anyopaque, err: anyerror) void {
+            const slot: *?anyerror = @ptrCast(@alignCast(ctx.?));
+            slot.* = err;
+        }
+    };
+
+    var factory = Factory{};
+    var seen: ?anyerror = null;
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .min_connections = 1,
+        .max_connections = 2,
+        .connect_ctx = &factory,
+        .connectCtx = Factory.f,
+        .health_check_on_borrow = false,
+        .max_retries = 0,
+        .metrics = .{ .context = &seen, .onError = OnError.f, .onWait = null },
+    });
+    defer pool.deinit();
+
+    const first = try pool.borrow();
+    // Nothing is available and the pool is below its ceiling, so this one has to
+    // open a connection — and the factory refuses.
+    try std.testing.expectError(error.ConnectionFailed, pool.borrow());
+    try std.testing.expectEqual(@as(?anyerror, error.ConnectionFailed), seen);
+    pool.release(first);
 }

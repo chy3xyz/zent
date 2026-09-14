@@ -604,6 +604,14 @@ kill — is closed instead of going back into `available`. PostgreSQL marks it
 lazily from `PQstatus`, so the *failing* call sets it and the next borrower fails
 fast; at most one request pays for a break.
 
+**Draining vs overloading.** `error.PoolExhausted` means the pool reached
+`max_connections` with everything lent out — a capacity signal, and the one worth
+mapping to 503. A connection that could not be *opened* surfaces as the driver's
+own error (`ConnectionFailed`, `PingFailed`), i.e. a configuration or
+connectivity fault, which `driver.isRetryable` also classifies for you. The
+give-up path logs a `warn` naming the reason, and `Metrics.onError` gets the real
+error rather than a constant.
+
 Whether that health check runs on *borrow* is a separate knob:
 `health_check_on_borrow` pings under the pool mutex, which serialises concurrent
 borrows (and deadlocks against a fiber-based IO runtime), so it is off by
