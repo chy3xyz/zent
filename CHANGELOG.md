@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A raw predicate containing `OR` could escape an injected scope predicate**
+  (Z25). `Where`/`Where-lists` are joined with a bare `" AND "`, so
+  `Where(.{sql.Raw("a = 1 OR b = 2")})` plus an interceptor-injected
+  `AND app_id = ?` rendered `WHERE a = 1 OR b = 2 AND app_id = ?` — the `AND`
+  binds to the second operand, and every row satisfying `a = 1` came back
+  whatever its tenant. `.raw` and `.raw_args` are now rendered inside
+  parentheses, so a fragment is always one operand. Proven with rows: a test
+  seeds a foreign tenant's row that satisfies the `OR`, and removing the
+  parentheses makes it fail with `expected 1, found 2`. Two pinned SQL-text
+  expectations changed accordingly (one gains the necessary pair, one gains a
+  redundant pair around a fragment that already had its own).
+
+### Added
+- **`sql_schema.assertNullability` — the drift check as a gate** (Z26). The
+  automatic report inside `migrateSchema` cannot reach a consumer whose DDL is a
+  set of `.sql` files and never calls `migrateSchema` — which is exactly the
+  consumer that reported needing it, with 70 drifted columns in hand. It now has
+  a callable form that fails rather than logs:
+
+  ```zig
+  try zent.sql_schema.assertNullability(alloc, drv.asDriver(), infos, .read_breaking_only);
+  ```
+
+  `.read_breaking_only` refuses only the direction that breaks reads (database
+  allows NULL, schema does not); `.any` refuses every difference, and a benign
+  disagreement (schema optional, column NOT NULL) is what tells the two apart —
+  pinned by a test, since a gate that blocks a deploy needs its boundary stated.
+
 ## [0.47.0] - 2026-09-14
 
 ### Added

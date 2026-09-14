@@ -402,10 +402,20 @@ pub const Predicate = union(enum) {
                 try b.qualifiedIdent(col);
                 try b.writeString(" IS NOT NULL");
             },
+            // Parenthesised: a raw fragment may contain `OR`, and the WHERE list
+            // is joined with a bare `" AND "`. Unparenthesised, `WHERE a = 1 OR
+            // b = 2` plus an injected `AND app_id = ?` binds the `AND` to the
+            // second operand only — the `a = 1` branch escapes the scope
+            // predicate entirely, which is how an interceptor's tenant filter
+            // gets bypassed by a raw predicate written in good faith.
             .raw => |sql_text| {
+                try b.writeByte('(');
                 try b.writeString(sql_text);
+                try b.writeByte(')');
             },
+            // Parenthesised for the same reason as `.raw` above.
             .raw_args => |p| {
+                try b.writeByte('(');
                 var rest = p.sql;
                 var n: usize = 0;
                 while (std.mem.indexOfScalar(u8, rest, '?')) |q| {
@@ -417,6 +427,7 @@ pub const Predicate = union(enum) {
                 }
                 if (n != p.args.len) return error.RawArgCountMismatch;
                 try b.writeString(rest);
+                try b.writeByte(')');
             },
             .in_subquery => |p| {
                 try b.qualifiedIdent(p.column);
@@ -2268,7 +2279,9 @@ test "Raw predicate" {
     _ = s.from(Table("users"));
     _ = try s.where(Raw("age > 20"));
     const q = try s.query();
-    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE age > 20", q.sql);
+    // Parenthesised so an injected `AND …` cannot bind to one operand of a raw
+    // `OR` (see the appendTo comment).
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\" WHERE (age > 20)", q.sql);
     try std.testing.expectEqual(@as(usize, 0), q.args.len);
 }
 
@@ -2280,7 +2293,10 @@ test "RawArgs predicate splices bound args" {
     _ = try s.where(RawArgs("(total_num <= 0 OR receive_num < ?)", &.{.{ .int = 5 }}));
     _ = try s.where(EQ("app_id", .{ .int = 9 }));
     const q = try s.query();
-    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"coupon\" WHERE (total_num <= 0 OR receive_num < $1) AND \"app_id\" = $2", q.sql);
+    // The fragment carries its own parentheses here; the rendered pair is
+    // redundant and harmless. What matters is that the injected `AND app_id = …`
+    // is joined to the *whole* fragment, not to its last operand.
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"coupon\" WHERE ((total_num <= 0 OR receive_num < $1)) AND \"app_id\" = $2", q.sql);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
     try std.testing.expectEqual(@as(i64, 5), q.args[0].int);
     try std.testing.expectEqual(@as(i64, 9), q.args[1].int);

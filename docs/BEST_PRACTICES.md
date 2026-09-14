@@ -695,6 +695,19 @@ zent: table 'xdaofood_order' column 'remark' is NULL, but field 'remark'
 `migrateSchema` never alters an existing column's nullability: that is a data
 decision (existing NULLs have to go somewhere), so it is reported, not applied.
 
+If your DDL is a set of `.sql` files and you never call `migrateSchema`, the
+automatic report never runs. Call the check yourself, as a gate:
+
+```zig
+// Fails with error.NullabilityDrift; the detail goes to the log as well.
+try zent.sql_schema.assertNullability(alloc, drv.asDriver(), infos, .read_breaking_only);
+```
+
+`.read_breaking_only` refuses only the direction that breaks reads;
+`.any` refuses every difference (a schema-optional column that the database
+declares NOT NULL fails a NULL *insert* loudly, so it is usually not worth
+blocking a deploy over).
+
 ## 6. Transactions
 
 ```zig

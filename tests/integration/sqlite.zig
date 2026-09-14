@@ -3265,12 +3265,119 @@ test "SQLite: the nullability self-check reports schema/DDL drift" {
     // warning rather than a return value.
     try migrate.migrateSchema(allocator, drv.asDriver(), infos);
 
+    // As a gate: the drifted table above has the read-breaking direction, so
+    // both strictness levels refuse it. This is the form a consumer whose DDL is
+    // Flyway-style can actually use — `migrateSchema` never runs for them.
+    try testing.expectError(
+        error.NullabilityDrift,
+        migrate.assertNullability(allocator, drv.asDriver(), infos, .read_breaking_only),
+    );
+    try testing.expectError(
+        error.NullabilityDrift,
+        migrate.assertNullability(allocator, drv.asDriver(), infos, .any),
+    );
+
+    // A benign-only disagreement (schema optional, column NOT NULL) is refused
+    // by `.any` and allowed by `.read_breaking_only`: inserting a NULL fails
+    // loudly there, so it is not worth blocking a deploy over.
+    {
+        const BenignBase = schema("NullBenignRow", .{
+            .fields = &.{field.String("optional_col").Optional()},
+        });
+        const benign_graph = comptime buildGraph(&.{BenignBase});
+        const benign_infos = benign_graph.types;
+        _ = try drv.exec("CREATE TABLE null_benign_row (id INTEGER PRIMARY KEY AUTOINCREMENT, optional_col TEXT NOT NULL)", &.{});
+        try testing.expectError(
+            error.NullabilityDrift,
+            migrate.assertNullability(allocator, drv.asDriver(), benign_infos, .any),
+        );
+        try migrate.assertNullability(allocator, drv.asDriver(), benign_infos, .read_breaking_only);
+        _ = try drv.exec("DROP TABLE null_benign_row", &.{});
+    }
+
     // An agreed schema reports nothing.
     _ = try drv.exec("DROP TABLE null_drift_row", &.{});
     try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     const clean = try migrate.checkNullability(allocator, drv.asDriver(), infos);
     defer migrate.freeNullabilityDrift(allocator, clean);
     try testing.expectEqual(@as(usize, 0), clean.len);
+}
+
+test "SQLite: a raw predicate's OR cannot escape an injected scope predicate" {
+    // The WHERE list is joined with a bare `" AND "`, so an unparenthesised raw
+    // fragment containing `OR` used to bind the injected scope predicate to the
+    // second operand only: `WHERE a = 1 OR b = 2 AND app_id = ?` returns rows
+    // whose `a = 1` regardless of tenant. Raw predicates are rendered inside
+    // parentheses now; this test proves it with rows, not with SQL text.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const RowBase = schema("RawOrRow", .{
+        .fields = &.{
+            field.String("code"),
+            field.Int("app_id"),
+            field.Int("a"),
+            field.Int("b"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{RowBase});
+    const infos = graph.types;
+
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                try view.whereEq("app_id", .{ .int = id.* });
+            }
+        }.f,
+    });
+
+    // Tenant 2 owns the row that `a = 1` matches; the OR branch would find it.
+    for ([_]struct { code: []const u8, app: i64, a: i64, b: i64 }{
+        .{ .code = "t1", .app = 1, .a = 0, .b = 2 },
+        .{ .code = "t2", .app = 2, .a = 1, .b = 0 },
+    }) |seed| {
+        var b = try client.raw_or_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("code", seed.code);
+        _ = try b.setFieldValue("app_id", seed.app);
+        _ = try b.setFieldValue("a", seed.a);
+        _ = try b.setFieldValue("b", seed.b);
+        var e = try b.Save();
+        defer client.raw_or_row.deinitRow(&e);
+    }
+
+    {
+        var q = client.raw_or_row.Query();
+        defer q.deinit();
+        _ = try q.Where(&.{zent.sql.Raw("a = 1 OR b = 2")});
+        var rows = try q.All();
+        defer client.raw_or_row.deinitRows(&rows);
+        // Tenant 1's own row only: `t2` satisfies `a = 1`, and must not survive
+        // the injected `app_id = 1`.
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("t1", rows.items[0].code);
+    }
+
+    // The same fragment written with `?` placeholders goes through the same
+    // path.
+    {
+        var q = client.raw_or_row.Query();
+        defer q.deinit();
+        _ = try q.Where(&.{zent.sql.RawArgs("a = ? OR b = ?", &.{ .{ .int = 1 }, .{ .int = 2 } })});
+        var rows = try q.All();
+        defer client.raw_or_row.deinitRows(&rows);
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("t1", rows.items[0].code);
+    }
 }
 
 test "SQLite: a scan failure names the table and the offending column" {

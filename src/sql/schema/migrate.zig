@@ -155,6 +155,52 @@ pub fn freeNullabilityDrift(allocator: std.mem.Allocator, drifts: []NullabilityD
     allocator.free(drifts);
 }
 
+/// How much disagreement `assertNullability` refuses to ship.
+pub const DriftStrictness = enum {
+    /// Only the direction that breaks reads: the database allows NULL where the
+    /// schema declares a non-optional field. The other direction makes a NULL
+    /// insert fail, which is loud, and blocking a deploy for it is usually not
+    /// what you want.
+    read_breaking_only,
+    /// Any difference at all.
+    any,
+};
+
+pub const NullabilityError = sql_driver.Error || error{ NullabilityDrift, UnsupportedDialect };
+
+/// The same check as `checkNullability`, as a **gate** rather than a side
+/// effect: fails with `error.NullabilityDrift` instead of writing a log line.
+///
+/// This exists because the automatic report inside `migrateSchema` only reaches
+/// a consumer that calls `migrateSchema` — one whose DDL is a Flyway-style set
+/// of `.sql` files never does, so the check it wants could never fire. Calling
+/// this from a startup step or a CI job makes it a decision instead.
+///
+/// ```zig
+/// try zent.sql_schema.assertNullability(allocator, drv.asDriver(), infos, .read_breaking_only);
+/// ```
+///
+/// On failure the drift is also logged (the detail at `debug`), because an error
+/// name alone does not say which column.
+pub fn assertNullability(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    strictness: DriftStrictness,
+) NullabilityError!void {
+    const drifts = try checkNullability(allocator, driver, infos);
+    defer freeNullabilityDrift(allocator, drifts);
+
+    var violating: usize = 0;
+    for (drifts) |d| {
+        if (strictness == .read_breaking_only and !d.breaksReads()) continue;
+        violating += 1;
+    }
+    if (violating == 0) return;
+    reportNullabilityDrift(drifts);
+    return error.NullabilityDrift;
+}
+
 /// Report nullability drift without flooding a startup log.
 ///
 /// One summary line at `warn` — enough to notice that the database and the
