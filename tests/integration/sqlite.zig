@@ -3380,6 +3380,83 @@ test "SQLite: a raw predicate's OR cannot escape an injected scope predicate" {
     }
 }
 
+test "SQLite: checkSchema reports every kind of schema/DDL drift" {
+    // The reason this exists: a column the schema believes in but the database
+    // does not have makes every query mentioning it fail, and a handler that
+    // swallows errors reports "empty result" for months. `migrateSchema` adds
+    // what is missing, but a consumer whose DDL lives in `.sql` files never runs
+    // it — they call this instead (see ZENT_IMPROVEMENTS.md item 6).
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const DriftBase = schema("SchemaDriftRow", .{
+        .fields = &.{
+            field.String("kept_col"),
+            field.Int("absent_col"), // schema has it, the table will not
+            field.String("nul_col"),
+            field.Int("typed_col"),
+        },
+    });
+    const graph = comptime buildGraph(&.{DriftBase});
+    const infos = graph.types;
+
+    // A legacy table: `absent_col` is missing, `extra_col` is unknown to the
+    // schema, `nul_col` is nullable where the schema says NOT NULL, and
+    // `typed_col` is TEXT where the schema says INTEGER.
+    _ = try drv.exec(
+        "CREATE TABLE schema_drift_row (id INTEGER PRIMARY KEY AUTOINCREMENT, kept_col TEXT NOT NULL, nul_col TEXT, typed_col TEXT, extra_col TEXT)",
+        &.{},
+    );
+
+    const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, drifts);
+
+    var seen_missing_col = false;
+    var seen_extra_col = false;
+    var seen_nullable = false;
+    var seen_type = false;
+    for (drifts) |d| {
+        try testing.expectEqualStrings("schema_drift_row", d.table);
+        if (std.mem.eql(u8, d.column, "absent_col")) {
+            seen_missing_col = d.kind == .missing_column;
+        } else if (std.mem.eql(u8, d.column, "extra_col")) {
+            seen_extra_col = d.kind == .extra_column;
+        } else if (std.mem.eql(u8, d.column, "nul_col")) {
+            seen_nullable = d.kind == .nullability and d.schema_optional == false and d.db_nullable;
+            try testing.expect(d.breaksReads());
+        } else if (std.mem.eql(u8, d.column, "typed_col")) {
+            seen_type = d.kind == .type_mismatch;
+        }
+    }
+    try testing.expect(seen_missing_col and seen_extra_col and seen_nullable and seen_type);
+
+    // A table the schema knows and the database does not.
+    {
+        const AbsentBase = schema("SchemaDriftAbsent", .{ .fields = &.{field.String("body")} });
+        const absent_graph = comptime buildGraph(&.{AbsentBase});
+        const absent_infos = absent_graph.types;
+        const absent = try migrate.checkSchema(allocator, drv.asDriver(), absent_infos);
+        defer migrate.freeSchemaDrift(allocator, absent);
+        try testing.expectEqual(@as(usize, 1), absent.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_table, absent[0].kind);
+        // The gate form fails on any of it under `.any`, and only the
+        // read-breaking kinds under `.read_breaking_only`.
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), absent_infos, .any));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), absent_infos, .read_breaking_only));
+    }
+
+    // `checkNullability` is the same traversal, filtered (it drives
+    // `assertNullability` and the report inside `migrateSchema`).
+    const nulls = try migrate.checkNullability(allocator, drv.asDriver(), infos);
+    defer migrate.freeNullabilityDrift(allocator, nulls);
+    // Two: `nul_col` is nullable in the DDL, and so is `typed_col` — whose type
+    // is also wrong, which is why one column can appear under two kinds.
+    try testing.expectEqual(@as(usize, 2), nulls.len);
+    try testing.expectEqualStrings("nul_col", nulls[0].column);
+    try testing.expectEqualStrings("typed_col", nulls[1].column);
+}
+
 test "SQLite: a scan failure names the table and the offending column" {
     // `error.TypeMismatch` on its own names neither, which is the third of four
     // consumer reports in this batch. The diagnosis is emitted through

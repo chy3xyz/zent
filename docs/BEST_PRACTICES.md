@@ -737,6 +737,21 @@ zent: table 'xdaofood_order' column 'remark' is NULL, but field 'remark'
 `migrateSchema` never alters an existing column's nullability: that is a data
 decision (existing NULLs have to go somewhere), so it is reported, not applied.
 
+For the same reason, and covering everything a schema can drift on rather than
+just NULL:
+
+```zig
+const drifts = try zent.sql_schema.checkSchema(alloc, drv.asDriver(), infos);
+defer zent.sql_schema.freeSchemaDrift(alloc, drifts);
+for (drifts) |d| if (d.breaksReads()) std.log.err("{s}.{s}: {s}", .{ d.table, d.column, @tagName(d.kind) });
+// or, as a gate:
+try zent.sql_schema.assertSchema(alloc, drv.asDriver(), infos, .read_breaking_only);
+```
+
+`breaksReads()` is true for a missing table or column and for a column the
+database made nullable under a non-optional field — the drifts that fail reads.
+Type differences and extra columns are reported but do not fail a gate.
+
 If your DDL is a set of `.sql` files and you never call `migrateSchema`, the
 automatic report never runs. Call the check yourself, as a gate:
 

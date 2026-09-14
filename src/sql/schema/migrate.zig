@@ -107,6 +107,179 @@ pub const NullabilityDrift = struct {
     }
 };
 
+/// What the database and the schema disagree about.
+pub const SchemaDrift = struct {
+    table: []const u8,
+    /// Empty for `missing_table`.
+    column: []const u8 = "",
+    kind: Kind,
+    /// For `.nullability`: the schema's view, and the database's.
+    schema_optional: bool = false,
+    db_nullable: bool = false,
+    /// For `.type_mismatch`: the schema's declared type. The database's type is
+    /// on the `ExistingColumn` for the same name — one string here rather than
+    /// two avoids owning it.
+    schema_type: []const u8 = "",
+    /// True when `column` was **duplicated** into this entry and must be freed.
+    ///
+    /// Only `.extra_column` needs it: every other kind names a column that comes
+    /// from `infos` (a comptime literal, stable for the program's life), while an
+    /// extra column exists only in the database's answer, which is freed before
+    /// the drift list reaches the caller — borrowing it there is a
+    /// use-after-free that shows up as garbage in the name.
+    column_owned: bool = false,
+
+    pub const Kind = enum {
+        missing_table,
+        missing_column,
+        extra_column,
+        type_mismatch,
+        nullability,
+    };
+
+    /// Whether this drift makes a *read* fail — the kinds worth blocking a
+    /// deploy over, as opposed to cosmetic agreement.
+    ///
+    /// A missing table or column fails every query that mentions it (the failure
+    /// mode behind "the endpoint quietly returned an empty list for months"), and
+    /// a column the database makes nullable while the schema declares it
+    /// non-optional fails on the first row that actually holds a NULL. An extra
+    /// column and a type difference do not fail reads by themselves.
+    pub fn breaksReads(self: SchemaDrift) bool {
+        return switch (self.kind) {
+            .missing_table, .missing_column => true,
+            .nullability => !self.schema_optional and self.db_nullable,
+            .extra_column, .type_mismatch => false,
+        };
+    }
+};
+
+/// Every non-view entity, compared against the live database: a missing table, a
+/// missing or extra column, a type or nullability difference.
+///
+/// Returns a caller-owned slice (`freeSchemaDrift`); names and types borrow from
+/// `infos` or from comptime literals, so freeing is one call. Foreign keys and
+/// primary keys are **not** compared — PG/MySQL introspection does not read them
+/// yet (see `ISSUES_FROM_ZAPI.md` Z28).
+///
+/// The point is the class of failure this cannot survive silently: a column the
+/// schema believes in but the database does not have makes every query that
+/// mentions it fail, and in a handler that swallows errors it looks like "empty
+/// result" for months. `migrateSchema` adds what is missing, but a consumer whose
+/// DDL lives in `.sql` files never runs it — that consumer calls this.
+pub fn checkSchema(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+) ![]SchemaDrift {
+    var drifts = std.array_list.Managed(SchemaDrift).init(allocator);
+    errdefer drifts.deinit();
+    const dialect = driver.dialect();
+
+    inline for (infos) |info| {
+        if (comptime !info.is_view) {
+            const table = comptime tableFromTypeInfoCrossRef(info, infos);
+            var existing = try getExistingColumns(allocator, driver, table.name);
+            defer freeExistingColumns(allocator, &existing);
+
+            if (existing.items.len == 0) {
+                try drifts.append(.{ .table = table.name, .kind = .missing_table });
+            } else {
+                inline for (table.columns) |col| {
+                    if (getExistingColumnByName(existing.items, col.name)) |db_col| {
+                        const schema_optional = !col.not_null;
+                        const db_nullable = db_nullableOf(db_col);
+                        if (schema_optional != db_nullable) {
+                            try drifts.append(.{
+                                .table = table.name,
+                                .column = col.name,
+                                .kind = .nullability,
+                                .schema_optional = schema_optional,
+                                .db_nullable = db_nullable,
+                            });
+                        }
+                        // Type comparison is text-based and best-effort: SQLite
+                        // is dynamically typed, and its declared type is all the
+                        // metadata there is. `normalizeSqlType` exists for
+                        // exactly this comparison (the ALTER TYPE path uses it).
+                        var schema_buf: [128]u8 = undefined;
+                        var db_buf: [128]u8 = undefined;
+                        const schema_norm = normalizeSqlType(columnSQLType(col, dialect), &schema_buf) catch null;
+                        const db_norm = normalizeSqlType(db_col.sql_type, &db_buf) catch null;
+                        if (schema_norm != null and db_norm != null and
+                            !std.mem.eql(u8, schema_norm.?, db_norm.?))
+                        {
+                            try drifts.append(.{
+                                .table = table.name,
+                                .column = col.name,
+                                .kind = .type_mismatch,
+                                .schema_type = columnSQLType(col, dialect),
+                            });
+                        }
+                    } else {
+                        try drifts.append(.{
+                            .table = table.name,
+                            .column = col.name,
+                            .kind = .missing_column,
+                            .schema_type = columnSQLType(col, dialect),
+                        });
+                    }
+                }
+            }
+
+            // Columns the database has and the schema does not. Reported, never
+            // dropped: `migrateSchema`'s `drop_columns` is the destructive path.
+            for (existing.items) |db_col| {
+                var known = false;
+                inline for (table.columns) |col| {
+                    if (std.mem.eql(u8, col.name, db_col.name)) known = true;
+                }
+                if (!known) {
+                    try drifts.append(.{
+                        .table = table.name,
+                        .column = try allocator.dupe(u8, db_col.name),
+                        .kind = .extra_column,
+                        .column_owned = true,
+                    });
+                }
+            }
+        }
+    }
+    return drifts.toOwnedSlice();
+}
+
+/// Frees the slice and the `.extra_column` names it duplicated; every other
+/// entry borrows from `infos` or from comptime literals (see
+/// `SchemaDrift.column_owned`).
+pub fn freeSchemaDrift(allocator: std.mem.Allocator, drifts: []SchemaDrift) void {
+    for (drifts) |d| {
+        if (d.column_owned) allocator.free(d.column);
+    }
+    allocator.free(drifts);
+}
+
+/// Assert that the schema and the database agree, for a startup step or a CI
+/// job (`migrateSchema`'s own report never runs for a consumer whose DDL is a
+/// set of `.sql` files).
+pub fn assertSchema(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    strictness: DriftStrictness,
+) (sql_driver.Error || error{ SchemaDrift, UnsupportedDialect })!void {
+    const drifts = try checkSchema(allocator, driver, infos);
+    defer freeSchemaDrift(allocator, drifts);
+    for (drifts) |d| {
+        if (strictness == .read_breaking_only and !d.breaksReads()) continue;
+        std.log.warn("zent: schema drift on {s}.{s}: {s}", .{
+            d.table,
+            if (d.column.len > 0) d.column else "(table)",
+            @tagName(d.kind),
+        });
+        return error.SchemaDrift;
+    }
+}
+
 /// Compare every column's nullability between `infos` and the live database.
 ///
 /// Returns a caller-owned slice (free with `freeNullabilityDrift`) of the
@@ -118,31 +291,24 @@ pub fn checkNullability(
     driver: sql_driver.Driver,
     comptime infos: []const TypeInfo,
 ) ![]NullabilityDrift {
-    var drifts = std.array_list.Managed(NullabilityDrift).init(allocator);
-    errdefer drifts.deinit();
+    // One traversal, two views: `checkSchema` is the implementation, this is the
+    // nullability projection of it, kept because that is the shape its callers
+    // (and `assertNullability`) already use.
+    const drifts = try checkSchema(allocator, driver, infos);
+    defer freeSchemaDrift(allocator, drifts);
 
-    inline for (infos) |info| {
-        if (comptime !info.is_view) {
-            const table = comptime tableFromTypeInfoCrossRef(info, infos);
-            var existing = try getExistingColumns(allocator, driver, table.name);
-            defer freeExistingColumns(allocator, &existing);
-
-            inline for (table.columns) |col| {
-                if (getExistingColumnByName(existing.items, col.name)) |db_col| {
-                    const schema_optional = !col.not_null;
-                    if (schema_optional != db_nullableOf(db_col)) {
-                        try drifts.append(.{
-                            .table = table.name,
-                            .column = col.name,
-                            .schema_optional = schema_optional,
-                            .db_nullable = db_nullableOf(db_col),
-                        });
-                    }
-                }
-            }
-        }
+    var out = std.array_list.Managed(NullabilityDrift).init(allocator);
+    errdefer out.deinit();
+    for (drifts) |d| {
+        if (d.kind != .nullability) continue;
+        try out.append(.{
+            .table = d.table,
+            .column = d.column,
+            .schema_optional = d.schema_optional,
+            .db_nullable = d.db_nullable,
+        });
     }
-    return drifts.toOwnedSlice();
+    return out.toOwnedSlice();
 }
 
 /// `db_nullable = NOT not_null`, spelled out because `pk` counts as non-nullable
@@ -1140,6 +1306,8 @@ fn toSnakeCase(name: []const u8) []const u8 {
     }
 }
 
+/// A column as the *database* reports it. Owned: `name` and `sql_type` are
+/// allocated, release the list with `freeExistingColumns`.
 pub const ExistingColumn = struct {
     name: []const u8,
     sql_type: []const u8,
@@ -1155,7 +1323,7 @@ pub const ExistingIndex = struct {
 const IntrospectionError = sql_driver.Error || error{UnsupportedDialect};
 
 /// Query existing columns for a table using dialect-specific metadata.
-fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingColumn) {
+pub fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingColumn) {
     var result = std.array_list.Managed(ExistingColumn).init(allocator);
     errdefer freeExistingColumns(allocator, &result);
 
@@ -1207,7 +1375,7 @@ fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
     return result;
 }
 
-fn freeExistingColumns(allocator: std.mem.Allocator, columns: *std.array_list.Managed(ExistingColumn)) void {
+pub fn freeExistingColumns(allocator: std.mem.Allocator, columns: *std.array_list.Managed(ExistingColumn)) void {
     for (columns.items) |c| {
         allocator.free(c.name);
         allocator.free(c.sql_type);
@@ -1216,7 +1384,7 @@ fn freeExistingColumns(allocator: std.mem.Allocator, columns: *std.array_list.Ma
 }
 
 /// Query existing indexes for a table using dialect-specific metadata.
-fn getExistingIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
+pub fn getExistingIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
     errdefer freeExistingIndexes(allocator, &result);
 
@@ -1263,7 +1431,7 @@ fn getExistingIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
     return result;
 }
 
-fn freeExistingIndexes(allocator: std.mem.Allocator, indexes: *std.array_list.Managed(ExistingIndex)) void {
+pub fn freeExistingIndexes(allocator: std.mem.Allocator, indexes: *std.array_list.Managed(ExistingIndex)) void {
     for (indexes.items) |i| {
         allocator.free(i.name);
     }

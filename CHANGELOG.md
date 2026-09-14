@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`sql_schema.checkSchema` / `assertSchema`, and the introspection behind
+  them, are public** (Z28). `migrateSchema` needs to know what the database
+  currently has, and it already did: `getExistingColumns` (all three dialects,
+  including `is_nullable` and SQLite's PK flag) and `getExistingIndexes`. They
+  were private, so consumers re-implemented the same `information_schema`
+  queries in three separate audit scripts. They are exported now, and the
+  comparison that was only made for NULL is a full report:
+
+  ```zig
+  const drifts = try sql_schema.checkSchema(alloc, drv.asDriver(), infos);
+  // .missing_table | .missing_column | .extra_column | .type_mismatch | .nullability
+  ```
+
+  `SchemaDrift.breaksReads()` marks the kinds that make a *read* fail — a missing
+  table or column (the failure mode behind an endpoint quietly returning an empty
+  list for months), and a column the database makes nullable where the schema
+  declares it non-optional. `assertSchema` is the gate form, with the same
+  `.read_breaking_only` / `.any` split as `assertNullability`. `checkNullability`
+  is now a projection of the same traversal rather than its own loop, so the two
+  cannot disagree.
+
+  Type comparison is text-based and best-effort (`normalizeSqlType`, the same
+  helper the ALTER TYPE path uses), and foreign keys and primary keys are **not**
+  compared — PG/MySQL introspection does not read them yet.
+
+  One bug found while testing it, worth naming because it is the kind this
+  repository keeps hitting: `extra_column` borrowed the column name from the
+  introspection list, which is freed before the caller sees the result — a
+  use-after-free that showed up as a garbage name. Those entries own their name
+  now (`SchemaDrift.column_owned`), and `freeSchemaDrift` frees exactly those.
+
 ## [0.51.0] - 2026-09-15
 
 ### Fixed
