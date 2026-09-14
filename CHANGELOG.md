@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-09-15
+
 ### Fixed
 - **`error.PoolExhausted` now means capacity, and nothing else** (Z27).
   `tryBorrowNoLock` folds every reason it cannot produce a connection into
