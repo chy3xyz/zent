@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-09-15
+
 ### Fixed
 - **A raw predicate containing `OR` could escape an injected scope predicate**
   (Z25). `Where`/`Where-lists` are joined with a bare `" AND "`, so
