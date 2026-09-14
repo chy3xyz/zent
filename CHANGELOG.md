@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-09-15
+
 ### Fixed
 - **`Has{Edge}()`, `NotHas{Edge}()` and `Has{Edge}With(…)` are satisfied
   correctly again — a soft-deleted neighbor no longer counts** (Z25). They are
