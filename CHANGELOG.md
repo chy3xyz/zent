@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-09-15
+
 ### Fixed
 - **A lost PostgreSQL connection is discarded instead of returned to the pool**
   (Z23). `ConnPool` evicts a released connection whose type has a `dead` field —
