@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-09-14
+
 ### Added
 - **`scope.Options.arg_index` and `.marker`, and `sql.Builder.arg_base`**
   (Z22/T1). A `zent.scope` fragment rendered its placeholders from `$1`
