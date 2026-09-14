@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-09-15
+
 ### Added
 - **`sql_schema.checkSchema` / `assertSchema`, and the introspection behind
   them, are public** (Z28). `migrateSchema` needs to know what the database
