@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-09-15
+
 ### Changed
 - **BREAKING for MySQL schemas: `field.String` and `field.Enum` map to
   `VARCHAR(255)` instead of `TEXT`.** MySQL refuses the three things a string
