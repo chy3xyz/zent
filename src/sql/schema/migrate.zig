@@ -171,7 +171,11 @@ pub const SchemaDrift = struct {
     /// `.missing_junction_table` also points it at a comptime literal (the edge
     /// and the junction table name it names are all comptime-known).
     /// `ownsIndexDetail` is the single place that decides which is which. Every
-    /// other kind leaves it empty.
+    /// other kind leaves it empty *except* where a junction is the subject: the
+    /// edge that put the expectation there is comptime-known, so
+    /// `.missing_column` for a junction's own column and
+    /// `.junction_pair_uniqueness` carry a comptime sentence built from it
+    /// (the same literal, not an allocation — see `ownsIndexDetail`).
     index_name: []const u8 = "",
     index_detail: []const u8 = "",
 
@@ -226,15 +230,62 @@ pub const SchemaDrift = struct {
         ///
         /// `table` is the junction table's name (`user_team`), because that is
         /// the relation the reader has to create; the edge that needs it is named
-        /// in `index_detail`. Only the relation's **existence** is asked about,
-        /// exactly as for `missing_view`: its columns, primary key and foreign
-        /// keys are not compared, so a junction table of the right name with the
-        /// wrong shape stays silent here.
+        /// in `index_detail`. Like `missing_view`, this kind is the relation's
+        /// **absence** and nothing else — but a relation that *is* there is not
+        /// left unexamined either: the two columns come back as
+        /// `.missing_column`, the pair's uniqueness as
+        /// `.junction_pair_uniqueness`, and the two foreign keys as
+        /// `.missing_foreign_key`. See `checkSchema` for the shape those three
+        /// compare and for what they deliberately leave alone.
         ///
         /// The relation is asked about on its own, with no gate on the two entity
         /// tables: a database that has never been migrated reports one of these
         /// beside each `missing_table`, not a silent gap.
         missing_junction_table,
+        /// The schema declares an **M2M junction table** whose two columns are
+        /// unique *together* — `junctionTableForEdge` gives it
+        /// `PRIMARY KEY (a_id, b_id)` — and the database has no unique
+        /// constraint forcing that pair.
+        ///
+        /// The other half of a junction table that *exists*. The columns are
+        /// there, so every query over the edge runs and returns rows; what is
+        /// missing is the constraint the pair is keyed by, so the same pair can
+        /// be written twice and the relation query then answers with the same
+        /// neighbour twice. A junction table created before the edge existed, or
+        /// hand-created to the shape of some earlier design (a surrogate `id`,
+        /// no composite key), is what this catches.
+        ///
+        /// Not `unique_constraint`, and not `index_uniqueness`:
+        ///
+        ///   - `unique_constraint` asks the same question about **one** column of
+        ///     a declared entity table (`ColumnDef.unique`), and a pair is not a
+        ///     column — a composite key does not make either half unique;
+        ///   - `index_uniqueness` compares a **named** index the schema declares
+        ///     against the database's index *of that name*. A junction's primary
+        ///     key has no name on the schema side — SQLite does not even keep one
+        ///     — so there is nothing to match on, and the question here is the
+        ///     one `unique_constraint` asks for a column: does **anything** force
+        ///     these two together?
+        ///
+        /// An index that is unique and **unreadable** (an expression key, a
+        /// prefix, a partial index) suppresses the report for the whole junction,
+        /// exactly as it does for `unique_constraint`: such an index may well be
+        /// what forces the pair, so the answer is unknown rather than negative. A
+        /// unique index over the pair **in the other order** does satisfy it —
+        /// `UNIQUE (b, a)` forbids the same duplicates — as does the primary key
+        /// `migrateSchema` creates.
+        ///
+        /// `breaksReads()` is **false**, and the split matters. A junction whose
+        /// *column* is missing (`missing_column`) fails every query over the edge
+        /// outright; a junction that merely cannot hold two identical pairs still
+        /// runs those queries and still answers with the rows the table holds. The
+        /// missing constraint changes whether a *write* is rejected, which is the
+        /// class `unique_constraint` and `missing_foreign_key` are in: reporting
+        /// it through `read_breaking_only` would turn a write constraint into a
+        /// blocked deploy, the widening that mode exists to avoid. (The extra rows
+        /// a duplicate puts on the page are the duplicate write's doing, not the
+        /// read's.)
+        junction_pair_uniqueness,
         /// The schema declares an index the database has under the same name
         /// with a **different key list**. Only reported when the database's
         /// key list could be read reliably (`ExistingIndex.columns_comparable`).
@@ -307,15 +358,23 @@ pub const SchemaDrift = struct {
     /// `missing_table`. An extra column and a type difference do not fail reads
     /// by themselves.
     ///
-    /// None of the four constraint kinds does either: a different key list
+    /// None of the five constraint kinds does either: a different key list
     /// changes how fast a query runs, a different uniqueness changes whether a
     /// *write* is rejected, a missing column constraint changes whether a
-    /// duplicate is rejected, and a missing foreign key changes whether an
-    /// orphan is rejected — a read returns the rows it always returned. So none
-    /// of them may fail `DriftStrictness.read_breaking_only`: that mode exists
-    /// to stop a deploy that would break reads, and widening it into "every
-    /// constraint must match" would convert a performance note, or a write that
-    /// now fails loudly, into an outage. They fail only under `.any`.
+    /// duplicate is rejected, a missing **junction pair** constraint changes
+    /// whether the same neighbour can be linked twice, and a missing foreign key
+    /// changes whether an orphan is rejected — a read returns the rows it always
+    /// returned. So none of them may fail
+    /// `DriftStrictness.read_breaking_only`: that mode exists to stop a deploy
+    /// that would break reads, and widening it into "every constraint must match"
+    /// would convert a performance note, or a write that now fails loudly, into
+    /// an outage. They fail only under `.any`.
+    ///
+    /// A junction is where the split is easiest to get wrong, because one drift
+    /// kind is a broken read and the other is not: a junction table missing a
+    /// **column** the relation query names is `.missing_column` and is
+    /// read-breaking like any other missing column, while a junction that cannot
+    /// hold the same pair twice is `.junction_pair_uniqueness` and is not.
     pub fn breaksReads(self: SchemaDrift) bool {
         return switch (self.kind) {
             .missing_table, .missing_column, .missing_view, .missing_junction_table => true,
@@ -325,6 +384,7 @@ pub const SchemaDrift = struct {
             .index_columns,
             .index_uniqueness,
             .unique_constraint,
+            .junction_pair_uniqueness,
             .missing_foreign_key,
             => false,
         };
@@ -362,23 +422,57 @@ pub const SchemaDrift = struct {
 /// A caller that wants to compare definitions can read them with
 /// `getExistingViews` and normalize per dialect; that judgement is theirs.
 ///
-/// **M2M junction tables** (`.missing_junction_table`) get the same one
-/// question. An M2M edge carries no FK column of its own — `migrateSchema`
-/// creates a junction table named after both sides (`junctionTableForEdge`) and
-/// the relation query reads it — so a junction that was never created, or was
-/// dropped out of band, leaves `SELECT` over that edge failing with "no such
-/// table" while this check stayed green. Only edges that need an implicit
-/// junction are looked at: `.relation == .m2m` **and** no `Through`, which is
-/// the condition `migrateSchema` creates them under. An explicit edge schema is
-/// a declared entity and is checked as one; O2M and O2O edges have no junction
-/// table at all (their FK is an entity-table column, which `missing_column` and
-/// `missing_foreign_key` cover).
+/// **M2M junction tables** are asked *two* questions, and the split between them
+/// is the same one a view draws and no further. An M2M edge carries no FK column
+/// of its own — `migrateSchema` creates a junction table named after both sides
+/// (`junctionTableForEdge`) and the relation query reads it — so a junction that
+/// was never created, or was dropped out of band, leaves `SELECT` over that edge
+/// failing with "no such table" while this check stayed green. That is
+/// `.missing_junction_table`, reported when no relation of the derived name
+/// exists.
 ///
-/// The report names the junction table in `table` and the edge that needs it in
-/// `index_detail`; like a view, the relation's **shape is never compared**, so a
-/// junction table of the right name with the wrong columns or keys is not
-/// reported. Both sides of a symmetric M2M edge produce the same junction table
-/// name, and it is reported once.
+/// A relation that **does** exist is not left there, because a junction table of
+/// the right name with the wrong shape fails the same query with `no such
+/// column` (the failure mode `missing_column` exists for), and one without the
+/// composite key `junctionTableForEdge` gives it accepts the same pair twice and
+/// answers the relation query with the same neighbour twice. So a present
+/// junction table is compared, **against the shape `migrateSchema` creates and
+/// `buildEdgeStep` reads**, on exactly three things:
+///
+///   - its two columns — `.missing_column`, `schema_type` `INTEGER`, and
+///     read-breaking like any other missing column;
+///   - the pair's uniqueness — `.junction_pair_uniqueness` (`PRIMARY KEY
+///     (a_id, b_id)` in the junction's own definition), a *write* constraint and
+///     so not read-breaking;
+///   - its two foreign keys — `.missing_foreign_key`, by shape like every other
+///     foreign key, and reported in that direction only.
+///
+/// The columns' **type** and **NOT NULL**, and any **extra** column the database
+/// carries (a `created_at`, a surrogate `id`), are deliberately not compared.
+/// The junction's `INTEGER` is a *derivation* — `junctionTableForEdge` writes it,
+/// the consumer never declared it — and neither a wider type nor an extra column
+/// changes which relation the query reads, which is what this check is about. A
+/// column the query names and the table does not have is the case that fails it,
+/// and that is `.missing_column`. **Nothing here repairs**: a junction table is
+/// created when it is absent and never reshaped, so these reports are for the
+/// consumer to act on, exactly like `.unique_constraint` and
+/// `.missing_foreign_key`.
+///
+/// A junction whose name a **view** carries is compared on its columns alone.
+/// `missing_junction_table` accepts any relation of the name, and a view can
+/// carry neither a primary key nor a foreign key: asking would report
+/// constraints no view could ever have, which is the false report this module's
+/// comparisons are written to avoid (`getExistingViews` is the probe, and it
+/// answers "is there a view of this name" on all three dialects).
+///
+/// Only edges that need an implicit junction are looked at: `.relation == .m2m`
+/// **and** no `Through`, which is the condition `migrateSchema` creates them
+/// under. An explicit edge schema is a declared entity and is checked as one;
+/// O2M and O2O edges have no junction table at all (their FK is an entity-table
+/// column, which `missing_column` and `missing_foreign_key` cover). The report
+/// names the junction table in `table` and the edge that needs it in
+/// `index_detail`. Both sides of a symmetric M2M edge produce the same junction
+/// table name, and it is reported once.
 ///
 /// The existence answer is `getExistingColumns`, the same relation probe
 /// `migrateSchema` uses to re-create a view that was dropped out of band: it
@@ -695,6 +789,14 @@ pub fn checkSchema(
                                 .kind = .missing_junction_table,
                                 .index_detail = comptime missingJunctionTableDetail(info, e),
                             });
+                        } else {
+                            // A relation *is* there, so the shape questions get
+                            // asked. They are the same three the entity loop asks
+                            // of a table the schema declares, against the shape
+                            // `junctionTableForEdge` derives — the definition
+                            // `migrateSchema` creates the table from and
+                            // `buildEdgeStep` builds the relation query against.
+                            try appendJunctionShapeDrifts(allocator, driver, &drifts, info, e, junction_relation.items);
                         }
                     }
                 }
@@ -702,6 +804,94 @@ pub fn checkSchema(
         }
     }
     return drifts.toOwnedSlice();
+}
+
+/// Compare a **present** junction table against the shape the M2M edge derives,
+/// and append what differs. `existing` is the relation's column list, which the
+/// caller has already read (a missing relation is `.missing_junction_table` and
+/// never reaches here).
+///
+/// The three questions, and nothing else — see `checkSchema` for why each is in
+/// and what is deliberately out:
+///
+///   - the relation query names both columns; a column that is not there fails
+///     every query over the edge, so it is `.missing_column` and read-breaking;
+///   - the junction's `PRIMARY KEY (a_id, b_id)` makes the *pair* unique, so a
+///     database with nothing forcing it is `.junction_pair_uniqueness` — the
+///     report `unique_constraint` gives a single column, for two;
+///   - the two foreign keys are `.missing_foreign_key`, by shape, in the same
+///     one direction the entity loop reports them.
+///
+/// **A relation that is a view is compared on its columns alone.** The existence
+/// probe accepts any relation of the junction's name, and a view can carry
+/// neither a primary key nor a foreign key: the constraint questions would
+/// report something no view could ever have. `getExistingViews` answers "is
+/// there a view of this name" on all three dialects, and the cost is one catalog
+/// query per junction table — paid only by a schema that has junctions at all.
+///
+/// There is no cascade short-circuit: a junction table missing a column still
+/// gets the uniqueness and foreign-key reports its indexes and constraints
+/// answer for. They are three separate facts a hand-fix has to cover, and with
+/// `migrateSchema` deliberately not reshaping junction tables, this report is
+/// the only place that says what the shape should have been.
+fn appendJunctionShapeDrifts(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    drifts: *std.array_list.Managed(SchemaDrift),
+    comptime info: TypeInfo,
+    comptime edge: EdgeInfo,
+    existing: []const ExistingColumn,
+) !void {
+    const jtable = comptime junctionTableForEdge(edge, info);
+    const dialect = driver.dialect();
+
+    inline for (jtable.columns) |col| {
+        if (getExistingColumnByName(existing, col.name) == null) {
+            try drifts.append(.{
+                .table = jtable.name,
+                .column = col.name,
+                .kind = .missing_column,
+                .schema_type = columnSQLType(col, dialect),
+                .index_detail = comptime missingJunctionColumnDetail(info, edge, col.name),
+            });
+        }
+    }
+
+    var views = try getExistingViews(allocator, driver, jtable.name);
+    defer freeExistingViews(allocator, &views);
+    if (views.items.len > 0) return;
+
+    var existing_idxs = try getExistingIndexes(allocator, driver, jtable.name);
+    defer freeExistingIndexes(allocator, &existing_idxs);
+
+    // The same escape hatch the column UNIQUE check uses, for the same reason: a
+    // *unique* index whose key list cannot be read (an expression, a prefix, a
+    // partial index) may well be what forces this pair, so the answer is unknown
+    // rather than negative — and a false report blocks a deploy, while a missed
+    // one is a log line nobody reads.
+    if (!hasUnreadableUniqueIndex(existing_idxs.items) and
+        !indexForcesPairAlone(existing_idxs.items, jtable.columns[0].name, jtable.columns[1].name))
+    {
+        try drifts.append(.{
+            .table = jtable.name,
+            .kind = .junction_pair_uniqueness,
+            .index_detail = comptime junctionPairUniquenessDetail(info, edge),
+        });
+    }
+
+    var existing_fks = try getExistingForeignKeys(allocator, driver, jtable.name);
+    defer freeExistingForeignKeys(allocator, &existing_fks);
+
+    inline for (jtable.foreign_keys) |fk| {
+        if (!foreignKeyPresent(existing_fks.items, fk)) {
+            try drifts.append(.{
+                .table = jtable.name,
+                .column = if (fk.columns.len > 0) fk.columns[0] else "",
+                .kind = .missing_foreign_key,
+                .index_detail = try foreignKeyDetailAlloc(allocator, fk),
+            });
+        }
+    }
 }
 
 /// True when the table has any column the field-level UNIQUE check must look at
@@ -751,6 +941,25 @@ fn indexForcesColumnAlone(indexes: []const ExistingIndex, column: []const u8) bo
     for (indexes) |idx| {
         if (!idx.unique or !idx.columns_comparable) continue;
         if (idx.columns.len == 1 and std.mem.eql(u8, idx.columns[0], column)) return true;
+    }
+    return false;
+}
+
+/// Whether some unique index forces exactly the pair `a`, `b` — and nothing else
+/// — to be unique, which is what a junction table's `PRIMARY KEY (a, b)` asks the
+/// database to enforce.
+///
+/// The **order is not part of the question**: `UNIQUE (a, b)` and `UNIQUE (b, a)`
+/// reject the same duplicate pairs, so reading the reversed index as a
+/// difference would report a constraint the database does enforce. Anything
+/// wider does not satisfy it — a `UNIQUE (a, b, c)` accepts two rows sharing
+/// `(a, b)` as soon as `c` differs, which is not the pair the junction is keyed
+/// by.
+fn indexForcesPairAlone(indexes: []const ExistingIndex, a: []const u8, b: []const u8) bool {
+    for (indexes) |idx| {
+        if (!idx.unique or !idx.columns_comparable or idx.columns.len != 2) continue;
+        if (std.mem.eql(u8, idx.columns[0], a) and std.mem.eql(u8, idx.columns[1], b)) return true;
+        if (std.mem.eql(u8, idx.columns[0], b) and std.mem.eql(u8, idx.columns[1], a)) return true;
     }
     return false;
 }
@@ -807,9 +1016,10 @@ const missingViewDriftDetail = "schema declares the view, database has no relati
 /// declares the edge. The expected columns are named for the consumer that
 /// creates the table by hand instead of running `migrateSchema`.
 ///
-/// The last clause is the boundary of this check: existence is all that is
-/// asked about, so a junction table of the right name with the wrong shape is
-/// not reported here (see `SchemaDrift.Kind.missing_junction_table`).
+/// The last clause is the boundary of this check: *this* kind is about the
+/// relation's absence, so a relation of that name is not reported here — it is
+/// compared on its shape by the reports beside it, which the clause names so the
+/// reader does not take the silence for completeness.
 fn missingJunctionTableDetail(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
     comptime {
         const source_table = info.table_name;
@@ -822,7 +1032,56 @@ fn missingJunctionTableDetail(comptime info: TypeInfo, comptime edge: EdgeInfo) 
         return "schema declares the M2M edge " ++ left ++ " <-> " ++ right ++
             ", database has no relation named " ++ jtable.name ++
             " (expected columns " ++ jtable.columns[0].name ++ ", " ++ jtable.columns[1].name ++
-            "); migrateSchema creates it, and only its existence is compared";
+            "); migrateSchema creates it, and a relation of that name is then compared on its columns, pair uniqueness and foreign keys";
+    }
+}
+
+/// "schema declares the M2M edge jc_member <-> jc_tag, which joins through
+/// jc_member_jc_tag (expected columns jc_member_id, jc_tag_id)" — the clause the
+/// two shape reports of a **present** junction share. A comptime literal, like
+/// everything it is built from (see `ownsIndexDetail`).
+///
+/// A junction table is not a `TypeInfo` and its columns are not `field`s, so
+/// neither the table nor the column in a report can be found in the consumer's
+/// schema. This clause is what does let the reader find the expectation: it names
+/// the edge they declared, and the relation and columns `migrateSchema` derives
+/// from it.
+fn junctionShapeClause(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
+    comptime {
+        const source_table = info.table_name;
+        const target_table = toSnakeCase(edge.target_name);
+        const a_first = std.mem.lessThan(u8, source_table, target_table);
+        const left = if (a_first) source_table else target_table;
+        const right = if (a_first) target_table else source_table;
+        const jtable = junctionTableForEdge(edge, info);
+
+        return "schema declares the M2M edge " ++ left ++ " <-> " ++ right ++
+            ", which joins through " ++ jtable.name ++
+            " (expected columns " ++ jtable.columns[0].name ++ ", " ++ jtable.columns[1].name ++ ")";
+    }
+}
+
+/// The `.missing_column` report when the column belongs to an **implicit
+/// junction table**. A comptime literal (see `ownsIndexDetail`), and the stake in
+/// one clause: the relation query names this column, so the database missing it
+/// fails every query over the edge rather than returning fewer rows.
+fn missingJunctionColumnDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime column: []const u8) []const u8 {
+    comptime {
+        return junctionShapeClause(info, edge) ++ "; the relation query names " ++ column;
+    }
+}
+
+/// The `.junction_pair_uniqueness` report, spelling out what the schema asks for
+/// and what goes wrong without it. A comptime literal (see `ownsIndexDetail`).
+///
+/// The *consequence* is in the sentence because it is the only part a reader
+/// cannot get from the drift kind: a duplicate pair is a write the database
+/// accepts, and it shows up on the read side as a neighbour returned twice.
+fn junctionPairUniquenessDetail(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
+    comptime {
+        return junctionShapeClause(info, edge) ++
+            ", whose primary key is that pair; the database has no unique constraint over the two columns, " ++
+            "so a duplicate pair is accepted and the relation query then returns the same neighbour twice";
     }
 }
 
@@ -899,8 +1158,11 @@ fn indexUniquenessDetailAlloc(allocator: std.mem.Allocator, schema_unique: bool,
 /// the two index kinds, whose sentence describes a difference read from the
 /// database, and `.missing_foreign_key`, whose sentence names a shape built at
 /// runtime. `.unique_constraint`, `.missing_view` and `.missing_junction_table`
-/// point the field at a `const`/comptime literal instead and must not be freed;
-/// every other kind leaves it empty.
+/// point the field at a `const`/comptime literal instead and must not be freed,
+/// as do the two junction-shape reports of `.missing_column` and
+/// `.junction_pair_uniqueness` (their sentence is built from the comptime edge
+/// and junction table — see `missingJunctionColumnDetail`); every other kind
+/// leaves it empty.
 fn ownsIndexDetail(kind: SchemaDrift.Kind) bool {
     return switch (kind) {
         .index_columns, .index_uniqueness, .missing_foreign_key => true,
@@ -941,7 +1203,10 @@ pub fn assertSchema(
                 d.index_name
             else if (d.kind == .missing_view)
                 "(view)"
-            else if (d.kind == .missing_junction_table)
+                // Both junction kinds: the relation's absence, and the pair nothing
+                // keys. `table` carries no column for either, so without this branch
+                // the line would read "(table)" for a junction table.
+            else if (d.kind == .missing_junction_table or d.kind == .junction_pair_uniqueness)
                 "(junction)"
             else
                 "(table)",
@@ -6035,7 +6300,8 @@ test "checkSchema reports a missing M2M junction table, and read_breaking_only s
         try std.testing.expectEqualStrings("", drifts[0].column);
         try std.testing.expectEqualStrings(
             "schema declares the M2M edge jc_member <-> jc_tag, database has no relation named jc_member_jc_tag " ++
-                "(expected columns jc_member_id, jc_tag_id); migrateSchema creates it, and only its existence is compared",
+                "(expected columns jc_member_id, jc_tag_id); migrateSchema creates it, and a relation of that name " ++
+                "is then compared on its columns, pair uniqueness and foreign keys",
             drifts[0].index_detail,
         );
         // The detail is a comptime literal, not an allocation: freeing the
@@ -6050,20 +6316,12 @@ test "checkSchema reports a missing M2M junction table, and read_breaking_only s
         try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
     }
 
-    // A **relation** of that name is what is asked about, never its shape: a
-    // table carrying the junction's name with the wrong columns is silent, the
-    // same boundary `missing_view` draws for `view_sql`.
-    _ = try drv.exec("CREATE TABLE jc_member_jc_tag (id INTEGER PRIMARY KEY)", &.{});
-    {
-        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
-        defer freeSchemaDrift(std.testing.allocator, drifts);
-        try std.testing.expectEqual(@as(usize, 0), drifts.len);
-    }
+    // A relation that *is* there never reaches this kind — what it is compared
+    // on instead is the subject of the test below.
 
     // `migrateSchema` heals it: the recorded `create_junction` version is
     // present but the relation is gone, so the junction table is re-created —
     // the out-of-band-drop path it already has for tables and views.
-    _ = try drv.exec("DROP TABLE jc_member_jc_tag", &.{});
     try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
     const healed = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
     defer freeSchemaDrift(std.testing.allocator, healed);
@@ -6074,6 +6332,264 @@ test "checkSchema reports a missing M2M junction table, and read_breaking_only s
     try std.testing.expectEqual(@as(usize, 2), junction.items.len);
     try std.testing.expectEqualStrings("jc_member_id", junction.items[0].name);
     try std.testing.expectEqualStrings("jc_tag_id", junction.items[1].name);
+}
+
+test "indexForcesPairAlone asks about the pair, in either order" {
+    const pair = ExistingIndex{ .name = "i", .unique = true, .columns = &.{ "a", "b" }, .columns_comparable = true };
+    try std.testing.expect(indexForcesPairAlone(&.{pair}, "a", "b"));
+    // `UNIQUE (b, a)` rejects the same duplicate pairs, so reading the reversed
+    // key list as a difference would report a constraint the database does
+    // enforce — the false report that blocks a deploy.
+    try std.testing.expect(indexForcesPairAlone(&.{pair}, "b", "a"));
+
+    // Wider is not the same question: two rows may share `(a, b)` as soon as `c`
+    // differs, which is not the key a junction is built on.
+    const wider = ExistingIndex{ .name = "i", .unique = true, .columns = &.{ "a", "b", "c" }, .columns_comparable = true };
+    try std.testing.expect(!indexForcesPairAlone(&.{wider}, "a", "b"));
+    // Narrower neither: one column of the pair is not the pair.
+    const single = ExistingIndex{ .name = "i", .unique = true, .columns = &.{"a"}, .columns_comparable = true };
+    try std.testing.expect(!indexForcesPairAlone(&.{single}, "a", "b"));
+    // A non-unique index forces nothing, and an unreadable one is not an answer
+    // at all (the caller skips the report while one is present).
+    const not_unique = ExistingIndex{ .name = "i", .unique = false, .columns = &.{ "a", "b" }, .columns_comparable = true };
+    try std.testing.expect(!indexForcesPairAlone(&.{not_unique}, "a", "b"));
+    const unreadable = ExistingIndex{ .name = "i", .unique = true, .columns = &.{}, .columns_comparable = false };
+    try std.testing.expect(!indexForcesPairAlone(&.{unreadable}, "a", "b"));
+    try std.testing.expect(hasUnreadableUniqueIndex(&.{unreadable}));
+}
+
+test "checkSchema compares a present M2M junction table's shape (SQLite)" {
+    // `missing_junction_table` answers "is the relation there"; this pins what
+    // happens when it *is*: the table is compared against the shape
+    // `junctionTableForEdge` derives and `migrateSchema` creates — the two
+    // columns, the pair's composite key, the two foreign keys — because a
+    // junction of the right name with the wrong shape fails the relation query
+    // (`no such column`) or accepts the same pair twice.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    const JsMemberBase = schema("JsMember", .{ .fields = &.{field.String("name")} });
+    const JsTagBase = schema("JsTag", .{ .fields = &.{field.String("label")} });
+    const JsMember = struct {
+        pub const schema_name = JsMemberBase.schema_name;
+        pub const fields = JsMemberBase.fields;
+        pub const edges = &.{edge.To("tags", JsTagBase)};
+        pub const indexes = JsMemberBase.indexes;
+    };
+    const JsTag = struct {
+        pub const schema_name = JsTagBase.schema_name;
+        pub const fields = JsTagBase.fields;
+        pub const edges = &.{edge.To("members", JsMemberBase)};
+        pub const indexes = JsTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ JsMember, JsTag });
+    const infos = graph.types;
+
+    // Migrated: the junction table `migrateSchema` created is the reference
+    // shape, and it has to stay silent on every gate — if its own primary key
+    // and foreign keys did not satisfy these three checks, every consumer with
+    // an M2M edge would see a false drift.
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+    {
+        const agreeing = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, agreeing);
+        try std.testing.expectEqual(@as(usize, 0), agreeing.len);
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .any);
+    }
+
+    // A table of the right name with neither the columns nor the keys: two
+    // missing columns the relation query would fail on, the pair nothing forces
+    // unique, and the two foreign keys that are not there.
+    _ = try drv.exec("DROP TABLE js_member_js_tag", &.{});
+    _ = try drv.exec("CREATE TABLE js_member_js_tag (id INTEGER PRIMARY KEY)", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 5), drifts.len);
+
+        var missing_columns: usize = 0;
+        var pair_uniqueness: usize = 0;
+        var missing_fks: usize = 0;
+        for (drifts) |d| {
+            try std.testing.expectEqualStrings("js_member_js_tag", d.table);
+            switch (d.kind) {
+                .missing_column => {
+                    missing_columns += 1;
+                    // The relation query names this column, so the read fails
+                    // outright — the `missing_column` half of the junction.
+                    try std.testing.expect(d.breaksReads());
+                    try std.testing.expectEqualStrings("INTEGER", d.schema_type);
+                    // The column is not a `field` anywhere in the schema, so the
+                    // report has to say which edge put the expectation there.
+                    const prefix = "schema declares the M2M edge js_member <-> js_tag, which joins through " ++
+                        "js_member_js_tag (expected columns js_member_id, js_tag_id); the relation query names ";
+                    try std.testing.expect(std.mem.startsWith(u8, d.index_detail, prefix));
+                    try std.testing.expectEqualStrings(d.column, d.index_detail[prefix.len..]);
+                    try std.testing.expect(
+                        std.mem.eql(u8, d.column, "js_member_id") or std.mem.eql(u8, d.column, "js_tag_id"),
+                    );
+                },
+                .junction_pair_uniqueness => {
+                    pair_uniqueness += 1;
+                    try std.testing.expectEqualStrings("", d.column);
+                    // A write constraint, not a broken read: the queries still run.
+                    try std.testing.expect(!d.breaksReads());
+                    try std.testing.expectEqualStrings(
+                        "schema declares the M2M edge js_member <-> js_tag, which joins through js_member_js_tag " ++
+                            "(expected columns js_member_id, js_tag_id), whose primary key is that pair; the database " ++
+                            "has no unique constraint over the two columns, so a duplicate pair is accepted and the " ++
+                            "relation query then returns the same neighbour twice",
+                        d.index_detail,
+                    );
+                },
+                .missing_foreign_key => {
+                    missing_fks += 1;
+                    try std.testing.expect(!d.breaksReads());
+                    try std.testing.expect(std.mem.indexOf(u8, d.index_detail, "database has none") != null);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), missing_columns);
+        try std.testing.expectEqual(@as(usize, 1), pair_uniqueness);
+        try std.testing.expectEqual(@as(usize, 2), missing_fks);
+
+        // The whole point of the split: only the missing columns may block a
+        // deploy, and they do.
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only));
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The columns are there but nothing keys the pair and nothing points it at
+    // the two entity tables. Every query over the edge runs, so the
+    // read-breaking gate passes — and `.any` still reports what a hand-fix has
+    // to cover.
+    _ = try drv.exec("DROP TABLE js_member_js_tag", &.{});
+    _ = try drv.exec("CREATE TABLE js_member_js_tag (js_member_id INTEGER NOT NULL, js_tag_id INTEGER NOT NULL, created_at INTEGER)", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 3), drifts.len);
+        for (drifts) |d| {
+            try std.testing.expect(d.kind == .junction_pair_uniqueness or d.kind == .missing_foreign_key);
+            try std.testing.expect(!d.breaksReads());
+        }
+        // The extra `created_at` column is deliberately not drift: it changes
+        // nothing the relation query reads, and the schema's junction shape is a
+        // derivation, not a declaration the consumer chose.
+        for (drifts) |d| try std.testing.expect(!std.mem.eql(u8, d.column, "created_at"));
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The pair keyed the other way round satisfies the composite key: the two
+    // orders reject the same duplicates. The foreign keys are still missing, so
+    // the count is two — and the uniqueness report is gone.
+    _ = try drv.exec("DROP TABLE js_member_js_tag", &.{});
+    _ = try drv.exec("CREATE TABLE js_member_js_tag (js_member_id INTEGER NOT NULL, js_tag_id INTEGER NOT NULL, PRIMARY KEY (js_tag_id, js_member_id))", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 2), drifts.len);
+        for (drifts) |d| try std.testing.expectEqual(SchemaDrift.Kind.missing_foreign_key, d.kind);
+    }
+
+    // A unique index it cannot read may be what forces the pair, so the
+    // uniqueness question has no answer and the report stays silent — the same
+    // erring-towards-silence rule the column UNIQUE check follows.
+    _ = try drv.exec("DROP TABLE js_member_js_tag", &.{});
+    _ = try drv.exec("CREATE TABLE js_member_js_tag (js_member_id INTEGER NOT NULL, js_tag_id INTEGER NOT NULL)", &.{});
+    _ = try drv.exec("CREATE UNIQUE INDEX js_partial ON js_member_js_tag (js_member_id, js_tag_id) WHERE js_member_id > 0", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        for (drifts) |d| try std.testing.expect(d.kind != .junction_pair_uniqueness);
+    }
+
+    // The shape `migrateSchema` itself creates is the one accepted, foreign keys
+    // and all — hand-created here, as a consumer with a `.sql` DDL would.
+    _ = try drv.exec("DROP TABLE js_member_js_tag", &.{});
+    _ = try drv.exec(
+        "CREATE TABLE js_member_js_tag (" ++
+            "js_member_id INTEGER NOT NULL, js_tag_id INTEGER NOT NULL, " ++
+            "PRIMARY KEY (js_member_id, js_tag_id), " ++
+            "FOREIGN KEY (js_member_id) REFERENCES js_member (id) ON DELETE CASCADE ON UPDATE CASCADE, " ++
+            "FOREIGN KEY (js_tag_id) REFERENCES js_tag (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+        &.{},
+    );
+    {
+        const agreeing = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, agreeing);
+        try std.testing.expectEqual(@as(usize, 0), agreeing.len);
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .any);
+    }
+}
+
+test "checkSchema compares a junction served by a view on its columns alone (SQLite)" {
+    // The existence probe accepts any relation of the junction's name, so a view
+    // that exposes the two columns is a junction this check must not report on:
+    // a view can carry neither a primary key nor a foreign key, and asking would
+    // report two foreign keys and a primary key no view could ever have — the
+    // false report that blocks a deploy.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    const JvMemberBase = schema("JvMember", .{ .fields = &.{field.String("name")} });
+    const JvTagBase = schema("JvTag", .{ .fields = &.{field.String("label")} });
+    const JvMember = struct {
+        pub const schema_name = JvMemberBase.schema_name;
+        pub const fields = JvMemberBase.fields;
+        pub const edges = &.{edge.To("tags", JvTagBase)};
+        pub const indexes = JvMemberBase.indexes;
+    };
+    const JvTag = struct {
+        pub const schema_name = JvTagBase.schema_name;
+        pub const fields = JvTagBase.fields;
+        pub const edges = &.{edge.To("members", JvMemberBase)};
+        pub const indexes = JvTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ JvMember, JvTag });
+    const infos = graph.types;
+
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+    _ = try drv.exec("DROP TABLE jv_member_jv_tag", &.{});
+    _ = try drv.exec(
+        "CREATE VIEW jv_member_jv_tag AS SELECT id AS jv_member_id, id AS jv_tag_id FROM jv_member",
+        &.{},
+    );
+    {
+        const agreeing = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, agreeing);
+        try std.testing.expectEqual(@as(usize, 0), agreeing.len);
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .any);
+    }
+
+    // The columns are still compared: a view that does not expose the names the
+    // relation query selects fails it exactly as a table would.
+    _ = try drv.exec("DROP VIEW jv_member_jv_tag", &.{});
+    _ = try drv.exec("CREATE VIEW jv_member_jv_tag AS SELECT id AS member_ref, id AS tag_ref FROM jv_member", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 2), drifts.len);
+        for (drifts) |d| {
+            try std.testing.expectEqual(SchemaDrift.Kind.missing_column, d.kind);
+            try std.testing.expect(d.breaksReads());
+        }
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only));
+    }
 }
 
 test "checkSchema needs no junction table for an M2M edge with an explicit edge schema (SQLite)" {

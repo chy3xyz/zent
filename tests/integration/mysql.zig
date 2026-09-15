@@ -3997,6 +3997,136 @@ test "MySQL: checkSchema reports a missing M2M junction table" {
     try testing.expectEqual(@as(usize, 0), healed.len);
 }
 
+test "MySQL: checkSchema reports a present M2M junction table whose shape is wrong" {
+    // The other half of the junction check: a relation of the right *name* is
+    // not a junction table. A missing column fails the relation query with
+    // `Unknown column`, and a table with nothing keying the pair accepts the
+    // same link twice. Both were silent while only existence was compared.
+    //
+    // Nothing here depends on which server this file runs against (MySQL 8/9
+    // locally, MariaDB 10.11 in CI): the DDL is plain and both servers report a
+    // composite primary key as `PRIMARY` in `information_schema.statistics` and
+    // the two foreign keys through `key_column_usage`, which is what the three
+    // comparisons read. The only server-specific value in reach, the driver's
+    // error name for a `SELECT` over the wrong shape, is deliberately not
+    // asserted (see the loose `if (…) |rows| … else |_| {}` below).
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Leftovers from an interrupted run. The junction table goes first: it
+    // holds foreign keys to both entity tables. The cleanup `defer`s are
+    // registered in the opposite order for the same reason — they run in
+    // reverse, so the junction table (registered last) is dropped first.
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_js_my_shape_zent_js_my_tag", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_js_my_shape", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_js_my_tag", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_js_my_tag", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_js_my_shape", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_js_my_shape_zent_js_my_tag", &.{}) catch {};
+
+    const ZentJsMyShapeBase = schema("ZentJsMyShape", .{ .fields = &.{field.String("name")} });
+    const ZentJsMyTagBase = schema("ZentJsMyTag", .{ .fields = &.{field.String("label")} });
+    const ZentJsMyShape = struct {
+        pub const schema_name = ZentJsMyShapeBase.schema_name;
+        pub const fields = ZentJsMyShapeBase.fields;
+        pub const edges = &.{edge.To("tags", ZentJsMyTagBase)};
+        pub const indexes = ZentJsMyShapeBase.indexes;
+    };
+    const ZentJsMyTag = struct {
+        pub const schema_name = ZentJsMyTagBase.schema_name;
+        pub const fields = ZentJsMyTagBase.fields;
+        pub const edges = &.{edge.To("shapes", ZentJsMyShapeBase)};
+        pub const indexes = ZentJsMyTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ ZentJsMyShape, ZentJsMyTag });
+    const infos = graph.types;
+
+    // The junction table `migrateSchema` builds is the reference shape, and it
+    // has to satisfy all three comparisons — the composite primary key arrives
+    // as `PRIMARY` in `information_schema.statistics`, which is where the pair
+    // uniqueness is read from.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // Hand-created with neither the columns nor the keys: two missing columns,
+    // the pair nothing forces unique, two foreign keys that are not there.
+    _ = try drv.exec("DROP TABLE zent_js_my_shape_zent_js_my_tag", &.{});
+    _ = try drv.exec("CREATE TABLE zent_js_my_shape_zent_js_my_tag (id INTEGER PRIMARY KEY)", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 5), drifts.len);
+
+        var missing_columns: usize = 0;
+        var pair_uniqueness: usize = 0;
+        var missing_fks: usize = 0;
+        for (drifts) |d| {
+            try testing.expectEqualStrings("zent_js_my_shape_zent_js_my_tag", d.table);
+            switch (d.kind) {
+                .missing_column => {
+                    missing_columns += 1;
+                    try testing.expect(d.breaksReads());
+                },
+                .junction_pair_uniqueness => pair_uniqueness += 1,
+                .missing_foreign_key => missing_fks += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try testing.expectEqual(@as(usize, 2), missing_columns);
+        try testing.expectEqual(@as(usize, 1), pair_uniqueness);
+        try testing.expectEqual(@as(usize, 2), missing_fks);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // Right columns, no key over the pair and no foreign keys: the relation
+    // query runs, so `read_breaking_only` passes while `.any` reports.
+    _ = try drv.exec("DROP TABLE zent_js_my_shape_zent_js_my_tag", &.{});
+    _ = try drv.exec("CREATE TABLE zent_js_my_shape_zent_js_my_tag (zent_js_my_shape_id INTEGER NOT NULL, zent_js_my_tag_id INTEGER NOT NULL)", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 3), drifts.len);
+        for (drifts) |d| {
+            try testing.expect(d.kind == .junction_pair_uniqueness or d.kind == .missing_foreign_key);
+            try testing.expect(!d.breaksReads());
+        }
+        // The relation query really does run — the stake behind `breaksReads`
+        // being false for these two kinds.
+        if (drv.query("SELECT zent_js_my_shape_id, zent_js_my_tag_id FROM zent_js_my_shape_zent_js_my_tag", &.{})) |rows| {
+            var r = rows;
+            r.deinit();
+        } else |_| return error.TestUnexpectedResult;
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The shape the junction should have had, created by hand — the only thing
+    // that makes the check green again, since `migrateSchema` never reshapes a
+    // junction table.
+    _ = try drv.exec("DROP TABLE zent_js_my_shape_zent_js_my_tag", &.{});
+    _ = try drv.exec(
+        "CREATE TABLE zent_js_my_shape_zent_js_my_tag (" ++
+            "zent_js_my_shape_id INTEGER NOT NULL, zent_js_my_tag_id INTEGER NOT NULL, " ++
+            "PRIMARY KEY (zent_js_my_shape_id, zent_js_my_tag_id), " ++
+            "FOREIGN KEY (zent_js_my_shape_id) REFERENCES zent_js_my_shape (id) ON DELETE CASCADE ON UPDATE CASCADE, " ++
+            "FOREIGN KEY (zent_js_my_tag_id) REFERENCES zent_js_my_tag (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+        &.{},
+    );
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+}
+
 test "MySQL: getExistingIndexes reads the key columns in order" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
