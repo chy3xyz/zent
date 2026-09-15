@@ -1545,9 +1545,21 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             }
         }
 
-        const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
+        // `NoPredicate` is the builder's own refusal, not a driver failure:
+        // naming it keeps the bulk-delete contract visible in the signature
+        // instead of letting `mapBuildError` fold it into `DriverFailed`.
+        const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed, NoPredicate };
 
         /// Execute the bulk DELETE and return rows affected.
+        ///
+        /// Fails with `error.NoPredicate` when the call constrains no rows at
+        /// all (no `Where`, and nothing injected by a policy or interceptor):
+        /// `DELETE FROM <table>` with no `WHERE` deletes every row on a
+        /// hard-deleting entity, and the identical call on a soft-deleting one
+        /// used to delete none — so the shape is refused by name rather than
+        /// resolved in either direction. A caller who does mean every row says
+        /// so explicitly, with a predicate that states it (`sql.Raw("1 = 1")`)
+        /// or with raw SQL.
         pub fn Exec(self: *Self) ExecError!usize {
             if (info.soft_delete) {
                 return self.execSoftDelete();
@@ -1566,7 +1578,11 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 if (result.decision == .deny) return error.PrivacyDenied;
             }
             try self.runInterceptors(.delete);
-            if (self.b.groups.items.len == 0) return 0;
+            // Asked after the policy and the interceptor chain, not before: an
+            // injected `tenant_id = ?` is a predicate like any other, and a
+            // scoped bulk delete with no caller `Where` is a legitimate call
+            // (it means "every row this tenant may delete").
+            try self.b.requirePredicate();
 
             // Each WHERE group becomes its own UPDATE (OR semantics across
             // groups); avoids pointer-based And/Or trees that would dangle.
@@ -1631,9 +1647,14 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 }
             }
 
-            if (self.b.groups.items.len == 0) return 0;
-
-            const q = self.b.query() catch |err| return mapBuildError(err);
+            // The builder owns the "no predicate" decision — the same rule the
+            // soft-delete path asks, so both paths answer alike. Reached after
+            // the policy and the interceptor chain (both can contribute
+            // predicates), which is where the statement has always been built.
+            const q = self.b.query() catch |err| return switch (err) {
+                error.NoPredicate => error.NoPredicate,
+                else => mapBuildError(err),
+            };
             self.ensureDeadline();
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
 
@@ -1872,6 +1893,10 @@ test "Update and delete execution methods expose explicit driver error unions" {
     const SaveOneError = SaveError || error{ NotFound, NotSingular };
     const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
     const ExecOneError = ExecError || error{ NotFound, NotSingular };
+    // Bulk delete refuses a call that constrains nothing, before any statement
+    // is handed to the driver; `Delete.Exec` keeps its set, so this inequality
+    // is asserted rather than papered over by widening the shared name.
+    const BulkDeleteExecError = ExecError || error{NoPredicate};
 
     comptime {
         if (@typeInfo(@typeInfo(@TypeOf(Upd.Save)).@"fn".return_type.?).error_union.error_set != SaveError) @compileError("Update.Save error set is not explicit");
@@ -1881,7 +1906,7 @@ test "Update and delete execution methods expose explicit driver error unions" {
         if (@typeInfo(@typeInfo(@TypeOf(Del.ExecOne)).@"fn".return_type.?).error_union.error_set != ExecOneError) @compileError("Delete.ExecOne error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(Del.ForceExecOne)).@"fn".return_type.?).error_union.error_set != ExecOneError) @compileError("Delete.ForceExecOne error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(BulkUpd.Save)).@"fn".return_type.?).error_union.error_set != SaveError) @compileError("BulkUpdate.Save error set is not explicit");
-        if (@typeInfo(@typeInfo(@TypeOf(BulkDel.Exec)).@"fn".return_type.?).error_union.error_set != ExecError) @compileError("BulkDelete.Exec error set is not explicit");
+        if (@typeInfo(@typeInfo(@TypeOf(BulkDel.Exec)).@"fn".return_type.?).error_union.error_set != BulkDeleteExecError) @compileError("BulkDelete.Exec error set is not explicit");
     }
 }
 
@@ -2246,6 +2271,174 @@ test "BulkDelete soft_delete performs bulk soft delete" {
             rows.deinit();
         }
         try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+    }
+}
+
+test "BulkDelete with no predicate is the same named error on soft- and hard-deleting entities" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+    const SoftDeleteMixin = @import("../core/mixin.zig").SoftDeleteMixin;
+
+    // Two schemas that differ in exactly one thing — `soft_delete` — because the
+    // whole point is that the predicate-less call no longer does.
+    const HardRow = Schema("BulkNoPredHard", .{ .fields = &.{field.String("title")} });
+    const SoftRow = Schema("BulkNoPredSoft", .{
+        .fields = &.{field.String("title")},
+        .mixins = &.{SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+
+    inline for (.{ HardRow, SoftRow }) |S| {
+        const info = comptime fromSchema(S);
+        const infos = &[_]TypeInfo{info};
+        try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+        const client = client_mod.EntityClient(infos, info).init(allocator, driver.asDriver());
+
+        for (0..3) |_| {
+            var b = try client.Create();
+            defer b.deinit();
+            _ = try b.setFieldValue("title", "t");
+            var row = try b.Save();
+            defer deinitEntity(infos, info, &row, allocator);
+        }
+
+        // No `Where` at all: used to be "delete every row" on the hard-deleting
+        // entity and a silent 0 on the soft-deleting one.
+        {
+            var d = try client.BulkDelete();
+            defer d.deinit();
+            try std.testing.expectError(error.NoPredicate, d.Exec());
+        }
+        // A group that was opened and never filled constrains just as little.
+        {
+            var d = try client.BulkDelete();
+            defer d.deinit();
+            _ = try d.Next();
+            try std.testing.expectError(error.NoPredicate, d.Exec());
+        }
+
+        // Nothing was touched in either sense: the same three rows are visible
+        // without asking for trashed ones.
+        var q = client.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+    }
+}
+
+test "BulkDelete with predicates keeps its semantics on soft- and hard-deleting entities" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+    const SoftDeleteMixin = @import("../core/mixin.zig").SoftDeleteMixin;
+
+    const HardRow = Schema("BulkPredHard", .{ .fields = &.{ field.String("title"), field.Int("n") } });
+    const SoftRow = Schema("BulkPredSoft", .{
+        .fields = &.{ field.String("title"), field.Int("n") },
+        .mixins = &.{SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+
+    inline for (.{ HardRow, SoftRow }) |S| {
+        const info = comptime fromSchema(S);
+        const infos = &[_]TypeInfo{info};
+        try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+        const client = client_mod.EntityClient(infos, info).init(allocator, driver.asDriver());
+        const preds = client.predicates;
+
+        const seed = [_]struct { title: []const u8, n: i64 }{
+            .{ .title = "a", .n = 1 },
+            .{ .title = "b", .n = 2 },
+            .{ .title = "b", .n = 3 },
+            .{ .title = "c", .n = 4 },
+        };
+        for (seed) |row_data| {
+            var b = try client.Create();
+            defer b.deinit();
+            _ = try b.setFieldValue("title", row_data.title);
+            _ = try b.setFieldValue("n", row_data.n);
+            var row = try b.Save();
+            defer deinitEntity(infos, info, &row, allocator);
+        }
+
+        // Two predicates in one group are ANDed: only the row matching both goes.
+        {
+            var d = try client.BulkDelete();
+            defer d.deinit();
+            _ = try d.Where(.{ preds.titleEQ(.{ .string = "b" }), preds.nGTE(.{ .int = 3 }) });
+            try std.testing.expectEqual(@as(usize, 1), try d.Exec());
+        }
+        {
+            var q = client.Query();
+            defer q.deinit();
+            var rows = try q.All();
+            defer {
+                for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+                rows.deinit();
+            }
+            try std.testing.expectEqual(@as(usize, 3), rows.items.len);
+        }
+
+        // Groups are ORed: one row per group goes (the two predicates are
+        // deliberately disjoint from each other *and* from the row above, so the
+        // two paths' row counts are exactly comparable — see the note below).
+        {
+            var d = try client.BulkDelete();
+            defer d.deinit();
+            _ = try d.Where(.{preds.titleEQ(.{ .string = "a" })});
+            _ = try d.Next();
+            _ = try d.Where(.{preds.nGTE(.{ .int = 4 })});
+            try std.testing.expectEqual(@as(usize, 2), try d.Exec());
+        }
+
+        // Hidden from a normal query on both kinds of entity, but a soft-deleting
+        // entity still has all four rows when trashed ones are asked for — the
+        // statement was `UPDATE … SET deleted_at`, not a `DELETE`. A hard-deleting
+        // entity has only the untouched row left, which is the difference between
+        // the two paths (and only that) that this test exists to keep.
+        {
+            var q = client.Query();
+            defer q.deinit();
+            var rows = try q.All();
+            defer {
+                for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+                rows.deinit();
+            }
+            try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+        }
+        {
+            var q = client.Query();
+            defer q.deinit();
+            _ = q.WithTrashed();
+            var rows = try q.All();
+            defer {
+                for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+                rows.deinit();
+            }
+            const expected: usize = if (info.soft_delete) 4 else 1;
+            try std.testing.expectEqual(expected, rows.items.len);
+        }
     }
 }
 

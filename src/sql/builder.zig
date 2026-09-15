@@ -1908,7 +1908,36 @@ pub const BulkDeleteBuilder = struct {
         return d;
     }
 
-    pub fn query(d: *BulkDeleteBuilder) !QueryResult {
+    /// Fails with `error.NoPredicate` unless at least one group carries a
+    /// predicate. `init` always installs one (empty) group and `next` adds more,
+    /// so "the group list is non-empty" says nothing about whether the statement
+    /// constrains anything: every reader has to ask *this* question instead.
+    ///
+    /// The codegen soft-delete path needs it too — it renders its own
+    /// `UPDATE … SET deleted_at` instead of calling `query`, so the check cannot
+    /// live inside `query` alone without the two paths disagreeing again.
+    pub fn requirePredicate(d: *const BulkDeleteBuilder) error{NoPredicate}!void {
+        for (d.groups.items) |g| {
+            if (g.items.len > 0) return;
+        }
+        return error.NoPredicate;
+    }
+
+    /// Shared body of `query` and `takeQuery`: `DELETE FROM <table>` plus one
+    /// `WHERE` clause over the predicate groups (groups ORed, predicates inside
+    /// a group ANDed). Keeping it in one place is the point — the two copies
+    /// here had drifted into "the same SQL, twice", so a rule added to one of
+    /// them (this one) would have missed the other.
+    ///
+    /// A group with no predicate constrains nothing, so it is skipped rather
+    /// than rendered as a dangling `OR`; the codegen soft-delete path skips such
+    /// a group too, which is what keeps both paths deleting the same rows.
+    ///
+    /// The check runs before a single byte is written, so a builder that fails
+    /// here is still empty and can be inspected.
+    fn writeStatement(d: *BulkDeleteBuilder) !void {
+        try d.requirePredicate();
+
         try d.b.writeString("DELETE FROM ");
         try d.b.ident(d.table);
 
@@ -1917,42 +1946,39 @@ pub const BulkDeleteBuilder = struct {
             last.deinit();
         }
 
-        if (d.groups.items.len > 0) {
-            try d.b.writeString(" WHERE ");
-            for (d.groups.items, 0..) |group, gi| {
-                if (gi > 0) try d.b.writeString(" OR ");
-                if (group.items.len > 1) try d.b.writeByte('(');
-                for (group.items, 0..) |pred, pi| {
-                    if (pi > 0) try d.b.writeString(" AND ");
-                    try pred.appendTo(&d.b);
-                }
-                if (group.items.len > 1) try d.b.writeByte(')');
+        try d.b.writeString(" WHERE ");
+        var first = true;
+        for (d.groups.items) |group| {
+            if (group.items.len == 0) continue;
+            if (!first) try d.b.writeString(" OR ");
+            first = false;
+            if (group.items.len > 1) try d.b.writeByte('(');
+            for (group.items, 0..) |pred, pi| {
+                if (pi > 0) try d.b.writeString(" AND ");
+                try pred.appendTo(&d.b);
             }
+            if (group.items.len > 1) try d.b.writeByte(')');
         }
+    }
+
+    /// `DELETE FROM <table> WHERE …` over the predicate groups.
+    ///
+    /// Fails with `error.NoPredicate` when no group carries a predicate. The
+    /// alternative that used to happen — `DELETE FROM <table>` with no `WHERE` —
+    /// deletes every row on a hard-deleting entity while the identical call on a
+    /// soft-deleting one silently deleted nothing, so the row set the caller got
+    /// depended on the schema rather than on the call. Neither reading was
+    /// something the call site could see, so the shape is refused by name; a
+    /// caller who really means "every row" asks for it explicitly, with a
+    /// predicate that says so (e.g. `sql.Raw("1 = 1")`) or raw SQL.
+    pub fn query(d: *BulkDeleteBuilder) !QueryResult {
+        try d.writeStatement();
         return d.b.query();
     }
 
+    /// `OwnedQuery` variant of `query`; same predicate requirement.
     pub fn takeQuery(d: *BulkDeleteBuilder) !OwnedQuery {
-        try d.b.writeString("DELETE FROM ");
-        try d.b.ident(d.table);
-
-        while (d.groups.items.len > 0 and d.groups.items[d.groups.items.len - 1].items.len == 0) {
-            var last = d.groups.pop().?;
-            last.deinit();
-        }
-
-        if (d.groups.items.len > 0) {
-            try d.b.writeString(" WHERE ");
-            for (d.groups.items, 0..) |group, gi| {
-                if (gi > 0) try d.b.writeString(" OR ");
-                if (group.items.len > 1) try d.b.writeByte('(');
-                for (group.items, 0..) |pred, pi| {
-                    if (pi > 0) try d.b.writeString(" AND ");
-                    try pred.appendTo(&d.b);
-                }
-                if (group.items.len > 1) try d.b.writeByte(')');
-            }
-        }
+        try d.writeStatement();
         return d.b.takeQuery();
     }
 };
@@ -2385,6 +2411,95 @@ test "BulkDelete with predicate groups" {
     const q = try d.query();
     try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE (\"status\" = ? AND \"age\" > ?) OR \"status\" = ?", q.sql);
     try std.testing.expectEqual(@as(usize, 3), q.args.len);
+}
+
+test "BulkDelete with no predicate is a named error, not a full-table DELETE" {
+    const allocator = std.testing.allocator;
+
+    // `init` installs one empty group. This shape may not render
+    // `DELETE FROM "users"` with no WHERE.
+    var d = try BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
+    defer d.deinit();
+
+    try std.testing.expectError(error.NoPredicate, d.query());
+    // The refusal happens before a byte is written, so the builder is still
+    // empty: no half-statement is left behind for a later call to append to.
+    try std.testing.expectEqualStrings("", d.b.query().sql);
+    try std.testing.expectEqual(@as(usize, 0), d.b.query().args.len);
+    // `takeQuery` shares the body, so it refuses the same shape the same way —
+    // and hands out no owned statement either.
+    try std.testing.expectError(error.NoPredicate, d.takeQuery());
+    try std.testing.expectEqualStrings("", d.b.query().sql);
+
+    // More groups with no predicates in them are the same shape: `next` grows
+    // the group list without adding a constraint, so the group *list* being
+    // non-empty must not read as "the statement constrains something".
+    _ = try d.next();
+    _ = try d.next();
+    try std.testing.expectEqual(@as(usize, 3), d.groups.items.len);
+    try std.testing.expectError(error.NoPredicate, d.query());
+    try std.testing.expectError(error.NoPredicate, d.takeQuery());
+    try std.testing.expectEqualStrings("", d.b.query().sql);
+}
+
+test "BulkDelete keeps a trailing empty group from swallowing the WHERE" {
+    const allocator = std.testing.allocator;
+
+    // Trailing empty groups are released and the predicate before them still
+    // renders (this is the pre-existing behaviour, pinned because the empty-group
+    // handling is now shared by `query` and `takeQuery`).
+    {
+        var d = try BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
+        defer d.deinit();
+        _ = try d.where(EQ("id", .{ .int = 1 }));
+        _ = try d.next();
+        _ = try d.next();
+        const q = try d.query();
+        try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE \"id\" = ?", q.sql);
+        try std.testing.expectEqual(@as(usize, 1), d.groups.items.len);
+    }
+
+    // The same through `takeQuery`, which used to carry its own copy of this.
+    {
+        var d = try BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
+        defer d.deinit();
+        _ = try d.where(EQ("status", .{ .string = "gone" }));
+        _ = try d.where(GT("age", .{ .int = 30 }));
+        _ = try d.next();
+        var q = try d.takeQuery();
+        defer q.deinit();
+        try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE (\"status\" = ? AND \"age\" > ?)", q.sql);
+        try std.testing.expectEqual(@as(usize, 2), q.args.len);
+    }
+
+    // A `Next()` before the first `Where` leaves an empty group *in front of* a
+    // populated one, which `Next()`-then-`Where()` in a loop produces naturally.
+    // That is a populated delete, not a predicate-less one — and the empty group
+    // contributes nothing, rather than rendering as `WHERE  OR …` (which is not
+    // SQL at all).
+    {
+        var d = try BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
+        defer d.deinit();
+        _ = try d.next();
+        _ = try d.where(EQ("id", .{ .int = 7 }));
+        _ = try d.next();
+        _ = try d.next();
+        _ = try d.where(EQ("id", .{ .int = 8 }));
+        const q = try d.query();
+        try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE \"id\" = ? OR \"id\" = ?", q.sql);
+        try std.testing.expectEqual(@as(usize, 2), q.args.len);
+    }
+
+    // An explicitly asked-for "every row" predicate still renders, which is the
+    // escape hatch the refusal message points at: the caller says it, not the
+    // schema.
+    {
+        var d = try BulkDeleteBuilder.init(allocator, Dialect.sqlite, "users");
+        defer d.deinit();
+        _ = try d.where(Raw("1 = 1"));
+        const q = try d.query();
+        try std.testing.expectEqualStrings("DELETE FROM \"users\" WHERE (1 = 1)", q.sql);
+    }
 }
 
 test "CTE WITH clause" {
