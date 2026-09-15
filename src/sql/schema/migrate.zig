@@ -138,7 +138,7 @@ pub const NullabilityDrift = struct {
 /// What the database and the schema disagree about.
 pub const SchemaDrift = struct {
     table: []const u8,
-    /// Empty for `missing_table`.
+    /// Empty for `missing_table` and `missing_view`.
     column: []const u8 = "",
     kind: Kind,
     /// For `.nullability`: the schema's view, and the database's.
@@ -166,10 +166,10 @@ pub const SchemaDrift = struct {
     ///
     /// `.missing_foreign_key` borrows the same field for the same reason (the
     /// shape it names — `(user_id)` → `user (id)` — is built at runtime) and is
-    /// freed with the two index kinds; `.unique_constraint` points it at a
-    /// `const` literal, which must **not** be freed. `ownsIndexDetail` is the
-    /// single place that decides which is which. Every other kind leaves it
-    /// empty.
+    /// freed with the two index kinds; `.unique_constraint` and `.missing_view`
+    /// point it at a `const` literal, which must **not** be freed.
+    /// `ownsIndexDetail` is the single place that decides which is which. Every
+    /// other kind leaves it empty.
     index_name: []const u8 = "",
     index_detail: []const u8 = "",
 
@@ -179,6 +179,29 @@ pub const SchemaDrift = struct {
         extra_column,
         type_mismatch,
         nullability,
+        /// The schema declares a **view** (`Schema(…, .{ .view = true })`) and
+        /// the database has no relation of that name — neither a view nor a
+        /// table.
+        ///
+        /// This is the drift nothing else can see: `migrateSchema` creates a
+        /// view with `CREATE VIEW IF NOT EXISTS`, and `checkSchema` used to skip
+        /// `is_view` entities entirely, so a view that was never created in this
+        /// database produced a green check and a `SELECT` against it failed with
+        /// "no such table/view" — the same silent-empty-result failure
+        /// `missing_table` exists for, which is why `breaksReads()` is **true**
+        /// here: the read fails outright, it does not merely change shape.
+        ///
+        /// A relation of that name counts whether it is a view or a table. The
+        /// check asks "is there anything to read?", and answering it with the
+        /// view catalog alone would report a declared name that a table already
+        /// serves — the shape `CREATE VIEW IF NOT EXISTS` itself accepts.
+        ///
+        /// The view's **definition is never compared** — see the doc comment on
+        /// `getExistingViews` for why (the database stores a canonical rewrite,
+        /// not the text the schema wrote, so the comparison would fire on every
+        /// database and block every deploy). A changed `view_sql` therefore
+        /// still takes no effect and is still not reported.
+        missing_view,
         /// The schema declares an index the database has under the same name
         /// with a **different key list**. Only reported when the database's
         /// key list could be read reliably (`ExistingIndex.columns_comparable`).
@@ -239,11 +262,15 @@ pub const SchemaDrift = struct {
     /// Whether this drift makes a *read* fail — the kinds worth blocking a
     /// deploy over, as opposed to cosmetic agreement.
     ///
-    /// A missing table or column fails every query that mentions it (the failure
-    /// mode behind "the endpoint quietly returned an empty list for months"), and
-    /// a column the database makes nullable while the schema declares it
-    /// non-optional fails on the first row that actually holds a NULL. An extra
-    /// column and a type difference do not fail reads by themselves.
+    /// A missing table, column or **view** fails every query that mentions it
+    /// (the failure mode behind "the endpoint quietly returned an empty list for
+    /// months"), and a column the database makes nullable while the schema
+    /// declares it non-optional fails on the first row that actually holds a
+    /// NULL. A view whose relation is absent is grouped with the first of those
+    /// and not with the constraints below: `SELECT … FROM the_view` does not
+    /// return fewer rows, it errors outright — so `read_breaking_only` must
+    /// catch it, exactly as it catches `missing_table`. An extra column and a
+    /// type difference do not fail reads by themselves.
     ///
     /// None of the four constraint kinds does either: a different key list
     /// changes how fast a query runs, a different uniqueness changes whether a
@@ -256,7 +283,7 @@ pub const SchemaDrift = struct {
     /// now fails loudly, into an outage. They fail only under `.any`.
     pub fn breaksReads(self: SchemaDrift) bool {
         return switch (self.kind) {
-            .missing_table, .missing_column => true,
+            .missing_table, .missing_column, .missing_view => true,
             .nullability => !self.schema_optional and self.db_nullable,
             .extra_column,
             .type_mismatch,
@@ -269,20 +296,40 @@ pub const SchemaDrift = struct {
     }
 };
 
-/// Every non-view entity, compared against the live database: a missing table, a
-/// missing or extra column, a type or nullability difference, a **column** the
-/// schema declares UNIQUE with nothing enforcing it, a **foreign key** the schema
-/// declares the database does not have, and — for a declared index the database
-/// already has under the same name — a different key list or a different
-/// uniqueness.
+/// Every entity, compared against the live database: a missing table, a missing
+/// or extra column, a type or nullability difference, a **column** the schema
+/// declares UNIQUE with nothing enforcing it, a **foreign key** the schema
+/// declares the database does not have, a **view** the schema declares with no
+/// relation of that name, and — for a declared index the database already has
+/// under the same name — a different key list or a different uniqueness.
 ///
 /// Returns a caller-owned slice (`freeSchemaDrift`); names and types borrow from
 /// `infos` or from comptime literals, so freeing is one call (the details of the
 /// two index kinds and of `.missing_foreign_key` are the exceptions, see
 /// `SchemaDrift.index_detail`).
-/// Primary keys are **not** compared (see `ISSUES_FROM_ZAPI.md` Z28), and views
-/// are skipped entirely: a view has no shape a `TableDef` describes, and its SQL
-/// is not compared either.
+/// Primary keys are **not** compared (see `ISSUES_FROM_ZAPI.md` Z28).
+///
+/// **Views** (`.missing_view`) get exactly one question asked of them: *is there
+/// a relation of this name at all?* A view's columns are not compared (a view's
+/// shape drift is a different matter — `migrateSchema` cannot `OR REPLACE` a view
+/// whose shape changed, and it does not try) and neither is its **SQL**, which
+/// would fire on every database: PostgreSQL's `pg_views.definition` is a rewrite
+/// of the query (`::text` casts, added parentheses, schema-qualified names) and
+/// MySQL/MariaDB and SQLite keep their own text, so comparing it against
+/// `view_sql` would report a difference that is not one. The consequence is the
+/// one to know: **a changed `view_sql` still takes no effect and is still not
+/// reported** — `CREATE VIEW IF NOT EXISTS` does nothing for an existing name.
+/// A caller that wants to compare definitions can read them with
+/// `getExistingViews` and normalize per dialect; that judgement is theirs.
+///
+/// The existence answer is `getExistingColumns`, the same relation probe
+/// `migrateSchema` uses to re-create a view that was dropped out of band: it
+/// answers "does this relation have columns", which is true for a view and for a
+/// table on all three dialects (PostgreSQL and MySQL report a view's columns
+/// through `information_schema.columns`, SQLite's `PRAGMA table_info` reads
+/// them), so one query covers both shapes and no second introspection path is
+/// needed. A declared view whose name a **table** already carries is therefore
+/// not reported — the relation is readable, which is what the check is about.
 ///
 /// Index comparison is deliberately narrow: only indexes the schema declares
 /// **and** the database already has by name are looked at. An index that exists
@@ -529,6 +576,25 @@ pub fn checkSchema(
                 }
             }
         }
+
+        // Views, which is the one declaration whose *absence* nothing here used
+        // to see (the entity loop skipped `is_view` entities outright). One
+        // question is asked and no more: is there a relation of this name at
+        // all? `getExistingColumns` answers it — see the doc comment above for
+        // why that probe covers a view and a table alike — and the definition is
+        // deliberately not compared.
+        if (comptime info.is_view) {
+            var view_relation = try getExistingColumns(allocator, driver, info.table_name);
+            defer freeExistingColumns(allocator, &view_relation);
+
+            if (view_relation.items.len == 0) {
+                try drifts.append(.{
+                    .table = info.table_name,
+                    .kind = .missing_view,
+                    .index_detail = missingViewDriftDetail,
+                });
+            }
+        }
     }
     return drifts.toOwnedSlice();
 }
@@ -614,6 +680,15 @@ fn foreignKeyPresent(existing: []const ExistingForeignKey, fk: ForeignKeyDef) bo
 /// is allocated for this kind (see `ownsIndexDetail`).
 const uniqueColumnDriftDetail = "schema declares the column UNIQUE, database has no unique constraint covering it";
 
+/// The `.missing_view` report in one sentence. A `const` literal — nothing is
+/// allocated for this kind (see `ownsIndexDetail`).
+///
+/// It says the two things the reader has to know and cannot see from the drift
+/// kind alone: which statement on the schema side produced the expectation, and
+/// the boundary of this check — the definition is never compared, so a stale
+/// `view_sql` is invisible *here* even after the view is created.
+const missingViewDriftDetail = "schema declares the view, database has no relation of that name; view_sql is never compared, so a stale definition is not reported either";
+
 /// "schema declares FOREIGN KEY (user_id) REFERENCES user (id), database has
 /// none" — **owned** (see `indexColumnsDetailAlloc`).
 ///
@@ -686,8 +761,9 @@ fn indexUniquenessDetailAlloc(allocator: std.mem.Allocator, schema_unique: bool,
 /// Which kinds carry an **allocated** `index_detail`, and so must be freed —
 /// the two index kinds, whose sentence describes a difference read from the
 /// database, and `.missing_foreign_key`, whose sentence names a shape built at
-/// runtime. `.unique_constraint` points the field at a `const` literal instead
-/// and must not be freed; every other kind leaves it empty.
+/// runtime. `.unique_constraint` and `.missing_view` point the field at a
+/// `const` literal instead and must not be freed; every other kind leaves it
+/// empty.
 fn ownsIndexDetail(kind: SchemaDrift.Kind) bool {
     return switch (kind) {
         .index_columns, .index_uniqueness, .missing_foreign_key => true,
@@ -726,6 +802,8 @@ pub fn assertSchema(
                 d.column
             else if (d.index_name.len > 0)
                 d.index_name
+            else if (d.kind == .missing_view)
+                "(view)"
             else
                 "(table)",
             @tagName(d.kind),
@@ -2671,6 +2749,145 @@ pub fn freeExistingForeignKeys(allocator: std.mem.Allocator, foreign_keys: *std.
         allocator.free(fk.ref_columns);
     }
     foreign_keys.deinit();
+}
+
+/// A view as the *database* reports it. Owned: `name` and `definition` are
+/// allocated, release the list with `freeExistingViews`.
+pub const ExistingView = struct {
+    /// The view's name, as the database spells it.
+    name: []const u8,
+    /// The definition **as the database stores it** — which is why it is not
+    /// comparable with the schema's `view_sql`; see `getExistingViews`.
+    definition: []const u8,
+};
+
+/// Query the view the database holds under `view_name`, from the catalog each
+/// dialect keeps: PostgreSQL's `pg_views`, MySQL/MariaDB's
+/// `information_schema.views`, SQLite's `sqlite_master` (`type = 'view'`). Never
+/// from a rendered `CREATE VIEW` statement parsed back into shape, for the same
+/// reason `getExistingIndexes` does not parse `indexdef`.
+///
+/// **`definition` cannot be compared against `TypeInfo.view_sql`**, and nothing
+/// here tries to. The database does not keep the text the schema wrote:
+///
+///   - PostgreSQL stores a **rewritten** query in `pg_views.definition` —
+///     explicit `::text`/`::integer` casts, added parentheses, schema-qualified
+///     relation names, `WHERE ((status)::text = 'active'::text)` for a schema
+///     that wrote `WHERE status = 'active'`.
+///   - MySQL and MariaDB store their own normalization (backtick-quoted
+///     identifiers, added parentheses), and the two servers differ from each
+///     other in how much they rewrite.
+///   - SQLite keeps the original statement text, but for a view this library
+///     created that text begins `CREATE VIEW IF NOT EXISTS "<name>" AS ` — the
+///     prefix is zent's, so the strings differ even there.
+///
+/// A string comparison would therefore report a difference on **every** database
+/// and, through `assertSchema`, block every deploy — the false-report trap this
+/// module's comparisons are written to avoid. That is why `checkSchema` reports
+/// a missing relation (`missing_view`) but never a changed definition, and why
+/// **a stale `view_sql` stays invisible**: the caller who wants to compare can
+/// normalize per dialect from this function and decide, which is a judgement
+/// this layer must not make for them.
+///
+/// The name is **bound** on all three dialects (`$1`, `?`), never interpolated:
+/// every query here is an ordinary catalog `SELECT`, not a `PRAGMA`, so no name
+/// has to be refused up front and `error.InvalidTableName` is never returned
+/// from this function.
+///
+/// A name that is not a view of this schema answers an **empty list**, not an
+/// error — a table of that name, a view in another schema, and no relation at
+/// all are all "no view", which is the question asked here. (`checkSchema` asks
+/// a different one — *any* relation of that name — which is why it probes with
+/// `getExistingColumns`; see its doc comment.)
+///
+/// PostgreSQL withholds `definition` (NULL) from a user without privilege on the
+/// view, and MySQL does the same without `SHOW VIEW`; the row is still returned,
+/// with an empty `definition`, because the view's *existence* is the answer this
+/// call also carries.
+pub fn getExistingViews(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, view_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingView) {
+    const dialect = driver_drv.dialect();
+    if (std.mem.eql(u8, dialect.name, "sqlite3")) return getSQLiteViews(allocator, driver_drv, view_name);
+    if (std.mem.eql(u8, dialect.name, "postgres")) return getPostgresViews(allocator, driver_drv, view_name);
+    if (std.mem.eql(u8, dialect.name, "mysql")) return getMySQLViews(allocator, driver_drv, view_name);
+    return error.UnsupportedDialect;
+}
+
+/// The body the three dialect wrappers share: one catalog row per view, two
+/// columns — the name and the stored definition — with the name bound as the
+/// single parameter. `sql_text` is a comptime literal from each caller; nothing
+/// is built from `view_name` at runtime.
+fn getViewsByQuery(
+    allocator: std.mem.Allocator,
+    driver_drv: sql_driver.Driver,
+    sql_text: []const u8,
+    view_name: []const u8,
+) IntrospectionError!std.array_list.Managed(ExistingView) {
+    var result = std.array_list.Managed(ExistingView).init(allocator);
+    errdefer freeExistingViews(allocator, &result);
+
+    var rows = try driver_drv.query(sql_text, &.{.{ .string = view_name }});
+    defer rows.deinit();
+
+    while (rows.next()) |row| {
+        const name = row.getText(0) orelse continue;
+        // NULL means the catalog withheld the text (no privilege), not that the
+        // view has an empty definition — see `getExistingViews`.
+        const definition = row.getText(1) orelse "";
+
+        const owned_name = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned_name);
+        const owned_definition = try allocator.dupe(u8, definition);
+        errdefer allocator.free(owned_definition);
+
+        try result.append(.{ .name = owned_name, .definition = owned_definition });
+    }
+    if (rows.nextError()) |err| return err;
+    return result;
+}
+
+/// SQLite: `sqlite_master`'s `sql` column, which is the statement text SQLite
+/// kept — see `getExistingViews` for why that still differs from the schema's
+/// `view_sql`. `sqlite_master` is an ordinary table, so the name is bound and
+/// `sqlitePragmaNameUsable` is not needed (no statement text is built here).
+fn getSQLiteViews(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, view_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingView) {
+    return getViewsByQuery(
+        allocator,
+        driver_drv,
+        "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND name = ?",
+        view_name,
+    );
+}
+
+/// PostgreSQL: `pg_views`, filtered by `current_schema()` — the same schema
+/// predicate `getExistingColumns` uses, so a view of another schema is not
+/// mistaken for this one.
+fn getPostgresViews(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, view_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingView) {
+    return getViewsByQuery(
+        allocator,
+        driver_drv,
+        "SELECT viewname, definition FROM pg_views WHERE schemaname = current_schema() AND viewname = $1",
+        view_name,
+    );
+}
+
+/// MySQL and MariaDB: `information_schema.views`, filtered by `DATABASE()` like
+/// every other MySQL introspection here. Standard `information_schema`, not a
+/// server-specific view, so the same statement runs on both servers.
+fn getMySQLViews(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, view_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingView) {
+    return getViewsByQuery(
+        allocator,
+        driver_drv,
+        "SELECT table_name, view_definition FROM information_schema.views WHERE table_schema = DATABASE() AND table_name = ?",
+        view_name,
+    );
+}
+
+pub fn freeExistingViews(allocator: std.mem.Allocator, views: *std.array_list.Managed(ExistingView)) void {
+    for (views.items) |v| {
+        allocator.free(v.name);
+        allocator.free(v.definition);
+    }
+    views.deinit();
 }
 
 fn columnExists(columns: []const ExistingColumn, name: []const u8) bool {
@@ -4995,4 +5212,126 @@ test "checkSchema still reports a UNIQUE column when the unreadable index is not
     try std.testing.expectEqualStrings("email", drifts[0].column);
     try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
     try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+}
+
+test "checkSchema reports a view the database does not have, and read_breaking_only stops it (SQLite)" {
+    // A view entity was the one declared shape `checkSchema` never looked at
+    // (the entity loop skipped `is_view` outright), so a view that was never
+    // created — or was dropped out of band — produced a green check while
+    // `SELECT … FROM it` errored. That is a *broken read*, not a missed
+    // optimisation, and this pins the difference.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE vw_base_row (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)", &.{});
+
+    const VwActiveRow = schema("VwActiveRow", .{
+        .view = true,
+        .view_sql = "SELECT id, name FROM vw_base_row",
+        .fields = &.{field.String("name")},
+    });
+    const info = comptime fromSchema(VwActiveRow);
+    const infos = &[_]TypeInfo{info};
+
+    // Never created: one report, and it is the relation that is missing.
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 1), drifts.len);
+        try std.testing.expectEqual(SchemaDrift.Kind.missing_view, drifts[0].kind);
+        try std.testing.expectEqualStrings("vw_active_row", drifts[0].table);
+        try std.testing.expectEqualStrings("", drifts[0].column);
+        try std.testing.expectEqualStrings(missingViewDriftDetail, drifts[0].index_detail);
+        // The whole point of the kind: a missing view breaks reads, so the gate
+        // that exists to stop such a deploy has to fail on it.
+        try std.testing.expect(drifts[0].breaksReads());
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only));
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+    }
+
+    // Created in the shape `migrateSchema` builds: silence. This also pins that
+    // the existence probe reads a *view* — a check that only understood tables
+    // would report every view here.
+    _ = try drv.exec("CREATE VIEW IF NOT EXISTS \"vw_active_row\" AS SELECT id, name FROM vw_base_row", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 0), drifts.len);
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .any);
+    }
+
+    // A **changed definition is silence**: the view exists, and its SQL is not
+    // compared (the database stores its own text, so comparing would report
+    // every view in every database). A stale `view_sql` is invisible here, and
+    // that is the documented boundary of this check.
+    _ = try drv.exec("DROP VIEW vw_active_row", &.{});
+    _ = try drv.exec("CREATE VIEW IF NOT EXISTS \"vw_active_row\" AS SELECT id, name FROM vw_base_row WHERE name <> ''", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+
+    // Dropped out of band: reported again.
+    _ = try drv.exec("DROP VIEW vw_active_row", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 1), drifts.len);
+        try std.testing.expectEqual(SchemaDrift.Kind.missing_view, drifts[0].kind);
+    }
+
+    // A *relation* of that name is what the check asks about, not a view
+    // specifically: `PRAGMA table_info` reads a view's columns as readily as a
+    // table's, so one probe answers both shapes and a name an existing table
+    // already serves is not reported.
+    _ = try drv.exec("CREATE TABLE vw_active_row (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+}
+
+test "getExistingViews reads the stored definition and answers an empty list otherwise (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE vw_src (id INTEGER PRIMARY KEY, flag TEXT NOT NULL)", &.{});
+    _ = try drv.exec("CREATE VIEW vw_flag_view AS SELECT id, flag FROM vw_src WHERE flag = 'on'", &.{});
+
+    var views = try getExistingViews(std.testing.allocator, drv.asDriver(), "vw_flag_view");
+    defer freeExistingViews(std.testing.allocator, &views);
+    try std.testing.expectEqual(@as(usize, 1), views.items.len);
+    try std.testing.expectEqualStrings("vw_flag_view", views.items[0].name);
+    // SQLite keeps the statement text, so what comes back is the whole
+    // `CREATE VIEW …`, not `view_sql` — which is exactly why nothing compares
+    // the two strings (see `getExistingViews`).
+    try std.testing.expect(std.mem.indexOf(u8, views.items[0].definition, "CREATE VIEW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, views.items[0].definition, "SELECT id, flag FROM vw_src") != null);
+
+    // A table of that name is not a view …
+    var table_named = try getExistingViews(std.testing.allocator, drv.asDriver(), "vw_src");
+    defer freeExistingViews(std.testing.allocator, &table_named);
+    try std.testing.expectEqual(@as(usize, 0), table_named.items.len);
+
+    // … and a name that is not there is an empty answer, not an error.
+    var absent = try getExistingViews(std.testing.allocator, drv.asDriver(), "vw_absent");
+    defer freeExistingViews(std.testing.allocator, &absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.items.len);
+
+    // The name is bound, never interpolated: a name carrying the quote that
+    // would close a literal answers an empty list instead of becoming statement
+    // text. (`PRAGMA` is where this dialect cannot bind; this query is an
+    // ordinary `sqlite_master` SELECT, so it can.)
+    var hostile = try getExistingViews(std.testing.allocator, drv.asDriver(), "vw_flag_view' OR 1=1 --");
+    defer freeExistingViews(std.testing.allocator, &hostile);
+    try std.testing.expectEqual(@as(usize, 0), hostile.items.len);
 }

@@ -3452,6 +3452,108 @@ test "Postgres: checkSchema reports a UNIQUE column and a foreign key the databa
     try testing.expectEqual(@as(usize, 0), absent.items.len);
 }
 
+test "Postgres: checkSchema reports a view the database does not have, and getExistingViews reads one it does" {
+    // Views were the one declared shape `checkSchema` never looked at. The
+    // failure that let through: the view is declared, `migrateSchema` records
+    // `create_view`, the view is later dropped out of band — and nothing
+    // re-checked it, so `SELECT … FROM the view` errored while `assertSchema`
+    // stayed green.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Leftovers from an interrupted run. The view is dropped first: a table
+    // cannot be dropped while a view still selects from it.
+    _ = try drv.exec("DROP VIEW IF EXISTS zent_vw_pg_probe", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_vw_pg_base", &.{});
+    defer _ = drv.exec("DROP VIEW IF EXISTS zent_vw_pg_probe", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_vw_pg_base", &.{}) catch {};
+
+    const ZentVwPgBase = schema("ZentVwPgBase", .{ .fields = &.{field.String("name")} });
+    const ZentVwPgProbe = schema("ZentVwPgProbe", .{
+        .view = true,
+        .view_sql = "SELECT id, name FROM zent_vw_pg_base",
+        .fields = &.{field.String("name")},
+    });
+
+    // The base table through the real path. The **view cannot be**, and that is
+    // a pre-existing defect this test found rather than a choice: see the
+    // assertion right below.
+    const base_graph = comptime buildGraph(&.{ZentVwPgBase});
+    try migrate.migrateSchema(allocator, drv.asDriver(), base_graph.types);
+
+    // `createViewSQLAlloc` emits `CREATE VIEW IF NOT EXISTS`, and PostgreSQL has
+    // no `IF NOT EXISTS` for `CREATE VIEW`: the statement is a syntax error
+    // (42601), so on PostgreSQL the migration path cannot create a declared
+    // view at all — `migrateSchema` and `createAllTables` both fail on one.
+    // Reported with this change, deliberately **not** fixed here (changing the
+    // DDL is outside this lane). Pinned rather than only commented so the claim
+    // is reproducible: when this stops failing, `createViewSQLAlloc` was fixed
+    // and this test has to be updated with it.
+    if (drv.exec("CREATE VIEW IF NOT EXISTS \"zent_vw_pg_probe\" AS SELECT id, name FROM zent_vw_pg_base", &.{})) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+
+    // The view is created with the DDL PostgreSQL accepts. `checkSchema` reads
+    // the catalog, so which statement built it does not matter to the check
+    // under test.
+    _ = try drv.exec("CREATE VIEW zent_vw_pg_probe AS SELECT id, name FROM zent_vw_pg_base", &.{});
+
+    const graph = comptime buildGraph(&.{ ZentVwPgBase, ZentVwPgProbe });
+    const infos = graph.types;
+
+    // The view is a relation `checkSchema` can see, on both gates.
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+
+        var views = try migrate.getExistingViews(allocator, drv.asDriver(), "zent_vw_pg_probe");
+        defer migrate.freeExistingViews(allocator, &views);
+        try testing.expectEqual(@as(usize, 1), views.items.len);
+        try testing.expectEqualStrings("zent_vw_pg_probe", views.items[0].name);
+        // PostgreSQL stores a **rewritten** query in `pg_views.definition`
+        // (casts, added parentheses, schema-qualified names), never the text
+        // the schema wrote — which is why nothing compares the two, and why a
+        // stale `view_sql` is silent rather than reported.
+        try testing.expect(views.items[0].definition.len > 0);
+        try testing.expect(!std.mem.eql(u8, views.items[0].definition, ZentVwPgProbe.view_sql.?));
+        try testing.expect(std.mem.indexOf(u8, views.items[0].definition, "zent_vw_pg_base") != null);
+
+        // A table of that name is not a view; a name that is not there is an
+        // empty answer, not an error.
+        var base_is_not_a_view = try migrate.getExistingViews(allocator, drv.asDriver(), "zent_vw_pg_base");
+        defer migrate.freeExistingViews(allocator, &base_is_not_a_view);
+        try testing.expectEqual(@as(usize, 0), base_is_not_a_view.items.len);
+
+        var absent = try migrate.getExistingViews(allocator, drv.asDriver(), "zent_vw_pg_absent");
+        defer migrate.freeExistingViews(allocator, &absent);
+        try testing.expectEqual(@as(usize, 0), absent.items.len);
+    }
+
+    // Dropped out of band: reported, and the read-breaking gate fails on it.
+    _ = try drv.exec("DROP VIEW zent_vw_pg_probe", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_view, drifts[0].kind);
+        try testing.expectEqualStrings("zent_vw_pg_probe", drifts[0].table);
+        try testing.expect(drifts[0].breaksReads());
+        // The read really does fail; that is the stake behind `breaksReads`.
+        // The error name is the driver's business, so only the failure itself
+        // is asserted here.
+        if (drv.query("SELECT id, name FROM zent_vw_pg_probe", &.{})) |rows| {
+            var r = rows;
+            r.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+}
+
 // ------------------------------------------------------------------
 // checkStatement: prepare-and-discard validation of a raw statement
 // ------------------------------------------------------------------

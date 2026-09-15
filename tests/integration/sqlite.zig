@@ -3645,6 +3645,78 @@ test "SQLite: checkSchema reports a UNIQUE column and a foreign key the database
     try testing.expectEqual(@as(usize, 0), agreeing.len);
 }
 
+test "SQLite: checkSchema reports a view the database does not have, and getExistingViews reads one it does" {
+    // Views were the one declared shape `checkSchema` never looked at (the
+    // entity loop skipped `is_view` outright). The failure that let through:
+    // the view is declared, `migrateSchema` records `create_view`, the view is
+    // later dropped out of band — and nothing re-checked it, so `SELECT … FROM
+    // the_view` errored while `assertSchema` stayed green.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const SqViewBase = schema("SqViewBase", .{ .fields = &.{field.String("name")} });
+    const SqActiveView = schema("SqActiveView", .{
+        .view = true,
+        .view_sql = "SELECT id, name FROM sq_view_base",
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{ SqViewBase, SqActiveView });
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The view `migrateSchema` built is a relation `checkSchema` can see, on
+    // both gates. Until this change the check never asked the question.
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+
+        var views = try migrate.getExistingViews(allocator, drv.asDriver(), "sq_active_view");
+        defer migrate.freeExistingViews(allocator, &views);
+        try testing.expectEqual(@as(usize, 1), views.items.len);
+        try testing.expectEqualStrings("sq_active_view", views.items[0].name);
+        // SQLite keeps the statement text, so what comes back is the whole
+        // `CREATE VIEW IF NOT EXISTS …` — not `view_sql`. Nothing compares the
+        // two (see `getExistingViews`), and this is the assertion saying why.
+        try testing.expect(!std.mem.eql(u8, views.items[0].definition, SqActiveView.view_sql.?));
+        try testing.expect(std.mem.indexOf(u8, views.items[0].definition, "SELECT id, name FROM sq_view_base") != null);
+
+        // A name that is not a view answers an empty list, not an error — the
+        // table beside it included.
+        var base_is_not_a_view = try migrate.getExistingViews(allocator, drv.asDriver(), "sq_view_base");
+        defer migrate.freeExistingViews(allocator, &base_is_not_a_view);
+        try testing.expectEqual(@as(usize, 0), base_is_not_a_view.items.len);
+    }
+
+    // Dropped out of band: reported, and the gate that exists to stop a deploy
+    // that breaks reads has to fail on it.
+    _ = try drv.exec("DROP VIEW sq_active_view", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_view, drifts[0].kind);
+        try testing.expectEqualStrings("sq_active_view", drifts[0].table);
+        try testing.expect(drifts[0].breaksReads());
+        // The read really does fail; that is the stake behind `breaksReads`.
+        try testing.expectError(error.SqlitePrepareFailed, drv.query("SELECT id, name FROM sq_active_view", &.{}));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // `migrateSchema` heals it: it re-creates a view whose recorded version is
+    // present but whose relation is gone — the out-of-band-drop path it already
+    // has for tables. The report and the repair are separate, which is the
+    // point of a check the `.sql`-file consumer can call.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const healed = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, healed);
+    try testing.expectEqual(@as(usize, 0), healed.len);
+}
+
 test "SQLite: a scan failure names the table and the offending column" {
     // `error.TypeMismatch` on its own names neither, which is the third of four
     // consumer reports in this batch. The diagnosis is emitted through
