@@ -1202,6 +1202,99 @@ test "MySQL: migrateSchema drops removed column" {
     }
 }
 
+test "MySQL: allow_nullability_change adds a NOT NULL column with a backfill default" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // The legacy table matches the schema except for the missing `added`, so
+    // the only operation the migration has to perform is the ADD COLUMN.
+    _ = try drv.exec("DROP TABLE IF EXISTS my_nn_doc", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_nn_doc", &.{}) catch {};
+    _ = try drv.exec(
+        "CREATE TABLE my_nn_doc (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL)",
+        &.{},
+    );
+    _ = try drv.exec("INSERT INTO my_nn_doc (name) VALUES ('before')", &.{});
+
+    // `added` is an Int on purpose: `field.String` maps to MySQL `TEXT`, and
+    // MySQL rejects a DEFAULT on a TEXT column (errno 1101), which would fail
+    // the CREATE TABLE long before this test reaches the ADD COLUMN.
+    const NnDoc = schema("MyNnDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("added").Default(7),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{NnDoc});
+    const infos = graph.types;
+
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .allow_nullability_change = true,
+    });
+
+    var rows = try drv.query(
+        "SELECT is_nullable FROM information_schema.columns WHERE table_name = 'my_nn_doc' AND table_schema = DATABASE() AND column_name = 'added'",
+        &.{},
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqualStrings("NO", row.getText(0).?);
+
+    // MySQL filled the row that predates the column from the DEFAULT.
+    var value_rows = try drv.query("SELECT added FROM my_nn_doc", &.{});
+    defer value_rows.deinit();
+    const value_row = value_rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 7), value_row.getInt(0).?);
+}
+
+test "MySQL: an existing column's nullability fails closed, it does not get a MODIFY" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // `loose` is nullable where the schema says NOT NULL. MySQL changes a
+    // column only through `MODIFY COLUMN`, which replaces the *whole*
+    // definition — and the introspection here reports a bare `data_type` with
+    // no DEFAULT and no AUTO_INCREMENT, so the rewrite would drop attributes it
+    // never saw. The migration must refuse rather than guess.
+    _ = try drv.exec("DROP TABLE IF EXISTS my_nn_loose_doc", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_nn_loose_doc", &.{}) catch {};
+    _ = try drv.exec(
+        "CREATE TABLE my_nn_loose_doc (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, loose VARCHAR(255) DEFAULT 'kept')",
+        &.{},
+    );
+
+    const NnLooseDoc = schema("MyNnLooseDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("loose"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{NnLooseDoc});
+    const infos = graph.types;
+
+    try testing.expectError(error.MySQLNullabilityChangeUnsafe, migrate.migrateSchemaWithOptions(
+        allocator,
+        drv.asDriver(),
+        infos,
+        migrate.MigrateOptions{ .allow_nullability_change = true },
+    ));
+
+    // Nothing was rewritten: the column is still nullable and still carries the
+    // DEFAULT a `MODIFY COLUMN` would have stripped.
+    var rows = try drv.query(
+        "SELECT is_nullable, column_default FROM information_schema.columns WHERE table_name = 'my_nn_loose_doc' AND table_schema = DATABASE() AND column_name = 'loose'",
+        &.{},
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqualStrings("YES", row.getText(0).?);
+    try testing.expectEqualStrings("kept", row.getText(1).?);
+}
+
 test "MySQL: migrateSchema dry-run outputs SQL without executing" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

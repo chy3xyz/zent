@@ -1210,6 +1210,86 @@ test "Postgres: migrateSchema drops removed column" {
     }
 }
 
+/// `information_schema`'s `is_nullable` for one column.
+fn pgColumnNullable(drv: *PostgresDriver, table: []const u8, column: []const u8) !bool {
+    var rows = try drv.query(
+        "SELECT is_nullable FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema() AND column_name = $2",
+        &.{ .{ .string = table }, .{ .string = column } },
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    return std.ascii.eqlIgnoreCase(row.getText(0) orelse "", "YES");
+}
+
+test "Postgres: allow_nullability_change converges both directions of nullability" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // `loose` is nullable where the schema says NOT NULL (the direction that
+    // breaks reads), `strict` is the other way round, and `added` does not
+    // exist yet — the column whose absence `migrateSchema` used to fill with a
+    // nullable one.
+    const legacy =
+        "CREATE TABLE pg_nn_doc (id SERIAL PRIMARY KEY, name TEXT NOT NULL, loose TEXT, strict TEXT NOT NULL)";
+    const seed = "INSERT INTO pg_nn_doc (name, loose, strict) VALUES ('a', 'v', 'v')";
+
+    const NnDoc = schema("PgNnDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("loose"),
+            field.String("strict").Optional(),
+            field.String("added").Default("pending"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{NnDoc});
+    const infos = graph.types;
+
+    const drop = "DROP TABLE IF EXISTS pg_nn_doc";
+    defer _ = drv.exec(drop, &.{}) catch {};
+
+    // Default: none of the three moves. `added` arrives nullable, which is the
+    // drift `check_nullability` reports at the end of the same run.
+    _ = try drv.exec(drop, &.{});
+    _ = try drv.exec(legacy, &.{});
+    _ = try drv.exec(seed, &.{});
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    try testing.expect(try pgColumnNullable(&drv, "pg_nn_doc", "loose"));
+    try testing.expect(!try pgColumnNullable(&drv, "pg_nn_doc", "strict"));
+    try testing.expect(try pgColumnNullable(&drv, "pg_nn_doc", "added"));
+
+    // Opted in, against a legacy table of the same age: the added column is
+    // created NOT NULL, and the two existing ones are altered to match.
+    _ = try drv.exec(drop, &.{});
+    _ = try drv.exec(legacy, &.{});
+    _ = try drv.exec(seed, &.{});
+
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .allow_nullability_change = true,
+    });
+    try testing.expect(!try pgColumnNullable(&drv, "pg_nn_doc", "loose"));
+    try testing.expect(try pgColumnNullable(&drv, "pg_nn_doc", "strict"));
+    try testing.expect(!try pgColumnNullable(&drv, "pg_nn_doc", "added"));
+
+    // The row that predates `added` took the field's default.
+    {
+        var rows = try drv.query("SELECT added FROM pg_nn_doc", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("pending", row.getText(0).?);
+    }
+
+    // And the schema and the database now agree, which is the point: the run
+    // has nothing left for `checkNullability` to report.
+    {
+        const drifts = try migrate.checkNullability(allocator, drv.asDriver(), infos);
+        defer migrate.freeNullabilityDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+}
+
 test "Postgres: migrateSchema dry-run outputs SQL without executing" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
