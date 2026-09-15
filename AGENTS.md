@@ -6,18 +6,19 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.64.1** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.65.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (413 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (423 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
 - `zig build run-complex` — run the `examples/complex` e-commerce demo
 - `zig build run-pool` — run the `examples/pool` connection-pool demo
 - `zig build run-interceptor` — run the `examples/interceptor` multi-tenant demo
+- `zig build run-check-sql` — run the `examples/check_sql` raw-SQL checker (Z28 CLI)
 - `zig fmt --check src examples tests build.zig` — formatting
 - `bash scripts/check-version.sh` — release-consistency gate (CI)
 - `bash scripts/check-deadcode.sh` — dead-code baseline gate (CI; needs
@@ -50,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 413, integration 215 passed + 3 skipped
+`baseline` counts move with this: unit 423, integration 227 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -218,6 +219,21 @@ Entities and queries are explicitly owned by the caller. See the contract:
   `planMigrateStatements`; a second, hand-rolled "what would we do" branch is how
   a preview starts disagreeing with the run it is previewing. Anything added to
   the migration has to be added to the plan, once.
+- **EntQL must consume the whole input.** `entql.parse` is a prefix parser, so
+  without the EOF check `age > 1 age < 5` parses as `age > 1` and the rest is
+  silently dropped — a filter with fewer conditions than was written, i.e. more
+  rows. Through `WhereEntQL` the input is user data, so this is the fail-open
+  shape to watch for. Keep the EOF requirement and the `errdefer`s that free a
+  half-built tree on the failure paths.
+- **A present junction table's shape is compared to `junctionTableForEdge`, not
+  to a second opinion.** Columns are read-breaking; `.junction_pair_uniqueness` is
+  not (a write constraint); a *unique* unreadable index suppresses the pair
+  report. Do not fold it into `unique_constraint` (that asks about a single
+  column) or `index_uniqueness` (that compares a named schema index).
+- **The logger renders an unknown row count as `?`, never `0`.** `LogContext`
+  carries `rows_affected_known`; a call site with no count to give must mark it.
+  Same rule as `driver.Result`: a value that cannot be told apart from a real 0
+  is a claim the driver did not make.
 - **`missing_junction_table` is read-breaking too, and only M2M needs it.** An M2M
   edge's junction table is not a `TypeInfo`, so it takes its own traversal in
   `checkSchema` (`junctionTableForEdge`, `relation == .m2m` **and no `Through`** —
@@ -266,4 +282,5 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `examples/pool/` — connection-pool usage demo
 - `examples/migrate/` — migration-file runner demo
 - `examples/interceptor/` — multi-tenant query-rewriting demo (`UseInterceptor`)
+- `examples/check_sql/` — raw-SQL checker CLI: `checkStatement` over `.sql` files / `--sql`, exit 1 on a failed statement, 0 when only `not_checkable`
 - `tests/integration/` — end-to-end tests

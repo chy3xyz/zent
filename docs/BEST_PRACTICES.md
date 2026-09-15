@@ -432,6 +432,13 @@ Three things it deliberately does not do:
 Use `explainSql` instead when you want the *plan*; it accepts no parameters, so
 it cannot answer the bound-parameter question this exists for.
 
+There is a CLI form of the same loop: `zig build run-check-sql` (or the installed
+`zig-out/bin/check_sql`) takes `.sql` files and `--sql` text, splits them into
+statements without being fooled by semicolons in strings, identifiers, comments or
+`$tag$` bodies, checks each against `--dsn`, and exits **1** on a failed statement
+and **0** when the only findings are `not_checkable` — which is what lets it sit in
+a pre-commit hook or a CI step. See `examples/check_sql`.
+
 ### The wrong number of arguments, per dialect
 
 Passing the wrong argument count is the most common raw-SQL mistake, and the
@@ -953,7 +960,7 @@ Everything the schema declares, against what `checkSchema` compares:
 | an index (by name) and its key list | `index_columns` | only when the database's key list is readable |
 | an index's uniqueness | `index_uniqueness` | always |
 | a view | `missing_view` | always — any relation of that name, view or table |
-| an M2M junction table (implicit) | `missing_junction_table` | always — existence only; only `.m2m` edges without `Through` need one |
+| an M2M junction table (implicit) | `missing_junction_table`, plus `missing_column` / `junction_pair_uniqueness` / `missing_foreign_key` for a **present** one | existence always; the shape is compared against `junctionTableForEdge` when the relation is there. Only `.m2m` edges without `Through` need one |
 | a field's `Unique()` | `unique_constraint` | unless a unique index forces that column alone, or a *unique* unreadable index makes it undecidable |
 | a foreign key | `missing_foreign_key` | by shape; `ON DELETE`/`ON UPDATE` not compared |
 
@@ -962,7 +969,7 @@ right":
 
 | Not covered | Consequence |
 |---|---|
-| a present junction table's **shape** (columns, PK, FKs, pair-uniqueness) | only its existence is compared |
+| a present junction table's column **types**, its `NOT NULL`, and any **extra** column it carries | the two columns the relation query names, the pair's key and the two foreign keys *are* compared; a wider type or an extra column is not drift |
 | a junction name **colliding** with a declared entity table | `CREATE TABLE IF NOT EXISTS` silently keeps whichever ran first |
 | **view definitions** | a changed `view_sql` is not reported — the database stores a canonical rewrite (PostgreSQL) or its own normalization, so comparing would fire on every database |
 | a declared index **missing** from the database | only indexes present under both are compared; a missing one is a performance matter, never reported |
@@ -973,11 +980,12 @@ right":
 
 Two more things worth knowing:
 
-- **`missing_view` and `missing_junction_table` are read-breaking**, unlike every
-  index and constraint kind: a
+- **`missing_view`, `missing_junction_table` and a junction's missing column are
+  read-breaking**, unlike every index and constraint kind: a
   missing view or junction table makes the read fail outright, so
   `read_breaking_only` blocks a deploy on them exactly as it does for a missing
-  table.
+  table — while `.junction_pair_uniqueness` does **not** (whether the pair is
+  keyed affects writes, not reads).
 - **`unique_constraint` and `missing_foreign_key` are reports, not repairs.**
   `migrateSchema` still does not add either with `ALTER TABLE … ADD CONSTRAINT`;
   non-destructiveness is deliberate.
@@ -1012,6 +1020,7 @@ guessed whenever the database's key list cannot be read reliably:
 | non-btree access methods (`USING gin`/`hash`/…) | column order and meaning do not map onto the schema's list |
 | `indisvalid = false` | a half-built index is not a definition to compare against |
 | `INCLUDE` columns, key-count mismatch, empty key list | the introspection would be comparing different things |
+| a *unique* index on a junction's pair whose key list cannot be read | the pair question has no answer, so `.junction_pair_uniqueness` stays silent (same rule as `unique_constraint`) |
 
 Two consequences worth knowing:
 

@@ -4,6 +4,119 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`check_sql`: the Z28 CLI entry point for raw SQL** (`examples/check_sql`,
+  installed as `zig-out/bin/check_sql`, `zig build run-check-sql`). Z28's last
+  open item: a consumer with ~476 hand-written call sites asked for a way to
+  validate a statement *before* it runs, and the library half shipped in v0.58.0
+  (`checkStatement`, prepare and discard) — what was missing was the thing that
+  can sit in a pre-commit hook or a CI step.
+
+  It reads `.sql` files and/or `--sql` text, splits each input into single
+  statements and runs every one through `checkStatement`. The splitter is real
+  rather than advertised: a semicolon inside `'a;b'`, `"ident;ifier"`,
+  `` `backtick` ``, a `-- line` / `/* block */` comment (nested, PostgreSQL's
+  rule) or a `$tag$ … $tag$` body does not split, each statement reports the line
+  it starts on, and the limits (no `#` comments, no backslash escapes, an
+  unterminated quote swallows the rest into one statement) are stated in `--help`
+  and in the module doc rather than papered over.
+
+  Exit **0** when everything prepared cleanly or could not be judged, **1** when
+  a statement failed, **2** when the run itself could not happen — including "no
+  statement found", so an empty glob cannot look green. `not_checkable` is
+  counted in its own bucket and never as a failure: it is a limit of the prepare
+  channel, not a defect in the statement, which is the distinction v0.58 drew and
+  the reason this can gate a build. `--dsn` takes `sqlite:<path>`,
+  `postgres://…`, a libpq keyword/value conninfo (the shape `PG_DSN` has in CI)
+  and `mysql://…`, defaulting to `$ZENT_DSN` then `sqlite::memory:`.
+
+- **`checkSchema` compares a present M2M junction table's shape**, not only its
+  existence. `missing_junction_table` answers "is the relation there"; a relation
+  of the right name with the **wrong shape** stayed silent even though it breaks
+  the same queries — a missing `*_id` column fails every read over the edge with
+  `no such column`, and a table with nothing keying the pair accepts the same link
+  twice, so the relation query answers with the same neighbour twice.
+
+  A present junction is compared against the shape `junctionTableForEdge` derives
+  — the same definition `migrateSchema` creates it from and `buildEdgeStep` reads
+  it with, so the checked shape is not a second opinion — on exactly three things:
+
+  - the two columns, as `.missing_column` — read-breaking, like any other missing
+    column;
+  - the pair's uniqueness, as the new **`.junction_pair_uniqueness`** — a *write*
+    constraint, so `breaksReads()` is **`false`** and `read_breaking_only` does not
+    block a deploy over it. `UNIQUE (b_id, a_id)` satisfies it, since the two
+    orders forbid the same duplicate pairs; a wider `UNIQUE (a, b, c)` does not;
+    and a *unique* index whose key list cannot be read (an expression key, a
+    prefix, a partial index) suppresses the report rather than guessing — the rule
+    `unique_constraint` already follows;
+  - the two foreign keys, as `.missing_foreign_key`, by shape like every other.
+
+  A junction whose name a **view** carries is compared on its columns alone,
+  because a view can carry neither a primary key nor a foreign key. Column
+  **types**, `NOT NULL` and extra columns are deliberately not compared, and
+  `migrateSchema` still never reshapes a junction table.
+
+### Fixed
+- **EntQL rejects an expression the parser does not consume entirely.**
+  `entql.parse` is a prefix parser and never checked that the input ran out, so
+  `age > 1 age < 5`, `name = "alice" zzz` and `status IN ("a","b") junk` all came
+  back as a tree for the **prefix alone** — indistinguishable from a full parse.
+  Through `QueryBuilder.WhereEntQL` that is a filter with **fewer conditions than
+  was written**, i.e. more rows returned: the fail-open shape this audit method
+  keeps turning up, in the one place where the input is user data. It now requires
+  EOF and answers `error.UnexpectedToken`, a name the error set already carried
+  and nobody constructed. Trailing whitespace still parses.
+
+  The failure paths also leaked everything they had built — `a IN (1, 2) OR`,
+  `has(cars, price > 5` and `name CONTAINS 'x' AND` left the half-built tree, the
+  `IN` value list and the `LIKE` pattern allocated, so a malformed filter string
+  leaked on every call. Eleven `errdefer` now cover them.
+
+- **`graph.neighbors.appendSetNeighbors{,Filtered}` reject an empty
+  `parent_ids`** with `error.EmptyParentIds` instead of emitting a statement with
+  a bare `WHERE ` — measured as `SELECT "car".*, "owner_id" AS __fk FROM "car"
+  WHERE `, which SQLite rejects with `near ";": syntax error`. Both in-tree callers
+  already short-circuit an empty page, so nothing hit it; the guard keeps the next
+  caller from inheriting a prepare error from deep in the driver. An error rather
+  than an assert, because in `ReleaseFast` an assert is UB and the bare `WHERE`
+  would come back.
+
+- **The logger no longer reports a row count the driver never obtained as `0`.**
+  `LogContext` carried only `rows_affected`, so the "the driver has no count" case
+  that `Result.rows_affected_known` exists for (v0.63.0) still reached the log line
+  as a real `0` — the same "matched nothing" claim the drivers had stopped making.
+  `LogContext` now carries the flag (additive, default `true`), the renderer prints
+  `?` for an unknown count, and the call sites that have no count to give forward
+  it: `QueryBuilder.Iterate`, which logs a stream it has not read, marks its `0`
+  unknown, and the three `UpdateBuilder`/`DeleteBuilder` `onExec` sites forward
+  `Result.rows_affected_known`.
+
+### Notes
+- **The log text itself is not capturable in tests** (this repo has no `logFn`), so
+  that fix is pinned at the renderer and at the `LogContext` each callback
+  receives — stated rather than dressed up as an end-to-end assertion.
+- **`crud_helpers.saveOrUpdate` keeps its exists-then-create window**, now
+  documented on it and on `batchSaveOrUpdate`: two writers can both read "no match"
+  and both insert. The helper receives opaque predicates, so it cannot name a
+  conflict target for an upsert, and the `.created`/`.updated` split that
+  `batchSaveOrUpdate` counts on has no upsert equivalent. With a unique index over
+  the predicate's columns the loser gets `error.UniqueViolation`; without one both
+  rows remain.
+- **`create.zig`'s two insert log sites still report a hardcoded
+  `rows_affected = 1`** (reported, not fixed): on the RETURNING path an ignored
+  `SaveIgnore` logged 1 while zero rows were written, and on the MySQL path the
+  server's count can be 2 (an ODKU update) or 0 (ignored).
+- **`create.zig`'s `last_insert_id orelse 0`** writes `0` into an entity's key and
+  fabricates a contiguous id run in the batch path — reachable only through a
+  driver that returns `null` (the in-tree MySQL driver always answers `Some`), and
+  fixing it changes `SaveError`, so it is reported rather than changed.
+- **`BulkDelete().Exec()` with no predicate is a silent no-op on a soft-deleting
+  entity and a full-table delete on a hard-deleting one** — the same call, two
+  semantics. Needs a decision rather than a patch.
+- **`examples/migrate` leaks eight allocations on every MySQL run** (it never frees
+  the parsed DSN parts). Reported, not fixed; the new CLI does it correctly.
+
 ## [0.64.1] - 2026-09-15
 
 ### Fixed
