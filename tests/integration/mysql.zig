@@ -3676,6 +3676,99 @@ test "MySQL: checkSchema reports a view the database does not have, and getExist
     try testing.expectEqual(@as(usize, 0), healed.len);
 }
 
+// ------------------------------------------------------------------
+// M2M junction tables
+// ------------------------------------------------------------------
+
+test "MySQL: checkSchema reports a missing M2M junction table" {
+    // An M2M edge is joined through a junction table that is not an entity, so
+    // the loop `checkSchema` walks — `infos` — never looked at it. The failure
+    // that let through: the edge is declared, `migrateSchema` records
+    // `create_junction`, the table is later dropped out of band — and nothing
+    // re-checked it, so a query over the edge errored while `assertSchema`
+    // stayed green.
+    //
+    // Nothing here depends on which server this file runs against (MySQL 8/9
+    // locally, MariaDB 10.11 in CI): the assertions are `information_schema`
+    // existence, the reported drift and a failing `SELECT` over the dropped
+    // table, none of which differ between the two — and the only server-specific
+    // value in reach, the driver's error name for that `SELECT`, is deliberately
+    // not asserted (see the loose `if (…) |rows| … else |_| {}` below).
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Leftovers from an interrupted run. The junction table goes first: it
+    // holds foreign keys to both entity tables.
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_my_member_zent_jc_my_tag", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_my_member", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_my_tag", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_member_zent_jc_my_tag", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_member", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_tag", &.{}) catch {};
+
+    const ZentJcMyMemberBase = schema("ZentJcMyMember", .{ .fields = &.{field.String("name")} });
+    const ZentJcMyTagBase = schema("ZentJcMyTag", .{ .fields = &.{field.String("label")} });
+    // Both sides declare the edge, which is what makes it M2M — and what makes
+    // an absent junction table a single report rather than two.
+    const ZentJcMyMember = struct {
+        pub const schema_name = ZentJcMyMemberBase.schema_name;
+        pub const fields = ZentJcMyMemberBase.fields;
+        pub const edges = &.{edge.To("tags", ZentJcMyTagBase)};
+        pub const indexes = ZentJcMyMemberBase.indexes;
+    };
+    const ZentJcMyTag = struct {
+        pub const schema_name = ZentJcMyTagBase.schema_name;
+        pub const fields = ZentJcMyTagBase.fields;
+        pub const edges = &.{edge.To("members", ZentJcMyMemberBase)};
+        pub const indexes = ZentJcMyTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ ZentJcMyMember, ZentJcMyTag });
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The junction table `migrateSchema` built is there, and its own primary
+    // key and foreign keys produce no other drift: agreement on both gates.
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // Dropped out of band: reported, and the read-breaking gate fails on it.
+    _ = try drv.exec("DROP TABLE zent_jc_my_member_zent_jc_my_tag", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_junction_table, drifts[0].kind);
+        try testing.expectEqualStrings("zent_jc_my_member_zent_jc_my_tag", drifts[0].table);
+        try testing.expectEqualStrings("", drifts[0].column);
+        try testing.expect(std.mem.indexOf(u8, drifts[0].index_detail, "zent_jc_my_member <-> zent_jc_my_tag") != null);
+        try testing.expect(std.mem.indexOf(u8, drifts[0].index_detail, "database has no relation named zent_jc_my_member_zent_jc_my_tag") != null);
+        try testing.expect(drifts[0].breaksReads());
+        // The relation query really does fail; that is the stake behind
+        // `breaksReads`. The error name is the driver's business, so only the
+        // failure itself is asserted here.
+        if (drv.query("SELECT zent_jc_my_member_id, zent_jc_my_tag_id FROM zent_jc_my_member_zent_jc_my_tag", &.{})) |rows| {
+            var r = rows;
+            r.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // `migrateSchema` heals it: the recorded `create_junction` version is
+    // present but the relation is gone, so the junction table is re-created.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const healed = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, healed);
+    try testing.expectEqual(@as(usize, 0), healed.len);
+}
+
 test "MySQL: getExistingIndexes reads the key columns in order" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

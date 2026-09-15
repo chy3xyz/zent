@@ -3717,6 +3717,78 @@ test "SQLite: checkSchema reports a view the database does not have, and getExis
     try testing.expectEqual(@as(usize, 0), healed.len);
 }
 
+test "SQLite: checkSchema reports a missing M2M junction table" {
+    // An M2M edge is joined through a junction table that is not an entity, so
+    // the loop `checkSchema` walks — `infos` — never looked at it. The failure
+    // that let through: the edge is declared, `migrateSchema` records
+    // `create_junction`, the table is later dropped out of band — and nothing
+    // re-checked it, so a query over the edge errored while `assertSchema`
+    // stayed green. Same silent class as the view case above.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const SqJcMemberBase = schema("SqJcMember", .{ .fields = &.{field.String("name")} });
+    const SqJcTagBase = schema("SqJcTag", .{ .fields = &.{field.String("label")} });
+    // Both sides declare the edge, which is what makes it M2M — and what makes
+    // an absent junction table a single report rather than two.
+    const SqJcMember = struct {
+        pub const schema_name = SqJcMemberBase.schema_name;
+        pub const fields = SqJcMemberBase.fields;
+        pub const edges = &.{edge.To("tags", SqJcTagBase)};
+        pub const indexes = SqJcMemberBase.indexes;
+    };
+    const SqJcTag = struct {
+        pub const schema_name = SqJcTagBase.schema_name;
+        pub const fields = SqJcTagBase.fields;
+        pub const edges = &.{edge.To("members", SqJcMemberBase)};
+        pub const indexes = SqJcTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ SqJcMember, SqJcTag });
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The junction table `migrateSchema` built is there, and its own primary
+    // key and foreign keys produce no other drift: agreement on both gates.
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // Dropped out of band: reported, and the gate that exists to stop a deploy
+    // that breaks reads has to fail on it.
+    _ = try drv.exec("DROP TABLE sq_jc_member_sq_jc_tag", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_junction_table, drifts[0].kind);
+        try testing.expectEqualStrings("sq_jc_member_sq_jc_tag", drifts[0].table);
+        // No column semantics for this kind: the relation is what is missing,
+        // the edge that needs it and its expected columns are in the detail.
+        try testing.expectEqualStrings("", drifts[0].column);
+        try testing.expect(std.mem.indexOf(u8, drifts[0].index_detail, "sq_jc_member <-> sq_jc_tag") != null);
+        try testing.expect(std.mem.indexOf(u8, drifts[0].index_detail, "database has no relation named sq_jc_member_sq_jc_tag") != null);
+        try testing.expect(drifts[0].breaksReads());
+        // The relation query really does fail; that is the stake behind
+        // `breaksReads`.
+        try testing.expectError(error.SqlitePrepareFailed, drv.query("SELECT sq_jc_member_id, sq_jc_tag_id FROM sq_jc_member_sq_jc_tag", &.{}));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // `migrateSchema` heals it: the recorded `create_junction` version is
+    // present but the relation is gone, so the junction table is re-created —
+    // the out-of-band-drop path it already has for tables and views.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const healed = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, healed);
+    try testing.expectEqual(@as(usize, 0), healed.len);
+}
+
 test "SQLite: a scan failure names the table and the offending column" {
     // `error.TypeMismatch` on its own names neither, which is the third of four
     // consumer reports in this batch. The diagnosis is emitted through
