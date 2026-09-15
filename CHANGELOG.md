@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-09-15
+
 ### Added
 - **`zent.sql_statement.checkStatement`** (Z28). Raw SQL had no way to be
   validated before it ran, so a consumer with ~476 hand-written call sites kept
