@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-09-15
+
 ### Added
 - **`driver.classify` — the 503/500 question, answered once** (Z29). Three
   unrelated error sets exist in this library (`driver.Error`, `runtime.error`'s
