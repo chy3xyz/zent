@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-09-15
+
 ### Added
 - **`checkSchema` now reports a declared view the database does not have**
   (`SchemaDrift.Kind.missing_view`). Views were the one declared shape it never
