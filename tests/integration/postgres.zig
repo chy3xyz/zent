@@ -3476,31 +3476,15 @@ test "Postgres: checkSchema reports a view the database does not have, and getEx
         .fields = &.{field.String("name")},
     });
 
-    // The base table through the real path. The **view cannot be**, and that is
-    // a pre-existing defect this test found rather than a choice: see the
-    // assertion right below.
-    const base_graph = comptime buildGraph(&.{ZentVwPgBase});
-    try migrate.migrateSchema(allocator, drv.asDriver(), base_graph.types);
-
-    // `createViewSQLAlloc` emits `CREATE VIEW IF NOT EXISTS`, and PostgreSQL has
-    // no `IF NOT EXISTS` for `CREATE VIEW`: the statement is a syntax error
-    // (42601), so on PostgreSQL the migration path cannot create a declared
-    // view at all — `migrateSchema` and `createAllTables` both fail on one.
-    // Reported with this change, deliberately **not** fixed here (changing the
-    // DDL is outside this lane). Pinned rather than only commented so the claim
-    // is reproducible: when this stops failing, `createViewSQLAlloc` was fixed
-    // and this test has to be updated with it.
-    if (drv.exec("CREATE VIEW IF NOT EXISTS \"zent_vw_pg_probe\" AS SELECT id, name FROM zent_vw_pg_base", &.{})) |_| {
-        return error.TestUnexpectedResult;
-    } else |_| {}
-
-    // The view is created with the DDL PostgreSQL accepts. `checkSchema` reads
-    // the catalog, so which statement built it does not matter to the check
-    // under test.
-    _ = try drv.exec("CREATE VIEW zent_vw_pg_probe AS SELECT id, name FROM zent_vw_pg_base", &.{});
-
+    // Both the base table and the view go through the real migration path. This
+    // is the assertion that proves the fix: `createViewSQLAlloc` used to emit
+    // `CREATE VIEW IF NOT EXISTS`, which PostgreSQL rejects outright (42601,
+    // `syntax error at or near "NOT"`) — so a schema declaring a view could not
+    // be migrated on PostgreSQL at all. It now emits `CREATE OR REPLACE VIEW`
+    // for every dialect but SQLite, and this call fails if that regresses.
     const graph = comptime buildGraph(&.{ ZentVwPgBase, ZentVwPgProbe });
     const infos = graph.types;
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
 
     // The view is a relation `checkSchema` can see, on both gates.
     {

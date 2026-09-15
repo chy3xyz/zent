@@ -895,7 +895,7 @@ migration ran, so the shape is right" and being surprised later:
 | An existing column's nullability is changed **only with `allow_nullability_change`** (and only on PostgreSQL) | the database keeps whatever it had, silently | see `checkSchema`/`assertSchema` above |
 | **Unique** on an added column is not emitted (SQLite cannot, and the `CREATE TABLE` path carries it for PG/MySQL) | an old table gains the column without the constraint | add the constraint in a real migration |
 | **Foreign keys** exist only in `CREATE TABLE`; `ALTER` never adds one | old tables stay unconstrained | same |
-| A **changed `view_sql` never takes effect** — views are `CREATE VIEW IF NOT EXISTS` | the definition you upgraded to is not the one in the database | `DROP VIEW` then re-run, or version the view name |
+| A **changed `view_sql`**: on SQLite it still never takes effect (`CREATE VIEW IF NOT EXISTS` leaves an existing name alone) | the definition you upgraded to is not the one in the database | `DROP VIEW` then re-run, or version the view name |
 | A **changed index definition is reported but not repaired** — `ExistingIndex.columns` now carries the key list, but `migrateSchema` still only asks whether the name exists | a declared index the database holds under the same name with different columns stays as it is | drop and recreate it by hand; `checkSchema` names the difference |
 
 #### What `checkSchema` covers, and what it does not
@@ -910,6 +910,7 @@ Everything the schema declares, against what `checkSchema` compares:
 | a column's nullability | `nullability` | always |
 | an index (by name) and its key list | `index_columns` | only when the database's key list is readable |
 | an index's uniqueness | `index_uniqueness` | always |
+| a view | `missing_view` | always — any relation of that name, view or table |
 | a field's `Unique()` | `unique_constraint` | unless a unique index forces that column alone, or a *unique* unreadable index makes it undecidable |
 | a foreign key | `missing_foreign_key` | by shape; `ON DELETE`/`ON UPDATE` not compared |
 
@@ -918,7 +919,8 @@ right":
 
 | Not covered | Consequence |
 |---|---|
-| **views** (`checkSchema` skips `is_view`) | a changed `view_sql` never takes effect and nothing says so |
+| **view definitions** | a changed `view_sql` is not reported — the database stores a canonical rewrite (PostgreSQL) or its own normalization, so comparing would fire on every database |
+| **M2M junction tables** (implicit, from an edge) | a missing junction table is not reported; the relation query fails |
 | a declared index **missing** from the database | only indexes present under both are compared; a missing one is a performance matter, never reported |
 | the primary key's shape | columns, order and name are not compared |
 | `ON DELETE` / `ON UPDATE` | an FK can point at the right place with the wrong action |
@@ -927,6 +929,9 @@ right":
 
 Two more things worth knowing:
 
+- **`missing_view` is read-breaking**, unlike every index and constraint kind: a
+  view that is not there makes the read fail outright, so `read_breaking_only`
+  blocks a deploy on it exactly as it does for a missing table.
 - **`unique_constraint` and `missing_foreign_key` are reports, not repairs.**
   `migrateSchema` still does not add either with `ALTER TABLE … ADD CONSTRAINT`;
   non-destructiveness is deliberate.

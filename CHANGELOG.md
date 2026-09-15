@@ -4,6 +4,92 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`checkSchema` now reports a declared view the database does not have**
+  (`SchemaDrift.Kind.missing_view`). Views were the one declared shape it never
+  looked at, so a view that was never created — or was dropped out of band —
+  produced a green `assertSchema` while `SELECT … FROM the_view` failed. That is
+  the same silent failure as a missing table, one scope up.
+
+  The check asks one question, *is there a relation of this name at all?* (a
+  table counts as well as a view), reusing the `getExistingColumns` probe
+  `migrateSchema` already uses to re-create a dropped view rather than adding a
+  second existence check. `breaksReads()` is **`true`** for it — a missing view
+  makes the read fail outright, it does not merely change shape — so
+  `DriftStrictness.read_breaking_only` blocks a deploy on it, exactly as it does
+  for `missing_table`.
+
+- **`getExistingViews` / `freeExistingViews` / `ExistingView`** — read the views
+  a database holds, from each dialect's catalog (`pg_views`,
+  `information_schema.views`, `sqlite_master`), with the view name **bound** on
+  all three (`$1` / `?` / `?`). `ExistingView.definition` is the definition *as
+  the database stores it*.
+
+- **Connection-pool stress tests** (`tests` in `src/sql/pool.zig`). The pool is
+  where this project's serious defects have been — an entry whose address moved
+  while borrowed (the raw-pointer `available` list, which a `swapRemove` plus a
+  fresh `addOne` could alias into a use-after-free), and a `release` that pooled
+  a connection it had failed to roll back. Both were found by report or by
+  audit, not by a test, because no test asserted what the pool must *never* do
+  under concurrency. Three tests now do, with invariants rather than a schedule
+  (a flaky stress test is worse than none):
+
+  - a connection is never lent to two borrowers (pointer-keyed registry + a
+    holder slot inside the driver);
+  - a borrowed connection is still its own entry after a storm of create/close
+    churn (a canary re-read while the borrow is live);
+  - connections really are closed while others are lent out (a reaper thread
+    drives `pingIdleConnections`/`reapIdleConnections` against the borrow-path
+    health check and lifetime eviction);
+  - `stats()` drains to `total == available`, `in_use == 0`, `waiters == 0`;
+  - the simultaneous-borrow peak never exceeds `max_connections`;
+  - every parked waiter is woken.
+
+  They run on `std.testing.allocator` — its `SafeAllocator` is thread-safe in
+  this Zig version, so leak detection stays on, which is how a leaked registry
+  in the first draft was caught. Ten consecutive runs, no jitter.
+
+### Fixed
+- **PostgreSQL could not create a declared view at all.** `createViewSQLAlloc`
+  emitted `CREATE VIEW IF NOT EXISTS` for every dialect, and **PostgreSQL has no
+  `IF NOT EXISTS` for `CREATE VIEW`** — it answers `42601 syntax error at or
+  near "NOT"`. A schema declaring a view entity therefore failed
+  `migrateSchema` *and* `createAllTables` outright, and had since views were
+  added (v0.30-era). SQLite is the mirror image and rejects `OR REPLACE`
+  (`near "OR": syntax error`), so one clause cannot serve both:
+
+  | Dialect | Emitted | A changed `view_sql` |
+  |---|---|---|
+  | PostgreSQL, MySQL/MariaDB | `CREATE OR REPLACE VIEW` | **now takes effect** on the next `migrateSchema` (PostgreSQL allows columns to be appended, not reordered or retyped) |
+  | SQLite | `CREATE VIEW IF NOT EXISTS` | still does not take effect — SQLite has no in-place replace |
+
+  This is a behaviour change, not only a fix: on PostgreSQL and MySQL a
+  migration now converges an existing view's definition where it previously did
+  nothing. The definition is still never *compared* (see below), so a converged
+  view is not reported either way — `migrateSchema` acting is not this check
+  observing. The view clause is pinned per dialect by a unit test, and the
+  PostgreSQL integration test now creates its view through the real migration
+  path, which is the assertion that failed with `syntax error at or near "NOT"`
+  before this change.
+
+### Notes
+- **The view definition is deliberately not compared.** PostgreSQL stores a
+  rewritten query (`WHERE status = 'active'` becomes
+  `((status)::text = 'active'::text)`), MySQL and MariaDB their own
+  normalizations, and SQLite the original text under zent's own clause — a
+  string comparison against `view_sql` would report every view in every database
+  and block every deploy. A caller that wants to compare can read
+  `getExistingViews` and normalize per dialect.
+- **`checkSchema` still does not see M2M junction tables.** A missing junction
+  table is not reported; relation queries against it fail. Same silent-failure
+  class as `missing_view`, not yet covered.
+- **A pool behaviour worth a decision, found by the stress tests:** with
+  `health_check_on_borrow = true` and a wait budget, a health check that fails
+  on a *newly created* connection parks the borrower until the budget expires
+  even though the pool could open another — and if no other thread holds a
+  connection, nothing can signal it, so the caller waits out `max_wait_ms`
+  instead of failing fast on the connection error. Reported, not changed.
+
 ## [0.60.1] - 2026-09-15
 
 ### Fixed

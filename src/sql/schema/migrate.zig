@@ -183,13 +183,14 @@ pub const SchemaDrift = struct {
         /// the database has no relation of that name — neither a view nor a
         /// table.
         ///
-        /// This is the drift nothing else can see: `migrateSchema` creates a
-        /// view with `CREATE VIEW IF NOT EXISTS`, and `checkSchema` used to skip
-        /// `is_view` entities entirely, so a view that was never created in this
-        /// database produced a green check and a `SELECT` against it failed with
-        /// "no such table/view" — the same silent-empty-result failure
-        /// `missing_table` exists for, which is why `breaksReads()` is **true**
-        /// here: the read fails outright, it does not merely change shape.
+        /// This is the drift nothing else can see: `checkSchema` used to skip
+        /// `is_view` entities entirely, while `migrateSchema` only creates a view
+        /// that is missing (see `createViewSQLAlloc` for the clause each dialect
+        /// gets), so a view that was never created produced a green check and a
+        /// `SELECT` against it failed with "no such table/view" — the same
+        /// silent-empty-result failure `missing_table` exists for, which is why
+        /// `breaksReads()` is **true** here: the read fails outright, it does not
+        /// merely change shape.
         ///
         /// A relation of that name counts whether it is a view or a table. The
         /// check asks "is there anything to read?", and answering it with the
@@ -317,8 +318,12 @@ pub const SchemaDrift = struct {
 /// of the query (`::text` casts, added parentheses, schema-qualified names) and
 /// MySQL/MariaDB and SQLite keep their own text, so comparing it against
 /// `view_sql` would report a difference that is not one. The consequence is the
-/// one to know: **a changed `view_sql` still takes no effect and is still not
-/// reported** — `CREATE VIEW IF NOT EXISTS` does nothing for an existing name.
+/// one to know: **a changed `view_sql` is still not reported here.** On SQLite
+/// it also still takes no effect (`CREATE VIEW IF NOT EXISTS` leaves an existing
+/// name alone); on PostgreSQL and MySQL/MariaDB `createViewSQLAlloc` emits
+/// `CREATE OR REPLACE VIEW`, so a migration does converge the definition — but
+/// that is `migrateSchema` acting, not this check observing, and this check
+/// cannot tell you whether it succeeded.
 /// A caller that wants to compare definitions can read them with
 /// `getExistingViews` and normalize per dialect; that judgement is theirs.
 ///
@@ -1737,12 +1742,33 @@ pub fn createIndexSQLForTableAlloc(allocator: std.mem.Allocator, index: IndexDef
 }
 
 /// Generate CREATE VIEW SQL using specified allocator.
+///
+/// The clause is dialect-dependent, and getting it wrong is not cosmetic:
+/// **PostgreSQL has no `CREATE VIEW IF NOT EXISTS`** — it rejects the statement
+/// with a syntax error (42601, `syntax error at or near "NOT"`), so on
+/// PostgreSQL a schema declaring a view could not be migrated at all. SQLite is
+/// the mirror image: it accepts `IF NOT EXISTS` and rejects `OR REPLACE`
+/// (`near "OR": syntax error`). So:
+///
+///   - PostgreSQL and MySQL/MariaDB: `CREATE OR REPLACE VIEW`, which is
+///     idempotent and replaces the stored definition — a changed `view_sql`
+///     therefore **does** take effect on those two, as long as the new shape is
+///     compatible (PostgreSQL allows columns to be added at the end, not
+///     reordered or retyped).
+///   - SQLite: `CREATE VIEW IF NOT EXISTS`, which creates a missing view and
+///     leaves an existing one alone. It has no way to replace a view in place,
+///     so on SQLite a changed `view_sql` still does not take effect — the
+///     original behaviour, and the only one SQLite offers.
 pub fn createViewSQLAlloc(allocator: std.mem.Allocator, comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
     const view_sql = info.view_sql orelse return error.MissingViewSQL;
     var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
     defer buf.deinit();
 
-    try buf.appendSlice("CREATE VIEW IF NOT EXISTS ");
+    if (std.mem.eql(u8, dialect.name, "sqlite3")) {
+        try buf.appendSlice("CREATE VIEW IF NOT EXISTS ");
+    } else {
+        try buf.appendSlice("CREATE OR REPLACE VIEW ");
+    }
     try quoteIdentToBuffer(dialect, &buf, info.table_name);
     try buf.appendSlice(" AS ");
     try buf.appendSlice(view_sql);
@@ -1753,6 +1779,36 @@ pub fn createViewSQLAlloc(allocator: std.mem.Allocator, comptime info: TypeInfo,
 /// Generate CREATE VIEW SQL.
 pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
     return createViewSQLAlloc(std.heap.page_allocator, info, dialect);
+}
+
+test "CREATE VIEW uses the clause each dialect actually accepts" {
+    // PostgreSQL has no `CREATE VIEW IF NOT EXISTS` (42601) and SQLite no
+    // `CREATE OR REPLACE VIEW` (near "OR"), so a single clause cannot serve
+    // both — and the wrong one is not a cosmetic difference: on PostgreSQL it
+    // made a schema with a view entity unmigratable.
+    const alloc = std.testing.allocator;
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const field = @import("../../core/field.zig");
+
+    const Probe = schema("CreateViewClauseProbe", .{
+        .view = true,
+        .view_sql = "SELECT 1 AS a",
+        .fields = &.{field.Int("a")},
+    });
+    const info = comptime fromSchema(Probe);
+
+    const pg = try createViewSQLAlloc(alloc, info, Dialect.postgres);
+    defer alloc.free(pg);
+    try std.testing.expectEqualStrings("CREATE OR REPLACE VIEW \"create_view_clause_probe\" AS SELECT 1 AS a", pg);
+
+    const my = try createViewSQLAlloc(alloc, info, Dialect.mysql);
+    defer alloc.free(my);
+    try std.testing.expectEqualStrings("CREATE OR REPLACE VIEW `create_view_clause_probe` AS SELECT 1 AS a", my);
+
+    const lite = try createViewSQLAlloc(alloc, info, Dialect.sqlite);
+    defer alloc.free(lite);
+    try std.testing.expectEqualStrings("CREATE VIEW IF NOT EXISTS \"create_view_clause_probe\" AS SELECT 1 AS a", lite);
 }
 
 /// Create entity and junction tables without creating indexes.

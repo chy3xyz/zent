@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.60.1** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.61.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (379 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (385 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -50,7 +50,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 379, integration 197 passed + 3 skipped
+`baseline` counts move with this: unit 385, integration 200 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -187,6 +187,23 @@ Entities and queries are explicitly owned by the caller. See the contract:
   rollback is checked: if the `ROLLBACK` fails the connection is closed, not
   returned to `available`, and MySQL's `in_tx` is cleared only on success. A
   `catch {}` here hands the next borrower someone else's transaction.
+- **A view clause is per dialect, and getting it wrong is fatal.** PostgreSQL has
+  no `CREATE VIEW IF NOT EXISTS` (42601) and SQLite no `CREATE OR REPLACE VIEW`
+  (near `OR`), so `createViewSQLAlloc` emits `OR REPLACE` for everything except
+  SQLite. Do not collapse it back to one clause — on PostgreSQL it made a schema
+  with a view entity unmigratable, and the unit test pinning each dialect exists
+  for exactly that.
+- **`missing_view` is read-breaking.** `checkSchema` asks only whether a relation
+  of the declared name exists (`getExistingColumns`, which answers for a view and
+  a table on all three dialects); the view *definition* is never compared, because
+  PostgreSQL returns a rewritten query and MySQL/SQLite their own text, so a
+  comparison would fire on every database and block every deploy. Read
+  definitions with `getExistingViews` and normalize per dialect if you must.
+- **The pool's invariants have a stress test; keep it honest.** Never weaken an
+  invariant or lower the concurrency to make it pass — decide first whether the
+  test or the pool is wrong, and say which. A flaky stress test is worse than
+  none, so the assertions are invariants (never two borrowers on one connection,
+  peak ≤ `max_connections`, `stats()` drains, every waiter woken), not a schedule.
 - **Foreign keys are compared by shape, never by name.** PostgreSQL and MySQL
   generate a constraint name and SQLite keeps none, so a name comparison would
   report every FK in every database. `breaksReads()` is `false`: a missing write
