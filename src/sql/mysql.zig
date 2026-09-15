@@ -248,6 +248,53 @@ pub const MySQLDriver = struct {
         c.mysql_close(self.conn);
     }
 
+    /// Prepare `sql` and read its parameter list back, then close the statement
+    /// without executing it (`mysql_stmt_prepare` is the whole of it — the row
+    /// count of a checked `INSERT` is where it was before).
+    ///
+    /// Because MySQL's driver always runs parameterized SQL through the
+    /// prepared-statement protocol, this is the same channel `exec` uses, with
+    /// one exception worth knowing about: the protocol rejects some perfectly
+    /// valid statements (`BEGIN`, `LOCK TABLES`, ... — errno 1295), and those
+    /// are reported as `CheckReport.Kind.unsupported` rather than as a
+    /// statement defect. `exec` runs them through `mysql_real_query` instead,
+    /// so "unsupported" means "this channel cannot judge it", not "invalid".
+    ///
+    /// Not logged, unlike the exec path: a statement that fails to prepare is
+    /// the expected outcome of a check.
+    pub fn prepareCheck(self: *MySQLDriver, allocator: std.mem.Allocator, sql: []const u8, args: []const Value, out: *driver.CheckReport) driver.Error!void {
+        try self.ensureAlive();
+
+        const stmt = c.mysql_stmt_init(self.conn) orelse return error.DriverFailed;
+        // Closing the statement frees the buffer `mysql_stmt_error` points
+        // into, so the text is copied before this runs.
+        defer _ = c.mysql_stmt_close(stmt);
+
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
+        defer self.allocator.free(sql_z);
+
+        if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
+            const errno = c.mysql_stmt_errno(stmt);
+            // A dead socket is not a statement verdict. markDead keeps the
+            // pool from handing this connection to the next borrower.
+            const err = errnoToError(errno);
+            self.markDead(err);
+            if (err == error.ConnectionFailed) return error.ConnectionFailed;
+            out.* = .{
+                .kind = if (errno == 1295) .unsupported else .prepare_failed,
+                .native_code = @intCast(errno),
+                .message = try allocator.dupe(u8, std.mem.span(c.mysql_stmt_error(stmt))),
+            };
+            return;
+        }
+
+        const n_params: usize = @intCast(c.mysql_stmt_param_count(stmt));
+        out.* = if (n_params == args.len)
+            .{ .kind = .ok, .param_count = n_params }
+        else
+            .{ .kind = .param_mismatch, .param_count = n_params };
+    }
+
     fn logMySQLError(drv: *MySQLDriver, conn: *c.MYSQL, context: []const u8) void {
         // 连接已死时禁止触碰 C 句柄（mysql_error 在已释放句柄上会段错误）。
         if (drv.dead) return;
@@ -741,6 +788,12 @@ pub const MySQLDriver = struct {
                 // current value differs, so no trailing reset is needed.
                 try self_ptr.applyServerTimeout(ctx);
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
+            }
+        }.f,
+        .prepareCheck = struct {
+            fn f(ptr: *anyopaque, allocator: std.mem.Allocator, q: []const u8, a: []const Value, out: *driver.CheckReport) driver.Error!void {
+                const self_ptr: *MySQLDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.prepareCheck(allocator, q, a, out);
             }
         }.f,
         .beginTx = struct {

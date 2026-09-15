@@ -997,6 +997,13 @@ pub fn ConnPool(comptime D: type) type {
             return .{ .ptr = wrapper, .vtable = &pooled_rows_vtable };
         }
 
+        fn driverPrepareCheck(ptr: *anyopaque, allocator: std.mem.Allocator, sql: []const u8, args: []const Value, out: *driver.CheckReport) driver.Error!void {
+            const pool: *Self = @ptrCast(@alignCast(ptr));
+            const conn = try pool.borrowForDriver();
+            defer pool.release(conn);
+            return conn.asDriver().prepareCheck(allocator, sql, args, out);
+        }
+
         fn driverBeginTx(ptr: *anyopaque) driver.Error!driver.Tx {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             return beginTxWithCtx(pool, null);
@@ -1090,6 +1097,7 @@ pub fn ConnPool(comptime D: type) type {
         const driver_vtable = driver.Driver.VTable{
             .exec = driverExec,
             .query = driverQuery,
+            .prepareCheck = driverPrepareCheck,
             .beginTx = driverBeginTx,
             .beginTxCtx = driverBeginTxCtx,
             .beginSavepoint = driverBeginSavepoint,

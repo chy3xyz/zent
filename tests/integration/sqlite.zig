@@ -4,6 +4,7 @@
 const std = @import("std");
 const zent = @import("zent");
 const SQLiteDriver = zent.sql_sqlite.SQLiteDriver;
+const sql_statement = zent.sql_statement;
 const Dialect = zent.sql_dialect.Dialect;
 const scanRow = zent.sql_scan.scanRow;
 const buildGraph = zent.codegen.graph.buildGraph;
@@ -4864,4 +4865,128 @@ test "SQLite: the caller's arena is the only release for AllIn/FirstIn/SaveIn/qu
         try testing.expectEqual(@as(usize, 1), rows.len);
         try testing.expectEqualStrings("parent", rows[0].name);
     }
+}
+
+// ------------------------------------------------------------------
+// checkStatement: prepare-and-discard validation of a raw statement
+// ------------------------------------------------------------------
+
+test "SQLite: checkStatement accepts a valid statement and its parameter list" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE zent_chk_sq (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    var d = try sql_statement.checkStatement(
+        allocator,
+        drv.asDriver(),
+        "SELECT name FROM zent_chk_sq WHERE id = ?",
+        &.{.{ .int = 1 }},
+    );
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Status.ok, d.status());
+    try testing.expectEqual(sql_statement.Problem.none, d.problem);
+    try testing.expectEqual(@as(?usize, 1), d.param_count);
+    try testing.expect(d.message == null);
+}
+
+test "SQLite: checkStatement rejects a syntax error" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELEC 1", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Status.failed, d.status());
+    try testing.expectEqual(sql_statement.Problem.syntax, d.problem);
+    // SQLite reports every prepare failure as SQLITE_ERROR, so the class comes
+    // from the message — and the diagnosis says so rather than pretending the
+    // label is structured.
+    try testing.expectEqual(@as(i32, 1), d.native_code);
+    try testing.expect(d.problem_heuristic);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "syntax error") != null);
+}
+
+test "SQLite: checkStatement rejects a statement naming a missing table" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT * FROM zent_chk_absent", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.missing_relation, d.problem);
+    try testing.expectEqual(sql_statement.Status.failed, d.status());
+    try testing.expectEqualStrings("no such table: zent_chk_absent", d.message.?);
+    try testing.expect(d.problem_heuristic);
+}
+
+test "SQLite: checkStatement rejects a statement naming a missing column" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE zent_chk_sq (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT zent_chk_bogus FROM zent_chk_sq", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.missing_column, d.problem);
+    try testing.expectEqualStrings("no such column: zent_chk_bogus", d.message.?);
+    try testing.expect(d.problem_heuristic);
+}
+
+test "SQLite: checkStatement reports a parameter that does not match the statement" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE zent_chk_sq (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT name FROM zent_chk_sq WHERE id = ?", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.parameter_mismatch, d.problem);
+    try testing.expectEqual(@as(?usize, 1), d.param_count);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "takes 1") != null);
+}
+
+test "SQLite: a checked INSERT, UPDATE or DELETE changes nothing" {
+    // The claim this whole entry point rests on: the statement is prepared and
+    // thrown away, never run. Each checked statement is followed by the row
+    // count it would have moved — the INSERT adds none, the UPDATE and DELETE
+    // (which do match a real row) leave it alone.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE zent_chk_sq (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    var ins = try sql_statement.checkStatement(allocator, drv.asDriver(), "INSERT INTO zent_chk_sq (id, name) VALUES (999, 'x')", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &ins);
+    try testing.expectEqual(sql_statement.Status.ok, ins.status());
+
+    var rows = try drv.query("SELECT COUNT(*) FROM zent_chk_sq", &.{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 0), (rows.next() orelse return error.NoRow).getInt(0).?);
+
+    // A row that the checked UPDATE/DELETE below really would hit.
+    _ = try drv.exec("INSERT INTO zent_chk_sq (id, name) VALUES (1, 'real')", &.{});
+
+    var upd = try sql_statement.checkStatement(allocator, drv.asDriver(), "UPDATE zent_chk_sq SET name = 'changed' WHERE id = 1", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &upd);
+    try testing.expectEqual(sql_statement.Status.ok, upd.status());
+
+    var del = try sql_statement.checkStatement(allocator, drv.asDriver(), "DELETE FROM zent_chk_sq WHERE id = 1", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &del);
+    try testing.expectEqual(sql_statement.Status.ok, del.status());
+
+    var rows2 = try drv.query("SELECT COUNT(*), name FROM zent_chk_sq WHERE id = 1", &.{});
+    defer rows2.deinit();
+    const row = rows2.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+    try testing.expectEqualStrings("real", row.getText(1).?);
 }

@@ -9,6 +9,15 @@ const PreparedCache = cache_mod.PreparedCache;
 
 const PG_ERRBUF_SIZE = 256;
 
+/// Copy a failed result's SQLSTATE (e.g. `"42P01"`) into `allocator`, or null
+/// when the result carries none.
+fn dupeSqlstate(allocator: std.mem.Allocator, result: *c.PGresult) !?[]u8 {
+    const field = c.PQresultErrorField(result, c.PG_DIAG_SQLSTATE) orelse return null;
+    const sqlstate = std.mem.span(field);
+    if (sqlstate.len == 0) return null;
+    return try allocator.dupe(u8, sqlstate);
+}
+
 fn toDriverError(err: anyerror) driver.Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -544,6 +553,60 @@ pub const PostgresDriver = struct {
         }
     }
 
+    /// Parse and plan `sql` on the server with `args` parameters, then discard
+    /// the unnamed prepared statement: `PQprepare` sends Parse + Describe and
+    /// stops there, so nothing in `sql` runs.
+    ///
+    /// `PQprepare` treats `nParams == 0` as "infer", not as "no parameters", so
+    /// the parameter count is read back with `PQdescribePrepared` instead of
+    /// being taken from `args.len`. That also catches the opposite case —
+    /// PostgreSQL accepts a Parse that declares more parameters than the
+    /// statement uses, so without the Describe an over-supplied `args` would go
+    /// unnoticed here (`PQexecParams` accepts it too, but MySQL's driver and
+    /// SQLite's parameter list do not, and one answer across the three is worth
+    /// more than matching PostgreSQL's laxity).
+    ///
+    /// Not logged, unlike the exec path: a statement that fails to prepare is
+    /// the expected outcome of a check.
+    pub fn prepareCheck(self: *PostgresDriver, allocator: std.mem.Allocator, sql: []const u8, args: []const Value, out: *driver.CheckReport) driver.Error!void {
+        try self.ensureAlive();
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
+        defer self.allocator.free(sql_z);
+
+        const res = c.PQprepare(self.conn, "", sql_z.ptr, @intCast(args.len), null) orelse {
+            return self.noteError(error.DriverFailed);
+        };
+        defer c.PQclear(res);
+
+        if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
+            out.* = .{
+                .kind = .prepare_failed,
+                .sqlstate = try dupeSqlstate(allocator, res),
+                .message = try allocator.dupe(u8, std.mem.span(c.PQresultErrorMessage(res))),
+            };
+            return;
+        }
+
+        // A statement that prepared is a statement that prepares; a Describe
+        // that fails is not evidence against it, so the count is left unknown
+        // rather than turned into a verdict.
+        const described = c.PQdescribePrepared(self.conn, "") orelse {
+            out.* = .{ .kind = .ok };
+            return;
+        };
+        defer c.PQclear(described);
+        if (c.PQresultStatus(described) != c.PGRES_COMMAND_OK) {
+            out.* = .{ .kind = .ok };
+            return;
+        }
+
+        const n_params: usize = @intCast(c.PQnparams(described));
+        out.* = if (n_params == args.len)
+            .{ .kind = .ok, .param_count = n_params }
+        else
+            .{ .kind = .param_mismatch, .param_count = n_params };
+    }
+
     /// Returns true if the connection currently has an active transaction.
     pub fn inTransaction(self: *PostgresDriver) bool {
         const status = c.PQtransactionStatus(self.conn);
@@ -646,6 +709,12 @@ pub const PostgresDriver = struct {
                 // See note in .exec above.
                 try self_ptr.applyStatementTimeout(ctx);
                 return self_ptr.query(q, a) catch |err| return toDriverError(err);
+            }
+        }.f,
+        .prepareCheck = struct {
+            fn f(ptr: *anyopaque, allocator: std.mem.Allocator, q: []const u8, a: []const Value, out: *driver.CheckReport) driver.Error!void {
+                const self_ptr: *PostgresDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.prepareCheck(allocator, q, a, out);
             }
         }.f,
         .beginTx = struct {

@@ -127,3 +127,42 @@ test "Pool: concurrent borrows respect max_connections" {
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 2), row.getInt(0).?);
 }
+
+test "Pool: checkStatement borrows a connection instead of answering unsupported" {
+    // The pool's vtable has to forward the prepare hook: without it every
+    // statement behind a pool would come back `not_checkable`, which is the
+    // honest answer for a driver that cannot check — and a useless one here.
+    const allocator = testing.allocator;
+    const path = "tests/integration/.pool_check.db";
+    cleanup(path);
+    defer cleanup(path);
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, path);
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .io = testing.io,
+    });
+    defer pool.deinit();
+
+    const drv = pool.asDriver();
+    _ = try drv.exec("CREATE TABLE t (id INTEGER, name TEXT)", &.{});
+
+    var ok = try zent.sql_statement.checkStatement(allocator, drv, "SELECT name FROM t WHERE id = ?", &.{.{ .int = 1 }});
+    defer zent.sql_statement.freeStatementDiagnosis(allocator, &ok);
+    try testing.expectEqual(zent.sql_statement.Status.ok, ok.status());
+
+    var bad = try zent.sql_statement.checkStatement(allocator, drv, "SELECT * FROM no_such_table", &.{});
+    defer zent.sql_statement.freeStatementDiagnosis(allocator, &bad);
+    try testing.expectEqual(zent.sql_statement.Problem.missing_relation, bad.problem);
+
+    // The connection came back: the next borrow works.
+    try testing.expectEqual(@as(usize, 1), pool.available.items.len);
+    var rows = try drv.query("SELECT COUNT(*) FROM t", &.{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 0), (rows.next() orelse return error.NoRow).getInt(0).?);
+}

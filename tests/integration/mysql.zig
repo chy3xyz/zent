@@ -8,6 +8,7 @@
 const std = @import("std");
 const zent = @import("zent");
 const MySQLDriver = zent.sql_mysql.MySQLDriver;
+const sql_statement = zent.sql_statement;
 const buildGraph = zent.codegen.graph.buildGraph;
 const Client = zent.codegen.client;
 const field = zent.core.field;
@@ -3367,4 +3368,143 @@ test "MySQL: unique/defaulted/indexed String columns build a usable table" {
         const row = rows.next() orelse return error.NoRow;
         try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
     }
+}
+
+// ------------------------------------------------------------------
+// checkStatement: prepare-and-discard validation of a raw statement
+// ------------------------------------------------------------------
+
+test "MySQL: checkStatement accepts a valid statement and its parameter list" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_my (id INT PRIMARY KEY, name VARCHAR(64))", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{}) catch {};
+
+    var d = try sql_statement.checkStatement(
+        allocator,
+        drv.asDriver(),
+        "SELECT name FROM zent_chk_my WHERE id = ?",
+        &.{.{ .int = 1 }},
+    );
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Status.ok, d.status());
+    try testing.expectEqual(sql_statement.Problem.none, d.problem);
+    // The count is the server's own (mysql_stmt_param_count), not args.len.
+    try testing.expectEqual(@as(?usize, 1), d.param_count);
+}
+
+test "MySQL: checkStatement rejects a syntax error" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELEC 1", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Status.failed, d.status());
+    try testing.expectEqual(sql_statement.Problem.syntax, d.problem);
+    try testing.expectEqual(@as(i32, 1064), d.native_code);
+    // MySQL's errno is structured, so the label is not a guess.
+    try testing.expect(!d.problem_heuristic);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "SQL syntax") != null);
+}
+
+test "MySQL: checkStatement rejects a statement naming a missing table" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT * FROM zent_chk_absent", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.missing_relation, d.problem);
+    try testing.expectEqual(sql_statement.Status.failed, d.status());
+    try testing.expectEqual(@as(i32, 1146), d.native_code);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "zent_chk_absent") != null);
+    try testing.expect(!d.problem_heuristic);
+}
+
+test "MySQL: checkStatement rejects a statement naming a missing column" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_my (id INT PRIMARY KEY, name VARCHAR(64))", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{}) catch {};
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT zent_chk_bogus FROM zent_chk_my", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.missing_column, d.problem);
+    try testing.expectEqual(@as(i32, 1054), d.native_code);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "zent_chk_bogus") != null);
+}
+
+test "MySQL: checkStatement reports a parameter that does not match the statement" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_my (id INT PRIMARY KEY, name VARCHAR(64))", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{}) catch {};
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT name FROM zent_chk_my WHERE id = ?", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.parameter_mismatch, d.problem);
+    try testing.expectEqual(@as(?usize, 1), d.param_count);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "takes 1") != null);
+}
+
+test "MySQL: a checked INSERT adds no row" {
+    // mysql_stmt_prepare without mysql_stmt_execute.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_my (id INT PRIMARY KEY, name VARCHAR(64))", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_my", &.{}) catch {};
+
+    var d = try sql_statement.checkStatement(
+        allocator,
+        drv.asDriver(),
+        "INSERT INTO zent_chk_my (id, name) VALUES (999, 'x')",
+        &.{},
+    );
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+    try testing.expectEqual(sql_statement.Status.ok, d.status());
+
+    var rows = try drv.query("SELECT COUNT(*) FROM zent_chk_my", &.{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 0), (rows.next() orelse return error.NoRow).getInt(0).?);
+
+    // The check used one statement on the connection; ordinary use follows.
+    _ = try drv.exec("INSERT INTO zent_chk_my (id, name) VALUES (1, 'real')", &.{});
+    var rows2 = try drv.query("SELECT COUNT(*) FROM zent_chk_my", &.{});
+    defer rows2.deinit();
+    try testing.expectEqual(@as(i64, 1), (rows2.next() orelse return error.NoRow).getInt(0).?);
+}
+
+test "MySQL: a statement the prepared protocol rejects is not_checkable, not failed" {
+    // `BEGIN` is valid SQL that MySQL's prepared-statement protocol refuses
+    // (errno 1295). Reporting it as a broken statement would be a false alarm:
+    // `exec` runs it through mysql_real_query, where it works.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "BEGIN", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Status.not_checkable, d.status());
+    try testing.expectEqual(sql_statement.Problem.not_checkable, d.problem);
+    try testing.expectEqual(@as(i32, 1295), d.native_code);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "not supported in the prepared statement protocol") != null);
 }

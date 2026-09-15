@@ -19,6 +19,10 @@ pub const sql_mysql = @import("sql/mysql.zig");
 pub const sql_schema = @import("sql/schema/migrate.zig");
 pub const sql_pool = @import("sql/pool.zig");
 pub const sql_explain = @import("sql/explain.zig");
+/// Validate a raw statement without running it: `checkStatement` prepares it
+/// with the driver and discards it. See `sql/statement.zig` for what each
+/// dialect can and cannot see at that stage.
+pub const sql_statement = @import("sql/statement.zig");
 pub const sql_logger = @import("sql/logger.zig");
 pub const sql_diagnostics = @import("sql/diagnostics.zig");
 
