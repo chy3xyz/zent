@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.58.1** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.59.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (364 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (371 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -50,7 +50,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 364, integration 190 passed + 3 skipped
+`baseline` counts move with this: unit 371, integration 194 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -158,6 +158,25 @@ Entities and queries are explicitly owned by the caller. See the contract:
   `step`/`execute`/`Bind+Execute`, no "run then roll back". A driver that cannot
   prepare answers `not_checkable` rather than erroring, so a bulk audit does not
   stop halfway; that is a normal result, not a failure.
+- **SQLite binding is fail-loud.** `bindArgs` compares the argument list with
+  `sqlite3_bind_parameter_count` and checks every `sqlite3_bind_*` return code.
+  Do not go back to ignoring the return codes: a missing argument then binds as
+  NULL and the statement **answers a different question** instead of erroring
+  (an empty page where the caller expected rows). Unifying PostgreSQL onto
+  `error.ParamCountMismatch` is deliberately not done — it surfaces its own bind
+  error as `DriverFailed`; that is recorded, not papered over.
+- **Every MySQL BLOB/TEXT guard covers the ALTER path too.** `CREATE TABLE`,
+  `CREATE INDEX` **and** `ALTER TABLE … ADD COLUMN` all go through
+  `findMySqlTextRestriction`; the ALTER path is the one reached when the table
+  already exists, so it is where a later `field.Text(…).Default(…)` lands. The
+  check is handed only what the statement emits (`unique`/`primary_key` cleared
+  for ALTER), so it never refuses SQL the server accepts.
+- **Index uniqueness and index columns are separate drift kinds.**
+  `index_uniqueness` comes from a plain boolean every catalog has and is always
+  reported; `index_columns` is reported only when the key list is reliably
+  readable. Do not fold one into the other — the result would either silence
+  uniqueness drift for expression/prefix/partial indexes or emit a key-list
+  verdict that was never established. `breaksReads()` is `false` for both.
 
 ## Layout
 

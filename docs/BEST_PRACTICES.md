@@ -432,6 +432,30 @@ Three things it deliberately does not do:
 Use `explainSql` instead when you want the *plan*; it accepts no parameters, so
 it cannot answer the bound-parameter question this exists for.
 
+### The wrong number of arguments, per dialect
+
+Passing the wrong argument count is the most common raw-SQL mistake, and the
+three drivers do **not** agree about what happens. Since v0.59.0 SQLite refuses
+it like the others, but the error you get still differs:
+
+| Dialect | What you get | Where it is caught |
+|---|---|---|
+| SQLite | `error.ParamCountMismatch` | zent compares `sqlite3_bind_parameter_count` with your list |
+| MySQL | `error.ParamCountMismatch` | zent compares `mysql_stmt_param_count` — **except** when your list is *empty*, which takes the non-prepared path and surfaces as the server's own error |
+| PostgreSQL | `error.DriverFailed` | libpq's Bind ("bind message supplies N parameters, but prepared statement requires M") |
+
+`driver.classify` maps `ParamCountMismatch` to `.client` — your input, not the
+server's fault, and retrying cannot help. Before v0.59.0 SQLite **silently
+accepted both directions**: surplus bindings were dropped and missing ones read
+as NULL, so the statement ran and answered a different question (one argument
+short produced an empty page, not an error). If you have code that was passing
+the wrong count, it was not working — it was querying something else.
+
+Two boundaries to know: a statement using explicit `?NNN` indices with a gap
+reports the *highest* slot number, so a list sized to the used parameters is
+rejected (the builder only ever emits `?`); and unifying PostgreSQL onto the same
+error is not done yet, which is why the table above still has three rows.
+
 ### Scoping raw SQL (`zent.scope`)
 
 Raw SQL bypasses the builders, and the builders are where privacy and the
@@ -907,6 +931,35 @@ Two consequences worth knowing:
 - **`migrateSchema` does not repair it.** Non-destructiveness is deliberate: it
   creates missing indexes and leaves differing ones alone. The report is the
   deliverable; the `DROP INDEX` + `CREATE INDEX` is yours.
+
+#### Index uniqueness: the drift that lets duplicate rows in
+
+`SchemaDrift.Kind.index_uniqueness` is a **separate kind** from `index_columns`,
+and the split is deliberate. An index the schema declares `Unique()` that the
+database holds *without* `UNIQUE` means the application believes the constraint
+is enforced while duplicates land — so unlike a key list, this is always
+reported, in both directions:
+
+```
+schema declares UNIQUE, database index is not unique     <- the dangerous one
+schema declares a non-unique index, database index is UNIQUE
+```
+
+The reason it is not folded into `index_columns`: uniqueness is a plain boolean
+in every catalog that has it (MySQL `statistics.non_unique`, PostgreSQL
+`pg_index.indisunique`, SQLite `PRAGMA index_list`), so it is *always* readable —
+while a key list is skipped whenever it cannot be read reliably. Folding them
+together would either silence uniqueness drift precisely for indexes with
+expression/prefix/partial keys, or produce a key-list verdict that was never
+established. `breaksReads()` is `false` for both (a wrong uniqueness breaks
+*writes*, not reads), so `read_breaking_only` does not fail on this either — it
+is a report, and `.any` is the mode that gates on it.
+
+One gap to know about: a **field-level** `.Unique()` on a column the table does
+not yet have is an inline column constraint, not a named index, so an existing
+table gaining it gets a plain column and **neither** drift kind can see it
+(there is no index by that name on either side). Add such a constraint in a real
+migration.
 
 #### Converging nullability (`allow_nullability_change`)
 

@@ -4,6 +4,94 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`SchemaDrift.Kind.index_uniqueness`** (Z31 follow-up). `ExistingIndex.unique`
+  was read on all three dialects and never compared, so an index the schema
+  declares `Unique()` that the database holds **without** `UNIQUE` was silent —
+  the application believed the constraint was enforced while duplicate rows
+  landed. `checkSchema` / `assertSchema` now report it in both directions, with
+  the difference in one sentence (`schema declares UNIQUE, database index is not
+  unique`).
+
+  It is a **separate kind from `.index_columns`** on purpose. A key list can be
+  an expression, a prefix, a `WHERE` or a non-btree access method, and is
+  skipped unless it can be read reliably; `unique` is a plain boolean in every
+  catalog and always is. Coupling them would either silence this drift for the
+  hardest-to-read indexes or produce a key-list verdict that was never
+  established. `breaksReads()` is `false` (a wrong uniqueness breaks *writes*,
+  not reads), so `read_breaking_only` never fails on it; `.any` does.
+
+### Changed
+- **BREAKING: `driver.Error` gained `ParamCountMismatch`.** Error sets are not
+  extensible, so a `switch` over `driver.Error` with no `else` stops compiling.
+  The one in-tree exhaustive switch (`migrate.zig`) was updated in the same
+  commit.
+
+- **BREAKING (MySQL): a bind list of the wrong length is now
+  `error.ParamCountMismatch`, not `error.QueryFailed`.** MySQL already refused
+  it; the specific error was being folded into the generic one, so a caller
+  could not tell "my argument list is wrong" from "the query failed".
+  `driver.classify` reports it as `.client` (the caller's own mistake, and
+  retrying cannot help) instead of falling through to `.bug`.
+
+- **SQLite no longer tolerates a wrong argument count.** `bindArgs` discarded
+  every `sqlite3_bind_*` return code: surplus bindings came back
+  `SQLITE_RANGE` and were dropped, and missing ones stayed unbound, which SQLite
+  reads as **NULL**. The statement therefore ran and answered a *different*
+  question — a raw query one argument short returned an empty page instead of an
+  error, which is the "endpoint returned empty for months" failure mode. The
+  statement's parameter count is now compared with the argument list (the same
+  rule `checkStatement` already applied), and a failing bind reports
+  `error.BindFailed` rather than being ignored.
+
+  Two boundaries, stated rather than hidden: an explicit `?NNN` with a gap
+  reports the *highest* slot number, so a list sized to the number of used
+  parameters is rejected (the builder only emits `?`); and **PostgreSQL does not
+  participate** — libpq answers from its own Bind path, which this driver
+  surfaces as `error.DriverFailed`. Unifying PG is a separate pass.
+
+- **MySQL's statement-level diagnostics log at `warn`, not `err`.** An `err`
+  line makes the Zig test runner fail the test that exercises the path, so the
+  message `mysql: expected N params, got M` was untestable. The caller still
+  receives the error; the log is context, not the signal.
+
+### Fixed
+- **MySQL: `ALTER TABLE … ADD COLUMN` fails closed on a BLOB/TEXT `DEFAULT`,
+  like `CREATE TABLE` already did.** The v0.58.0 guards covered
+  `createTableSQLAlloc` and `createIndexSQLForTableAlloc`, but the ALTER path is
+  reached exactly when the table **already exists** — the case where no
+  `CREATE TABLE` is generated — so `ALTER TABLE t ADD COLUMN body TEXT DEFAULT
+  'x'` still arrived as a bare errno 1101 in a warning. It now goes through the
+  same `findMySqlTextRestriction` classification and returns
+  `error.MySQLTextColumnCannotHaveDefault`, naming the table, the column, the
+  dialect type and the way out (`field.String` is `VARCHAR(255)` on MySQL).
+  PostgreSQL and SQLite are unchanged, as is a TEXT column added without a
+  default.
+
+  The check is handed exactly what the statement emits: `unique` and
+  `primary_key` are **cleared**, because the ALTER writes neither — retaining
+  them would refuse SQL the server accepts, for a constraint this statement does
+  not introduce.
+
+  Note the guard is **stricter than MariaDB requires**: MariaDB ≥ 10.2.1 does
+  accept a `DEFAULT` on `TEXT`/`BLOB`, but the DDL layer cannot tell the two
+  servers apart without a connection, so it applies MySQL's rule to both. A
+  MariaDB user who needs a default on a `Text` column must therefore drop to a
+  hand-written migration, or declare the field `field.String` (which is the
+  only type that could be indexed anyway). This conservatism is inherited from
+  v0.58.0's CREATE-side guard, not new here.
+
+- **PostgreSQL introspection binds the table name instead of interpolating
+  it.** `getExistingColumns` and the index query pasted the name into a string
+  literal (`WHERE table_name = '…'`), so a name carrying a quote either broke
+  the statement or turned the rest of it into more predicate; both now bind
+  `$1`, as the MySQL branch already bound `?`. SQLite cannot bind a `PRAGMA`
+  argument (`PRAGMA table_info(?)` is a parse error), so it **validates**
+  instead: a name containing `'`, `"`, `` ` `` or NUL returns the new named
+  error `error.InvalidTableName` (logged with the pragma and the name) rather
+  than emitting a statement it would break. Spaces and non-ASCII names are
+  unaffected.
+
 ## [0.58.1] - 2026-09-15
 
 ### Fixed

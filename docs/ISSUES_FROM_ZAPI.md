@@ -281,7 +281,7 @@ here were reachable only through documentation this project wrote.
 | Z28 | raw identifiers have no validation entry point; introspection is private | P2 | **Fixed (API)**: v0.53.0 introspection + `checkSchema`; v0.58.0 `checkStatement` (prepare-and-discard). CLI entry **Open** |
 | Z29 | Error classification invisible; pool has no stats or capacity guidance | P2 | **Fixed** v0.53.0 — `driver.classify`, `ConnPool.stats()`, capacity formula |
 | Z30 | `CrudService.create` filled the tenant column from the caller's entity | P2 | **Fixed** v0.54.0 — `create(entity, tenant_id)` |
-| Z31 | `migrateSchema` creates the drift it later warns about | P2 | **Partly fixed** — v0.56.0 nullability behind `allow_nullability_change`; v0.58.0 `ExistingIndex.columns` + `index_columns` drift, and MySQL BLOB/TEXT DDL diagnosis. View replacement, `UNIQUE`/FK by `ALTER` **Open** |
+| Z31 | `migrateSchema` creates the drift it later warns about | P2 | **Mostly fixed** — v0.56.0 nullability behind `allow_nullability_change`; v0.58.0 `ExistingIndex.columns` + `index_columns` drift and MySQL BLOB/TEXT DDL diagnosis; v0.59.0 `index_uniqueness` drift on all three dialects, the ALTER ADD COLUMN half of the MySQL diagnosis, and bound/validated table names in introspection. View replacement, `UNIQUE`/FK by `ALTER`, and a field-level `.Unique()` on an existing table **Open** |
 | Z32 | Sub-query predicates do not scope the inner table | P2 | **Partly fixed** v0.52.0 — `Has*` targets scoped; bare `sql.InSelect` documented as out of reach |
 
 **On IDs.** `Z<n>` numbers are allocated once and never reused; before v0.56.0 the
