@@ -3368,3 +3368,49 @@ test "MySQL: unique/defaulted/indexed String columns build a usable table" {
         try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
     }
 }
+
+test "MySQL: getExistingIndexes reads the key columns in order" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_idx_probe", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_idx_probe", &.{}) catch {};
+    _ = try drv.exec(
+        "CREATE TABLE zent_idx_probe (id BIGINT PRIMARY KEY, a VARCHAR(255) NOT NULL, b VARCHAR(255), c VARCHAR(255))",
+        &.{},
+    );
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_zent_inspect_ab ON zent_idx_probe (a, b)", &.{});
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_b ON zent_idx_probe (b)", &.{});
+    // A functional index has no `column_name` in information_schema.statistics
+    // — the case that must come back as not comparable rather than as an empty
+    // key list that then compares unequal to everything.
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_fn ON zent_idx_probe ((lower(c)))", &.{});
+
+    var indexes = try migrate.getExistingIndexes(allocator, drv.asDriver(), "zent_idx_probe");
+    defer migrate.freeExistingIndexes(allocator, &indexes);
+
+    var composite: ?migrate.ExistingIndex = null;
+    var single: ?migrate.ExistingIndex = null;
+    var functional: ?migrate.ExistingIndex = null;
+    for (indexes.items) |i| {
+        if (std.mem.eql(u8, i.name, "idx_zent_inspect_ab")) composite = i;
+        if (std.mem.eql(u8, i.name, "idx_zent_inspect_b")) single = i;
+        if (std.mem.eql(u8, i.name, "idx_zent_inspect_fn")) functional = i;
+    }
+
+    try testing.expect(composite != null);
+    try testing.expect(composite.?.unique);
+    try testing.expect(composite.?.columns_comparable);
+    try testing.expectEqual(@as(usize, 2), composite.?.columns.len);
+    try testing.expectEqualStrings("a", composite.?.columns[0]);
+    try testing.expectEqualStrings("b", composite.?.columns[1]);
+
+    try testing.expect(single != null);
+    try testing.expect(!single.?.unique);
+    try testing.expect(single.?.columns_comparable);
+    try testing.expectEqualStrings("b", single.?.columns[0]);
+
+    try testing.expect(functional != null);
+    try testing.expect(!functional.?.columns_comparable);
+}

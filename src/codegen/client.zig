@@ -552,7 +552,7 @@ pub fn beginTxFromDriver(comptime infos: []const TypeInfo, driver: sql_driver.Dr
     };
 }
 
-const CreateTablesError = sql_driver.Error || error{MissingViewSQL};
+const CreateTablesError = sql_driver.Error || migrate.MySqlTextError || error{MissingViewSQL};
 
 /// Create all database tables (create-only migration).
 /// Creates entity tables and junction tables for M2M edges.
