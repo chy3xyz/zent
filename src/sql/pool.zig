@@ -720,13 +720,22 @@ pub fn ConnPool(comptime D: type) type {
 
                 // Transaction leak protection: if the connection was returned with
                 // an active transaction, roll it back before returning it to the
-                // pool. Ignore errors because the transaction may already be aborted.
+                // pool. A rollback that **fails** is not ignorable: the connection
+                // may still be inside that transaction, and the next borrower would
+                // then run its statements inside someone else's transaction — the
+                // silent-state-divergence shape this pool has been bitten by
+                // before. A connection we could not clean is dropped, not handed on.
                 if (conn.asDriver().inTransaction()) {
-                    _ = conn.asDriver().exec("ROLLBACK", &.{}) catch {};
-                    // MySQL tracks transaction state client-side; clear the stale
-                    // flag after a successful rollback attempt.
-                    if (@hasField(D, "in_tx")) {
-                        conn.in_tx = false;
+                    if (conn.asDriver().exec("ROLLBACK", &.{})) |_| {
+                        // MySQL tracks transaction state client-side; clear the
+                        // stale flag only after a rollback that actually worked.
+                        if (@hasField(D, "in_tx")) {
+                            conn.in_tx = false;
+                        }
+                    } else |_| {
+                        self.closeConnection(entry);
+                        self.cond.signal(io);
+                        return;
                     }
                 }
 
@@ -1981,6 +1990,100 @@ const StubDriver = struct {
 fn stubConnect(allocator: std.mem.Allocator) anyerror!StubDriver {
     _ = allocator;
     return StubDriver{};
+}
+
+/// A driver that claims to be inside a transaction and **fails** to roll it
+/// back — the shape the pool's transaction-leak protection has to refuse to hand
+/// on. `close` records the id so a test can tell whether the pool dropped the
+/// connection or put it back in `available`.
+const StuckTxDriver = struct {
+    id: usize = 0,
+
+    var next_id: usize = 0;
+    var closed_id: usize = 0;
+
+    pub fn asDriver(self: *@This()) driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn close(self: *@This()) void {
+        closed_id = self.id;
+    }
+
+    fn stuckExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+        // The only statement this path issues is `ROLLBACK`, and it fails: the
+        // connection is stuck inside someone else's transaction.
+        return error.ExecFailed;
+    }
+    fn stuckQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+        unreachable;
+    }
+    fn stuckBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+        unreachable;
+    }
+    fn stuckBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+        unreachable;
+    }
+    fn stuckClose(_: *anyopaque) void {
+        unreachable;
+    }
+    fn stuckDialect(_: *anyopaque) Dialect {
+        return .sqlite;
+    }
+    fn stuckPing(_: *anyopaque) driver.Error!void {}
+    fn stuckInTransaction(_: *anyopaque) bool {
+        return true;
+    }
+
+    const vtable = driver.Driver.VTable{
+        .exec = stuckExec,
+        .query = stuckQuery,
+        .beginTx = stuckBeginTx,
+        .close = stuckClose,
+        .dialect = stuckDialect,
+        .ping = stuckPing,
+        .inTransaction = stuckInTransaction,
+        .beginSavepoint = stuckBeginSavepoint,
+    };
+};
+
+fn stuckConnect(allocator: std.mem.Allocator) anyerror!StuckTxDriver {
+    _ = allocator;
+    StuckTxDriver.next_id += 1;
+    return StuckTxDriver{ .id = StuckTxDriver.next_id };
+}
+
+test "a connection whose leaked transaction cannot be rolled back is dropped" {
+    // The leak protection rolls back a connection returned with an active
+    // transaction. When that rollback FAILS the connection may still be inside
+    // the transaction, and pooling it would leave the next borrower running its
+    // statements inside someone else's — so it must be closed instead. The
+    // successful-rollback case has a test; the failing one did not, which is
+    // why the error was swallowed rather than acted on.
+    const allocator = std.heap.page_allocator;
+    const P = ConnPool(StuckTxDriver);
+    StuckTxDriver.closed_id = 0;
+
+    var pool = try P.init(allocator, .{
+        .connect = stuckConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const conn = try pool.borrow();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().total);
+    const id = conn.id;
+
+    pool.release(conn);
+
+    // Not pooled: the pool grew a connection to lend and holds none after it.
+    try std.testing.expectEqual(id, StuckTxDriver.closed_id);
+    const stats = pool.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.total);
+    try std.testing.expectEqual(@as(usize, 0), stats.available);
 }
 
 test "ConnPool blocked borrow is served by a release" {

@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A connection whose leaked transaction cannot be rolled back is dropped
+  instead of pooled.** `ConnPool.release` rolls back a connection that comes
+  back with an active transaction, and it discarded the result of that
+  `ROLLBACK` (`catch {}`) while unconditionally clearing MySQL's `in_tx` flag.
+  A rollback that **fails** leaves the connection possibly still inside that
+  transaction, so the next borrower would run its statements inside someone
+  else's — the silent-state-divergence shape this pool has been bitten by
+  before, one level down. The connection is now closed and the pool signalling
+  instead, and `in_tx` is cleared only after a rollback that actually worked.
+
+  The successful-rollback case already had a test (`ConnPool rolls back leaked
+  transaction on release`); the failing one did not, which is why the error was
+  swallowed rather than acted on. The new test drives a connection that reports
+  `inTransaction()` and fails its `ROLLBACK`, and asserts the pool holds nothing
+  afterwards rather than lending the dirty connection on. Falsified by restoring
+  the `catch {}` — the close never happens and the test fails on it.
+
 ## [0.60.0] - 2026-09-15
 
 ### Added
