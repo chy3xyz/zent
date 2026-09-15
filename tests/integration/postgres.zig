@@ -375,6 +375,40 @@ test "Postgres: prepared statement cache hit" {
     try testing.expectEqual(@as(i64, 3), row3.getInt(0).?);
 }
 
+test "Postgres: an empty command tag is 0 rows, a DML count is the count" {
+    // The tag vocabulary `PQcmdTuples` actually produces (read off a live
+    // server): `""` for every command with no row count, and the decimal count
+    // for the ones that have one — including the `"0"` a DML reports when it
+    // matched nothing. Both are 0 affected rows, so the driver must derive one
+    // from the tag itself, never from a failed parse.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_tag_test", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_tag_test", &.{}) catch {};
+
+    // "" — DDL and TRUNCATE report no rows affected.
+    try testing.expectEqual(@as(usize, 0), (try drv.exec("CREATE TABLE pg_tag_test (id SERIAL PRIMARY KEY, n INT)", &.{})).rows_affected);
+    try testing.expectEqual(@as(usize, 0), (try drv.exec("TRUNCATE pg_tag_test", &.{})).rows_affected);
+
+    // The PQexecParams path (no args): "INSERT 0 2", "INSERT 0 0", "UPDATE 0".
+    try testing.expectEqual(@as(usize, 2), (try drv.exec("INSERT INTO pg_tag_test (n) VALUES (1), (2)", &.{})).rows_affected);
+    try testing.expectEqual(@as(usize, 0), (try drv.exec("INSERT INTO pg_tag_test (n) SELECT 9 WHERE false", &.{})).rows_affected);
+    try testing.expectEqual(@as(usize, 0), (try drv.exec("UPDATE pg_tag_test SET n = 3 WHERE id = -1", &.{})).rows_affected);
+
+    // A no-arg SELECT issued through exec answers PGRES_TUPLES_OK with the row
+    // count in the tag, so it reads as rows returned rather than as "".
+    try testing.expectEqual(@as(usize, 2), (try drv.exec("SELECT n FROM pg_tag_test", &.{})).rows_affected);
+
+    // The cached prepared path (PQexecPrepared, args present) parses the same
+    // tags: the second UPDATE reuses the statement the first one prepared.
+    drv.cache = PreparedCache(16, *pg_c.PGresult){};
+    try testing.expectEqual(@as(usize, 1), (try drv.exec("INSERT INTO pg_tag_test (n) VALUES ($1)", &.{.{ .int = 4 }})).rows_affected);
+    try testing.expectEqual(@as(usize, 1), (try drv.exec("UPDATE pg_tag_test SET n = $1 WHERE n = 4", &.{.{ .int = 5 }})).rows_affected);
+    try testing.expectEqual(@as(usize, 0), (try drv.exec("UPDATE pg_tag_test SET n = $1 WHERE n = 4", &.{.{ .int = -1 }})).rows_affected);
+}
+
 test "Postgres: connection pool basic operations" {
     const allocator = testing.allocator;
 

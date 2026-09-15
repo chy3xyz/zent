@@ -551,9 +551,21 @@ const SQLiteRows = struct {
             const primary_rc = rc & 0xff;
             if (primary_rc == c.SQLITE_BUSY or primary_rc == c.SQLITE_LOCKED) {
                 self.next_error = error.LockTimeout;
-            } else if (rc == c.SQLITE_CONSTRAINT) {
-                const db = c.sqlite3_db_handle(self.stmt) orelse return null;
+            } else if (primary_rc == c.SQLITE_CONSTRAINT) {
+                // The extended code names the constraint; without a handle to
+                // read it from the failure is still a failure.
+                const db = c.sqlite3_db_handle(self.stmt) orelse {
+                    self.next_error = error.ExecFailed;
+                    return null;
+                };
                 self.next_error = sqliteErrnoToDriver(db, error.ExecFailed);
+            } else {
+                // Everything else — SQLITE_FULL, SQLITE_IOERR, SQLITE_MISMATCH,
+                // SQLITE_TOOBIG, SQLITE_INTERRUPT — is a step failure too.
+                // Leaving `next_error` null announced a clean end of results,
+                // which is how a failed query came back as a short (or empty)
+                // page for a caller that only checks `next()`.
+                self.next_error = error.ExecFailed;
             }
             return null;
         }
@@ -906,6 +918,28 @@ test "SQLite transaction" {
 test "SQLite busy/locked errors classify as retryable LockTimeout" {
     try std.testing.expectEqual(driver.Error.LockTimeout, SQLiteDriver.toDriverError(error.LockTimeout));
     try std.testing.expect(driver.isRetryable(SQLiteDriver.toDriverError(error.LockTimeout)));
+}
+
+test "SQLite: a step failure that is not a lock or a constraint is not read as end-of-rows" {
+    // SQLITE_FULL — the one step failure reachable on demand — stands in for
+    // every non-lock, non-constraint step error (IOERR, MISMATCH, TOOBIG,
+    // INTERRUPT). `next()` answers "no rows" for all of them either way, so a
+    // dropped error is indistinguishable from a result set that ended: the
+    // caller sees a short page (or `error.NotFound`) instead of a failure.
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)", &.{});
+    // A page ceiling that cannot hold the row below, so sqlite3_step itself
+    // gives up rather than a constraint or the busy handler.
+    _ = try d.exec("PRAGMA max_page_count = 2", &.{});
+
+    var rows = try d.query("INSERT INTO t (v) VALUES (randomblob(200000))", &.{});
+    defer rows.deinit();
+    try std.testing.expect(rows.next() == null);
+    try std.testing.expectEqual(@as(?driver.Error, error.ExecFailed), rows.nextError());
 }
 
 test "SQLite uncached exec finalizes statements after success" {
