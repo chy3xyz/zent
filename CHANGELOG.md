@@ -4,6 +4,76 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING: an insert whose driver reports no `last_insert_id` is now
+  `error.MissingLastInsertId` instead of a key of `0`, and the MySQL bulk path
+  no longer invents a run of ids.** `CreateBuilder.Save` wrote `0` into the
+  entity's primary key when the driver had no id to give
+  (`res.last_insert_id orelse 0`), and `BulkInsertBuilder.Save` / `SaveOrUpdate`
+  derived `base + i` from a single statement's `last_insert_id`. A `0` cannot be
+  told apart from a real key — the caller holds an entity that looks like a row
+  that exists — and the derived run is wrong as soon as a chunk contains an
+  `ON DUPLICATE KEY UPDATE` that *updates* a row, because an updated row consumes
+  no `AUTO_INCREMENT` value while the statement still reports its first generated
+  one. Measured on MySQL 9.3: a three-row ODKU whose first row collided reported
+  `last_insert_id = 2` for true ids `[1, 2, 3]`, so every derived id was wrong and
+  the last named **no row at all**. The in-tree MySQL driver always answers
+  `Some`, so this was a contract gap rather than a live failure on the MVP path.
+
+  **Migration:** `SaveError` grew a member, so **every exhaustive `switch` over
+  the `Save`/`SaveOrUpdate` error set must handle
+  `error.MissingLastInsertId`** — a compile error, not a silent one. Callers that
+  read a `0` key as "the database did not tell us" now get the error; the row
+  *was* written, only its key is unknown.
+
+- **BREAKING: the MySQL bulk insert/upsert path sends one statement per row.**
+  SQLite and PostgreSQL keep one multi-row statement per chunk (with
+  `RETURNING`); MySQL now sends one per row so each id is the one the driver
+  reported for that row. The emitted `id=LAST_INSERT_ID(id)` — already generated —
+  is what makes an updated row answer its existing id, so
+  `BulkInsert.SaveOrUpdate` returns the rows' real keys, collisions included. Cost:
+  one round trip per row on MySQL (`chunkRows` still bounds the batch, though a
+  one-row statement never reaches the bind-parameter limit), and a mid-chunk
+  failure leaves the rows before it written where the single multi-row statement
+  was atomic. A driver that reports no id makes the call
+  `error.MissingLastInsertId` rather than a fabricated run.
+
+### Fixed
+- **A soft delete no longer re-trashes a row that is already in the trash.** Both
+  soft-delete statements (`Delete().Exec()` and `BulkDelete().Exec()`) emitted
+  `UPDATE <t> SET deleted_at = <now> WHERE <preds>`, so a second call matched the
+  trashed row, pushed `deleted_at` forward — losing **when** the row was really
+  trashed — and counted it again, where a hard-deleting entity answers `0` for the
+  same call because there is no row left to delete. That asymmetry is what Z34 was
+  about, so this closes the half its verification had recorded as "reported, not
+  fixed". Both paths now add `AND deleted_at IS NULL`, the condition the edge-write
+  helpers already used for the same reason. It is applied to the statement rather
+  than to the predicate groups, so `error.NoPredicate` still refuses a call that
+  constrains nothing, and a row matched by two ORed bulk groups is no longer
+  counted twice.
+
+  **Behaviour change, single-row path:** `Delete().Exec()` on an
+  already-soft-deleted row now answers **0 instead of 1**, so `ExecOne()` raises
+  `error.NotFound` and a `setVersion` caller gets `error.OptimisticLockConflict`
+  where a repeat delete used to "succeed". Checked before changing it: no test,
+  example or bench pinned the old behaviour, and `0` is what the hard path answers
+  for a row that is gone. Live rows are unchanged.
+
+### Notes
+- **The bulk insert API does not validate that every row supplies the same fields
+  in the same order, and does not fail when they differ.** Reported while
+  verifying the above, not fixed — it writes values into the wrong columns and
+  reads uninitialised memory: with row 1 setting `(name, age)` and row 2 setting
+  only `age`, row 2's statement is still `INSERT INTO user (name, age) VALUES
+  (?, ?)`, its `age` lands in the `name` column, and the second argument is the
+  testing allocator's `0xAA` fill. The column list comes from the first row and
+  the values are flattened per row, so `MultiInsert`'s length assert holds
+  vacuously. A public-API data-corruption surface that needs its own decision
+  (a named error, or a per-row column list).
+- A MySQL text (uuid) primary key the caller did not set still leaves the entity's
+  key empty — the same "unknown as a value" family, in the one branch this change
+  deliberately did not touch.
+
 ## [0.66.0] - 2026-09-15
 
 ### Changed

@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.66.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.67.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (431 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (437 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -51,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 431, integration 227 passed + 3 skipped
+`baseline` counts move with this: unit 437, integration 228 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -219,6 +219,18 @@ Entities and queries are explicitly owned by the caller. See the contract:
   `planMigrateStatements`; a second, hand-rolled "what would we do" branch is how
   a preview starts disagreeing with the run it is previewing. Anything added to
   the migration has to be added to the plan, once.
+- **An unknown key is an error, never a value.** `CreateBuilder.Save` answers
+  `error.MissingLastInsertId` when the driver reports no `last_insert_id`, and the
+  MySQL bulk path sends one statement per row so each id is the one reported for
+  that row — never `base + i`, which is wrong as soon as a chunk updates a row
+  (an updated row consumes no `AUTO_INCREMENT`). `SaveError` carries the member, so
+  an exhaustive switch over it must handle it.
+- **A soft delete filters `deleted_at IS NULL`.** Without it a repeat delete
+  rewrites the timestamp (losing when the row was really trashed) and counts the
+  row again, where the hard path answers 0. Put the condition on the statement,
+  not in a predicate group — `requirePredicate()` runs before the group loop, so a
+  group-local condition would let a `Where`-less call slip past
+  `error.NoPredicate`.
 - **An empty `dept_ids` list is a "cannot be built", not a "no restriction".**
   `DataScopeFilter` returns the always-false `deny_pred` for a list longer than
   `max_dept_ids`, for an **empty** list, and for a `PrivacyContext` without
