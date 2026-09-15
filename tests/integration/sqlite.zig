@@ -1401,6 +1401,42 @@ test "SQLite: migrateSchema dry-run outputs SQL without executing" {
     try testing.expectEqual(@as(usize, 0), table_count);
 }
 
+test "SQLite: dry-run previews an incremental migration without applying it" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // V1 shape, migrated for real: the history table records create_table,
+    // so the V2 preview below exercises the incremental diff path (the case
+    // the old dry-run never showed: an ALTER on a table that already exists).
+    const DrInc = schema("DrInc", .{
+        .fields = &.{
+            field.String("name"),
+        },
+    });
+    const graph_v1 = comptime buildGraph(&.{DrInc});
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph_v1.types);
+
+    // V2 adds a column.
+    const DrIncV2 = schema("DrInc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+        },
+    });
+    const graph_v2 = comptime buildGraph(&.{DrIncV2});
+
+    // The preview: runs clean, changes nothing.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), graph_v2.types, migrate.MigrateOptions{
+        .dry_run = true,
+    });
+    try testing.expectEqual(@as(?bool, null), try sqliteColumnNotNull(&drv, "dr_inc", "age"));
+
+    // The real run applies what the preview showed.
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph_v2.types);
+    try testing.expectEqual(@as(?bool, false), try sqliteColumnNotNull(&drv, "dr_inc", "age"));
+}
+
 /// `PRAGMA table_info` column 3 (`notnull`) for one column, or null when the
 /// column does not exist at all.
 fn sqliteColumnNotNull(drv: *SQLiteDriver, table: []const u8, column: []const u8) !?bool {

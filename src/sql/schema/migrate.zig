@@ -3437,6 +3437,244 @@ test "ALTER COLUMN nullability renders on PostgreSQL, refuses elsewhere" {
     );
 }
 
+/// One statement a `migrateSchemaWithOptions` run would execute, in execution
+/// order. `sql` is owned by the plan list (`freePlannedStatements` releases
+/// it); `version` is the `zent_schema_migrations` history row recorded after a
+/// successful exec, or null for the statements the migration deliberately does
+/// not record (DROP COLUMN, nullability convergence).
+const PlannedStatement = struct {
+    sql: []const u8,
+    version: ?i64,
+};
+
+fn freePlannedStatements(allocator: std.mem.Allocator, plan: *std.array_list.Managed(PlannedStatement)) void {
+    for (plan.items) |s| allocator.free(s.sql);
+    plan.deinit();
+}
+
+/// Compute the ordered statement list a `migrateSchemaWithOptions` run would
+/// execute, without executing anything.
+///
+/// This is the single diff the real path and the dry-run share: the real path
+/// plans and then execs each statement (recording `version` when one is
+/// carried); the dry-run plans through this same function and prints the
+/// result. Because both sides call this one function, the preview cannot drift
+/// from what a real run would do — the statement set, the order and the
+/// opt-in gates are decided here, once.
+///
+/// `driver` is used for **read-only** introspection only — table/column/index
+/// existence through the catalog helpers, never `exec` — so the real path can
+/// hand its transaction driver and the dry-run its plain driver. `applied` is
+/// the history snapshot the version gates check against: the same snapshot the
+/// real path reads before opening its transaction, so a plan is always the
+/// answer to "given this history, what runs next".
+///
+/// One ordering subtlety: the ADD COLUMN loop is skipped for a table this run
+/// creates. The real path introspects a freshly created table (every column
+/// present, by construction) and emits nothing there; planning against the
+/// pre-creation state would otherwise invent ALTERs the CREATE TABLE already
+/// carries. The other per-column gates need no such skip — they are keyed on a
+/// column *existing* in the introspected state, which a not-yet-created table
+/// fails for every column — and the named-index check still runs, matching the
+/// real path, which creates named indexes even on a table it just created.
+fn planMigrateStatements(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    opts: MigrateOptions,
+    applied: []const AppliedMigration,
+) !std.array_list.Managed(PlannedStatement) {
+    const dialect = driver.dialect();
+    var plan = std.array_list.Managed(PlannedStatement).init(allocator);
+    errdefer freePlannedStatements(allocator, &plan);
+
+    // Step 1: create tables, views, and M2M junction tables. `created[i]`
+    // records whether entity i is created by this run, so step 2 can tell
+    // "fresh table, matches the schema by construction" apart from "existing
+    // table, diff it". Same existence + history gates as the real path.
+    var created: [infos.len]bool = @splat(false);
+    inline for (infos, 0..) |info, i| {
+        if (info.is_view) {
+            const version = computeMigrationVersion(info.table_name, "create_view", "");
+            if (!versionContains(applied, version)) {
+                try plan.append(.{ .sql = try createViewSQLAlloc(allocator, info, dialect), .version = version });
+            } else {
+                // Version is recorded but the view may have been dropped
+                // out-of-band. If the view no longer exists, re-create it.
+                var existing = try getExistingColumns(allocator, driver, info.table_name);
+                if (existing.items.len == 0) {
+                    existing.deinit();
+                    try plan.append(.{ .sql = try createViewSQLAlloc(allocator, info, dialect), .version = version });
+                } else {
+                    freeExistingColumns(allocator, &existing);
+                }
+            }
+        } else {
+            const table = comptime tableFromTypeInfoCrossRef(info, infos);
+            const version = computeMigrationVersion(info.table_name, "create_table", "");
+            // `created` is true only when the table is genuinely absent
+            // before this run: only then does the CREATE build a fresh table
+            // that matches the schema by construction, so only then does the
+            // real path find every column present in step 2 and emit nothing.
+            // When the version is missing from the history but the table
+            // already exists (created by hand, or a wiped history), the
+            // CREATE TABLE IF NOT EXISTS is a no-op and the real path still
+            // diffs — and adds to — the existing table.
+            if (!versionContains(applied, version)) {
+                try plan.append(.{ .sql = try createTableSQLAlloc(allocator, table, dialect), .version = version });
+                var existing = try getExistingColumns(allocator, driver, table.name);
+                if (existing.items.len == 0) {
+                    existing.deinit();
+                    created[i] = true;
+                } else {
+                    freeExistingColumns(allocator, &existing);
+                }
+            } else {
+                // Version is recorded but the table may have been dropped
+                // out-of-band. If the table no longer exists, re-create it.
+                var existing = try getExistingColumns(allocator, driver, table.name);
+                if (existing.items.len == 0) {
+                    existing.deinit();
+                    try plan.append(.{ .sql = try createTableSQLAlloc(allocator, table, dialect), .version = version });
+                    created[i] = true;
+                } else {
+                    freeExistingColumns(allocator, &existing);
+                }
+            }
+        }
+    }
+
+    // M2M junction tables: only declared on one side at a time, and only
+    // when the edge doesn't use an explicit edge schema (through).
+    inline for (infos) |info| {
+        if (info.is_view) continue;
+        inline for (info.edges) |e| {
+            if (e.relation == .m2m and e.through == null) {
+                const jtable = comptime junctionTableForEdge(e, info);
+                const version = computeMigrationVersion(jtable.name, "create_junction", "");
+                if (!versionContains(applied, version)) {
+                    try plan.append(.{ .sql = try createTableSQLAlloc(allocator, jtable, dialect), .version = version });
+                } else {
+                    // Version is recorded but the junction table may have
+                    // been dropped out-of-band. Re-create it if missing.
+                    var existing = try getExistingColumns(allocator, driver, jtable.name);
+                    if (existing.items.len == 0) {
+                        existing.deinit();
+                        try plan.append(.{ .sql = try createTableSQLAlloc(allocator, jtable, dialect), .version = version });
+                    } else {
+                        freeExistingColumns(allocator, &existing);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: for each non-view entity, add missing columns and indexes, plus
+    // the opt-in convergences. The live schema (introspected via
+    // information_schema / PRAGMA) is the authoritative gate — exactly the
+    // checks the real path performs before each exec.
+    inline for (infos, 0..) |info, i| {
+        if (info.is_view) continue;
+
+        const table = comptime tableFromTypeInfoCrossRef(info, infos);
+
+        var existing_cols = try getExistingColumns(allocator, driver, table.name);
+        defer freeExistingColumns(allocator, &existing_cols);
+
+        if (!created[i]) {
+            inline for (table.columns) |col| {
+                if (!columnExists(existing_cols.items, col.name)) {
+                    try plan.append(.{
+                        .sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect, opts.allow_nullability_change),
+                        .version = computeMigrationVersion(info.table_name, "add_column", col.name),
+                    });
+                }
+            }
+        }
+
+        // Phase 3 Task 12 — DROP COLUMN: remove columns that exist in the
+        // database but not in the schema. Guarded by opts.drop_columns to
+        // avoid accidental data loss. No version recording: column names are
+        // runtime data from introspection.
+        if (opts.drop_columns) {
+            for (existing_cols.items) |existing_col| {
+                if (!columnExistsTableDef(table, existing_col.name)) {
+                    try plan.append(.{
+                        .sql = try dropColumnSQL(allocator, table.name, existing_col.name, dialect),
+                        .version = null,
+                    });
+                }
+            }
+        }
+
+        // Phase 3 Task 12 — ALTER TYPE: change column types that differ
+        // between the database and the schema. Guarded by opts.allow_data_loss;
+        // SQLite is skipped (unsupported).
+        if (opts.allow_data_loss) {
+            inline for (table.columns) |col| {
+                if (columnExists(existing_cols.items, col.name)) {
+                    const existing_col = getExistingColumnByName(existing_cols.items, col.name) orelse unreachable;
+                    const schema_type_upper = columnSQLType(col, dialect);
+                    var schema_buf: [128]u8 = undefined;
+                    var db_buf: [128]u8 = undefined;
+                    const schema_norm = try normalizeSqlType(schema_type_upper, &schema_buf);
+                    const db_norm = try normalizeSqlType(existing_col.sql_type, &db_buf);
+
+                    if (!std.mem.eql(u8, db_norm, schema_norm)) {
+                        // Skip ALTER TYPE on SQLite (unsupported natively).
+                        if (dialect.name[0] != 's') {
+                            const version = computeMigrationVersion(info.table_name, "alter_type", col.name);
+                            if (!versionContains(applied, version)) {
+                                try plan.append(.{
+                                    .sql = try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect),
+                                    .version = version,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Nullability of an **existing** column — the opt-in that fixes the
+        // drift `checkNullability` reports. Gated like drop_columns /
+        // allow_data_loss because SET NOT NULL fails on rows already holding
+        // a NULL. SQLite is skipped: it has no ALTER COLUMN at all.
+        if (opts.allow_nullability_change and dialect.name[0] != 's') {
+            inline for (table.columns) |col| {
+                if (getExistingColumnByName(existing_cols.items, col.name)) |existing_col| {
+                    if (db_nullableOf(existing_col) != !col.not_null) {
+                        try plan.append(.{
+                            .sql = try alterColumnNullabilitySQL(allocator, table.name, col.name, col.not_null, dialect),
+                            .version = null,
+                        });
+                    }
+                }
+            }
+        }
+
+        var existing_idxs = try getExistingIndexes(allocator, driver, table.name);
+        defer freeExistingIndexes(allocator, &existing_idxs);
+
+        inline for (info.indexes) |idx| {
+            const idx_def = IndexDef{
+                .name = idx.name,
+                .columns = idx.columns,
+                .unique = idx.unique,
+            };
+            if (!indexExists(existing_idxs.items, idx_def.name)) {
+                const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
+                try plan.append(.{
+                    .sql = try createIndexSQLForTableAlloc(allocator, idx_def, table, dialect),
+                    .version = version,
+                });
+            }
+        }
+    }
+
+    return plan;
+}
+
 /// Migrate schema: create missing tables, add missing columns, create missing
 /// indexes, and — when requested via `opts` — drop orphaned columns, alter
 /// column types, and/or converge nullability.
@@ -3465,61 +3703,32 @@ pub fn migrateSchemaWithOptions(
     comptime infos: []const TypeInfo,
     opts: MigrateOptions,
 ) !void {
-    const dialect = driver.dialect();
-
-    // Dry-run: collect all generated SQL and print without executing.
+    // Dry-run: plan the exact statement list a real run would execute — same
+    // introspection, same history snapshot, same opt-in gates, same order —
+    // and print it without executing anything. Everything here is read-only:
+    // no migration lock (it can only race a real deploy, and holding one
+    // would make the preview fail with MigrationLockTimeout instead of
+    // answering), no history bootstrap, no transaction.
     if (opts.dry_run) {
-        var sqls = std.array_list.Managed([]const u8).init(allocator);
-        defer {
-            for (sqls.items) |s| allocator.free(s);
-            sqls.deinit();
+        // The version gates read the same history snapshot a real run would.
+        // A database that has never been migrated has no history table at
+        // all — that means "nothing applied". Probing with the same read-only
+        // existence check `checkSchema` uses keeps this branch a pure read.
+        var applied: []AppliedMigration = &.{};
+        var history_cols = try getExistingColumns(allocator, driver, "zent_schema_migrations");
+        const has_history = history_cols.items.len > 0;
+        freeExistingColumns(allocator, &history_cols);
+        if (has_history) {
+            applied = try appliedMigrations(allocator, driver);
         }
+        defer if (has_history) freeAppliedMigrations(allocator, applied);
 
-        // Each SQL string is owned by `sqls` and freed with `allocator` above;
-        // the `*Alloc` helpers allocate from the same allocator.
-        // CREATE TABLE for non-view entities.
-        inline for (infos) |info| {
-            if (!info.is_view) {
-                const table = comptime tableFromTypeInfoCrossRef(info, infos);
-                try sqls.append(try createTableSQLAlloc(allocator, table, dialect));
-            }
-        }
-
-        // CREATE VIEW.
-        inline for (infos) |info| {
-            if (info.is_view) {
-                try sqls.append(try createViewSQLAlloc(allocator, info, dialect));
-            }
-        }
-
-        // M2M junction tables.
-        inline for (infos) |info| {
-            if (info.is_view) continue;
-            inline for (info.edges) |e| {
-                if (e.relation == .m2m and e.through == null) {
-                    const jtable = comptime junctionTableForEdge(e, info);
-                    try sqls.append(try createTableSQLAlloc(allocator, jtable, dialect));
-                }
-            }
-        }
-
-        // CREATE INDEX for non-view entities.
-        inline for (infos) |info| {
-            if (info.is_view or info.indexes.len == 0) continue;
-            const table = comptime tableFromTypeInfoCrossRef(info, infos);
-            inline for (info.indexes) |idx| {
-                const idx_def = IndexDef{
-                    .name = idx.name,
-                    .columns = idx.columns,
-                    .unique = idx.unique,
-                };
-                try sqls.append(try createIndexSQLForTableAlloc(allocator, idx_def, table, dialect));
-            }
-        }
+        var plan = try planMigrateStatements(allocator, driver, infos, opts, applied);
+        defer freePlannedStatements(allocator, &plan);
 
         // Print collected SQL.
-        for (sqls.items) |s| {
-            std.debug.print("{s};\n", .{s});
+        for (plan.items) |st| {
+            std.debug.print("{s};\n", .{st.sql});
         }
         return;
     }
@@ -3546,213 +3755,32 @@ pub fn migrateSchemaWithOptions(
     var tx = try driver.beginTx();
     errdefer tx.deinit();
 
-    // Tx.inner is a Driver value type, so every existing helper that
-    // accepts a Driver can run inside the transaction unchanged.
+    // Tx.inner is a Driver value type, so every helper that accepts a Driver
+    // can run inside the transaction unchanged.
     const tx_drv = tx.inner;
 
-    // Step 1: create tables, views, and M2M junction tables. CREATE TABLE
-    // IF NOT EXISTS keeps this safe even on a partial previous run.
+    // The statement list this run executes is planned up front — the same
+    // `planMigrateStatements` call the dry-run previews — and then applied in
+    // order. Planning introspects through `tx_drv`, exactly where the old
+    // interleaved path performed its checks, against the same `applied`
+    // snapshot read above, so the executed set is unchanged: one shared diff,
+    // not two copies that can drift apart.
     //
-    // The schema state (table/column/index existence) is the authoritative
-    // gate — we always re-check the database before applying each change.
+    // Step 1+2 shape the plan: create tables/views/junction tables first
+    // (CREATE TABLE IF NOT EXISTS keeps this safe even on a partial previous
+    // run), then per-entity column/index diffs. The schema state
+    // (table/column/index existence) is the authoritative gate — we always
+    // re-check the database before planning each change.
     // `zent_schema_migrations` is an audit trail: `recordMigration` uses
     // `ON CONFLICT DO NOTHING` / `ON DUPLICATE KEY UPDATE`, so re-recording
     // a version (e.g. after a table was dropped out-of-band) never produces
     // duplicates.
-    //
-    // When a version is already in `applied`, we still verify the table
-    // actually exists: if it was dropped out-of-band, the `applied` entry is
-    // stale and we must re-create the table.
-    inline for (infos) |info| {
-        if (info.is_view) {
-            const version = computeMigrationVersion(info.table_name, "create_view", "");
-            if (!versionContains(applied, version)) {
-                const sql = try createViewSQLAlloc(allocator, info, dialect);
-                defer allocator.free(sql);
-                _ = try tx_drv.exec(sql, &.{});
-                try recordMigration(tx_drv, version, null);
-            } else {
-                // Version is recorded but the view may have been dropped
-                // out-of-band. If the view no longer exists, re-create it.
-                var existing = try getExistingColumns(allocator, tx_drv, info.table_name);
-                if (existing.items.len == 0) {
-                    existing.deinit();
-                    const sql = try createViewSQLAlloc(allocator, info, dialect);
-                    defer allocator.free(sql);
-                    _ = try tx_drv.exec(sql, &.{});
-                    try recordMigration(tx_drv, version, null);
-                } else {
-                    freeExistingColumns(allocator, &existing);
-                }
-            }
-        } else {
-            const table = comptime tableFromTypeInfoCrossRef(info, infos);
-            const version = computeMigrationVersion(info.table_name, "create_table", "");
-            if (!versionContains(applied, version)) {
-                const sql = try createTableSQLAlloc(allocator, table, dialect);
-                defer allocator.free(sql);
-                _ = try tx_drv.exec(sql, &.{});
-                try recordMigration(tx_drv, version, null);
-            } else {
-                // Version is recorded but the table may have been dropped
-                // out-of-band. If the table no longer exists, re-create it.
-                var existing = try getExistingColumns(allocator, tx_drv, table.name);
-                if (existing.items.len == 0) {
-                    // Table does not exist — re-create it.
-                    existing.deinit();
-                    const sql = try createTableSQLAlloc(allocator, table, dialect);
-                    defer allocator.free(sql);
-                    _ = try tx_drv.exec(sql, &.{});
-                    try recordMigration(tx_drv, version, null);
-                } else {
-                    freeExistingColumns(allocator, &existing);
-                }
-            }
-        }
-    }
+    var plan = try planMigrateStatements(allocator, tx_drv, infos, opts, applied);
+    defer freePlannedStatements(allocator, &plan);
 
-    // M2M junction tables: only declared on one side at a time, and only
-    // when the edge doesn't use an explicit edge schema (through).
-    inline for (infos) |info| {
-        if (info.is_view) continue;
-        inline for (info.edges) |e| {
-            if (e.relation == .m2m and e.through == null) {
-                const jtable = comptime junctionTableForEdge(e, info);
-                const version = computeMigrationVersion(jtable.name, "create_junction", "");
-                if (!versionContains(applied, version)) {
-                    const sql = try createTableSQLAlloc(allocator, jtable, dialect);
-                    defer allocator.free(sql);
-                    _ = try tx_drv.exec(sql, &.{});
-                    try recordMigration(tx_drv, version, null);
-                } else {
-                    // Version is recorded but the junction table may have been
-                    // dropped out-of-band. Re-create it if missing.
-                    var existing = try getExistingColumns(allocator, tx_drv, jtable.name);
-                    if (existing.items.len == 0) {
-                        existing.deinit();
-                        const sql = try createTableSQLAlloc(allocator, jtable, dialect);
-                        defer allocator.free(sql);
-                        _ = try tx_drv.exec(sql, &.{});
-                        try recordMigration(tx_drv, version, null);
-                    } else {
-                        freeExistingColumns(allocator, &existing);
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 2: for each non-view entity, add missing columns and indexes.
-    // The live schema (introspected via information_schema / PRAGMA) is
-    // the authoritative gate: we always add a column or index if it is
-    // absent, even if a prior `zent_schema_migrations` row claimed the
-    // work was done. This handles the common case of a table being
-    // dropped or truncated out-of-band — the migration must still bring
-    // the schema back to the declared shape. The `recordMigration` INSERT
-    // itself is idempotent (`ON CONFLICT DO NOTHING`), so re-recording a
-    // version never produces duplicate history rows.
-    inline for (infos) |info| {
-        if (info.is_view) continue;
-
-        const table = comptime tableFromTypeInfoCrossRef(info, infos);
-
-        var existing_cols = try getExistingColumns(allocator, tx_drv, table.name);
-        defer freeExistingColumns(allocator, &existing_cols);
-
-        inline for (table.columns) |col| {
-            const version = computeMigrationVersion(info.table_name, "add_column", col.name);
-            if (!columnExists(existing_cols.items, col.name)) {
-                const sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect, opts.allow_nullability_change);
-                defer allocator.free(sql);
-                _ = try tx_drv.exec(sql, &.{});
-                try recordMigration(tx_drv, version, null);
-            }
-        }
-
-        // Phase 3 Task 12 — DROP COLUMN: remove columns that exist in
-        // the database but not in the schema. Guarded by opts.drop_columns
-        // to avoid accidental data loss.
-        // No version recording: column names are runtime data from
-        // introspection, and DROP COLUMN is naturally idempotent
-        // (re-running on an already-dropped column is a no-op error
-        // that we silently tolerate).
-        if (opts.drop_columns) {
-            for (existing_cols.items) |existing_col| {
-                if (!columnExistsTableDef(table, existing_col.name)) {
-                    const sql = try dropColumnSQL(allocator, table.name, existing_col.name, dialect);
-                    defer allocator.free(sql);
-                    _ = try tx_drv.exec(sql, &.{});
-                }
-            }
-        }
-
-        // Phase 3 Task 12 — ALTER TYPE: change column types that differ
-        // between the database and the schema. Guarded by
-        // opts.allow_data_loss; SQLite is skipped (unsupported).
-        if (opts.allow_data_loss) {
-            inline for (table.columns) |col| {
-                if (columnExists(existing_cols.items, col.name)) {
-                    const existing_col = getExistingColumnByName(existing_cols.items, col.name) orelse unreachable;
-                    const schema_type_upper = columnSQLType(col, dialect);
-                    var schema_buf: [128]u8 = undefined;
-                    var db_buf: [128]u8 = undefined;
-                    const schema_norm = try normalizeSqlType(schema_type_upper, &schema_buf);
-                    const db_norm = try normalizeSqlType(existing_col.sql_type, &db_buf);
-
-                    if (!std.mem.eql(u8, db_norm, schema_norm)) {
-                        // Skip ALTER TYPE on SQLite (unsupported natively).
-                        if (dialect.name[0] != 's') {
-                            const version = computeMigrationVersion(info.table_name, "alter_type", col.name);
-                            if (!versionContains(applied, version)) {
-                                const sql = try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect);
-                                defer allocator.free(sql);
-                                _ = try tx_drv.exec(sql, &.{});
-                                try recordMigration(tx_drv, version, null);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Nullability of an **existing** column. `migrateSchema` used to leave
-        // it alone whatever the schema said, so the two stayed disagreed for the
-        // life of the deployment; `checkNullability` reports it, and this is the
-        // opt-in that fixes it. Gated next to `drop_columns`/`allow_data_loss`
-        // because `SET NOT NULL` fails on the rows that already hold a NULL —
-        // which way the data goes is the caller's decision.
-        //
-        // SQLite is skipped: it has no `ALTER COLUMN` at all, so the drift stays
-        // and the `check_nullability` report at the end of the run names it.
-        if (opts.allow_nullability_change and dialect.name[0] != 's') {
-            inline for (table.columns) |col| {
-                if (getExistingColumnByName(existing_cols.items, col.name)) |existing_col| {
-                    if (db_nullableOf(existing_col) != !col.not_null) {
-                        const sql = try alterColumnNullabilitySQL(allocator, table.name, col.name, col.not_null, dialect);
-                        defer allocator.free(sql);
-                        _ = try tx_drv.exec(sql, &.{});
-                    }
-                }
-            }
-        }
-
-        var existing_idxs = try getExistingIndexes(allocator, tx_drv, table.name);
-        defer freeExistingIndexes(allocator, &existing_idxs);
-
-        inline for (info.indexes) |idx| {
-            const idx_def = IndexDef{
-                .name = idx.name,
-                .columns = idx.columns,
-                .unique = idx.unique,
-            };
-            if (!indexExists(existing_idxs.items, idx_def.name)) {
-                const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
-                const sql = try createIndexSQLForTableAlloc(allocator, idx_def, table, dialect);
-                defer allocator.free(sql);
-                _ = try tx_drv.exec(sql, &.{});
-                try recordMigration(tx_drv, version, null);
-            }
-        }
+    for (plan.items) |st| {
+        _ = try tx_drv.exec(st.sql, &.{});
+        if (st.version) |version| try recordMigration(tx_drv, version, null);
     }
 
     try tx.commit();
@@ -4397,6 +4425,404 @@ test "Migrate schema alters column type when opts.allow_data_loss set (SQLite �
             try std.testing.expect(std.mem.eql(u8, col_type, "TEXT"));
         }
     }
+}
+
+/// Test-only driver wrapper: forwards every operation to a real driver and
+/// records each executed SQL string. Lets a test assert that the statements a
+/// real migration ran are exactly the ones `planMigrateStatements` — the
+/// dry-run's computation — produced, in order.
+const RecordingDriver = struct {
+    inner: sql_driver.Driver,
+    allocator: std.mem.Allocator,
+    execs: std.array_list.Managed([]const u8),
+
+    fn init(allocator: std.mem.Allocator, inner: sql_driver.Driver) RecordingDriver {
+        return .{
+            .inner = inner,
+            .allocator = allocator,
+            .execs = std.array_list.Managed([]const u8).init(allocator),
+        };
+    }
+
+    fn deinit(self: *RecordingDriver) void {
+        self.clearExecs();
+        self.execs.deinit();
+    }
+
+    fn clearExecs(self: *RecordingDriver) void {
+        for (self.execs.items) |s| self.allocator.free(s);
+        self.execs.clearRetainingCapacity();
+    }
+
+    fn asDriver(self: *RecordingDriver) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn execHook(ptr: *anyopaque, ctx: ?*const sql_driver.ExecutionContext, query: []const u8, args: []const Value) sql_driver.Error!sql_driver.Result {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        const owned = self.allocator.dupe(u8, query) catch return error.OutOfMemory;
+        self.execs.append(owned) catch {
+            self.allocator.free(owned);
+            return error.OutOfMemory;
+        };
+        return self.inner.execCtx(ctx, query, args);
+    }
+
+    fn queryHook(ptr: *anyopaque, ctx: ?*const sql_driver.ExecutionContext, query: []const u8, args: []const Value) sql_driver.Error!sql_driver.Rows {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        return self.inner.queryCtx(ctx, query, args);
+    }
+
+    fn beginTxHook(ptr: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        var tx = try self.inner.beginTx();
+        // The migration execs through `tx.inner`, so re-route the tx's inner
+        // driver back through this wrapper — transaction-scoped DDL must be
+        // recorded too. commit/rollback/deinit keep the original handle.
+        tx.inner = self.asDriver();
+        return tx;
+    }
+
+    fn beginSavepointHook(ptr: *anyopaque, name: []const u8) sql_driver.Error!sql_driver.Tx {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        var tx = try self.inner.beginSavepoint(name);
+        tx.inner = self.asDriver();
+        return tx;
+    }
+
+    fn closeHook(ptr: *anyopaque) void {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        self.inner.close();
+    }
+
+    fn dialectHook(ptr: *anyopaque) Dialect {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        return self.inner.dialect();
+    }
+
+    fn pingHook(ptr: *anyopaque) sql_driver.Error!void {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        return self.inner.ping();
+    }
+
+    fn inTransactionHook(ptr: *anyopaque) bool {
+        const self: *RecordingDriver = @ptrCast(@alignCast(ptr));
+        return self.inner.inTransaction();
+    }
+
+    const vtable: sql_driver.Driver.VTable = .{
+        .exec = execHook,
+        .query = queryHook,
+        .beginTx = beginTxHook,
+        .close = closeHook,
+        .dialect = dialectHook,
+        .ping = pingHook,
+        .inTransaction = inTransactionHook,
+        .beginSavepoint = beginSavepointHook,
+    };
+};
+
+/// The DDL statements recorded by a real run, minus the history-table
+/// bookkeeping (`ensureMigrationsTable`, `recordMigration` INSERTs) that the
+/// statement plan deliberately does not carry.
+fn recordedDdl(allocator: std.mem.Allocator, rec: *RecordingDriver) !std.array_list.Managed([]const u8) {
+    var ddl = std.array_list.Managed([]const u8).init(allocator);
+    errdefer ddl.deinit();
+    for (rec.execs.items) |s| {
+        if (std.mem.indexOf(u8, s, "zent_schema_migrations") != null) continue;
+        try ddl.append(s);
+    }
+    return ddl;
+}
+
+/// The core dry-run invariant: the statement list `planMigrateStatements`
+/// produces (what the dry-run prints, one line per statement) is exactly the
+/// list a real run executes, in the same order.
+fn expectPlanMatchesRecorded(plan: []const PlannedStatement, ddl: []const []const u8) !void {
+    try std.testing.expectEqual(plan.len, ddl.len);
+    for (plan, ddl, 0..) |st, exec_sql, k| {
+        if (!std.mem.eql(u8, st.sql, exec_sql)) {
+            std.debug.print("statement {d} differs:\n  plan: {s}\n  exec: {s}\n", .{ k, st.sql, exec_sql });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn planHasStatementContaining(plan: []const PlannedStatement, needle: []const u8) bool {
+    for (plan) |st| {
+        if (std.mem.indexOf(u8, st.sql, needle) != null) return true;
+    }
+    return false;
+}
+
+test "dry-run plans exactly the statements an incremental migrate executes (SQLite)" {
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const index = @import("../../core/index.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    var rec = RecordingDriver.init(allocator, drv.asDriver());
+    defer rec.deinit();
+
+    // V1: plan_user(name) — migrated for real, so the history table records
+    // the create_table version exactly as it would in production.
+    const V1 = schema("PlanUser", .{
+        .fields = &.{field.String("name")},
+    });
+    const v1_infos = &[_]TypeInfo{comptime fromSchema(V1)};
+    try migrateSchema(allocator, rec.asDriver(), v1_infos);
+    rec.clearExecs();
+
+    // Out-of-band drift the V2 schema does not declare: an extra column.
+    _ = try drv.exec("ALTER TABLE plan_user ADD COLUMN obsolete TEXT", &.{});
+    _ = try drv.exec("INSERT INTO plan_user (name, obsolete) VALUES ('n', 'o')", &.{});
+
+    // V2: adds age/email/status (status carries a DEFAULT backfill), an
+    // index on name, and — with drop_columns — drops "obsolete".
+    const V2 = schema("PlanUser", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+            field.String("email"),
+            field.String("status").Default("pending"),
+        },
+        .indexes = &.{
+            index.Named("idx_plan_user_name", &.{"name"}),
+        },
+    });
+    const v2_infos = &[_]TypeInfo{comptime fromSchema(V2)};
+    const opts = MigrateOptions{ .drop_columns = true };
+
+    // Plan first, against the history snapshot a real run would read...
+    const applied = try appliedMigrations(allocator, rec.asDriver());
+    defer freeAppliedMigrations(allocator, applied);
+    var plan = try planMigrateStatements(allocator, rec.asDriver(), v2_infos, opts, applied);
+    defer freePlannedStatements(allocator, &plan);
+
+    // Semantic anchors: the plan is an *incremental* diff, not a fresh dump.
+    try std.testing.expect(!planHasStatementContaining(plan.items, "CREATE TABLE"));
+    try std.testing.expect(planHasStatementContaining(plan.items, "ADD COLUMN \"age\" INTEGER"));
+    try std.testing.expect(planHasStatementContaining(plan.items, "ADD COLUMN \"status\" TEXT DEFAULT 'pending'"));
+    try std.testing.expect(planHasStatementContaining(plan.items, "DROP COLUMN \"obsolete\""));
+    try std.testing.expect(planHasStatementContaining(plan.items, "CREATE INDEX"));
+    // The recorded kind is set: add_column records history, drop does not.
+    for (plan.items) |st| {
+        if (std.mem.indexOf(u8, st.sql, "DROP COLUMN") != null) {
+            try std.testing.expectEqual(@as(?i64, null), st.version);
+        }
+        if (std.mem.indexOf(u8, st.sql, "ADD COLUMN") != null) {
+            try std.testing.expect(st.version != null);
+        }
+    }
+
+    // ...then the real run, recorded statement for statement.
+    try migrateSchemaWithOptions(allocator, rec.asDriver(), v2_infos, opts);
+    var ddl = try recordedDdl(allocator, &rec);
+    defer ddl.deinit();
+
+    try expectPlanMatchesRecorded(plan.items, ddl.items);
+
+    // And the drift is actually gone, so the migration did what the plan said.
+    var rows = try drv.query("PRAGMA table_info(plan_user)", &.{});
+    defer rows.deinit();
+    var found_age = false;
+    var found_obsolete = false;
+    while (rows.next()) |row| {
+        const col_name = row.getText(1) orelse continue;
+        if (std.mem.eql(u8, col_name, "age")) found_age = true;
+        if (std.mem.eql(u8, col_name, "obsolete")) found_obsolete = true;
+    }
+    try std.testing.expect(found_age);
+    try std.testing.expect(!found_obsolete);
+}
+
+test "dry-run on a fresh database plans the same statements the real migrate executes" {
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const edge = @import("../../core/edge.zig");
+    const field = @import("../../core/field.zig");
+    const index = @import("../../core/index.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    var rec = RecordingDriver.init(allocator, drv.asDriver());
+    defer rec.deinit();
+
+    const Doc = schema("FreshDoc", .{
+        .fields = &.{
+            field.String("title"),
+            field.Int("pages"),
+        },
+        .indexes = &.{
+            index.Named("idx_fresh_doc_title", &.{"title"}),
+        },
+    });
+
+    // A view entity and an m2m pair, so the plan covers the CREATE VIEW and
+    // junction-table branches too — both are existence-gated exactly like
+    // the real path.
+    const DocView = schema("FreshDocView", .{
+        .view = true,
+        .view_sql = "SELECT 1 AS one",
+        .fields = &.{field.Int("one")},
+    });
+    const PostBase = schema("FreshPost", .{
+        .fields = &.{field.String("title")},
+    });
+    const TagBase = schema("FreshTag", .{
+        .fields = &.{field.String("label")},
+    });
+    const Post = struct {
+        pub const schema_name = PostBase.schema_name;
+        pub const fields = PostBase.fields;
+        pub const edges = &.{edge.To("tags", TagBase)};
+        pub const indexes = PostBase.indexes;
+        pub const policy = PostBase.policy;
+        pub const is_view = PostBase.is_view;
+        pub const view_sql = PostBase.view_sql;
+        pub const soft_delete = PostBase.soft_delete;
+    };
+    const Tag = struct {
+        pub const schema_name = TagBase.schema_name;
+        pub const fields = TagBase.fields;
+        pub const edges = &.{edge.To("posts", PostBase)};
+        pub const indexes = TagBase.indexes;
+        pub const policy = TagBase.policy;
+        pub const is_view = TagBase.is_view;
+        pub const view_sql = TagBase.view_sql;
+        pub const soft_delete = TagBase.soft_delete;
+    };
+
+    const infos = comptime buildGraph(&.{ Doc, DocView, Post, Tag }).types;
+
+    // No history table, nothing applied — the dry-run branch reads exactly
+    // this shape of (empty) history.
+    var plan = try planMigrateStatements(allocator, rec.asDriver(), infos, .{}, &.{});
+    defer freePlannedStatements(allocator, &plan);
+
+    try std.testing.expect(planHasStatementContaining(plan.items, "CREATE TABLE IF NOT EXISTS \"fresh_doc\""));
+    try std.testing.expect(planHasStatementContaining(plan.items, "CREATE INDEX"));
+    try std.testing.expect(planHasStatementContaining(plan.items, "CREATE VIEW IF NOT EXISTS \"fresh_doc_view\""));
+    try std.testing.expect(planHasStatementContaining(plan.items, "CREATE TABLE IF NOT EXISTS \"fresh_post_fresh_tag\""));
+    // Tables this run creates get no ALTER ADD COLUMNs: the CREATEs carry
+    // the full shape.
+    try std.testing.expect(!planHasStatementContaining(plan.items, "ADD COLUMN"));
+
+    try migrateSchema(allocator, rec.asDriver(), infos);
+    var ddl = try recordedDdl(allocator, &rec);
+    defer ddl.deinit();
+
+    try expectPlanMatchesRecorded(plan.items, ddl.items);
+}
+
+test "dry-run honours the opt-in switches on an existing table" {
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Gate = schema("GateDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("status").Default("pending"),
+        },
+    });
+    const infos = &[_]TypeInfo{comptime fromSchema(Gate)};
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    // Drift: a column the schema does not declare, and — for the
+    // nullability half — the table simply predates "status".
+    _ = try drv.exec("ALTER TABLE gate_doc ADD COLUMN stray TEXT", &.{});
+    _ = try drv.exec("ALTER TABLE gate_doc DROP COLUMN status", &.{});
+
+    // Default opts: no DROP COLUMN, and an added NOT NULL column arrives
+    // nullable (the drift check_nullability reports) rather than converged.
+    const applied = try appliedMigrations(allocator, drv.asDriver());
+    defer freeAppliedMigrations(allocator, applied);
+    var loose = try planMigrateStatements(allocator, drv.asDriver(), infos, .{}, applied);
+    defer freePlannedStatements(allocator, &loose);
+    try std.testing.expect(!planHasStatementContaining(loose.items, "DROP COLUMN"));
+    try std.testing.expect(planHasStatementContaining(loose.items, "ADD COLUMN \"status\" TEXT DEFAULT 'pending'"));
+    try std.testing.expect(!planHasStatementContaining(loose.items, "NOT NULL"));
+
+    // Opted in: the DROP appears and the column converges NOT NULL with its
+    // DEFAULT backfill.
+    var strict = try planMigrateStatements(allocator, drv.asDriver(), infos, .{
+        .drop_columns = true,
+        .allow_nullability_change = true,
+    }, applied);
+    defer freePlannedStatements(allocator, &strict);
+    try std.testing.expect(planHasStatementContaining(strict.items, "DROP COLUMN \"stray\""));
+    try std.testing.expect(planHasStatementContaining(strict.items, "ADD COLUMN \"status\" TEXT NOT NULL DEFAULT 'pending'"));
+
+    // A converged database plans nothing at all.
+    try migrateSchemaWithOptions(allocator, drv.asDriver(), infos, .{
+        .drop_columns = true,
+        .allow_nullability_change = true,
+    });
+    var settled = try planMigrateStatements(allocator, drv.asDriver(), infos, .{}, applied);
+    defer freePlannedStatements(allocator, &settled);
+    try std.testing.expectEqual(@as(usize, 0), settled.items.len);
+}
+
+test "migrateSchemaWithOptions dry_run executes nothing but plans the incremental diff" {
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    var rec = RecordingDriver.init(allocator, drv.asDriver());
+    defer rec.deinit();
+
+    const V1 = schema("DryRunDoc", .{
+        .fields = &.{field.String("name")},
+    });
+    const v1_infos = &[_]TypeInfo{comptime fromSchema(V1)};
+    try migrateSchema(allocator, rec.asDriver(), v1_infos);
+    rec.clearExecs();
+
+    const V2 = schema("DryRunDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+        },
+    });
+    const v2_infos = &[_]TypeInfo{comptime fromSchema(V2)};
+
+    // The dry-run branch itself: it introspects (queries are fine) but must
+    // never exec — the recording wrapper is the witness.
+    try migrateSchemaWithOptions(allocator, rec.asDriver(), v2_infos, .{ .dry_run = true });
+    try std.testing.expectEqual(@as(usize, 0), rec.execs.items.len);
+
+    // And it changed nothing.
+    var rows = try drv.query("PRAGMA table_info(dry_run_doc)", &.{});
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        try std.testing.expect(!std.mem.eql(u8, row.getText(1) orelse "", "age"));
+    }
+
+    // The real run then applies exactly the diff the dry-run previewed.
+    const applied = try appliedMigrations(allocator, rec.asDriver());
+    defer freeAppliedMigrations(allocator, applied);
+    var plan = try planMigrateStatements(allocator, rec.asDriver(), v2_infos, .{}, applied);
+    defer freePlannedStatements(allocator, &plan);
+    try migrateSchemaWithOptions(allocator, rec.asDriver(), v2_infos, .{});
+    var ddl = try recordedDdl(allocator, &rec);
+    defer ddl.deinit();
+    try expectPlanMatchesRecorded(plan.items, ddl.items);
 }
 
 test "file migration checksum mismatch is rejected" {

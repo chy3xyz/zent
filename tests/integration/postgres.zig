@@ -1362,6 +1362,53 @@ test "Postgres: migrateSchema dry-run outputs SQL without executing" {
     try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
 }
 
+test "Postgres: dry-run previews an incremental migration without applying it" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // A legacy table that matches V1 of the schema (created by hand, so the
+    // migration history has no create_table version for it).
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_dr_inc", &.{});
+    _ = try drv.exec("CREATE TABLE pg_dr_inc (id SERIAL PRIMARY KEY, name TEXT NOT NULL)", &.{});
+    _ = try drv.exec("INSERT INTO pg_dr_inc (name) VALUES ('a')", &.{});
+
+    // V2 adds a column.
+    const DrInc = schema("PgDrInc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+        },
+    });
+    const graph = comptime buildGraph(&.{DrInc});
+
+    // The preview: runs clean, changes nothing — the new column is not added.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), graph.types, migrate.MigrateOptions{
+        .dry_run = true,
+    });
+    {
+        var rows = try drv.query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'pg_dr_inc' AND table_schema = current_schema() AND column_name = 'age'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+    }
+
+    // The real run applies what the preview showed.
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+    {
+        var rows = try drv.query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'pg_dr_inc' AND table_schema = current_schema() AND column_name = 'age'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+    }
+}
+
 test "Postgres: WhereIn chunks OR-joins IN predicates" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
