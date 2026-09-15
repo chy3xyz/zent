@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.64.0] - 2026-09-15
+
 ### Added
 - **Concurrency invariants for the prepared-statement cache and the outbox.**
   The pool has had stress tests since v0.61, and they are the reason the two
