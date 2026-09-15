@@ -760,8 +760,26 @@ zent: table 'xdaofood_order' column 'remark' is NULL, but field 'remark'
       does not; make the field Optional()/Nillable(), or fix the column
 ```
 
-`migrateSchema` never alters an existing column's nullability: that is a data
-decision (existing NULLs have to go somewhere), so it is reported, not applied.
+### What `migrateSchema` does **not** do
+
+It converges the database towards the schema, and it stops short of anything
+that needs a data decision. Knowing the list is the difference between "the
+migration ran, so the shape is right" and being surprised later:
+
+| Not done | Consequence | What to do |
+|---|---|---|
+| An added column is **never `NOT NULL`** (`ALTER TABLE … ADD COLUMN` emits the type and any `DEFAULT`, and the code comment says why: SQLite rejects `NOT NULL` without a default) | `migrateSchema` **creates** the drift `checkNullability` then reports — an "optional" column where the schema says otherwise | backfill, then `ALTER COLUMN … SET NOT NULL` yourself, or make the field `Optional()` |
+| An existing column's nullability is **never** changed | the database keeps whatever it had, silently | see `checkSchema`/`assertSchema` above |
+| **Unique** on an added column is not emitted (SQLite cannot, and the `CREATE TABLE` path carries it for PG/MySQL) | an old table gains the column without the constraint | add the constraint in a real migration |
+| **Foreign keys** exist only in `CREATE TABLE`; `ALTER` never adds one | old tables stay unconstrained | same |
+| A **changed `view_sql` never takes effect** — views are `CREATE VIEW IF NOT EXISTS` | the definition you upgraded to is not the one in the database | `DROP VIEW` then re-run, or version the view name |
+| Index comparison is **by name only** (`ExistingIndex` carries no columns) | an index whose definition changed is left as-is | drop and recreate it by hand |
+
+Everything in that table is also what `checkSchema` reports, which is the point:
+the migration path is not a substitute for the check.
+
+`migrateSchema` never alters an existing column's nullability as a *deliberate*
+omission: existing NULLs have to go somewhere, so it is reported, not applied.
 
 For the same reason, and covering everything a schema can drift on rather than
 just NULL:

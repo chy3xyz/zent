@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Docs
+- **What `migrateSchema` deliberately does not converge** (Z31). Item 8 of the
+  report, verified line by line and recorded rather than fixed. Confirmed: an
+  `ALTER TABLE … ADD COLUMN` never emits `NOT NULL` (the code comment says why —
+  SQLite rejects it without a default), so "add a non-null field to an old table"
+  produces exactly the drift `checkNullability` then warns about; an existing
+  column's nullability is never modified; `UNIQUE` and foreign keys are not added
+  by `ALTER`; a **changed `view_sql` never takes effect** (`CREATE VIEW IF NOT
+  EXISTS`, so the definition stays whatever it was); and index comparison is by
+  name only, since `ExistingIndex` carries no columns. `BEST_PRACTICES` §5h now
+  has a table of all six with the consequence and the manual remedy — "the
+  migration ran" was never a guarantee that the shape matches, and nothing said
+  so. The fixes themselves (an option-gated `NOT NULL` with a backfill default,
+  view replacement, columns on `ExistingIndex`) change migration semantics and
+  are left for a pass that can test them against real databases.
+
 ## [0.54.0] - 2026-09-15
 
 ### Changed
