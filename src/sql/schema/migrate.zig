@@ -168,6 +168,8 @@ pub const SchemaDrift = struct {
     /// shape it names — `(user_id)` → `user (id)` — is built at runtime) and is
     /// freed with the two index kinds; `.unique_constraint` and `.missing_view`
     /// point it at a `const` literal, which must **not** be freed.
+    /// `.missing_junction_table` also points it at a comptime literal (the edge
+    /// and the junction table name it names are all comptime-known).
     /// `ownsIndexDetail` is the single place that decides which is which. Every
     /// other kind leaves it empty.
     index_name: []const u8 = "",
@@ -203,6 +205,36 @@ pub const SchemaDrift = struct {
         /// database and block every deploy). A changed `view_sql` therefore
         /// still takes no effect and is still not reported.
         missing_view,
+        /// The schema declares an **M2M edge** and the database has no relation
+        /// of the junction table that edge needs — neither a table nor a view.
+        ///
+        /// An M2M edge carries no foreign key column (see `junctionTableForEdge`):
+        /// the two sides are joined through a table named after both of them, in
+        /// alphabetical order, which `migrateSchema` creates beside the entity
+        /// tables. Nothing in this check used to look at it — the loop walks
+        /// `infos`, and a junction table is not a `TypeInfo` — so a junction that
+        /// was never created, or was dropped out of band, produced a green check
+        /// while every query over that edge failed with "no such table" (the same
+        /// class as `missing_view`: a *broken read*, not a missed optimisation),
+        /// which is why `breaksReads()` is **true** here.
+        ///
+        /// Only an M2M edge without an explicit edge schema needs one: an edge
+        /// with `Through(EdgeSchema)` reads and writes the through entity's own
+        /// table, which is a declared entity and is checked as one. O2M and O2O
+        /// edges need no junction table at all — their FK is a column of the
+        /// entity table, covered by `missing_column` / `missing_foreign_key`.
+        ///
+        /// `table` is the junction table's name (`user_team`), because that is
+        /// the relation the reader has to create; the edge that needs it is named
+        /// in `index_detail`. Only the relation's **existence** is asked about,
+        /// exactly as for `missing_view`: its columns, primary key and foreign
+        /// keys are not compared, so a junction table of the right name with the
+        /// wrong shape stays silent here.
+        ///
+        /// The relation is asked about on its own, with no gate on the two entity
+        /// tables: a database that has never been migrated reports one of these
+        /// beside each `missing_table`, not a silent gap.
+        missing_junction_table,
         /// The schema declares an index the database has under the same name
         /// with a **different key list**. Only reported when the database's
         /// key list could be read reliably (`ExistingIndex.columns_comparable`).
@@ -263,15 +295,17 @@ pub const SchemaDrift = struct {
     /// Whether this drift makes a *read* fail — the kinds worth blocking a
     /// deploy over, as opposed to cosmetic agreement.
     ///
-    /// A missing table, column or **view** fails every query that mentions it
-    /// (the failure mode behind "the endpoint quietly returned an empty list for
-    /// months"), and a column the database makes nullable while the schema
-    /// declares it non-optional fails on the first row that actually holds a
-    /// NULL. A view whose relation is absent is grouped with the first of those
-    /// and not with the constraints below: `SELECT … FROM the_view` does not
-    /// return fewer rows, it errors outright — so `read_breaking_only` must
-    /// catch it, exactly as it catches `missing_table`. An extra column and a
-    /// type difference do not fail reads by themselves.
+    /// A missing table, column, **view** or M2M **junction table** fails every
+    /// query that mentions it (the failure mode behind "the endpoint quietly
+    /// returned an empty list for months"), and a column the database makes
+    /// nullable while the schema declares it non-optional fails on the first row
+    /// that actually holds a NULL. A view or a junction table whose relation is
+    /// absent is grouped with the first of those and not with the constraints
+    /// below: `SELECT … FROM the_view` and a query over the M2M edge both do not
+    /// return fewer rows, they error outright ("no such table/view") — so
+    /// `read_breaking_only` must catch them, exactly as it catches
+    /// `missing_table`. An extra column and a type difference do not fail reads
+    /// by themselves.
     ///
     /// None of the four constraint kinds does either: a different key list
     /// changes how fast a query runs, a different uniqueness changes whether a
@@ -284,7 +318,7 @@ pub const SchemaDrift = struct {
     /// now fails loudly, into an outage. They fail only under `.any`.
     pub fn breaksReads(self: SchemaDrift) bool {
         return switch (self.kind) {
-            .missing_table, .missing_column, .missing_view => true,
+            .missing_table, .missing_column, .missing_view, .missing_junction_table => true,
             .nullability => !self.schema_optional and self.db_nullable,
             .extra_column,
             .type_mismatch,
@@ -301,6 +335,7 @@ pub const SchemaDrift = struct {
 /// or extra column, a type or nullability difference, a **column** the schema
 /// declares UNIQUE with nothing enforcing it, a **foreign key** the schema
 /// declares the database does not have, a **view** the schema declares with no
+/// relation of that name, an **M2M junction table** an edge needs with no
 /// relation of that name, and — for a declared index the database already has
 /// under the same name — a different key list or a different uniqueness.
 ///
@@ -326,6 +361,24 @@ pub const SchemaDrift = struct {
 /// cannot tell you whether it succeeded.
 /// A caller that wants to compare definitions can read them with
 /// `getExistingViews` and normalize per dialect; that judgement is theirs.
+///
+/// **M2M junction tables** (`.missing_junction_table`) get the same one
+/// question. An M2M edge carries no FK column of its own — `migrateSchema`
+/// creates a junction table named after both sides (`junctionTableForEdge`) and
+/// the relation query reads it — so a junction that was never created, or was
+/// dropped out of band, leaves `SELECT` over that edge failing with "no such
+/// table" while this check stayed green. Only edges that need an implicit
+/// junction are looked at: `.relation == .m2m` **and** no `Through`, which is
+/// the condition `migrateSchema` creates them under. An explicit edge schema is
+/// a declared entity and is checked as one; O2M and O2O edges have no junction
+/// table at all (their FK is an entity-table column, which `missing_column` and
+/// `missing_foreign_key` cover).
+///
+/// The report names the junction table in `table` and the edge that needs it in
+/// `index_detail`; like a view, the relation's **shape is never compared**, so a
+/// junction table of the right name with the wrong columns or keys is not
+/// reported. Both sides of a symmetric M2M edge produce the same junction table
+/// name, and it is reported once.
 ///
 /// The existence answer is `getExistingColumns`, the same relation probe
 /// `migrateSchema` uses to re-create a view that was dropped out of band: it
@@ -601,6 +654,53 @@ pub fn checkSchema(
             }
         }
     }
+
+    // M2M junction tables — the other declaration whose *absence* nothing else
+    // here sees. A junction table is not a `TypeInfo`, so the loop above walks
+    // past it however complete the graph is, yet a query over the edge reads it
+    // directly and fails outright when it is not there. The traversal is
+    // `migrateSchema`'s own junction loop: every non-view entity, every edge
+    // that is M2M **without** an explicit edge schema (`Through` is checked as
+    // its own entity, and O2M/O2O carry an FK column instead), and the name
+    // `junctionTableForEdge` derives from the two table names.
+    //
+    // Both sides of a symmetric M2M declare a `To` edge, so the same junction
+    // table is visited twice with the same name — `seen_junctions` collapses that
+    // into one report, the same way `CREATE TABLE IF NOT EXISTS` collapses the
+    // two creations on the migration side.
+    var seen_junctions = std.array_list.Managed([]const u8).init(allocator);
+    defer seen_junctions.deinit();
+    inline for (infos) |info| {
+        if (comptime !info.is_view) {
+            inline for (info.edges) |e| {
+                if (e.relation == .m2m and e.through == null) {
+                    const jtable = comptime junctionTableForEdge(e, info);
+
+                    var already_seen = false;
+                    for (seen_junctions.items) |seen_name| {
+                        if (std.mem.eql(u8, seen_name, jtable.name)) already_seen = true;
+                    }
+                    // Nested rather than `continue`: a runtime `continue` is
+                    // comptime control flow inside the unrolled body, which 0.17
+                    // rejects.
+                    if (!already_seen) {
+                        try seen_junctions.append(jtable.name);
+
+                        var junction_relation = try getExistingColumns(allocator, driver, jtable.name);
+                        defer freeExistingColumns(allocator, &junction_relation);
+
+                        if (junction_relation.items.len == 0) {
+                            try drifts.append(.{
+                                .table = jtable.name,
+                                .kind = .missing_junction_table,
+                                .index_detail = comptime missingJunctionTableDetail(info, e),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
     return drifts.toOwnedSlice();
 }
 
@@ -694,6 +794,38 @@ const uniqueColumnDriftDetail = "schema declares the column UNIQUE, database has
 /// `view_sql` is invisible *here* even after the view is created.
 const missingViewDriftDetail = "schema declares the view, database has no relation of that name; view_sql is never compared, so a stale definition is not reported either";
 
+/// The `.missing_junction_table` report, naming the edge that needs the relation
+/// and the relation itself. A **comptime** literal — every part of it comes from
+/// `infos` and from `junctionTableForEdge`, both comptime-known, so nothing is
+/// allocated for this kind (see `ownsIndexDetail`).
+///
+/// Names are spelled out because a schema can carry several M2M edges: "a
+/// junction table is missing" would send the reader back to the schema to work
+/// out which one, and the junction *table* name alone does not say which two
+/// entities it joins. The edge is printed in the same alphabetical order the
+/// junction table's own name uses, so the sentence reads the same whichever side
+/// declares the edge. The expected columns are named for the consumer that
+/// creates the table by hand instead of running `migrateSchema`.
+///
+/// The last clause is the boundary of this check: existence is all that is
+/// asked about, so a junction table of the right name with the wrong shape is
+/// not reported here (see `SchemaDrift.Kind.missing_junction_table`).
+fn missingJunctionTableDetail(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
+    comptime {
+        const source_table = info.table_name;
+        const target_table = toSnakeCase(edge.target_name);
+        const a_first = std.mem.lessThan(u8, source_table, target_table);
+        const left = if (a_first) source_table else target_table;
+        const right = if (a_first) target_table else source_table;
+        const jtable = junctionTableForEdge(edge, info);
+
+        return "schema declares the M2M edge " ++ left ++ " <-> " ++ right ++
+            ", database has no relation named " ++ jtable.name ++
+            " (expected columns " ++ jtable.columns[0].name ++ ", " ++ jtable.columns[1].name ++
+            "); migrateSchema creates it, and only its existence is compared";
+    }
+}
+
 /// "schema declares FOREIGN KEY (user_id) REFERENCES user (id), database has
 /// none" — **owned** (see `indexColumnsDetailAlloc`).
 ///
@@ -766,9 +898,9 @@ fn indexUniquenessDetailAlloc(allocator: std.mem.Allocator, schema_unique: bool,
 /// Which kinds carry an **allocated** `index_detail`, and so must be freed —
 /// the two index kinds, whose sentence describes a difference read from the
 /// database, and `.missing_foreign_key`, whose sentence names a shape built at
-/// runtime. `.unique_constraint` and `.missing_view` point the field at a
-/// `const` literal instead and must not be freed; every other kind leaves it
-/// empty.
+/// runtime. `.unique_constraint`, `.missing_view` and `.missing_junction_table`
+/// point the field at a `const`/comptime literal instead and must not be freed;
+/// every other kind leaves it empty.
 fn ownsIndexDetail(kind: SchemaDrift.Kind) bool {
     return switch (kind) {
         .index_columns, .index_uniqueness, .missing_foreign_key => true,
@@ -809,6 +941,8 @@ pub fn assertSchema(
                 d.index_name
             else if (d.kind == .missing_view)
                 "(view)"
+            else if (d.kind == .missing_junction_table)
+                "(junction)"
             else
                 "(table)",
             @tagName(d.kind),
@@ -5392,6 +5526,179 @@ test "checkSchema reports a view the database does not have, and read_breaking_o
         defer freeSchemaDrift(std.testing.allocator, drifts);
         try std.testing.expectEqual(@as(usize, 0), drifts.len);
     }
+}
+
+test "checkSchema reports a missing M2M junction table, and read_breaking_only stops it (SQLite)" {
+    // The last declared shape the entity loop walked past: a junction table is
+    // not a `TypeInfo`, so an M2M edge survived a green check while a query over
+    // it failed with "no such table". Same silent class as `missing_view`, and
+    // pinned the same way.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    const JcMemberBase = schema("JcMember", .{ .fields = &.{field.String("name")} });
+    const JcTagBase = schema("JcTag", .{ .fields = &.{field.String("label")} });
+    const JcMember = struct {
+        pub const schema_name = JcMemberBase.schema_name;
+        pub const fields = JcMemberBase.fields;
+        // Both sides declare the edge, which is what makes it M2M — and what
+        // makes the junction table get reported once instead of twice.
+        pub const edges = &.{edge.To("tags", JcTagBase)};
+        pub const indexes = JcMemberBase.indexes;
+    };
+    const JcTag = struct {
+        pub const schema_name = JcTagBase.schema_name;
+        pub const fields = JcTagBase.fields;
+        pub const edges = &.{edge.To("members", JcMemberBase)};
+        pub const indexes = JcTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ JcMember, JcTag });
+    const infos = graph.types;
+
+    // Never migrated: the two entity tables and the junction table they need are
+    // all absent, and each relation is reported on its own — the junction check
+    // is not gated on the entity tables, exactly as the view check is not. A
+    // whole-database first run therefore says "three relations are missing", not
+    // two with a gap where the edge's table should be.
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 3), drifts.len);
+        var missing_tables: usize = 0;
+        var missing_junctions: usize = 0;
+        for (drifts) |d| switch (d.kind) {
+            .missing_table => missing_tables += 1,
+            .missing_junction_table => missing_junctions += 1,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(@as(usize, 2), missing_tables);
+        try std.testing.expectEqual(@as(usize, 1), missing_junctions);
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only));
+    }
+
+    // `migrateSchema` builds both entity tables and the junction table between
+    // them, and the junction table's own primary key and foreign keys disturb
+    // nothing else here: complete agreement. That is the other half of this
+    // kind — it reports an absent relation, not the shape of a present one.
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+    {
+        const agreeing = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, agreeing);
+        try std.testing.expectEqual(@as(usize, 0), agreeing.len);
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .any);
+    }
+
+    // Dropped out of band. One report, not two: both sides of the edge derive
+    // the same junction table name.
+    _ = try drv.exec("DROP TABLE jc_member_jc_tag", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 1), drifts.len);
+        try std.testing.expectEqual(SchemaDrift.Kind.missing_junction_table, drifts[0].kind);
+        // `table` is the relation that is missing; the edge that needs it is in
+        // the detail, spelled out in the same alphabetical order the junction
+        // table's name uses, together with the columns a hand-created one needs.
+        try std.testing.expectEqualStrings("jc_member_jc_tag", drifts[0].table);
+        try std.testing.expectEqualStrings("", drifts[0].column);
+        try std.testing.expectEqualStrings(
+            "schema declares the M2M edge jc_member <-> jc_tag, database has no relation named jc_member_jc_tag " ++
+                "(expected columns jc_member_id, jc_tag_id); migrateSchema creates it, and only its existence is compared",
+            drifts[0].index_detail,
+        );
+        // The detail is a comptime literal, not an allocation: freeing the
+        // report must leave it alone (a double free would show up as a leak
+        // check failure on the freeing allocator, not as an assertion).
+        try std.testing.expect(!ownsIndexDetail(drifts[0].kind));
+        // The relation query fails outright; that is the stake behind
+        // `breaksReads`, and why the read-breaking gate has to catch it.
+        try std.testing.expect(drifts[0].breaksReads());
+        try std.testing.expectError(error.SqlitePrepareFailed, drv.query("SELECT jc_member_id, jc_tag_id FROM jc_member_jc_tag", &.{}));
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only));
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+    }
+
+    // A **relation** of that name is what is asked about, never its shape: a
+    // table carrying the junction's name with the wrong columns is silent, the
+    // same boundary `missing_view` draws for `view_sql`.
+    _ = try drv.exec("CREATE TABLE jc_member_jc_tag (id INTEGER PRIMARY KEY)", &.{});
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+
+    // `migrateSchema` heals it: the recorded `create_junction` version is
+    // present but the relation is gone, so the junction table is re-created —
+    // the out-of-band-drop path it already has for tables and views.
+    _ = try drv.exec("DROP TABLE jc_member_jc_tag", &.{});
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+    const healed = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, healed);
+    try std.testing.expectEqual(@as(usize, 0), healed.len);
+
+    var junction = try getExistingColumns(std.testing.allocator, drv.asDriver(), "jc_member_jc_tag");
+    defer freeExistingColumns(std.testing.allocator, &junction);
+    try std.testing.expectEqual(@as(usize, 2), junction.items.len);
+    try std.testing.expectEqualStrings("jc_member_id", junction.items[0].name);
+    try std.testing.expectEqualStrings("jc_tag_id", junction.items[1].name);
+}
+
+test "checkSchema needs no junction table for an M2M edge with an explicit edge schema (SQLite)" {
+    // The other half of the enumeration: an edge with `Through(EdgeSchema)`
+    // reads and writes the through entity's own table, which is a declared
+    // entity and is checked as one. Expecting an implicit junction here would
+    // report a table `migrateSchema` never creates — a false drift, which blocks
+    // deploys.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    const JtTagBase = schema("JtTag", .{ .fields = &.{field.String("label")} });
+    const JtPostBase = schema("JtPost", .{ .fields = &.{field.String("title")} });
+    const JtPostTag = schema("JtPostTag", .{
+        .fields = &.{ field.Int("jt_post_id"), field.Int("jt_tag_id") },
+    });
+    const JtTag = struct {
+        pub const schema_name = JtTagBase.schema_name;
+        pub const fields = JtTagBase.fields;
+        pub const edges = &.{edge.To("posts", JtPostBase).Through(JtPostTag)};
+        pub const indexes = JtTagBase.indexes;
+    };
+    const JtPost = struct {
+        pub const schema_name = JtPostBase.schema_name;
+        pub const fields = JtPostBase.fields;
+        pub const edges = &.{edge.To("tags", JtTagBase).Through(JtPostTag)};
+        pub const indexes = JtPostBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ JtTag, JtPost, JtPostTag });
+    const infos = graph.types;
+
+    // Nothing migrated: the three declared entities are missing, and nothing
+    // else is — in particular no `jt_tag_jt_post` junction table, which no
+    // `CREATE TABLE` on the migration side ever emits for a through edge.
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+        try std.testing.expectEqual(@as(usize, 3), drifts.len);
+        for (drifts) |d| try std.testing.expectEqual(SchemaDrift.Kind.missing_table, d.kind);
+    }
+
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+    const agreeing = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, agreeing);
+    try std.testing.expectEqual(@as(usize, 0), agreeing.len);
 }
 
 test "getExistingViews reads the stored definition and answers an empty list otherwise (SQLite)" {
