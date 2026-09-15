@@ -738,12 +738,17 @@ fn finalizeStmt(_: void, stmt: *c.sqlite3_stmt) void {
 /// can run nested statements while holding the driver lock. Blocking wait via
 /// pthread mutex (std.Io.Mutex would need an Io this layer doesn't have, and
 /// std.Thread.Futex no longer exists in this Zig).
-const RecursiveMutex = struct {
+///
+/// Public because the same lock has to guard anything else that fronts one
+/// SQLite connection: a `Driver` wrapper that fans out to a shared handle, or
+/// the prepared-statement cache when it is driven directly. Re-implementing it
+/// at those sites is how two locks that must be the same become two locks.
+pub const RecursiveMutex = struct {
     inner: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     owner: std.atomic.Value(std.Thread.Id) = .init(0),
     recursion: usize = 0,
 
-    fn lock(self: *RecursiveMutex) void {
+    pub fn lock(self: *RecursiveMutex) void {
         const tid = std.Thread.getCurrentId();
         // Only the owner thread ever mutates `recursion`; a live holder always
         // has a unique thread id, so a same-id hit means we are the holder.
@@ -756,7 +761,7 @@ const RecursiveMutex = struct {
         self.recursion = 1;
     }
 
-    fn unlock(self: *RecursiveMutex) void {
+    pub fn unlock(self: *RecursiveMutex) void {
         self.recursion -= 1;
         if (self.recursion != 0) return;
         self.owner.store(0, .release);
