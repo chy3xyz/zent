@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-09-15
+
 ### Changed
 - **BREAKING: an insert whose driver reports no `last_insert_id` is now
   `error.MissingLastInsertId` instead of a key of `0`, and the MySQL bulk path
