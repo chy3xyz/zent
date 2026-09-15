@@ -178,6 +178,91 @@ test "MySQL: SaveOrUpdate updates existing row" {
     try testing.expectEqual(@as(i64, 200), r.getInt(0).?);
 }
 
+test "MySQL: crud.update answers true for an idempotent PUT (changed vs matched rows)" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CfIdemProduct = schema("CfIdemProduct", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.String("name"),
+            field.Int("price_cents"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{CfIdemProduct});
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS cf_idem_product", &.{}) catch {};
+
+    const client = zent.codegen.client.EntityClient(infos, infos[0]).init(allocator, drv.asDriver());
+    const Service = zent.crud.CrudService(infos, infos[0], "tenant_id");
+    var svc = Service.init(allocator, client);
+
+    const id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "widget", .price_cents = 100 }, 1);
+
+    var got = (try svc.get(allocator, 1, id)).?;
+    defer zent.codegen.deinitEntity(infos, infos[0], &got, allocator);
+
+    // Idempotent PUT: the fetched row written back unchanged. This server
+    // reports *changed* rows for UPDATE (CLIENT_FOUND_ROWS is off), so the
+    // statement itself answers 0 — the pre-fix `affected > 0` read that as
+    // "missing" and answered false (a 404 upstream). The row exists, so the
+    // answer must be true. MariaDB shares the changed-rows default
+    // (mysql_stmt_affected_rows is the same wire call), so this holds on CI's
+    // MariaDB 10.11 too and needs no isMariaDB branch.
+    try testing.expect(try svc.update(got, 1));
+
+    // A row that actually changes: affected > 0 on every dialect.
+    var changed = got;
+    changed.price_cents = 150;
+    try testing.expect(try svc.update(changed, 1));
+
+    // The (id, tenant) pair matches no row for another tenant: false.
+    try testing.expect(!(try svc.update(changed, 2)));
+
+    // A missing id in the right tenant: false.
+    var missing = got;
+    missing.id = id + 100000;
+    try testing.expect(!(try svc.update(missing, 1)));
+}
+
+test "MySQL: crud_helpers.update reports matched rows, not changed rows" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CfMatchCoupon = schema("CfMatchCoupon", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.String("name"),
+            field.Int("status"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{CfMatchCoupon});
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS cf_match_coupon", &.{}) catch {};
+
+    const client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var created = try zent.crud_helpers.create(client.cf_match_coupon, .{ .tenant_id = 1, .name = "new", .status = 20 });
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+
+    const id_pred = client.cf_match_coupon.predicates.idEQ(.{ .int = created.id });
+    try testing.expectEqual(@as(usize, 1), try zent.crud_helpers.update(client.cf_match_coupon, .{ .status = 30 }, .{id_pred}));
+
+    // Idempotent write-back: 0 changed rows on this server, but the predicate
+    // matches the row, so the count is 1 — the same answer SQLite/PostgreSQL
+    // give natively, and what a `> 0` or `== 0` caller can rely on.
+    try testing.expectEqual(@as(usize, 1), try zent.crud_helpers.update(client.cf_match_coupon, .{ .status = 30 }, .{id_pred}));
+
+    // No row matches: 0 on every dialect.
+    try testing.expectEqual(@as(usize, 0), try zent.crud_helpers.update(client.cf_match_coupon, .{ .status = 40 }, .{client.cf_match_coupon.predicates.idEQ(.{ .int = created.id + 100000 })}));
+}
+
 test "MySQL: SaveIgnore ignores unique-key conflict" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
