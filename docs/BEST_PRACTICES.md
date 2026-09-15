@@ -911,6 +911,7 @@ Everything the schema declares, against what `checkSchema` compares:
 | an index (by name) and its key list | `index_columns` | only when the database's key list is readable |
 | an index's uniqueness | `index_uniqueness` | always |
 | a view | `missing_view` | always — any relation of that name, view or table |
+| an M2M junction table (implicit) | `missing_junction_table` | always — existence only; only `.m2m` edges without `Through` need one |
 | a field's `Unique()` | `unique_constraint` | unless a unique index forces that column alone, or a *unique* unreadable index makes it undecidable |
 | a foreign key | `missing_foreign_key` | by shape; `ON DELETE`/`ON UPDATE` not compared |
 
@@ -919,8 +920,9 @@ right":
 
 | Not covered | Consequence |
 |---|---|
+| a present junction table's **shape** (columns, PK, FKs, pair-uniqueness) | only its existence is compared |
+| a junction name **colliding** with a declared entity table | `CREATE TABLE IF NOT EXISTS` silently keeps whichever ran first |
 | **view definitions** | a changed `view_sql` is not reported — the database stores a canonical rewrite (PostgreSQL) or its own normalization, so comparing would fire on every database |
-| **M2M junction tables** (implicit, from an edge) | a missing junction table is not reported; the relation query fails |
 | a declared index **missing** from the database | only indexes present under both are compared; a missing one is a performance matter, never reported |
 | the primary key's shape | columns, order and name are not compared |
 | `ON DELETE` / `ON UPDATE` | an FK can point at the right place with the wrong action |
@@ -929,9 +931,11 @@ right":
 
 Two more things worth knowing:
 
-- **`missing_view` is read-breaking**, unlike every index and constraint kind: a
-  view that is not there makes the read fail outright, so `read_breaking_only`
-  blocks a deploy on it exactly as it does for a missing table.
+- **`missing_view` and `missing_junction_table` are read-breaking**, unlike every
+  index and constraint kind: a
+  missing view or junction table makes the read fail outright, so
+  `read_breaking_only` blocks a deploy on them exactly as it does for a missing
+  table.
 - **`unique_constraint` and `missing_foreign_key` are reports, not repairs.**
   `migrateSchema` still does not add either with `ALTER TABLE … ADD CONSTRAINT`;
   non-destructiveness is deliberate.

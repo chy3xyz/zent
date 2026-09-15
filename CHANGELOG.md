@@ -4,6 +4,82 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`checkSchema` now checks M2M junction tables**
+  (`SchemaDrift.Kind.missing_junction_table`) — the last declared surface nothing
+  looked at. An M2M edge implies a junction table (`junctionTableForEdge`), and a
+  junction table is not a `TypeInfo`, so the entity loop walked past it: an edge
+  whose junction was never created, or was dropped out of band, kept
+  `assertSchema` green while every query over that edge failed with
+  `no such table`. Same silent class as `missing_view`, one scope over;
+  `migrateSchema` already created these tables, only the report was missing.
+
+  The drift names the junction in `table`, leaves `column` empty (no column
+  semantics), and puts the edge plus the columns a hand-created table needs in
+  `index_detail`. `breaksReads()` is **`true`** — the relation query errors
+  outright rather than returning fewer rows, so `read_breaking_only` blocks a
+  deploy on it, like `missing_table` and `missing_view`.
+
+  Existence uses the same `getExistingColumns` probe as `missing_view`. Only
+  `relation == .m2m` edges with no `Through` need a junction: a `Through` edge
+  uses the edge schema's own table (checked as an entity), and O2M/O2O have none
+  (their FK is `missing_foreign_key`'s business). Both sides of a symmetric M2M
+  derive the same name, so a seen-list collapses the pair into one report.
+
+### Fixed
+- **SQLite read a failed query as a short or empty page.** `SQLiteRows.next()`
+  handled `SQLITE_BUSY`, `SQLITE_LOCKED` and `SQLITE_CONSTRAINT` and left
+  `next_error` at its null default for **every other** step failure —
+  `SQLITE_FULL`, `SQLITE_IOERR`, `SQLITE_MISMATCH`, `SQLITE_TOOBIG`,
+  `SQLITE_INTERRUPT`. `nextError() == null` is how every consumer distinguishes
+  "finished" from "broke", so a failure came back as "no more rows": a partial
+  page, or `error.NotFound` for a single-row read. Those failures now report
+  `error.ExecFailed`; the lock/constraint classification is unchanged.
+
+- **PostgreSQL's affected-row count was `parseInt(...) catch 0`.** Two different
+  situations collapsed into `0`: a command tag that reports no row count
+  (PostgreSQL returns `""` for DDL, `BEGIN`/`COMMIT`, `SET`, …), where `0` is
+  correct, and a tag that does not parse, where `0` is indistinguishable from "a
+  statement that matched no rows" — which consumers read as
+  `OptimisticLockConflict` or `error.NotFound`. `rowCountFromCommandTag` keeps
+  `""` as `0` and, for anything else, warns with the raw tag and fails with
+  `error.DriverFailed`.
+
+  Probing real libpq (every statement class through `PQexec`, `PQexecParams` and
+  the prepared path) showed the malformed case is **not reachable today** — which
+  is the point: `catch 0` made it unfalsifiable and hid a real distinction.
+  Treating `""` as malformed instead would have broken every DDL through `exec`
+  (52 integration tests), and that is what pins the two cases apart.
+
+### Notes
+- **Audit result, so the negative half is recorded too.** Eight further
+  `catch null` / `catch 0` sites were examined and judged benign with their
+  reasoning: the `?i64`/`?f64` getters and `last_insert_id` answer `null`, which
+  is the legal "not knowable" (and what the strict scanner turns into
+  `TypeMismatch`); `scan.zig`'s lenient defaults are its documented contract;
+  `classify`'s `else => .bug` is a conservative answer about an *unknown* error,
+  not a value for a known one.
+- **Three further "a value that cannot be told apart" findings, reported not
+  fixed** — all three are consequences of `driver.Result.rows_affected: usize`
+  not being able to express "the driver does not know":
+  - `sqlite3_changes` is stale after a non-DML, so `exec("SELECT …")` returns the
+    *previous* DML's count while PostgreSQL and MySQL report the select's rows —
+    the three drivers disagree, and a `rows_affected == 0` consumer gets "found"
+    from a `SELECT`.
+  - `mysql_affected_rows` returns `(my_ulonglong)-1` on error and `@intCast` to
+    `usize` turns it into `18446744073709551615` rather than failing. Unreachable
+    today (every `CR_*` failure is checked first), same family.
+  - `getBool` turns any unrecognised text into a definite boolean where `null`
+    (→ `error.TypeMismatch`) would be honest. Correct for each dialect's own wire
+    format; only misfires when a non-boolean column is read into a bool field.
+- **A junction-table name colliding with a declared entity table is not
+  detected.** `junctionTableForEdge` derives `<a>_<b>`, so an entity whose table
+  is literally that collides, and `CREATE TABLE IF NOT EXISTS` silently keeps
+  whichever ran first. Reported, not fixed.
+- **Only the existence of a junction table is compared**, not its shape
+  (columns, PK, FKs, pair-uniqueness); and the check costs one extra
+  `getExistingColumns` per distinct junction table.
+
 ## [0.61.0] - 2026-09-15
 
 ### Added

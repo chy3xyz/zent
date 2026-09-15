@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.61.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.62.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (385 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (390 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -50,7 +50,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 385, integration 200 passed + 3 skipped
+`baseline` counts move with this: unit 390, integration 204 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -193,6 +193,20 @@ Entities and queries are explicitly owned by the caller. See the contract:
   SQLite. Do not collapse it back to one clause — on PostgreSQL it made a schema
   with a view entity unmigratable, and the unit test pinning each dialect exists
   for exactly that.
+- **`missing_junction_table` is read-breaking too, and only M2M needs it.** An M2M
+  edge's junction table is not a `TypeInfo`, so it takes its own traversal in
+  `checkSchema` (`junctionTableForEdge`, `relation == .m2m` **and no `Through`** —
+  a through-edge uses the edge schema's own table, and O2M/O2O have no junction).
+  `breaksReads()` is `true`: the relation query errors rather than returning fewer
+  rows.
+- **A driver failure must not be reported as a value.** `SQLiteRows.next()` leaves
+  `next_error` null only for a genuine end of rows — every other step failure sets
+  it, because `nextError() == null` is how consumers tell "finished" from "broke".
+  PostgreSQL's command tag goes through `rowCountFromCommandTag`, which keeps `""`
+  (a command reporting no count) as 0 and fails with `DriverFailed` plus a warn
+  for anything unparseable. When adding a default for a fallible call, ask whether
+  it can be told apart from a legal value — if it cannot, report instead of
+  guessing.
 - **`missing_view` is read-breaking.** `checkSchema` asks only whether a relation
   of the declared name exists (`getExistingColumns`, which answers for a view and
   a table on all three dialects); the view *definition* is never compared, because
