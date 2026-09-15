@@ -338,6 +338,44 @@ pub const SQLiteDriver = struct {
         };
     }
 
+    /// Prepare `sql` (and bind `args`) without ever stepping it: SQLite
+    /// resolves tables and columns in `sqlite3_prepare_v2`, so this is where a
+    /// broken statement is found — and no statement is executed either way.
+    ///
+    /// Not logged, unlike the exec path: a statement that fails to prepare is
+    /// the expected outcome of a check, not a fault (the same reason the
+    /// drivers keep `QueryTimeout` and constraint violations quiet). The text
+    /// is handed to the caller in `out.message`.
+    pub fn prepareCheck(self: *SQLiteDriver, allocator: std.mem.Allocator, sql: []const u8, args: []const Value, out: *driver.CheckReport) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, @ptrCast(sql.ptr), @intCast(sql.len), @ptrCast(&stmt), null);
+        if (rc != c.SQLITE_OK or stmt == null) {
+            const msg = std.mem.span(c.sqlite3_errmsg(self.db));
+            out.* = .{
+                .kind = .prepare_failed,
+                .native_code = c.sqlite3_extended_errcode(self.db),
+                .message = try allocator.dupe(u8, msg),
+            };
+            return;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+        const prepared = stmt.?;
+
+        // SQLite does not insist that every parameter is bound and ignores
+        // bindings past the last one, so the count is compared here — where a
+        // mismatch is still attributable to the caller.
+        const n_params: usize = @intCast(c.sqlite3_bind_parameter_count(prepared));
+        if (n_params != args.len) {
+            out.* = .{ .kind = .param_mismatch, .param_count = n_params };
+            return;
+        }
+        bindArgs(prepared, args) catch {};
+        out.* = .{ .kind = .ok, .param_count = n_params };
+    }
+
     const vtable = driver.Driver.VTable{
         .exec = struct {
             fn f(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, q: []const u8, a: []const Value) driver.Error!driver.Result {
@@ -354,6 +392,12 @@ pub const SQLiteDriver = struct {
                 errdefer self_ptr.mutex.unlock();
                 // 成功路径锁所有权随 Rows 转移（deinit 时释放）。
                 return self_ptr.queryInner(ctx, q, a) catch |err| return toDriverError(err);
+            }
+        }.f,
+        .prepareCheck = struct {
+            fn f(ptr: *anyopaque, allocator: std.mem.Allocator, q: []const u8, a: []const Value, out: *driver.CheckReport) driver.Error!void {
+                const self_ptr: *SQLiteDriver = @ptrCast(@alignCast(ptr));
+                return self_ptr.prepareCheck(allocator, q, a, out) catch |err| return toDriverError(err);
             }
         }.f,
         .beginTx = struct {

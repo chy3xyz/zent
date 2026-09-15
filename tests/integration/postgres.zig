@@ -9,6 +9,7 @@ const std = @import("std");
 const zent = @import("zent");
 const pg_c = @import("pg_c");
 const PostgresDriver = zent.sql_postgres.PostgresDriver;
+const sql_statement = zent.sql_statement;
 const buildGraph = zent.codegen.graph.buildGraph;
 const Client = zent.codegen.client;
 const field = zent.core.field;
@@ -3309,4 +3310,131 @@ test "Postgres: getExistingIndexes reads plain key columns and skips the rest" {
         try testing.expect(found != null);
         try testing.expect(!found.?.columns_comparable);
     }
+}
+
+// ------------------------------------------------------------------
+// checkStatement: prepare-and-discard validation of a raw statement
+// ------------------------------------------------------------------
+
+test "Postgres: checkStatement accepts a valid statement and its parameter list" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_pg (id INT PRIMARY KEY, name TEXT)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{}) catch {};
+
+    var d = try sql_statement.checkStatement(
+        allocator,
+        drv.asDriver(),
+        "SELECT name FROM zent_chk_pg WHERE id = $1",
+        &.{.{ .int = 1 }},
+    );
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Status.ok, d.status());
+    try testing.expectEqual(sql_statement.Problem.none, d.problem);
+    // The count comes from PQdescribePrepared, not from args.len: with zero
+    // parameters PQprepare infers rather than asserts, so args.len alone would
+    // report every parameterized statement as fine.
+    try testing.expectEqual(@as(?usize, 1), d.param_count);
+}
+
+test "Postgres: checkStatement rejects a syntax error" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELEC 1", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Status.failed, d.status());
+    try testing.expectEqual(sql_statement.Problem.syntax, d.problem);
+    try testing.expectEqualStrings("42601", d.sqlstate.?);
+    // PostgreSQL names the class structurally, so the label is not a guess.
+    try testing.expect(!d.problem_heuristic);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "syntax error") != null);
+}
+
+test "Postgres: checkStatement rejects a statement naming a missing table" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT * FROM zent_chk_absent", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.missing_relation, d.problem);
+    try testing.expectEqual(sql_statement.Status.failed, d.status());
+    try testing.expectEqualStrings("42P01", d.sqlstate.?);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "does not exist") != null);
+    try testing.expect(!d.problem_heuristic);
+}
+
+test "Postgres: checkStatement rejects a statement naming a missing column" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_pg (id INT PRIMARY KEY, name TEXT)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{}) catch {};
+
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT zent_chk_bogus FROM zent_chk_pg", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.missing_column, d.problem);
+    try testing.expectEqualStrings("42703", d.sqlstate.?);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "does not exist") != null);
+    try testing.expect(!d.problem_heuristic);
+}
+
+test "Postgres: checkStatement reports a parameter the statement does not take" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_pg (id INT PRIMARY KEY, name TEXT)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{}) catch {};
+
+    // PostgreSQL accepts a Parse that declares no parameters for a statement
+    // that uses $1: the count has to come from the Describe.
+    var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "SELECT name FROM zent_chk_pg WHERE id = $1", &.{});
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+
+    try testing.expectEqual(sql_statement.Problem.parameter_mismatch, d.problem);
+    try testing.expectEqual(@as(?usize, 1), d.param_count);
+    try testing.expect(std.mem.indexOf(u8, d.message.?, "takes 1") != null);
+}
+
+test "Postgres: a checked INSERT adds no row" {
+    // PQprepare is Parse + Describe and stops there — no Bind, no Execute.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{});
+    _ = try drv.exec("CREATE TABLE zent_chk_pg (id INT PRIMARY KEY, name TEXT)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_chk_pg", &.{}) catch {};
+
+    var d = try sql_statement.checkStatement(
+        allocator,
+        drv.asDriver(),
+        "INSERT INTO zent_chk_pg (id, name) VALUES (999, 'x')",
+        &.{},
+    );
+    defer sql_statement.freeStatementDiagnosis(allocator, &d);
+    try testing.expectEqual(sql_statement.Status.ok, d.status());
+
+    var rows = try drv.query("SELECT COUNT(*) FROM zent_chk_pg", &.{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 0), (rows.next() orelse return error.NoRow).getInt(0).?);
+
+    // The unnamed statement the check left behind does not disturb ordinary use.
+    _ = try drv.exec("INSERT INTO zent_chk_pg (id, name) VALUES (1, 'real')", &.{});
+    var rows2 = try drv.query("SELECT COUNT(*) FROM zent_chk_pg", &.{});
+    defer rows2.deinit();
+    try testing.expectEqual(@as(i64, 1), (rows2.next() orelse return error.NoRow).getInt(0).?);
 }

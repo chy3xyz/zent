@@ -8,6 +8,50 @@ pub const Result = struct {
     last_insert_id: ?i64,
 };
 
+/// What a driver can report about a statement it prepared (and discarded)
+/// without executing it — the body of `Driver.VTable.prepareCheck`.
+///
+/// The two fields that carry text are allocated with the allocator handed to
+/// the hook and are **owned by the caller**; a driver that has nothing to say
+/// leaves them null rather than allocating an empty slice.
+pub const CheckReport = struct {
+    kind: Kind = .ok,
+    /// The dialect's own numeric code: SQLite's extended result code, MySQL's
+    /// errno. PostgreSQL reports a SQLSTATE instead, so this stays 0 there.
+    native_code: i32 = 0,
+    /// The PostgreSQL SQLSTATE (e.g. `"42P01"`), owned. Null on the dialects
+    /// that have no such code.
+    sqlstate: ?[]const u8 = null,
+    /// The driver's own error text, owned. This is the part the caller cannot
+    /// reconstruct from a numeric code.
+    message: ?[]const u8 = null,
+    /// How many parameters the driver says the statement takes; null when it
+    /// could not get that far.
+    param_count: ?usize = null,
+
+    pub const Kind = enum {
+        /// The statement prepared with `args`. Nothing was executed.
+        ok,
+        /// It did not prepare at all.
+        prepare_failed,
+        /// It prepared, but does not take exactly `args.len` parameters.
+        param_mismatch,
+        /// Nothing was learned, and nothing was executed: either the driver has
+        /// no prepare hook, or the statement kind is one its prepare protocol
+        /// does not accept (MySQL errno 1295 — `BEGIN`, `LOCK TABLES`, ...).
+        /// Says nothing about whether the statement is valid.
+        unsupported,
+    };
+
+    /// Release the owned text. A no-op after the first call, so a caller that
+    /// hands the report on to a `StatementDiagnosis` cannot double-free.
+    pub fn deinit(self: *CheckReport, allocator: std.mem.Allocator) void {
+        if (self.sqlstate) |s| allocator.free(s);
+        if (self.message) |m| allocator.free(m);
+        self.* = .{};
+    }
+};
+
 /// Unified error set returned by all driver implementations.
 pub const Error = error{
     OutOfMemory,
@@ -399,6 +443,19 @@ pub const Driver = struct {
     pub const VTable = struct {
         exec: *const fn (ptr: *anyopaque, ctx: ?*const ExecutionContext, query: []const u8, args: []const Value) Error!Result,
         query: *const fn (ptr: *anyopaque, ctx: ?*const ExecutionContext, query: []const u8, args: []const Value) Error!Rows,
+        /// Optional: prepare `sql` with `args` and discard it, reporting what
+        /// the server thought. **Never executes the statement** — a driver that
+        /// implements this must stop after prepare (sqlite3_prepare_v2 with no
+        /// step, PQprepare with no Bind, mysql_stmt_prepare with no execute).
+        ///
+        /// A statement that does not prepare is not an error of the call: the
+        /// channel worked and the answer is "this statement is broken". The
+        /// error union is for the check itself failing (a dead connection, OOM).
+        ///
+        /// A driver that leaves this null has `Driver.prepareCheck` report
+        /// `CheckReport.Kind.unsupported`, which is the honest answer for a
+        /// driver with no prepare channel of its own.
+        prepareCheck: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, sql: []const u8, args: []const Value, out: *CheckReport) Error!void = null,
         beginTx: *const fn (ptr: *anyopaque) Error!Tx,
         /// Optional deadline-carrying variant of `beginTx`.
         ///
@@ -424,6 +481,20 @@ pub const Driver = struct {
 
     pub fn query(self: Driver, query_sql: []const u8, args: []const Value) !Rows {
         return self.vtable.query(self.ptr, null, query_sql, args);
+    }
+
+    /// Prepare `sql` with `args` and discard it — see `VTable.prepareCheck`.
+    ///
+    /// A driver without a prepare hook fills `out` with
+    /// `CheckReport.Kind.unsupported` rather than failing, so a caller that
+    /// walks a list of statements gets an answer per statement instead of an
+    /// exception.
+    pub fn prepareCheck(self: Driver, allocator: std.mem.Allocator, query_sql: []const u8, args: []const Value, out: *CheckReport) Error!void {
+        const f = self.vtable.prepareCheck orelse {
+            out.* = .{ .kind = .unsupported };
+            return;
+        };
+        return f(self.ptr, allocator, query_sql, args, out);
     }
 
     /// Execute an `OwnedQuery` built by `Builder.takeQuery` /
