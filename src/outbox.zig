@@ -357,6 +357,11 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
 
         /// Duplicate every row of `rows` into an owned `[]Entry`. The caller
         /// still owns `rows` (it must call `deinit`).
+        ///
+        /// A step failure ends the scan the same way the end of the result set
+        /// does, so it is read back from `nextError` and returned: `claim` must
+        /// not report "these are the rows I reserved" for a batch the driver
+        /// gave up on halfway.
         fn collectRows(allocator: std.mem.Allocator, rows: sql_driver.Rows) ![]Entry {
             var list: std.ArrayListUnmanaged(Entry) = .empty;
             errdefer {
@@ -388,13 +393,25 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
                     .created_at = created_at,
                 });
             }
+            // A step failure surfaces as `next() == null` — indistinguishable
+            // from a complete scan until the driver is asked. Returning the
+            // error keeps a broken claim from looking like a small batch
+            // (the rows it did return are freed by the errdefer above).
+            if (rows.nextError()) |err| return err;
             return try list.toOwnedSlice(allocator);
         }
 
-        /// At-least-once dispatch: claim a batch of pending rows, publish each
+        /// at-least-once dispatch: claim a batch of pending rows, publish each
         /// one, marking it published on success; on error the row is requeued
         /// (pending, attempts+1) until `max_attempts` is reached, then marked
         /// failed. Returns the number of successfully dispatched rows.
+        ///
+        /// One failing row does not abort the batch, and the publisher's error
+        /// is not propagated: it is logged (`warn`, with the row id and the
+        /// attempt count) and recorded on the row itself. A batch in which
+        /// every publish failed therefore returns `0`, exactly like a claim
+        /// that found nothing — the per-row `status`/`attempts` and the log
+        /// are where the difference lives, not in this count.
         ///
         /// Rows are claimed (pending -> processing, `claimed_at` stamped)
         /// before publishing, so concurrent dispatchers never publish the same
@@ -413,13 +430,23 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             defer freeEntries(allocator, entries);
             var dispatched: usize = 0;
             for (entries) |e| {
-                publisher.call(publisher.ctx, e) catch {
+                publisher.call(publisher.ctx, e) catch |err| {
                     const next = e.attempts + 1;
                     if (next >= max_attempts) {
                         try markFailed(allocator, client, e.id, next);
                     } else {
                         try requeue(allocator, client, e.id, next);
                     }
+                    // The error is deliberately not propagated — one poison
+                    // message must not abort the batch — but it is not
+                    // discarded either: `dispatched` counts successes, so
+                    // without this line "the queue was empty" and "every row
+                    // failed" produce the same `0` and the publisher's reason
+                    // never reaches a log anywhere.
+                    std.log.warn(
+                        "outbox: publish failed for row {d} (event '{s}', attempt {d}/{d}): {s}",
+                        .{ e.id, e.event_type, next, max_attempts, @errorName(err) },
+                    );
                     continue;
                 };
                 try markPublished(allocator, client, e.id, now_ms);
@@ -731,6 +758,158 @@ test "outbox claim is exclusive and requeue re-enables a row" {
     defer OutboxOps.freeEntries(allocator, fourth);
     try testing.expectEqual(@as(usize, 0), fourth.len);
 }
+
+test "outbox claim reports a step failure instead of half a batch" {
+    // SQLite's claim is one `UPDATE ... RETURNING` whose rows arrive through
+    // `step`. A step failure ends that scan with `next() == null`, exactly like
+    // the end of a complete result set, so only `nextError()` says which of the
+    // two happened. A claim that read the truncated batch as the whole batch
+    // would report rows as reserved that the driver never returned — and the
+    // dispatcher would never publish them, while `dispatch` still counted the
+    // call as a success. The failure is injected with a driver stub because
+    // SQLITE_FULL cannot be aimed at this particular UPDATE.
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const OutboxOps = Outbox(graph.types, info);
+
+    const StubClient = struct { driver: sql_driver.Driver };
+    var stub_driver = StubDriver{};
+    var stub = StubClient{ .driver = stub_driver.asDriver() };
+
+    // The one row the stub did hand over must not be returned as a claimed
+    // batch: the caller would mark it published and count it as dispatched.
+    try testing.expectError(error.ExecFailed, OutboxOps.claim(allocator, &stub, 10));
+}
+
+/// Test scaffolding for the claim step-failure test: one well-formed outbox row,
+/// then a step failure. `next()` answers null for both, so only `nextError()`
+/// tells them apart — which is the point of that test.
+const StubRows = struct {
+    delivered: bool = false,
+
+    const rows_vtable = sql_driver.Rows.VTable{
+        .next = next,
+        .deinit = deinit,
+        .nextError = nextError,
+    };
+    const row_vtable = sql_driver.Row.VTable{
+        .columnCount = columnCount,
+        .columnName = columnName,
+        .getBool = getBool,
+        .getInt = getInt,
+        .getFloat = getFloat,
+        .getText = getText,
+        .getBlob = getBlob,
+        .isNull = isNull,
+    };
+
+    /// One well-formed outbox row, then the failure.
+    fn next(ptr: *anyopaque) ?sql_driver.Row {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.delivered) return null;
+        self.delivered = true;
+        return sql_driver.Row{ .ptr = self, .vtable = &row_vtable };
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        std.testing.allocator.destroy(self);
+    }
+
+    fn nextError(_: *anyopaque) ?sql_driver.Error {
+        return error.ExecFailed;
+    }
+
+    fn columnCount(_: *anyopaque) usize {
+        return 7;
+    }
+
+    fn columnName(_: *anyopaque, _: usize) []const u8 {
+        return "";
+    }
+
+    fn getBool(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+
+    fn getInt(_: *anyopaque, index: usize) ?i64 {
+        return switch (index) {
+            0 => 1, // id
+            2 => 7, // aggregate_id
+            5 => 0, // attempts
+            6 => 1000, // created_at
+            else => null,
+        };
+    }
+
+    fn getFloat(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+
+    fn getText(_: *anyopaque, index: usize) ?[]const u8 {
+        return switch (index) {
+            1 => "product", // aggregate_type
+            3 => "product.created", // event_type
+            4 => "{}", // payload
+            else => null,
+        };
+    }
+
+    fn getBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+
+    fn isNull(_: *anyopaque, _: usize) bool {
+        return false;
+    }
+};
+
+const StubDriver = struct {
+    const vtable = sql_driver.Driver.VTable{
+        .exec = exec,
+        .query = query,
+        .beginTx = beginTx,
+        .close = close,
+        .dialect = dialect,
+        .ping = ping,
+        .inTransaction = inTransaction,
+        .beginSavepoint = beginSavepoint,
+    };
+
+    fn asDriver(self: *@This()) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn exec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        return .{ .rows_affected = 0, .last_insert_id = null };
+    }
+
+    fn query(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        const rows = try std.testing.allocator.create(StubRows);
+        rows.* = .{};
+        return .{ .ptr = rows, .vtable = &StubRows.rows_vtable };
+    }
+
+    fn beginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn dialect(_: *anyopaque) @import("sql/dialect.zig").Dialect {
+        return .sqlite;
+    }
+
+    fn ping(_: *anyopaque) sql_driver.Error!void {}
+
+    fn inTransaction(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn beginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+};
 
 test "outbox dispatch claims before publish so a nested dispatcher cannot double-publish" {
     const allocator = testing.allocator;
