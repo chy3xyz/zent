@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-09-15
+
 ### Added
 - **`SchemaDrift.Kind.index_uniqueness`** (Z31 follow-up). `ExistingIndex.unique`
   was read on all three dialects and never compared, so an index the schema
