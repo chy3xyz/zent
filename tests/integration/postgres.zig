@@ -3784,3 +3784,65 @@ test "Postgres: a checked INSERT adds no row" {
     defer rows2.deinit();
     try testing.expectEqual(@as(i64, 1), (rows2.next() orelse return error.NoRow).getInt(0).?);
 }
+
+test "Postgres: exec reports a count only for the commands that published one" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("DROP TABLE IF EXISTS pg_rowcount", &.{});
+    // DDL carries no count: libpq's command tag is empty and `PQcmdTuples`
+    // returns "". Reporting 0 was a number this statement never gave.
+    const created = try d.exec("CREATE TABLE pg_rowcount (id INT PRIMARY KEY, v TEXT)", &.{});
+    try testing.expectEqual(@as(usize, 0), created.rows_affected);
+    try testing.expect(!created.rows_affected_known);
+    defer _ = d.exec("DROP TABLE IF EXISTS pg_rowcount", &.{}) catch {};
+
+    // Transaction control and SET are the same shape: PGRES_COMMAND_OK, no tag.
+    {
+        const begin = try d.exec("BEGIN", &.{});
+        try testing.expectEqual(@as(usize, 0), begin.rows_affected);
+        try testing.expect(!begin.rows_affected_known);
+        const commit = try d.exec("COMMIT", &.{});
+        try testing.expectEqual(@as(usize, 0), commit.rows_affected);
+        try testing.expect(!commit.rows_affected_known);
+    }
+    const set = try d.exec("SET statement_timeout = 0", &.{});
+    try testing.expectEqual(@as(usize, 0), set.rows_affected);
+    try testing.expect(!set.rows_affected_known);
+
+    // DML publishes its count — zero included, which is the value the
+    // optimistic-lock check and the NotFound paths read.
+    const inserted = try d.exec("INSERT INTO pg_rowcount VALUES (1,'a'),(2,'b'),(3,'c')", &.{});
+    try testing.expectEqual(@as(usize, 3), inserted.rows_affected);
+    try testing.expect(inserted.rows_affected_known);
+
+    const updated = try d.exec("UPDATE pg_rowcount SET v = 'z' WHERE id = 1", &.{});
+    try testing.expectEqual(@as(usize, 1), updated.rows_affected);
+    try testing.expect(updated.rows_affected_known);
+
+    const matched_none = try d.exec("UPDATE pg_rowcount SET v = 'z' WHERE id = 999", &.{});
+    try testing.expectEqual(@as(usize, 0), matched_none.rows_affected);
+    try testing.expect(matched_none.rows_affected_known);
+
+    const deleted_none = try d.exec("DELETE FROM pg_rowcount WHERE id = 999", &.{});
+    try testing.expectEqual(@as(usize, 0), deleted_none.rows_affected);
+    try testing.expect(deleted_none.rows_affected_known);
+
+    // PostgreSQL does publish a SELECT's row count, unlike SQLite — the
+    // dialects differ here and the flag reports each one as it is.
+    const selected = try d.exec("SELECT * FROM pg_rowcount", &.{});
+    try testing.expectEqual(@as(usize, 3), selected.rows_affected);
+    try testing.expect(selected.rows_affected_known);
+
+    // TRUNCATE is why an empty tag cannot be read as "zero rows": it removes
+    // every row and still reports no count.
+    const truncated = try d.exec("TRUNCATE pg_rowcount", &.{});
+    try testing.expectEqual(@as(usize, 0), truncated.rows_affected);
+    try testing.expect(!truncated.rows_affected_known);
+
+    var rows = try drv.query("SELECT COUNT(*) FROM pg_rowcount", &.{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 0), (rows.next() orelse return error.NoRow).getInt(0).?);
+}
