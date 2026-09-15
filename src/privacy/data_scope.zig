@@ -36,7 +36,10 @@ pub const max_dept_ids = 32;
 
 /// The always-false predicate every fail-closed path in this module shares: a
 /// scope that cannot be built denies, and it must never come out looking like
-/// "no restriction" (`.all`) — `null` is how the filter rule spells that. `1 = 0`
+/// "no restriction" (`.all`) — `null` is how the filter rule spells that. The
+/// cases are a `dept_ids` list longer than `max_dept_ids`, an empty `dept_ids`
+/// list (its `IN ()` has no valid SQL, and a caller in no department sees no
+/// rows) and a `PrivacyContext` without `.extra`. `1 = 0`
 /// is valid on all three dialects, and carrying no column reference keeps it
 /// unambiguous in the joins the predicate is spliced into.
 const deny_pred: sql.Predicate = sql.Raw("1 = 0");
@@ -48,6 +51,9 @@ pub const DataScopeFilter = struct {
     scope: DataScope = .self_,
     user_id: i64 = 0,
     self_dept_id: i64 = 0,
+    /// Departments a `.dept_custom` / `.dept_and_child` scope may see. An empty
+    /// list denies (the caller belongs to no department); use `.all` to lift
+    /// the restriction.
     dept_ids: []const i64 = &.{},
     dept_column: []const u8 = "dept_id",
     user_column: []const u8 = "user_id",
@@ -86,9 +92,23 @@ pub const DataScopeFilter = struct {
             .self_ => self.pred = sql.EQ(self.user_column, .{ .int = self.user_id }),
             .dept_only => self.pred = sql.EQ(self.dept_column, .{ .int = self.self_dept_id }),
             .dept_and_child, .dept_custom => {
-                // An empty list means "no restriction" (documented): `.all`
-                // in effect, and the one shape with no predicate to build.
-                if (self.dept_ids.len == 0) return;
+                if (self.dept_ids.len == 0) {
+                    // The list names the departments the caller may see, so an
+                    // empty one matches no department — the caller belongs to
+                    // none and sees no rows. `.all` is already a first-class way
+                    // to spell "no restriction", so an empty list has nothing to
+                    // mean but this; leaving `pred` null would hand the query
+                    // every row, the one reading this branch must not have.
+                    // (An empty IN list is not portable SQL either: PostgreSQL
+                    // and MySQL reject `dept_id IN ()` as a syntax error, and
+                    // SQLite accepts it and matches nothing.)
+                    std.log.warn(
+                        "data scope: the dept list is empty, so the scope matches no department; denying it rather than reading as no restriction (use `.all` for an unrestricted scope)",
+                        .{},
+                    );
+                    self.pred = deny_pred;
+                    return;
+                }
                 if (self.dept_ids.len > max_dept_ids) {
                     // Over capacity. Truncating to the first `max_dept_ids`
                     // would silently widen the scope, and leaving `pred` null
@@ -111,8 +131,8 @@ pub const DataScopeFilter = struct {
     }
 
     /// Ensure the predicate is materialized and return it (null = no
-    /// restriction, e.g. `.all` or an empty dept list). A `.dept_custom` /
-    /// `.dept_and_child` list longer than `max_dept_ids` is never "no
+    /// restriction, i.e. `.all`). A `.dept_custom` / `.dept_and_child` list that
+    /// cannot be built — empty, or longer than `max_dept_ids` — is never "no
     /// restriction": it materializes the always-false predicate instead.
     pub fn predicate(self: *DataScopeFilter) ?*const sql.Predicate {
         self.ensurePred();
@@ -121,7 +141,7 @@ pub const DataScopeFilter = struct {
     }
 
     /// Filter-rule predicate used by the policy: returns the materialized
-    /// predicate pointer, or null for `.all` / empty dept lists.
+    /// predicate pointer, or null for `.all` (the only unscoped shape).
     ///
     /// A context that carries no filter at all (no `.extra`) denies rather
     /// than returning null: null means "this filter does not apply", and for a
@@ -330,7 +350,7 @@ test "DataScopePolicy filters queries at the SQL layer" {
 
 test "DataScopeFilter over-long dept list fails closed, not open" {
     // max_dept_ids is 32. A longer list left `pred` null, and null is the value
-    // that means "no restriction" (`.all`, an empty list) — so a request
+    // that means "no restriction" (`.all`) — so a request
     // carrying more departments than the inline buffer holds came out as an
     // unrestricted query over every row. Dropping the extra ids would be just
     // as wrong in the other direction, so the scope must deny.
@@ -356,6 +376,49 @@ test "DataScopeFilter over-long dept list fails closed, not open" {
     const out2 = b2.query();
     try testing.expect(std.mem.startsWith(u8, out2.sql, "\"dept_id\" IN ("));
     try testing.expectEqual(@as(usize, max_dept_ids), out2.args.len);
+}
+
+test "DataScopeFilter empty dept list fails closed, not open" {
+    // `.all` is a first-class way to say "no restriction", so an empty dept
+    // list has no second meaning to carry: it says the caller sits in no
+    // department, i.e. sees no rows. It used to leave `pred` null — the value
+    // that spells "no restriction" — and so ran the query over every row.
+    inline for (.{ .dept_custom, .dept_and_child }) |scope| {
+        var f = DataScopeFilter.init("dept_id", "owner_id", scope, .{ .dept_ids = &.{} });
+        var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+        defer b.deinit();
+        const pred = f.predicate() orelse return error.ScopeDropped;
+        try pred.appendTo(&b);
+        const out = b.query();
+        try testing.expectEqualStrings("(1 = 0)", out.sql);
+        try testing.expectEqual(@as(usize, 0), out.args.len);
+
+        // The policy layer gets the deny too: a filter rule can only restrict
+        // by handing a predicate over, so the empty list must not answer null.
+        const ctx = f.context(.{ .user_id = 7 });
+        try testing.expect(DataScopeFilter.call(ctx) != null);
+    }
+}
+
+test "DataScopeFilter empty-list deny leaves .all and non-empty lists alone" {
+    // The contrast: `.all` stays unrestricted — it is how a caller asks for
+    // that, and its `dept_ids` is empty by default — and a non-empty list of
+    // either dept scope still builds its IN predicate.
+    var all = DataScopeFilter.init("dept_id", "owner_id", .all, .{});
+    try testing.expect(all.predicate() == null);
+    try testing.expect(DataScopeFilter.call(all.context(.{ .user_id = 1 })) == null);
+
+    const ids = [_]i64{ 3, 4 };
+    inline for (.{ .dept_custom, .dept_and_child }) |scope| {
+        var f = DataScopeFilter.init("dept_id", "owner_id", scope, .{ .dept_ids = &ids });
+        var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+        defer b.deinit();
+        try f.predicate().?.appendTo(&b);
+        const out = b.query();
+        try testing.expectEqualStrings("\"dept_id\" IN (?, ?)", out.sql);
+        try testing.expectEqual(@as(i64, 3), out.args[0].int);
+        try testing.expectEqual(@as(i64, 4), out.args[1].int);
+    }
 }
 
 test "DataScopePolicy applies the over-long dept list as a deny, not as no filter" {
@@ -410,6 +473,65 @@ test "DataScopePolicy applies the over-long dept list as a deny, not as no filte
     var wide = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &many });
     const wide_client = base.withContext(wide.context(.{ .tenant_id = 1 }));
     var q = wide_client.Query();
+    defer q.deinit();
+    var rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), rows.items.len);
+}
+
+test "DataScopePolicy applies an empty dept list as a deny, not as no filter" {
+    // The end-to-end shape of the empty-list case: through the client, a
+    // `.dept_custom` scope with no departments must return no rows rather than
+    // every row — a tenant that has not assigned the caller a department must
+    // not read the whole table.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+
+    const EmptyDoc = Schema("EmptyDoc", .{
+        .table_name = "empty_doc",
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.Int("owner_id"),
+            field.Int("dept_id"),
+            field.String("title"),
+        },
+        .policy = Policy,
+    });
+    const info = comptime fromSchema(EmptyDoc);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = @import("../codegen/client.zig").EntityClient(infos, info);
+    const base = Client.init(allocator, driver.asDriver());
+
+    var seed_scope = DataScopeFilter.init("dept_id", "owner_id", .all, .{});
+    const seed_client = base.withContext(seed_scope.context(.{ .tenant_id = 1 }));
+    {
+        var b = try seed_client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("tenant_id", @as(i64, 1));
+        _ = try b.setFieldValue("owner_id", @as(i64, 1));
+        _ = try b.setFieldValue("dept_id", @as(i64, 3));
+        _ = try b.setFieldValue("title", "seed");
+        var row = try b.Save();
+        deinitEntity(infos, info, &row, allocator);
+    }
+
+    var empty = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &.{} });
+    const empty_client = base.withContext(empty.context(.{ .tenant_id = 1 }));
+    var q = empty_client.Query();
     defer q.deinit();
     var rows = try q.All();
     defer {
