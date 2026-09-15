@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The new nullability test no longer pins MySQL's rendering of
+  `column_default`.** CI runs MariaDB 10.11 while the development machine has
+  MySQL 9.3, and the two disagree about
+  `information_schema.columns.column_default` for a string default: MariaDB
+  returns the literal expression text (`'kept'`), MySQL 8+ strips the quoting
+  (`kept`). The test compared against the unquoted form, so it passed locally and
+  failed on CI's MariaDB job — the v0.56.0 tag was published with that job red.
+  The vendor's quoting convention is not what the test is about; it asserts that
+  the DEFAULT survived a refused migration, so it now compares the content with
+  one layer of quotes removed. Test-only: the library only `SELECT`s
+  `column_default` and never parses it (`ExistingColumn` carries name, type and
+  nullability), so no caller behaviour was ever affected.
+
 ## [0.56.0] - 2026-09-15
 
 ### Added
