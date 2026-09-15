@@ -2626,3 +2626,643 @@ test "ConnPool runs the borrow-path health check outside the mutex" {
     try std.testing.expect(stats_returned_during_ping);
     try std.testing.expect(borrower.got.load(.acquire));
 }
+
+// ------------------------------------------------------------------
+// Stress tests: a pool under concurrent borrow, release and eviction
+// ------------------------------------------------------------------
+//
+// Both of the pool's historical failures were bookkeeping bugs, not logic
+// bugs: one entry lent to two borrowers while a `swapRemove` recycled the slot
+// it lived in (the borrowed pointer aliased a recycled slot), and one
+// connection returned to `available` still carrying somebody else's
+// transaction. Neither is reachable from a single-threaded test, and neither
+// shows up as a *timing* claim: where the bug lands depends on the scheduler,
+// so a timing assertion would be flaky rather than wrong.
+//
+// Everything below therefore asserts invariants — facts that must hold after
+// every operation, whatever the interleaving — and never an ordering or a
+// duration. Each invariant is a probe for one of those shapes:
+//
+//   1. a connection is never inside two borrowers at once (`holder`,
+//      `live`);
+//   2. a borrowed connection is still its own entry after a storm of
+//      insert/evict churn (`guard`);
+//   3. closing connections concurrently with borrowing them (ping failures,
+//      `reapIdleConnections`, `pingIdleConnections`) does not break 1 or 2;
+//   4. the books balance once everyone has let go: `total == available`,
+//      `in_use == 0`, `waiters == 0`;
+//   5. the pool never lends out more than `max_connections` at one time;
+//   6. every parked waiter is eventually served.
+
+/// A spin lock for the harness registry. `std.atomic.Mutex` is a raw try-lock
+/// and that is enough here: the critical sections are a couple of hash-map
+/// operations wide, and the lock is taken from threads the pool did not spawn
+/// (an `Io.Mutex` needs an `Io` to unlock).
+const StressLock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *@This()) void {
+        self.inner.unlock();
+    }
+};
+
+/// Shared, cross-thread bookkeeping for the stress tests.
+///
+/// The registry (`live`) is the direct probe for a double lend: a connection
+/// address that is already in the table when another borrower arrives is the
+/// pool having handed one entry to two borrowers. `peak` is the same table's
+/// high-water mark, which is what proves `max_connections` stayed a ceiling.
+const StressState = struct {
+    allocator: std.mem.Allocator,
+    lock: StressLock = .{},
+
+    /// Connection address -> borrower token, one entry per live borrow.
+    live: std.AutoHashMapUnmanaged(usize, u64) = .empty,
+    /// Highest number of simultaneous borrows seen.
+    peak: usize = 0,
+    /// Borrows registered, releases unregistered.
+    borrows: usize = 0,
+    releases: usize = 0,
+    /// A borrower found the driver canary overwritten (invariant 2).
+    guard_violations: usize = 0,
+    /// A borrower entered, or left, a connection whose holder slot said
+    /// somebody else was inside it (invariant 1).
+    holder_violations: usize = 0,
+    /// A connection address was already registered as lent (invariant 1).
+    double_lends: usize = 0,
+    /// A release unregistered an address that was never lent.
+    stray_releases: usize = 0,
+    /// The harness itself could not record — an allocation failure, not a pool
+    /// bug, but it would silently blind the probes, so it fails the test too.
+    registry_failures: usize = 0,
+
+    connects: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    closes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    pings: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    ping_failures: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Borrows that returned an error instead of a connection.
+    borrow_errors: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Borrows that had to park (`Metrics.onWait`).
+    waits: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Connections `reapIdleConnections` dropped, and how often it ran.
+    reaped: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    reap_passes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    idle_ping_passes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// 0 = every connection passes its health check. Otherwise a connection
+    /// fails from its `fail_ping_after`-th check onwards, so the pool drops it
+    /// — from `selectNoLock`'s borrow path, or from `pingIdleConnections` —
+    /// and opens a replacement while other threads are inside other entries.
+    /// That close-open pair is where the historical slot-recycling aliased a
+    /// live borrow.
+    ///
+    /// The check right after the pool opened a connection has to pass, which is
+    /// why this counts checks per connection rather than connections: a *fresh*
+    /// connection that fails its check makes `borrow` park until its budget
+    /// runs out even though the pool has room to open another, and with a
+    /// borrower holding a connection for the whole storm there is nobody left
+    /// to signal it. That stall is a real behaviour of this pool (it is not
+    /// what these tests are about), and it is not what makes a connection get
+    /// dropped while another is in flight — the later checks are.
+    fail_ping_after: usize = 0,
+    /// Tells the threads that outlive the borrowers (the reaper, the holder)
+    /// that the storm is over.
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// A live borrow: the connection and the token registered for it.
+    const Borrow = struct {
+        conn: *StressDriver,
+        token: u64,
+    };
+
+    fn setup(self: *StressState, allocator: std.mem.Allocator) !void {
+        self.* = .{ .allocator = allocator };
+        // Reserved up front: `enter` runs under a spin lock and must not
+        // allocate there.
+        try self.live.ensureTotalCapacity(allocator, 64);
+    }
+
+    /// Pool options shared by the stress tests: a real health check on borrow
+    /// (the path that evicts stale entries), no legacy retry/backoff, and a
+    /// wait budget so a borrower queues instead of failing outright.
+    fn options(self: *StressState, min: usize, max: usize, wait_ms: u32) StressPool.Options {
+        return .{
+            .connect_ctx = self,
+            .connectCtx = StressDriver.connectCtx,
+            .min_connections = min,
+            .max_connections = max,
+            .health_check_on_borrow = true,
+            .max_wait_ms = wait_ms,
+            .max_retries = 0,
+            .metrics = .{ .context = self, .onWait = onWait },
+        };
+    }
+
+    fn onWait(ctx: ?*anyopaque) void {
+        const self: *StressState = @ptrCast(@alignCast(ctx.?));
+        _ = self.waits.fetchAdd(1, .monotonic);
+    }
+
+    /// Borrow and register. Null when the pool reported an error instead of a
+    /// connection (the caller counts it; the tests assert on how many).
+    fn borrowOne(self: *StressState, pool: *StressPool) ?Borrow {
+        const conn = pool.borrow() catch {
+            _ = self.borrow_errors.fetchAdd(1, .monotonic);
+            return null;
+        };
+        return .{ .conn = conn, .token = self.enter(conn) };
+    }
+
+    /// Unregister and hand back. The probes run first: after `release` the
+    /// entry may be closed and its memory gone.
+    fn releaseOne(self: *StressState, pool: *StressPool, b: Borrow) void {
+        self.leave(b.conn, b.token);
+        pool.release(b.conn);
+    }
+
+    /// Run the borrow-side probes and register the connection as lent. Returns
+    /// the token `leave` expects.
+    fn enter(self: *StressState, conn: *StressDriver) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        if (conn.guard != StressDriver.guard_value) self.guard_violations += 1;
+
+        self.borrows += 1;
+        const token: u64 = self.borrows;
+        if (conn.holder.cmpxchgStrong(0, token, .acq_rel, .acquire) != null) {
+            // Somebody else is already inside this connection.
+            self.holder_violations += 1;
+        }
+
+        const slot = self.live.getOrPut(self.allocator, @intFromPtr(conn)) catch {
+            self.registry_failures += 1;
+            return token;
+        };
+        if (slot.found_existing) {
+            self.double_lends += 1;
+        } else {
+            slot.value_ptr.* = token;
+        }
+        const lent = self.live.count();
+        if (lent > self.peak) self.peak = lent;
+        return token;
+    }
+
+    /// Run the release-side probes and unregister the connection.
+    fn leave(self: *StressState, conn: *StressDriver, token: u64) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        if (conn.guard != StressDriver.guard_value) self.guard_violations += 1;
+        self.releases += 1;
+        if (conn.holder.cmpxchgStrong(token, 0, .acq_rel, .acquire) != null) {
+            // The slot was not ours any more: either the entry was lent twice,
+            // or the memory we are standing on is no longer our entry.
+            self.holder_violations += 1;
+        }
+        if (!self.live.remove(@intFromPtr(conn))) self.stray_releases += 1;
+    }
+};
+
+/// A connection for the stress tests. The fields are probes rather than
+/// payload:
+///
+///   * `guard` is a canary written once, when the pool constructs the
+///     connection. Borrowers re-read it on entry and before handing the
+///     connection back, so memory that was moved or recycled underneath a live
+///     borrow shows up as a missing canary instead of as a silent alias.
+///   * `holder` names the borrower currently inside the connection, `0` when
+///     nobody holds it. The pool must never lend one entry to two borrowers,
+///     and that is what the `cmpxchg` in `enter` refuses to let happen twice.
+///   * `checks` counts the health checks this one connection has answered; see
+///     `StressState.fail_ping_after` for what the count drives.
+const StressDriver = struct {
+    const guard_value: u64 = 0x5eed_0cce_c0de_5eed;
+
+    guard: u64 = guard_value,
+    holder: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    checks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    state: *StressState,
+
+    pub fn asDriver(self: *@This()) driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn close(self: *@This()) void {
+        _ = self.state.closes.fetchAdd(1, .monotonic);
+    }
+
+    fn connectCtx(ctx: ?*anyopaque, _: std.mem.Allocator) anyerror!StressDriver {
+        const state: *StressState = @ptrCast(@alignCast(ctx.?));
+        _ = state.connects.fetchAdd(1, .monotonic);
+        return .{ .state = state };
+    }
+
+    fn stressExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+        unreachable;
+    }
+    fn stressQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+        unreachable;
+    }
+    fn stressBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+        unreachable;
+    }
+    fn stressBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+        unreachable;
+    }
+    fn stressClose(_: *anyopaque) void {
+        unreachable;
+    }
+    fn stressDialect(_: *anyopaque) Dialect {
+        return .sqlite;
+    }
+    fn stressPing(ptr: *anyopaque) driver.Error!void {
+        const self: *StressDriver = @ptrCast(@alignCast(ptr));
+        _ = self.state.pings.fetchAdd(1, .monotonic);
+        const after = self.state.fail_ping_after;
+        if (after != 0 and self.checks.fetchAdd(1, .monotonic) + 1 >= after) {
+            _ = self.state.ping_failures.fetchAdd(1, .monotonic);
+            return error.PingFailed;
+        }
+    }
+    fn stressInTransaction(_: *anyopaque) bool {
+        return false;
+    }
+
+    const vtable = driver.Driver.VTable{
+        .exec = stressExec,
+        .query = stressQuery,
+        .beginTx = stressBeginTx,
+        .close = stressClose,
+        .dialect = stressDialect,
+        .ping = stressPing,
+        .inTransaction = stressInTransaction,
+        .beginSavepoint = stressBeginSavepoint,
+    };
+};
+
+const StressPool = ConnPool(StressDriver);
+
+/// A borrower that hammers the pool the way a request-serving thread does.
+const StressWorker = struct {
+    state: *StressState,
+    pool: *StressPool,
+    iterations: usize,
+    /// Backdate the entry this worker holds, so the pool's own max-lifetime
+    /// rule drops it in `release` instead of pooling it. That makes the
+    /// close-a-connection-while-another-is-borrowed race deterministic: without
+    /// it the pool can sit at its ceiling with the same connections for a whole
+    /// run and never recycle an entry, which is exactly what made the first
+    /// version of this test miss the path it was written for. `created_at` is
+    /// only read by `release` (by this same thread) and written at creation, so
+    /// the borrower may touch it before handing the connection back.
+    evict_on_release: bool = false,
+
+    fn run(self: *@This()) void {
+        for (0..self.iterations) |_| {
+            const b = self.state.borrowOne(self.pool) orelse continue;
+            // Hold the connection across a scheduling point so the threads
+            // really contend for the same slots instead of running one after
+            // the other.
+            std.Thread.yield() catch {};
+            if (self.evict_on_release) {
+                const entry: *StressPool.PooledEntry = @fieldParentPtr("conn", b.conn);
+                entry.created_at = unixTimestamp() - 3600;
+            }
+            self.state.releaseOne(self.pool, b);
+        }
+    }
+};
+
+/// A borrower that stays inside one connection for the whole storm.
+///
+/// The *pointer* a borrower holds cannot move — what can move is the memory at
+/// the other end of it, which is exactly what the historical entry-recycling
+/// bug did (an entry `swapRemove`d while borrowed, or a `PooledEntry` freed and
+/// re-created at the same address for another borrower). The borrowed driver
+/// carries a canary and its own holder slot, so re-reading both after the storm
+/// says whether the connection is still the same live entry; touching it
+/// afterwards is the use-after-free the old layout produced.
+const StressHolder = struct {
+    state: *StressState,
+    pool: *StressPool,
+    /// Set once the connection is in hand, so the test starts the storm knowing
+    /// a live borrow is in flight.
+    holding: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set when the connection still passed its probes after the storm.
+    intact: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *@This()) void {
+        const b = self.state.borrowOne(self.pool) orelse {
+            // Nothing to hold: unblock the test instead of hanging it.
+            self.state.stop.store(true, .release);
+            return;
+        };
+        self.holding.store(true, .release);
+        while (!self.state.stop.load(.acquire)) std.Thread.yield() catch {};
+
+        const canary_ok = b.conn.guard == StressDriver.guard_value;
+        const still_ours = b.conn.holder.load(.acquire) == b.token;
+        // Use the connection the way its borrower would after the storm. With
+        // the entry freed or recycled underneath it, this read is the
+        // use-after-free the old layout produced (the historical symptom was a
+        // segfault inside the driver's own health check).
+        b.conn.asDriver().ping() catch {};
+        self.intact.store(canary_ok and still_ours, .release);
+
+        self.state.releaseOne(self.pool, b);
+    }
+};
+
+/// The eviction pressure: everything the pool closes while other threads are
+/// borrowing.
+const StressReaper = struct {
+    state: *StressState,
+    pool: *StressPool,
+    /// Set once a full pass has run, so the test can start its assertions
+    /// knowing the idle-scan paths met live borrowers rather than trusting that
+    /// the thread was scheduled.
+    passed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn run(self: *@This()) void {
+        while (!self.state.stop.load(.acquire)) {
+            // Idleness is measured in whole `unixTimestamp()` seconds, so a
+            // real reap would need the test to sit idle for a second — and even
+            // then it would only happen if a connection was idle across a
+            // second boundary. Backdating what is idle right now is the same
+            // thing from the pool's point of view while the pool mutex is held,
+            // and it keeps the storm short.
+            //
+            // A borrower that picks up a backdated entry usually closes it
+            // itself (`selectNoLock` applies the same idle rule), so what the
+            // reap below catches is whatever the borrowers left behind — the
+            // point of the pass is that closing and borrowing overlap, not that
+            // a particular call site does the closing.
+            const io = self.pool.io;
+            self.pool.mutex.lockUncancelable(io);
+            const now = unixTimestamp();
+            for (self.pool.available.items) |entry| entry.idle_since = now - 60;
+            self.pool.mutex.unlock(io);
+
+            _ = self.state.idle_ping_passes.fetchAdd(1, .monotonic);
+            _ = self.pool.pingIdleConnections();
+            _ = self.state.reap_passes.fetchAdd(1, .monotonic);
+            _ = self.state.reaped.fetchAdd(self.pool.reapIdleConnections(1), .monotonic);
+            self.passed.store(true, .release);
+        }
+    }
+};
+
+/// A waiter that parks, is woken, and does it again.
+const StressWaiter = struct {
+    state: *StressState,
+    pool: *StressPool,
+    cycles: usize,
+
+    fn run(self: *@This()) void {
+        for (0..self.cycles) |_| {
+            const b = self.state.borrowOne(self.pool) orelse return;
+            std.Thread.yield() catch {};
+            self.state.releaseOne(self.pool, b);
+        }
+    }
+};
+
+/// The invariants every stress test must leave behind, split by what they are
+/// about: the registry (nothing was lent twice, nothing was lost track of), the
+/// ceiling, and the pool's own accounting.
+fn expectStressInvariants(state: *StressState, pool: *StressPool, max_connections: usize) !void {
+    const testing = std.testing;
+    // Invariant 1 and 2: no connection was live twice, and no canary went
+    // missing while a borrower was inside it.
+    try testing.expectEqual(@as(usize, 0), state.double_lends);
+    try testing.expectEqual(@as(usize, 0), state.holder_violations);
+    try testing.expectEqual(@as(usize, 0), state.guard_violations);
+    try testing.expectEqual(@as(usize, 0), state.stray_releases);
+    try testing.expectEqual(@as(usize, 0), state.registry_failures);
+    // Every borrow the harness recorded was handed back, and none twice.
+    try testing.expectEqual(state.borrows, state.releases);
+    try testing.expectEqual(@as(usize, 0), state.live.count());
+    // Invariant 5: the ceiling held the whole way through.
+    try testing.expect(state.peak <= max_connections);
+    // Invariant 4: drained, with the pool's totals agreeing with reality.
+    const snapshot = pool.stats();
+    try testing.expectEqual(@as(usize, 0), snapshot.in_use);
+    try testing.expectEqual(snapshot.total, snapshot.available);
+    try testing.expectEqual(@as(usize, 0), snapshot.waiters);
+}
+
+test "ConnPool stress: a connection is never lent to two borrowers" {
+    // `std.testing.allocator` is a `SafeAllocator`, which is documented
+    // thread-safe (per-thread tables, atomic counters) in this Zig version, so
+    // unlike the older concurrency tests in this file it can be handed to the
+    // spawned threads — and the run keeps its leak detection. That matters
+    // here: entry create/destroy is the pool's allocation traffic, and this is
+    // the test that hammers it.
+    const allocator = std.testing.allocator;
+    var state: StressState = undefined;
+    try state.setup(allocator);
+    defer state.live.deinit(allocator);
+
+    const max_connections = 4;
+    const thread_count = 8;
+    const iterations = 50;
+
+    var pool = try StressPool.init(allocator, state.options(2, max_connections, 3000));
+    defer pool.deinit();
+
+    var workers: [thread_count]StressWorker = undefined;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .state = &state, .pool = &pool, .iterations = iterations };
+        thread.* = try std.Thread.spawn(.{}, StressWorker.run, .{worker});
+    }
+    for (&threads) |*thread| thread.join();
+
+    // Eight threads turning four connections over: a borrow that gives up means
+    // a parked borrower was not woken inside its 3 s budget.
+    try std.testing.expectEqual(@as(usize, 0), state.borrow_errors.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, thread_count * iterations), state.borrows);
+    try expectStressInvariants(&state, &pool, max_connections);
+}
+
+test "ConnPool stress: eviction racing with borrow never recycles a live connection" {
+    const allocator = std.testing.allocator;
+    var state: StressState = undefined;
+    try state.setup(allocator);
+    defer state.live.deinit(allocator);
+    // Every connection starts failing its health check after the first one, so
+    // the pool keeps dropping entries and opening replacements while borrowers
+    // are inside other ones.
+    state.fail_ping_after = 4;
+
+    const max_connections = 4;
+    const thread_count = 8;
+    const iterations = 30;
+
+    var options = state.options(1, max_connections, 1000);
+    // An entry the reaper backdated is stale by the pool's own rule too, so the
+    // borrow-path eviction can drop it as well; and `max_lifetime_secs` is what
+    // turns the evicting workers' backdated `created_at` into a close.
+    options.max_idle_secs = 30;
+    options.max_lifetime_secs = 1;
+    var pool = try StressPool.init(allocator, options);
+    defer pool.deinit();
+
+    // The idle-scan entry points, checked once deterministically before the
+    // storm. They have no other coverage in this file, and the storm itself
+    // cannot assert on them: which thread closes a backdated entry depends on
+    // who reaches the pool mutex first, and a borrower that picks one up closes
+    // it in `selectNoLock` rather than leaving it for the reaper.
+    {
+        const io = pool.io;
+        pool.mutex.lockUncancelable(io);
+        const now = unixTimestamp();
+        for (pool.available.items) |entry| entry.idle_since = now - 60;
+        const idle_now = pool.available.items.len;
+        pool.mutex.unlock(io);
+        try std.testing.expectEqual(idle_now, pool.reapIdleConnections(1));
+        try std.testing.expect(idle_now > 0);
+    }
+
+    // Start the borrowers first (they never wait on `stop`), then the thread
+    // that holds one connection for the whole storm, then the reaper: every
+    // spawn failure below has a bounded way out, so a failure cannot leave a
+    // thread running past the test body.
+    var workers: [thread_count]StressWorker = undefined;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&workers, &threads, 0..) |*worker, *thread, i| {
+        // One borrower in four drops the connection it was given instead of
+        // pooling it, so `closeConnection` keeps running against live borrows
+        // while the other three hand connections back and forth — which is what
+        // keeps both halves of the race alive at once: entries being closed,
+        // and entries being lent and returned. Leaving most of the borrowers
+        // pooling their connections also keeps the pool from draining to
+        // nothing, where every borrow would have no choice but to open a
+        // connection and the entries would never be shared at all.
+        worker.* = .{
+            .state = &state,
+            .pool = &pool,
+            .iterations = iterations,
+            .evict_on_release = (i % 4) == 3,
+        };
+        thread.* = try std.Thread.spawn(.{}, StressWorker.run, .{worker});
+    }
+
+    var holder = StressHolder{ .state = &state, .pool = &pool };
+    const holder_thread = std.Thread.spawn(.{}, StressHolder.run, .{&holder}) catch |err| {
+        for (&threads) |*thread| thread.join();
+        return err;
+    };
+    var spins: usize = 0;
+    while (!holder.holding.load(.acquire) and spins < 5000) : (spins += 1) {
+        pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const holder_started = holder.holding.load(.acquire);
+
+    var reaper = StressReaper{ .state = &state, .pool = &pool };
+    const reaper_thread = std.Thread.spawn(.{}, StressReaper.run, .{&reaper}) catch |err| {
+        state.stop.store(true, .release);
+        holder_thread.join();
+        for (&threads) |*thread| thread.join();
+        return err;
+    };
+    // Wait for a full pass before letting the storm end, so "the idle scans ran
+    // while connections were lent out" is a fact about this run rather than
+    // about the scheduler.
+    spins = 0;
+    while (!reaper.passed.load(.acquire) and spins < 5000) : (spins += 1) {
+        pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const reaper_passed = reaper.passed.load(.acquire);
+
+    for (&threads) |*thread| thread.join();
+    state.stop.store(true, .release);
+    reaper_thread.join();
+    holder_thread.join();
+
+    // Invariant 2: the connection was in one borrower's hands for the whole
+    // storm, and it is still the entry the pool lent out.
+    try std.testing.expect(holder_started);
+    try std.testing.expect(holder.intact.load(.acquire));
+    try std.testing.expect(state.peak >= 2);
+    // ... and the storm really did close connections while others were lent
+    // out: the reaper's scans ran against live borrowers, the evicting
+    // borrowers saw their own connection dropped on release, and the health
+    // checks dropped pooled connections whose replacement the pool then opened.
+    // The pool holds at most `max_connections`, so the borrows that are served
+    // on top of that are served by reusing or opening — and with the borrowers
+    // that drop what they were given, `connects` has to run far above the eight
+    // a connection needs to reach its fourth check below.
+    try std.testing.expect(reaper_passed);
+    try std.testing.expect(state.reap_passes.load(.monotonic) > 0);
+    try std.testing.expect(state.closes.load(.monotonic) > 0);
+    try std.testing.expect(state.connects.load(.monotonic) >= 8);
+    try std.testing.expect(state.ping_failures.load(.monotonic) > 0);
+    // Every borrower was served: with a 1 s budget and the pool's own release
+    // and reap signals in flight, a borrow that gives up means a parked
+    // borrower was not woken.
+    try std.testing.expectEqual(@as(usize, 0), state.borrow_errors.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, thread_count * iterations + 1), state.borrows);
+    try expectStressInvariants(&state, &pool, max_connections);
+}
+
+test "ConnPool stress: every parked waiter is served when connections come back" {
+    const allocator = std.testing.allocator;
+    var state: StressState = undefined;
+    try state.setup(allocator);
+    defer state.live.deinit(allocator);
+
+    // More borrowers than connections, all of them parked before a single
+    // connection is handed back: the pool has to wake every waiter it parked,
+    // not just the first one it happens to serve.
+    const max_connections = 4;
+    const waiters = 8;
+    const cycles = 5;
+
+    var pool = try StressPool.init(allocator, state.options(max_connections, max_connections, 8000));
+    defer pool.deinit();
+
+    // Take the whole pool, so the waiters have nowhere to go.
+    var held: [max_connections]StressState.Borrow = undefined;
+    for (&held) |*b| b.* = state.borrowOne(&pool) orelse return error.PoolExhausted;
+
+    var waiter_states: [waiters]StressWaiter = undefined;
+    var threads: [waiters]std.Thread = undefined;
+    for (&waiter_states, &threads) |*waiter, *thread| {
+        waiter.* = .{ .state = &state, .pool = &pool, .cycles = cycles };
+        thread.* = try std.Thread.spawn(.{}, StressWaiter.run, .{waiter});
+    }
+
+    // Deterministic synchronization point (the same one the single-waiter case
+    // uses): a waiter registers its ticket and starts waiting inside one
+    // critical section, so once all eight tickets are visible every thread is
+    // committed to parking and cannot miss a release.
+    var all_parked = false;
+    var spins: usize = 0;
+    while (!all_parked and spins < 2000) : (spins += 1) {
+        const io = pool.io;
+        pool.mutex.lockUncancelable(io);
+        all_parked = pool.wait_tickets.items.len == waiters;
+        pool.mutex.unlock(io);
+        if (!all_parked) pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    // Release unconditionally, so a pool that loses a wake-up fails the
+    // assertions below (on the waiter's budget) instead of hanging the run.
+    for (&held) |*b| state.releaseOne(&pool, b.*);
+
+    for (&threads) |*thread| thread.join();
+
+    try std.testing.expect(all_parked);
+    // Coverage rather than timing: the parks were observed above, so the wait
+    // path was entered and `onWait` cannot have stayed at zero.
+    try std.testing.expect(state.waits.load(.monotonic) >= waiters);
+    try std.testing.expectEqual(@as(usize, 0), state.borrow_errors.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, max_connections + waiters * cycles), state.borrows);
+    try expectStressInvariants(&state, &pool, max_connections);
+}
