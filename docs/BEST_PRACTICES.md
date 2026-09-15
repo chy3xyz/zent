@@ -604,6 +604,26 @@ kill — is closed instead of going back into `available`. PostgreSQL marks it
 lazily from `PQstatus`, so the *failing* call sets it and the next borrower fails
 fast; at most one request pays for a break.
 
+**From an error to a status code.** `driver.classify(err)` answers the question
+a handler actually has, so no handler has to enumerate the three error sets:
+
+| Class | Errors | Answer |
+|---|---|---|
+| `.capacity` | `ConnectionFailed`, `PingFailed`, `PoolExhausted`, `PoolClosed`, `OutOfMemory`, `QueryTimeout` | 503, back off |
+| `.transient` | `DeadlockDetected`, `SerializationFailure`, `LockTimeout`, `TxFailed`, `OptimisticLockConflict` | retry the same work |
+| `.client` | `UniqueViolation`, `NotNullViolation`, `ForeignKeyViolation`, `ExecFailed`, `QueryFailed`, `NotFound` | 4xx |
+| `.bug` | `PrepareFailed`, `BindFailed`, `ProtocolError`, `DriverFailed`, and anything from outside this library | 500 |
+
+`driver.isRetryable(err)` is the narrower "would retrying help?" — the transient
+and connection/pool classes, **not** `OutOfMemory`/`QueryTimeout`, where a retry
+usually makes things worse.
+
+**Seeing inside the pool.** `pool.stats()` takes the mutex and returns
+`total` / `in_use` / `available` / `waiters` / `exhausted_total` / `closed` —
+enough for a gauge plus a counter that says "the pool is too small, or the
+database is gone". Size the pool against the server:
+*instances × max_connections + reserved roles ≤ the server's `max_connections`.*
+
 **Draining vs overloading.** `error.PoolExhausted` means the pool reached
 `max_connections` with everything lent out — a capacity signal, and the one worth
 mapping to 503. A connection that could not be *opened* surfaces as the driver's

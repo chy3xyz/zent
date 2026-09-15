@@ -156,6 +156,9 @@ pub fn ConnPool(comptime D: type) type {
         /// sorted). Best-effort fairness bookkeeping only — see `borrow`.
         wait_tickets: std.ArrayListUnmanaged(u64) = .empty,
         owned_io: ?*std.Io.Threaded = null,
+        /// Total borrows that gave up, for a dashboard: the number that says
+        /// "the pool is too small" or "the database is gone".
+        exhausted_total: u64 = 0,
         /// Why the most recent borrow attempt produced nothing. `tryBorrowNoLock`
         /// can fail for reasons that are *not* exhaustion — a refused connection,
         /// bad credentials, OOM — and folding all of them into `PoolExhausted`
@@ -562,6 +565,7 @@ pub fn ConnPool(comptime D: type) type {
             // everything lent out; otherwise the failure that actually happened
             // travels to the caller, and a consumer can tell "capacity" from
             // "misconfiguration" (see `ZENT_IMPROVEMENTS.md` item 3).
+            self.exhausted_total += 1;
             const reason: anyerror = self.last_attempt_error orelse error.PoolExhausted;
             if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, reason);
             // Silent exhaustion was the other half of that report: the pool had
@@ -669,6 +673,39 @@ pub fn ConnPool(comptime D: type) type {
             // their `max_wait_ms` budget.
             if (reaped > 0) self.cond.broadcast(io);
             return reaped;
+        }
+
+        /// A snapshot of the pool, for a metrics scrape or a health endpoint.
+        ///
+        /// Everything a consumer previously had to read out of the internal
+        /// lists — one of them without holding the mutex, which is a data race
+        /// waiting to happen (`examples/pool/main.zig` did exactly that).
+        pub const Stats = struct {
+            /// Connections the pool holds, idle or lent out.
+            total: usize,
+            /// Lent out right now.
+            in_use: usize,
+            /// Idle and available.
+            available: usize,
+            /// Borrowers blocked on the condition variable.
+            waiters: usize,
+            /// Borrows that gave up since the pool was created.
+            exhausted_total: u64,
+            closed: bool,
+        };
+
+        pub fn stats(self: *Self) Stats {
+            const io = self.io;
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            return .{
+                .total = self.all.items.len,
+                .in_use = self.all.items.len - self.available.items.len,
+                .available = self.available.items.len,
+                .waiters = self.wait_tickets.items.len,
+                .exhausted_total = self.exhausted_total,
+                .closed = self.closed,
+            };
         }
 
         /// Actively ping all idle connections in the pool and drop dead ones.
@@ -1954,6 +1991,7 @@ test "an unusable factory reports its own error instead of PoolExhausted" {
     // fault forever). The cause must survive, and the metrics callback must see
     // it rather than a constant.
     const allocator = std.testing.allocator;
+    const testing = std.testing;
 
     // Succeeds once (so `init` can warm up), then refuses: the second borrow has
     // to open a connection, which is the path being tested.
@@ -1988,9 +2026,25 @@ test "an unusable factory reports its own error instead of PoolExhausted" {
     defer pool.deinit();
 
     const first = try pool.borrow();
+    // `stats()` is the observability the report asked for (#13): a snapshot
+    // under the mutex, where the shipping example used to read the internal
+    // lists unlocked.
+    {
+        const held = pool.stats();
+        try testing.expectEqual(@as(usize, 1), held.total);
+        try testing.expectEqual(@as(usize, 1), held.in_use);
+        try testing.expectEqual(@as(usize, 0), held.available);
+        try testing.expectEqual(@as(u64, 0), held.exhausted_total);
+    }
     // Nothing is available and the pool is below its ceiling, so this one has to
     // open a connection — and the factory refuses.
     try std.testing.expectError(error.ConnectionFailed, pool.borrow());
     try std.testing.expectEqual(@as(?anyerror, error.ConnectionFailed), seen);
+    try testing.expectEqual(@as(u64, 1), pool.stats().exhausted_total);
     pool.release(first);
+    {
+        const idle = pool.stats();
+        try testing.expectEqual(@as(usize, 0), idle.in_use);
+        try testing.expectEqual(@as(usize, 1), idle.available);
+    }
 }

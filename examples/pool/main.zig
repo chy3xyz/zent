@@ -56,5 +56,10 @@ pub fn main() !void {
     const found = try q.Only();
     std.debug.print("Queried user: id={d}, name={s}, age={d}\n", .{ found.id, found.name, found.age });
 
-    std.debug.print("Pool size: {d} (available {d})\n", .{ pool.all.items.len, pool.available.items.len });
+    // `stats()` rather than the internal lists: it takes the mutex, and the
+    // unlocked read this example used to do is a data race.
+    const st = pool.stats();
+    std.debug.print("Pool: total={d} in_use={d} available={d} waiters={d} exhausted={d}\n", .{
+        st.total, st.in_use, st.available, st.waiters, st.exhausted_total,
+    });
 }

@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`driver.classify` — the 503/500 question, answered once** (Z29). Three
+  unrelated error sets exist in this library (`driver.Error`, `runtime.error`'s
+  `DbError`/`DriverError`, and the pool's `PoolClosed`/`PoolExhausted`), and a
+  service that has to decide "is this capacity, a lost race, or the caller's
+  fault?" had to enumerate them itself:
+
+  ```zig
+  switch (zent.sql_driver.classify(err)) {
+      .capacity => 503,   // database unavailable, pool at capacity, OOM, timeout
+      .transient => retry, // deadlock, serialization failure, lock timeout, tx died
+      .client => 400,      // constraint violation, bad data, not found
+      .bug => 500,         // bind/prepare failure, protocol error, driver bug
+  }
+  ```
+
+  `isRetryable` now covers `PoolExhausted`, `PoolClosed`, `PingFailed`, `TxFailed`
+  and `OptimisticLockConflict` as well as the four it had — `PoolExhausted` is
+  exactly the error a consumer needs this answer for, and it was reported as not
+  retryable. It is deliberately **not** `classify(…) == .capacity or .transient`:
+  `OutOfMemory` and `QueryTimeout` are capacity for a status code while retrying
+  them makes things worse, and the existing test that asserts
+  `!isRetryable(OutOfMemory)` is right.
+
+- **`ConnPool.stats()`** (Z29). A snapshot under the mutex — `total`, `in_use`,
+  `available`, `waiters`, `exhausted_total`, `closed` — for a metrics scrape or a
+  health endpoint. The pool tracks what a dashboard wants; the shipping example
+  read the internal lists *without* the mutex to print a pool size, which is a
+  data race and now impossible to copy by accident.
+
 ## [0.52.0] - 2026-09-15
 
 ### Added

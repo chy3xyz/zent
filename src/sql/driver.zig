@@ -57,6 +57,69 @@ pub const Error = error{
 /// attempt lost a race (deadlock, serialization conflict, lock timeout) or the
 /// connection dropped. For transaction-scoped errors the retry must replay the
 /// whole transaction — use `retryTx` rather than retrying a single statement.
+/// What a caller should *do* about an error, which is a different question from
+/// which error it is. Three error sets exist in this library (`driver.Error`,
+/// `runtime.error`'s `DbError`/`DriverError`, and the pool's `PoolClosed` /
+/// `PoolExhausted`), and a service that has to answer "is this a 503, a 500, or
+/// the caller's fault?" should not have to enumerate them.
+pub const Class = enum {
+    /// Not the request's fault and not the data's: the database or its
+    /// connection is unavailable, or the pool is at capacity. Retry, back off,
+    /// and answer 503 if it persists.
+    capacity,
+    /// The request lost a race — a deadlock, a serialization failure, a lock
+    /// timeout, a transaction that died. Retrying the same work is the remedy.
+    transient,
+    /// The statement or the data is wrong: a constraint violation, a type
+    /// mismatch, a missing column. Retrying changes nothing.
+    client,
+    /// The same input would fail every time and nothing about it is the
+    /// caller's to fix — a bind/prepare failure, a protocol error, a driver bug.
+    bug,
+};
+
+/// Classify an error for the "what now?" decision. `anyerror` because the
+/// caller's own error values flow through here too.
+pub fn classify(err: anyerror) Class {
+    return switch (err) {
+        // Capacity: nothing to do with the statement.
+        error.ConnectionFailed,
+        // `PingFailed` means a connection was lost; `PoolExhausted`/`PoolClosed`
+        // mean the pool has nothing to give. All answer 503, not 500.
+        error.PingFailed,
+        error.PoolExhausted,
+        error.PoolClosed,
+        error.OutOfMemory,
+        error.QueryTimeout,
+        => .capacity,
+
+        error.DeadlockDetected,
+        error.SerializationFailure,
+        error.LockTimeout,
+        error.TxFailed,
+        error.OptimisticLockConflict,
+        => .transient,
+
+        error.UniqueViolation,
+        error.NotNullViolation,
+        error.ForeignKeyViolation,
+        error.ExecFailed,
+        error.QueryFailed,
+        error.NotFound,
+        => .client,
+
+        else => .bug,
+    };
+}
+
+/// Whether retrying the same operation could plausibly succeed.
+///
+/// Broader than a four-name list but deliberately not `classify(…) ==
+/// .capacity or .transient`: `OutOfMemory` and `QueryTimeout` are capacity
+/// problems for a *status code*, and retrying them usually makes things worse
+/// rather than better. The pool's own errors are here because that is the error
+/// a consumer most needs to answer "capacity or my bug?" for, and it was
+/// reported as not retryable.
 pub fn isRetryable(err: Error) bool {
     return isRetryableAny(err);
 }
@@ -68,7 +131,12 @@ fn isRetryableAny(err: anyerror) bool {
         error.DeadlockDetected,
         error.SerializationFailure,
         error.LockTimeout,
+        error.TxFailed,
+        error.OptimisticLockConflict,
         error.ConnectionFailed,
+        error.PingFailed,
+        error.PoolExhausted,
+        error.PoolClosed,
         => true,
         else => false,
     };
@@ -535,6 +603,24 @@ test "isRetryable classifies transient errors" {
     try std.testing.expect(!isRetryable(error.UniqueViolation));
     try std.testing.expect(!isRetryable(error.ExecFailed));
     try std.testing.expect(!isRetryable(error.OutOfMemory));
+    // The pool's own errors are capacity, and retrying is the right answer to
+    // them (the report's consumers had no way to ask this).
+    try std.testing.expect(isRetryable(error.PoolExhausted));
+    try std.testing.expect(isRetryable(error.PoolClosed));
+    try std.testing.expect(isRetryable(error.PingFailed));
+    try std.testing.expect(isRetryable(error.TxFailed));
+    // `classify` answers the 503-vs-500 question, which is a different one:
+    // `OutOfMemory` is capacity for a status code without being retryable.
+    try std.testing.expectEqual(Class.capacity, classify(error.PoolExhausted));
+    try std.testing.expectEqual(Class.capacity, classify(error.ConnectionFailed));
+    try std.testing.expectEqual(Class.capacity, classify(error.OutOfMemory));
+    try std.testing.expectEqual(Class.transient, classify(error.DeadlockDetected));
+    try std.testing.expectEqual(Class.client, classify(error.UniqueViolation));
+    try std.testing.expectEqual(Class.client, classify(error.NotNullViolation));
+    try std.testing.expectEqual(Class.bug, classify(error.PrepareFailed));
+    // An error from outside this library (a caller's own) is not ours to
+    // classify as anything but a bug.
+    try std.testing.expectEqual(Class.bug, classify(error.SomeAppError));
 }
 
 fn bodyFailFirst(state: *MockTxState, tx: Tx) anyerror!void {
