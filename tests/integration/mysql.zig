@@ -1423,6 +1423,103 @@ test "MySQL: migrateSchema dry-run outputs SQL without executing" {
     try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
 }
 
+test "MySQL: dry-run previews an incremental migration without applying it" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // A legacy table that matches V1 of the schema (created by hand, so the
+    // migration history has no create_table version for it). Runs on both
+    // MySQL and MariaDB: the assertions below are existence-only, which both
+    // servers answer identically.
+    _ = try drv.exec("DROP TABLE IF EXISTS my_dr_inc", &.{});
+    _ = try drv.exec("CREATE TABLE my_dr_inc (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL)", &.{});
+    _ = try drv.exec("INSERT INTO my_dr_inc (name) VALUES ('a')", &.{});
+
+    // V2 adds a column.
+    const DrInc = schema("MyDrInc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("age"),
+        },
+    });
+    const graph = comptime buildGraph(&.{DrInc});
+
+    // The preview: runs clean, changes nothing — the new column is not added.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), graph.types, migrate.MigrateOptions{
+        .dry_run = true,
+    });
+    {
+        var rows = try drv.query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'my_dr_inc' AND table_schema = DATABASE() AND column_name = 'age'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+    }
+
+    // The real run applies what the preview showed.
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
+    {
+        var rows = try drv.query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'my_dr_inc' AND table_schema = DATABASE() AND column_name = 'age'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+    }
+}
+
+test "MySQL: dry-run fails closed on a TEXT DEFAULT in ALTER like the real path" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // V1 migrated for real, so the history has the create_table version and
+    // the V2 diff reaches the ALTER ADD COLUMN generator — the guard the
+    // BLOB/TEXT restriction lives on for existing tables (errno 1101).
+    _ = try drv.exec("DROP TABLE IF EXISTS my_dr_text", &.{});
+    const V1 = schema("MyDrText", .{
+        .fields = &.{
+            field.String("name"),
+        },
+    });
+    const graph_v1 = comptime buildGraph(&.{V1});
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph_v1.types);
+
+    // V2 adds a TEXT column with a DEFAULT — a shape MySQL rejects, which
+    // must be diagnosed at generation time on BOTH paths, never printed or
+    // executed. The guard is a pure function of the schema, so this holds on
+    // MariaDB too.
+    const V2 = schema("MyDrText", .{
+        .fields = &.{
+            field.String("name"),
+            field.Text("body").Default("x"),
+        },
+    });
+    const graph_v2 = comptime buildGraph(&.{V2});
+
+    try testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), graph_v2.types, migrate.MigrateOptions{ .dry_run = true }),
+    );
+    try testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), graph_v2.types, .{}),
+    );
+
+    // Neither run added the column.
+    var rows = try drv.query(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'my_dr_text' AND table_schema = DATABASE() AND column_name = 'body'",
+        &.{},
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+}
+
 test "MySQL: WhereIn chunks OR-joins IN predicates" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
