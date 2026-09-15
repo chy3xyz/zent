@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.62.0] - 2026-09-15
+
 ### Added
 - **`checkSchema` now checks M2M junction tables**
   (`SchemaDrift.Kind.missing_junction_table`) — the last declared surface nothing
