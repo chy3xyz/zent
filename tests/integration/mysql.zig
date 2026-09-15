@@ -1292,7 +1292,17 @@ test "MySQL: an existing column's nullability fails closed, it does not get a MO
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqualStrings("YES", row.getText(0).?);
-    try testing.expectEqualStrings("kept", row.getText(1).?);
+
+    // MariaDB reports `column_default` as the literal expression text, so its
+    // string default comes back quoted ('kept'), while MySQL 8+ strips the
+    // quoting and reports `kept`. Both mean the DEFAULT survived — which is the
+    // assertion here — so compare the content, not the vendor's rendering.
+    const reported = row.getText(1).?;
+    const unquoted = if (reported.len >= 2 and reported[0] == '\'' and reported[reported.len - 1] == '\'')
+        reported[1 .. reported.len - 1]
+    else
+        reported;
+    try testing.expectEqualStrings("kept", unquoted);
 }
 
 test "MySQL: migrateSchema dry-run outputs SQL without executing" {
