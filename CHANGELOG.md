@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`crud_helpers.increment` reports rows *matched*, not rows *changed*.**
+  `SET hits = hits + 0` changes nothing, so MySQL counted 0 while SQLite's
+  `changes()` and PostgreSQL's `UPDATE 1` tag both counted the matched row
+  (measured on all three) — and a caller reading 0 as "no such row" took the
+  wrong branch. The zero path now re-checks with the same count query
+  `crud_helpers.update` uses, so the answer is the matched count on every
+  dialect. A non-zero delta changes the value and never reaches that path.
+
+  `crud_helpers.batchSaveOrUpdate` needed no change: it accumulates the result of
+  `saveOrUpdate`, which goes through `update` — so the v0.64.0 fix to that
+  function already corrected its `updated_count` on MySQL.
+
 ## [0.64.0] - 2026-09-15
 
 ### Added

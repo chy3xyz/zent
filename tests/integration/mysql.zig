@@ -263,6 +263,52 @@ test "MySQL: crud_helpers.update reports matched rows, not changed rows" {
     try testing.expectEqual(@as(usize, 0), try zent.crud_helpers.update(client.cf_match_coupon, .{ .status = 40 }, .{client.cf_match_coupon.predicates.idEQ(.{ .int = created.id + 100000 })}));
 }
 
+test "MySQL: crud_helpers.increment reports matched rows for a zero delta" {
+    // `SET hits = hits + 0` changes nothing, so this server counts 0 changed
+    // rows — measured as ROW_COUNT() = 0 against SQLite's changes() = 1 and
+    // PostgreSQL's `UPDATE 1`. A caller reading 0 as "no such row" took the
+    // wrong branch, so the zero path re-checks with the same count query
+    // `update` uses. MariaDB reports changed rows the same way, so no
+    // isMariaDB branch is needed.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const CfIncrement = schema("CfIncrement", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("hits"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{CfIncrement});
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS cf_increment", &.{}) catch {};
+
+    const client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var created = try zent.crud_helpers.create(client.cf_increment, .{ .name = "page", .hits = 10 });
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+
+    const id_pred = client.cf_increment.predicates.idEQ(.{ .int = created.id });
+
+    // A real increment changes the value, so the server counts the row.
+    try testing.expectEqual(@as(usize, 1), try zent.crud_helpers.increment(client.cf_increment, "hits", 5, .{id_pred}));
+
+    // A zero delta matches without changing: 0 changed rows on this server, and
+    // the answer must still be 1.
+    try testing.expectEqual(@as(usize, 1), try zent.crud_helpers.increment(client.cf_increment, "hits", 0, .{id_pred}));
+
+    // A predicate that matches nothing is still 0.
+    try testing.expectEqual(@as(usize, 0), try zent.crud_helpers.increment(
+        client.cf_increment,
+        "hits",
+        0,
+        .{client.cf_increment.predicates.idEQ(.{ .int = created.id + 100000 })},
+    ));
+}
+
 test "MySQL: SaveIgnore ignores unique-key conflict" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

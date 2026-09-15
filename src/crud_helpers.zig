@@ -553,6 +553,12 @@ pub fn withTx(
 
 /// Atomically increment (or decrement if delta < 0) a numeric field for rows matching `predicates`.
 /// Returns rows affected.
+/// Increment `field_name` by `delta` on rows matching `predicates`.
+/// Returns the number of rows the update **matched**, with the same meaning as
+/// `update`: a `delta` of `0` still matches the row it targets, and MySQL's
+/// *changed*-rows count would report it as `0` — indistinguishable from "the
+/// predicate matched nothing". The zero path therefore re-checks with the same
+/// count query `update` uses.
 pub fn increment(
     accessor: anytype,
     comptime field_name: []const u8,
@@ -565,7 +571,14 @@ pub fn increment(
     const expr = comptime col ++ " + ?";
     _ = try upd.setExprArgs(field_name, expr, &.{.{ .int = delta }});
     _ = try upd.Where(predicates);
-    return try upd.Save();
+    const affected = try upd.Save();
+    if (affected == 0) {
+        // `SET col = col + 0` changes nothing, so MySQL counts 0 while SQLite
+        // and PostgreSQL count the matched row. Report what `update` reports.
+        const matched = try count(accessor, predicates);
+        return @intCast(matched);
+    }
+    return affected;
 }
 
 fn ScopedAllResult(comptime Accessor: type) type {
@@ -1125,6 +1138,53 @@ test "crud_helpers: update returns matched rows, not changed rows" {
 
     // Predicate matches nothing: 0 on every dialect, through the same path.
     try std.testing.expectEqual(@as(usize, 0), try update(client.matched_product, .{ .stock = 1 }, .{client.matched_product.predicates.idEQ(.{ .int = 999999 })}));
+}
+
+test "crud_helpers: increment reports matched rows for a zero delta" {
+    // `SET col = col + 0` changes nothing, so MySQL counts 0 changed rows while
+    // SQLite and PostgreSQL count the matched row (measured: changes() = 1,
+    // ROW_COUNT() = 0, `UPDATE 1`). A caller reading 0 as "no such row" took the
+    // wrong branch, so the zero path re-checks exactly as `update` does.
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Counter = Schema("IncrementCounter", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("hits"),
+        },
+    });
+    const info = comptime fromSchema(Counter);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    var client = client_mod.makeClient(infos, allocator, driver);
+
+    var created = try create(client.increment_counter, .{ .name = "page", .hits = 10 });
+    defer deinitEntity(infos, info, &created, allocator);
+    const id_pred = client.increment_counter.predicates.idEQ(.{ .int = created.id });
+
+    // A real increment changes the value, so every dialect counts the row.
+    try std.testing.expectEqual(@as(usize, 1), try increment(client.increment_counter, "hits", 5, .{id_pred}));
+
+    // A zero delta matches the row without changing it: still 1, not the
+    // changed-rows 0 that MySQL would report.
+    try std.testing.expectEqual(@as(usize, 1), try increment(client.increment_counter, "hits", 0, .{id_pred}));
+
+    // And a predicate that matches nothing is still 0.
+    try std.testing.expectEqual(@as(usize, 0), try increment(
+        client.increment_counter,
+        "hits",
+        0,
+        .{client.increment_counter.predicates.idEQ(.{ .int = 999999 })},
+    ));
 }
 
 test "crud_helpers: queryRows collects mapped rows into owned Rows(T)" {
