@@ -898,6 +898,45 @@ migration ran, so the shape is right" and being surprised later:
 | A **changed `view_sql` never takes effect** — views are `CREATE VIEW IF NOT EXISTS` | the definition you upgraded to is not the one in the database | `DROP VIEW` then re-run, or version the view name |
 | A **changed index definition is reported but not repaired** — `ExistingIndex.columns` now carries the key list, but `migrateSchema` still only asks whether the name exists | a declared index the database holds under the same name with different columns stays as it is | drop and recreate it by hand; `checkSchema` names the difference |
 
+#### What `checkSchema` covers, and what it does not
+
+Everything the schema declares, against what `checkSchema` compares:
+
+| Schema declares | Reported as | When |
+|---|---|---|
+| a table | `missing_table` | always |
+| a column | `missing_column` / `extra_column` | always |
+| a column's type | `type_mismatch` | always (text-normalized) |
+| a column's nullability | `nullability` | always |
+| an index (by name) and its key list | `index_columns` | only when the database's key list is readable |
+| an index's uniqueness | `index_uniqueness` | always |
+| a field's `Unique()` | `unique_constraint` | unless a unique index forces that column alone, or a *unique* unreadable index makes it undecidable |
+| a foreign key | `missing_foreign_key` | by shape; `ON DELETE`/`ON UPDATE` not compared |
+
+**Not covered at all** — do not read a green `assertSchema` as "the shape is
+right":
+
+| Not covered | Consequence |
+|---|---|
+| **views** (`checkSchema` skips `is_view`) | a changed `view_sql` never takes effect and nothing says so |
+| a declared index **missing** from the database | only indexes present under both are compared; a missing one is a performance matter, never reported |
+| the primary key's shape | columns, order and name are not compared |
+| `ON DELETE` / `ON UPDATE` | an FK can point at the right place with the wrong action |
+| a constraint the database has and the schema does not | deliberately ignored — it only rejects writes the schema never promised |
+| `DEFAULT`, `CHECK`, charset, collation | never compared |
+
+Two more things worth knowing:
+
+- **`unique_constraint` and `missing_foreign_key` are reports, not repairs.**
+  `migrateSchema` still does not add either with `ALTER TABLE … ADD CONSTRAINT`;
+  non-destructiveness is deliberate.
+- **On SQLite, an FK in the DDL is not necessarily enforced.** SQLite ships with
+  `PRAGMA foreign_keys = OFF`, so dangling references are accepted unless the
+  connection turns it on. `checkSchema` compares the **DDL shape** — it cannot
+  see that switch — so `missing_foreign_key` means "the constraint is not
+  declared", and a *clean* result means "it is declared", not "it is enforced".
+  Turn the pragma on per connection if you rely on it.
+
 Everything in that table is also what `checkSchema` reports, which is the point:
 the migration path is not a substitute for the check.
 

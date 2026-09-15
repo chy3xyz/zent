@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`checkSchema` / `assertSchema` now cover column-level `UNIQUE` and foreign
+  keys** — the last two declarations that only ever reached a table inside
+  `CREATE TABLE`, so a table built before the field was declared `Unique()`, or
+  that never had the edge, keeps neither and **nothing reported it**. A
+  column-level `UNIQUE` is not a named index, so neither `index_columns` nor
+  `index_uniqueness` could see it, and there was no foreign-key introspection at
+  all.
+
+  - **`SchemaDrift.Kind.unique_constraint`** — a field declared `Unique()` with
+    no unique index forcing that column **alone**. A composite
+    `UNIQUE (a, b)` does **not** satisfy `a`: two rows may share it, which is the
+    whole point of the constraint being declared. An index that is not unique
+    never suppresses the report (it cannot be the constraint either way).
+    A table carrying a **unique index whose key list cannot be read**
+    (`lower(email)`, `email(10)`, a partial index, a non-btree access method) is
+    **skipped rather than guessed at** — each of those does constrain the
+    column, so reporting would be a guess, and a false report blocks a deploy.
+    A non-unique unreadable index does not suppress anything, which keeps the
+    check useful on real schemas.
+  - **`SchemaDrift.Kind.missing_foreign_key`** — a foreign key the schema
+    declares and the database does not have, compared **by shape** (ordered
+    local columns, target table, target columns) and **never by name**:
+    PostgreSQL generates one (`t_col_fkey`), MySQL generates one
+    (`t_ibfk_1`), SQLite keeps none, and `migrateSchema`'s own `FOREIGN KEY (…)`
+    clause names nothing — so a name comparison would report every constraint in
+    every database. `ON DELETE` / `ON UPDATE` are **not** compared. A constraint
+    the database has and the schema does not is deliberately **not** reported:
+    it can only reject writes the schema never promised, and reporting it would
+    turn "someone added the protection by hand" into a red gate.
+  - Both kinds answer `false` from `SchemaDrift.breaksReads()` — a write
+    constraint does not break reads — so `DriftStrictness.read_breaking_only`
+    never fails a deploy over them. Only `.any` does.
+
+- **`sql_schema.getExistingForeignKeys` / `freeExistingForeignKeys` /
+  `ExistingForeignKey`** — foreign-key introspection for all three dialects,
+  from structured catalogs rather than parsed DDL: PostgreSQL
+  `pg_constraint` + `pg_attribute` (`conkey`/`confkey` paired positionally
+  through `generate_subscripts`, so composite keys are exact and
+  `constraint_column_usage`'s cartesian product is avoided), MySQL/MariaDB
+  `information_schema.key_column_usage` (`referenced_table_name IS NOT NULL`),
+  and SQLite `PRAGMA foreign_key_list` — which takes the same table-name guard
+  as the existing pragmas and has the same caveat: it returns an **empty set**
+  for a table that does not exist, so the caller establishes existence first.
+  `ExistingForeignKey.ref_columns_comparable` is `false` for SQLite's
+  `REFERENCES t` short form, where the target columns are not stated; an
+  unreadable target column list is treated as *not* a difference, so it cannot
+  produce a false drift.
+
 ## [0.59.0] - 2026-09-15
 
 ### Added
