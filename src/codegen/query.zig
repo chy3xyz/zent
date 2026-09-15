@@ -866,7 +866,35 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// `deinitEntity(infos, info, &item, allocator)` before `result.deinit()`.
         /// Contrast with `paged()`, which returns a `PagedResult` whose rows
         /// live at `result.items.items` and whose `deinit()` frees the entities.
+        ///
+        /// For a page whose whole lifetime is one arena, use `AllIn`.
         pub fn All(self: *Self) QueryError!std.array_list.Managed(Entity) {
+            return std.array_list.Managed(Entity).fromOwnedSlice(
+                self.allocator,
+                try self.readAll(self.allocator),
+            );
+        }
+
+        /// `All`, with every byte the page owns coming from `arena`: the row
+        /// slice, every `[]const u8` / slice field, every JSON payload (its
+        /// per-entity arena is a child of `arena`), and every eager-loaded
+        /// edge. Nothing needs freeing — `arena.deinit()` is the release, and
+        /// the rows must **not** be passed to `deinitRows`/`deinitEntity`,
+        /// which would free them into the wrong allocator.
+        ///
+        /// Use it when the request itself owns a `std.heap.ArenaAllocator`
+        /// (HTTP handlers, one-shot reports): the whole page disappears with
+        /// the request, instead of a per-entity teardown the caller has to
+        /// remember. `All`'s caller-owned contract is unchanged.
+        pub fn AllIn(self: *Self, arena: *std.heap.ArenaAllocator) QueryError![]Entity {
+            return self.readAll(arena.allocator());
+        }
+
+        /// Shared implementation of `All` / `AllIn`. `alloc` is the *scan*
+        /// allocator — the one that owns the rows — as distinct from
+        /// `self.allocator`, which still owns the SQL text and the argument
+        /// list released by `q.deinit()` below.
+        fn readAll(self: *Self, alloc: std.mem.Allocator) QueryError![]Entity {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -877,18 +905,18 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
             defer rows.deinit();
 
-            var result = std.array_list.Managed(Entity).init(self.allocator);
+            var result = std.array_list.Managed(Entity).init(alloc);
             errdefer {
-                for (result.items) |*e| deinitEntity(infos, info, e, self.allocator);
+                for (result.items) |*e| deinitEntity(infos, info, e, alloc);
                 result.deinit();
             }
 
             while (rows.next()) |row| {
                 var entity = if (self.select_cols != null)
-                    try scanEntityNamed(info, Entity, self.allocator, row)
+                    try scanEntityNamed(info, Entity, alloc, row)
                 else
-                    try scanEntity(info, Entity, self.allocator, row);
-                errdefer deinitEntity(infos, info, &entity, self.allocator);
+                    try scanEntity(info, Entity, alloc, row);
+                errdefer deinitEntity(infos, info, &entity, alloc);
                 try result.append(entity);
             }
             if (rows.nextError()) |e| return e;
@@ -905,9 +933,12 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
 
             for (self.with_edges.items) |we| {
-                try self.loadEdges(we.path, result.items);
+                try self.loadEdges(alloc, we.path, result.items);
             }
-            return result;
+            // The backing slice is handed back as-is: with the caller's
+            // allocator the page still owns it (`deinitRows` frees it), with
+            // an arena the arena does.
+            return try result.toOwnedSlice();
         }
 
         /// Execute the query and return a streaming iterator that yields entities
@@ -945,6 +976,22 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn First(self: *Self) QueryError!?Entity {
+            return self.readFirst(self.allocator);
+        }
+
+        /// `First`, with the entity owned by `arena` instead of the builder's
+        /// allocator: every string/slice field, its JSON payload and its
+        /// eager-loaded edges come from `arena`, so `arena.deinit()` is the
+        /// release and `deinitEntity` must not be called on the result.
+        ///
+        /// Returns `null` when nothing matches; the arena is untouched then.
+        pub fn FirstIn(self: *Self, arena: *std.heap.ArenaAllocator) QueryError!?Entity {
+            return self.readFirst(arena.allocator());
+        }
+
+        /// Shared implementation of `First` / `FirstIn`; `alloc` owns the
+        /// returned entity (see `readAll`).
+        fn readFirst(self: *Self, alloc: std.mem.Allocator) QueryError!?Entity {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -961,10 +1008,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 return null;
             };
             var entity = if (self.select_cols != null)
-                try scanEntityNamed(info, Entity, self.allocator, row)
+                try scanEntityNamed(info, Entity, alloc, row)
             else
-                try scanEntity(info, Entity, self.allocator, row);
-            errdefer deinitEntity(infos, info, &entity, self.allocator);
+                try scanEntity(info, Entity, alloc, row);
+            errdefer deinitEntity(infos, info, &entity, alloc);
 
             const duration_us: u64 = nowUs() - start;
             if (self.logger.onQuery) |log| {
@@ -979,7 +1026,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |we| {
-                try self.loadEdges(we.path, &entities_arr);
+                try self.loadEdges(alloc, we.path, &entities_arr);
             }
             return entities_arr[0];
         }
@@ -1020,7 +1067,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
             var entities_arr = [_]Entity{entity};
             for (self.with_edges.items) |we| {
-                try self.loadEdges(we.path, &entities_arr);
+                try self.loadEdges(self.allocator, we.path, &entities_arr);
             }
             return entities_arr[0];
         }
@@ -1386,12 +1433,17 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return result;
         }
 
-        fn loadEdges(self: *Self, edge_path: []const u8, entities: []Entity) !void {
+        /// Eager-load `edge_path` for `entities`. `alloc` owns every byte the
+        /// loaded edges keep: the slice written back into each parent, the
+        /// neighbour rows' strings, and their JSON arenas. It is
+        /// `self.allocator` for `All`/`First`/`Only`, and the caller's arena
+        /// for `AllIn`/`FirstIn`.
+        fn loadEdges(self: *Self, alloc: std.mem.Allocator, edge_path: []const u8, entities: []Entity) !void {
             if (entities.len == 0) return;
-            const ptrs = try self.allocator.alloc(*Entity, entities.len);
-            defer self.allocator.free(ptrs);
+            const ptrs = try alloc.alloc(*Entity, entities.len);
+            defer alloc.free(ptrs);
             for (entities, 0..) |*e, i| ptrs[i] = e;
-            return loadEdgePath(infos, info, Entity, self.allocator, self.driver, self.execution_context, ptrs, edge_path, self.privacy_ctx, self.interceptors, self.with_trashed);
+            return loadEdgePath(infos, info, Entity, alloc, self.driver, self.execution_context, ptrs, edge_path, self.privacy_ctx, self.interceptors, self.with_trashed);
         }
 
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {

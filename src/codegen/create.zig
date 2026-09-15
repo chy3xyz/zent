@@ -191,25 +191,37 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         }
 
         pub fn Save(self: *Self) SaveError!Entity {
-            return self.saveInternal(false, false, null);
+            return self.saveInternal(false, false, null, self.allocator);
+        }
+
+        /// `Save`, with the returned entity owned by `arena`: its string /
+        /// slice fields and its JSON payload (parsed into an arena that is a
+        /// child of `arena`) all come from there, so `arena.deinit()` is the
+        /// release. The entity must **not** be passed to `deinitEntity` /
+        /// `deinitRow` afterwards.
+        ///
+        /// The complement of `AllIn`: a handler that owns one arena can
+        /// create and read through it without tracking anything per row.
+        pub fn SaveIn(self: *Self, arena: *std.heap.ArenaAllocator) SaveError!Entity {
+            return self.saveInternal(false, false, null, arena.allocator());
         }
 
         pub fn SaveOrUpdate(self: *Self) SaveError!Entity {
-            return self.saveInternal(true, false, null);
+            return self.saveInternal(true, false, null, self.allocator);
         }
 
         /// Insert the row, silently ignoring unique-key conflicts.
         /// MySQL → INSERT IGNORE, PostgreSQL → ON CONFLICT DO NOTHING,
         /// SQLite → INSERT OR IGNORE.
         pub fn SaveIgnore(self: *Self) SaveError!Entity {
-            return self.saveInternal(false, true, null);
+            return self.saveInternal(false, true, null, self.allocator);
         }
 
         /// Upsert using the given columns as the conflict target instead of
         /// the primary key. Requires a matching UNIQUE index on those columns.
         pub fn SaveOrUpdateOn(self: *Self, conflict_columns: []const []const u8) SaveError!Entity {
             self.upsert_conflict_columns = conflict_columns;
-            return self.saveInternal(true, false, conflict_columns);
+            return self.saveInternal(true, false, conflict_columns, self.allocator);
         }
 
         /// Upsert with a custom conflict target AND per-column SET
@@ -219,10 +231,16 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         pub fn SaveOrUpdateOnWith(self: *Self, conflict_columns: []const []const u8, update_exprs: []const UpsertSetExpr) SaveError!Entity {
             self.upsert_conflict_columns = conflict_columns;
             self.upsert_set_exprs = update_exprs;
-            return self.saveInternal(true, false, conflict_columns);
+            return self.saveInternal(true, false, conflict_columns, self.allocator);
         }
 
-        fn saveInternal(self: *Self, comptime or_replace: bool, comptime ignore_conflicts: bool, conflict_columns: ?[]const []const u8) SaveError!Entity {
+        /// `entity_alloc` owns the *returned entity* only — its owning fields
+        /// and its JSON arena. The statement itself (columns, args, SQL text,
+        /// builders) stays on `self.allocator`, which is what the `defer`s in
+        /// here free; handing those to an arena would just strand them until
+        /// the arena dies. `Save` passes `self.allocator` (unchanged
+        /// behaviour), `SaveIn` passes the caller's arena.
+        fn saveInternal(self: *Self, comptime or_replace: bool, comptime ignore_conflicts: bool, conflict_columns: ?[]const []const u8, entity_alloc: std.mem.Allocator) SaveError!Entity {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .create;
@@ -352,7 +370,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                         @field(entity, info.pk_field) = @intCast(row.getInt(0) orelse return error.TypeMismatch);
                     } else {
                         // Textual primary key (uuid): RETURNING gives the value back.
-                        @field(entity, info.pk_field) = try self.allocator.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
+                        @field(entity, info.pk_field) = try entity_alloc.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
                     }
                 } else {
                     // For ignore mode a missing RETURNING row means the row
@@ -417,7 +435,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     // the caller-provided id from the values.
                     for (self.values.items) |fv| {
                         if (std.mem.eql(u8, fv.name, info.pk_field) and fv.value == .string) {
-                            @field(entity, info.pk_field) = try self.allocator.dupe(u8, fv.value.string);
+                            @field(entity, info.pk_field) = try entity_alloc.dupe(u8, fv.value.string);
                         }
                     }
                 }
@@ -446,7 +464,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // Fill other fields from mutation values
             for (self.values.items) |fv| {
                 if (std.mem.eql(u8, fv.name, info.pk_field)) continue;
-                try setEntityField(&entity, fv.name, fv.value, self.allocator);
+                try setEntityField(&entity, fv.name, fv.value, entity_alloc);
             }
 
             // Insert M2M junction table rows (or edge schema rows)
