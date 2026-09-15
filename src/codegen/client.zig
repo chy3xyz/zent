@@ -351,9 +351,21 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
 
         /// Transfer ownership of the collected event payloads to the caller
         /// (caller frees each entry and the slice). Valid after commit.
+        ///
+        /// If the hand-over allocation fails, the queue is **left intact**
+        /// instead of being dropped: an empty slice must not mean "there was
+        /// nothing to hand over" when there was, and the caller keeps the
+        /// option of asking again (`TxClient.deinit` frees what is left). The
+        /// returned slice is `[]` in that case, and a `warn` names the count
+        /// and the allocator error. Propagating the failure would need a
+        /// breaking signature change (`[][]u8` → `error{OutOfMemory}!…`), so
+        /// it is deliberately reported rather than returned.
         pub fn takePendingEvents(self: *@This()) [][]u8 {
             const alloc = self.client.allocator;
-            const out = alloc.dupe([]u8, self.events.items) catch return &.{};
+            const out = alloc.dupe([]u8, self.events.items) catch |err| {
+                std.log.warn("zent: takePendingEvents could not hand over {d} pending transaction event(s) ({s}); they stay queued on the TxClient", .{ self.events.items.len, @errorName(err) });
+                return &.{};
+            };
             self.events.deinit(alloc);
             self.events = .empty;
             return out;
@@ -1497,6 +1509,52 @@ test "TxClient enqueueEvent collects transaction-scoped events" {
     for (Ctx.handled) |p| allocator.free(p);
     allocator.free(Ctx.handled);
     Ctx.handled = &.{};
+}
+
+test "TxClient takePendingEvents leaves the queue intact when the hand-over allocation fails" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Item = Schema("Item4b", .{
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    // Everything up to the failure runs on an allocator that never fails;
+    // the failure is armed for the single `dupe` in `takePendingEvents`.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = makeClient(infos, allocator, driver.asDriver());
+
+    var tx = try beginTx(infos, root);
+    defer tx.deinit();
+    try tx.enqueueEvent("{\"type\":\"order.created\"}");
+    try tx.enqueueEvent("{\"type\":\"stock.updated\"}");
+
+    // The returned slice cannot carry the reason (the signature is `[][]u8`;
+    // see the doc comment), so what this pins is the *invariant* behind the
+    // warn: an empty slice from a failed hand-over must not consume the
+    // queue — the payloads stay retrievable and are freed by `deinit`, so a
+    // failed hand-over neither loses nor leaks them.
+    failing.fail_index = failing.alloc_index;
+    const dropped = tx.takePendingEvents();
+    try std.testing.expectEqual(@as(usize, 0), dropped.len);
+    try std.testing.expectEqual(@as(usize, 2), tx.events.items.len);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const retried = tx.takePendingEvents();
+    try std.testing.expectEqual(@as(usize, 2), retried.len);
+    try std.testing.expectEqualStrings("{\"type\":\"order.created\"}", retried[0]);
+    try std.testing.expectEqualStrings("{\"type\":\"stock.updated\"}", retried[1]);
+    for (retried) |p| std.testing.allocator.free(p);
+    std.testing.allocator.free(retried);
 }
 
 test "interceptor stays effective after a by-value Client copy" {

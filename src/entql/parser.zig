@@ -279,25 +279,49 @@ const ParserContext = struct {
 
 /// Parse a full EntQL expression and return the resulting Predicate.
 /// The returned Predicate owns its data (allocated with `allocator`).
+///
+/// The **whole** input must be consumed. The parser is a prefix parser: it
+/// stops at the first token that cannot continue the expression under
+/// construction, so without this check `name = "a" zzz` and `age > 1 age < 5`
+/// come back as a tree for the part it understood, and the caller cannot tell
+/// that apart from a full parse — the query then runs with fewer conditions
+/// than was written. Trailing whitespace is not a problem: the lexer skips it
+/// before the end-of-input check.
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !sql.Predicate {
     var ctx = try ParserContext.init(allocator, input);
-    return try parseExpr(&ctx);
+    var parsed = try parseExpr(&ctx);
+    if (ctx.peek() != .eof) {
+        // The tree is complete but the input is not; hand back nothing and
+        // release everything the successful part allocated.
+        deinitPred(allocator, &parsed);
+        return ParseError.UnexpectedToken;
+    }
+    return parsed;
 }
 
 fn parseExpr(ctx: *ParserContext) ParseError!sql.Predicate {
     return try parseOr(ctx);
 }
 
+// A parse that fails halfway must not leave the tree it already built
+// allocated: the caller only ever sees the error, so everything below is
+// unreachable afterwards. Each `errdefer` covers one partially built node;
+// `deinitPred` releases the subtree and the IN lists / LIKE patterns inside
+// it, and a node already handed to its parent is reached through that parent
+// instead (so nothing is released twice).
 fn parseOr(ctx: *ParserContext) ParseError!sql.Predicate {
     var left = try parseAnd(ctx);
+    errdefer deinitPred(ctx.allocator, &left);
     while (true) {
         const tok = ctx.peek();
         switch (tok) {
             .kw_or => {
                 _ = try ctx.next(); // consume OR
                 const right = try parseAnd(ctx);
+                errdefer deinitPred(ctx.allocator, &right);
                 // Allocate left on heap for the Or predicate
                 const left_ptr = try ctx.allocator.create(sql.Predicate);
+                errdefer ctx.allocator.destroy(left_ptr);
                 left_ptr.* = left;
                 const right_ptr = try ctx.allocator.create(sql.Predicate);
                 right_ptr.* = right;
@@ -311,13 +335,16 @@ fn parseOr(ctx: *ParserContext) ParseError!sql.Predicate {
 
 fn parseAnd(ctx: *ParserContext) ParseError!sql.Predicate {
     var left = try parseNot(ctx);
+    errdefer deinitPred(ctx.allocator, &left);
     while (true) {
         const tok = ctx.peek();
         switch (tok) {
             .kw_and => {
                 _ = try ctx.next(); // consume AND
                 const right = try parseNot(ctx);
+                errdefer deinitPred(ctx.allocator, &right);
                 const left_ptr = try ctx.allocator.create(sql.Predicate);
+                errdefer ctx.allocator.destroy(left_ptr);
                 left_ptr.* = left;
                 const right_ptr = try ctx.allocator.create(sql.Predicate);
                 right_ptr.* = right;
@@ -335,6 +362,7 @@ fn parseNot(ctx: *ParserContext) ParseError!sql.Predicate {
         .kw_not => {
             _ = try ctx.next(); // consume NOT
             const inner = try parseNot(ctx);
+            errdefer deinitPred(ctx.allocator, &inner);
             const inner_ptr = try ctx.allocator.create(sql.Predicate);
             inner_ptr.* = inner;
             return sql.Predicate{ .not_ = inner_ptr };
@@ -349,6 +377,7 @@ fn parsePrimary(ctx: *ParserContext) ParseError!sql.Predicate {
         .lparen => {
             _ = try ctx.next(); // consume (
             const inner = try parseExpr(ctx);
+            errdefer deinitPred(ctx.allocator, &inner);
             const close = ctx.peek();
             switch (close) {
                 .rparen => {
@@ -379,10 +408,15 @@ fn parseHasEdge(ctx: *ParserContext, is_not: bool) ParseError!sql.Predicate {
     if (edge_name.len == 0) return ParseError.ExpectedIdentifier;
 
     var nested: ?*const sql.Predicate = null;
+    errdefer if (nested) |n| {
+        deinitPred(ctx.allocator, n);
+        ctx.allocator.destroy(@constCast(n));
+    };
     if (ctx.peek() == .comma) {
         if (is_not) return ParseError.ExpectedRParen; // not_has takes no predicate
         _ = try ctx.next(); // consume ,
         const inner = try parseExpr(ctx);
+        errdefer deinitPred(ctx.allocator, &inner);
         const p = try ctx.allocator.create(sql.Predicate);
         p.* = inner;
         nested = p;
@@ -437,6 +471,7 @@ fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
                 else => return ParseError.ExpectedLParen,
             }
             var values = std.array_list.Managed(sql.Value).init(ctx.allocator);
+            errdefer values.deinit();
             while (true) {
                 const val = try ctx.expectValue();
                 try values.append(val);
@@ -467,6 +502,7 @@ fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
                         else => return ParseError.ExpectedLParen,
                     }
                     var values = std.array_list.Managed(sql.Value).init(ctx.allocator);
+                    errdefer values.deinit();
                     while (true) {
                         const val = try ctx.expectValue();
                         try values.append(val);
@@ -859,4 +895,63 @@ test "EntQL: parseOrder terms" {
     try std.testing.expect(!orders[1].column.desc);
     try std.testing.expectEqualStrings("name", orders[2].column.name);
     try std.testing.expect(!orders[2].column.desc);
+}
+
+// The parser is a prefix parser: it stops at the first token it cannot
+// continue with. Everything after that token used to be dropped silently, so
+// `WhereEntQL("age > 1 age < 5")` filtered on `age > 1` alone — a query with
+// fewer conditions than was written, indistinguishable from a full parse.
+test "EntQL: input the parser does not consume entirely is rejected" {
+    const allocator = std.testing.allocator;
+
+    const rejected = [_][]const u8{
+        "name = \"alice\" zzz",
+        "age > 1 age < 5",
+        "age > 1, name = \"b\"",
+        "name = \"alice\" )",
+        "status IN (\"a\", \"b\") junk",
+        "has(cars) trailing",
+        "not_has(cars) x",
+        "(name = \"a\") (name = \"b\")",
+    };
+    for (rejected) |input| {
+        try std.testing.expectError(ParseError.UnexpectedToken, parse(allocator, input));
+    }
+
+    // Controls: a complete expression still parses, trailing whitespace
+    // included, and the prefix that used to be accepted alone still is.
+    const accepted = [_][]const u8{
+        "name = \"alice\"",
+        "name = \"alice\"   ",
+        "\t age > 1  AND ( name = \"a\" OR name = \"b\" ) \n",
+        "status IN (\"a\", \"b\")",
+    };
+    for (accepted) |input| {
+        const pred = try parse(allocator, input);
+        deinitPred(allocator, &pred);
+    }
+}
+
+// A rejected expression must release what it built before failing. The
+// testing allocator turns a leak into a test failure, so these assertions
+// cover the cleanup as well as the error: the IN lists (heap `values`) and
+// the `CONTAINS` pattern are the allocations a half-built tree holds.
+test "EntQL: a rejected expression frees the tree it built" {
+    const allocator = std.testing.allocator;
+
+    // Fails while parsing the right operand of OR/AND — the left operand is a
+    // complete tree by then (an IN list in the second case).
+    try std.testing.expectError(error.ExpectedExpression, parse(allocator, "a IN (1, 2) OR"));
+    try std.testing.expectError(error.ExpectedExpression, parse(allocator, "name CONTAINS 'x' AND"));
+    try std.testing.expectError(error.ExpectedExpression, parse(allocator, "a = 1 AND b = 2 OR"));
+    try std.testing.expectError(error.ExpectedExpression, parse(allocator, "NOT (a IN (1, 2)) AND"));
+
+    // Fails on the closing paren of a nested `has(…)` predicate.
+    try std.testing.expectError(error.ExpectedRParen, parse(allocator, "has(cars, price > 5"));
+    try std.testing.expectError(error.ExpectedRParen, parse(allocator, "has(cars, price IN (1, 2)"));
+
+    // Fails on the end-of-input check with a complete tree in hand, which is
+    // the path added with that check.
+    try std.testing.expectError(error.UnexpectedToken, parse(allocator, "a IN (1, 2) zzz"));
+    try std.testing.expectError(error.UnexpectedToken, parse(allocator, "name CONTAINS 'x' zzz"));
 }
