@@ -13,6 +13,13 @@ pub const Error = error{
     OutOfMemory,
     /// The pool has no idle connections and has reached its maximum size.
     PoolExhausted,
+    /// The caller's own budget for waiting on a pool connection ran out while
+    /// the pool was at its ceiling with everything lent out. Distinct from
+    /// `PoolExhausted`, which is reported without waiting: "the pool is too
+    /// small" and "I gave up after my budget" call for different answers (a
+    /// bigger pool vs. a cheaper request), and a request-scoped deadline must
+    /// not be reported as the global capacity answer.
+    PoolWaitTimeout,
     /// The pool has been shut down and cannot serve new requests.
     PoolClosed,
     ConnectionFailed,
@@ -85,9 +92,11 @@ pub fn classify(err: anyerror) Class {
         // Capacity: nothing to do with the statement.
         error.ConnectionFailed,
         // `PingFailed` means a connection was lost; `PoolExhausted`/`PoolClosed`
-        // mean the pool has nothing to give. All answer 503, not 500.
+        // mean the pool has nothing to give, and `PoolWaitTimeout` means it had
+        // nothing to give within the caller's budget. All answer 503, not 500.
         error.PingFailed,
         error.PoolExhausted,
+        error.PoolWaitTimeout,
         error.PoolClosed,
         error.OutOfMemory,
         error.QueryTimeout,
@@ -136,6 +145,7 @@ fn isRetryableAny(err: anyerror) bool {
         error.ConnectionFailed,
         error.PingFailed,
         error.PoolExhausted,
+        error.PoolWaitTimeout,
         error.PoolClosed,
         => true,
         else => false,
@@ -390,6 +400,16 @@ pub const Driver = struct {
         exec: *const fn (ptr: *anyopaque, ctx: ?*const ExecutionContext, query: []const u8, args: []const Value) Error!Result,
         query: *const fn (ptr: *anyopaque, ctx: ?*const ExecutionContext, query: []const u8, args: []const Value) Error!Rows,
         beginTx: *const fn (ptr: *anyopaque) Error!Tx,
+        /// Optional deadline-carrying variant of `beginTx`.
+        ///
+        /// Acquiring a transaction is not free: behind a pool it waits for a
+        /// connection, and that wait is where a request-scoped budget belongs
+        /// (a fiber per request cannot spend its whole budget queued behind one
+        /// saturated pool). A driver that has nothing to bound leaves this null
+        /// and `Driver.beginTxCtx` falls back to `beginTx`; there is no way to
+        /// report that the deadline was ignored, so a driver that keeps it null
+        /// is saying its `beginTx` never blocks.
+        beginTxCtx: ?*const fn (ptr: *anyopaque, ctx: ?*const ExecutionContext) Error!Tx = null,
         close: *const fn (ptr: *anyopaque) void,
         dialect: *const fn (ptr: *anyopaque) Dialect,
         ping: *const fn (ptr: *anyopaque) Error!void,
@@ -422,6 +442,15 @@ pub const Driver = struct {
     }
 
     pub fn beginTx(self: Driver) !Tx {
+        return self.vtable.beginTx(self.ptr);
+    }
+
+    /// `beginTx` with a deadline the driver may use to bound acquiring the
+    /// transaction (a pooled driver bounds its wait for a connection with it).
+    /// Falls back to `beginTx` when the driver does not implement the
+    /// ctx-carrying entry point.
+    pub fn beginTxCtx(self: Driver, ctx: ?*const ExecutionContext) !Tx {
+        if (self.vtable.beginTxCtx) |f| return f(self.ptr, ctx);
         return self.vtable.beginTx(self.ptr);
     }
 
@@ -524,6 +553,7 @@ pub fn retryTx(d: Driver, ctx: anytype, body: anytype, opts: RetryOpts) anyerror
 
 const MockTxState = struct {
     begin_calls: u32 = 0,
+    begin_ctx_calls: u32 = 0,
     commit_calls: u32 = 0,
     rollback_calls: u32 = 0,
     deinit_calls: u32 = 0,
@@ -594,6 +624,50 @@ const mock_vtable = Driver.VTable{
     }.f,
 };
 
+/// Same mock, but with the optional ctx-carrying `beginTx` hook filled in.
+const mock_ctx_vtable: Driver.VTable = blk: {
+    var v = mock_vtable;
+    v.beginTxCtx = struct {
+        fn f(ptr: *anyopaque, ctx: ?*const ExecutionContext) Error!Tx {
+            // The deadline has to arrive, not just be accepted: a hook that
+            // ignores its ctx would silently disable every request budget.
+            if (ctx == null or ctx.?.deadline_ns == null) return error.TxFailed;
+            const s: *MockTxState = @ptrCast(@alignCast(ptr));
+            s.begin_ctx_calls += 1;
+            return Tx{
+                .inner = .{ .ptr = ptr, .vtable = &mock_ctx_vtable },
+                .commitFn = mockCommit,
+                .rollbackFn = mockRollback,
+                .deinitFn = mockTxDeinit,
+                .ptr = ptr,
+            };
+        }
+    }.f;
+    break :blk v;
+};
+
+test "beginTxCtx falls back to beginTx, and forwards ctx when a driver has a hook" {
+    const ctx = ExecutionContext{ .deadline_ns = monotonicNs() + std.time.ns_per_s };
+
+    // A driver that keeps the optional hook null (every in-tree driver except
+    // the pool) must still open a transaction.
+    var plain_state = MockTxState{};
+    const plain = Driver{ .ptr = &plain_state, .vtable = &mock_vtable };
+    const plain_tx = try plain.beginTxCtx(&ctx);
+    plain_tx.deinit();
+    try std.testing.expectEqual(@as(u32, 1), plain_state.begin_calls);
+    try std.testing.expectEqual(@as(u32, 0), plain_state.begin_ctx_calls);
+
+    // With the hook present the deadline travels with the call.
+    var ctx_state = MockTxState{};
+    const carrying = Driver{ .ptr = &ctx_state, .vtable = &mock_ctx_vtable };
+    const ctx_tx = try carrying.beginTxCtx(&ctx);
+    ctx_tx.deinit();
+    try std.testing.expectEqual(@as(u32, 0), ctx_state.begin_calls);
+    try std.testing.expectEqual(@as(u32, 1), ctx_state.begin_ctx_calls);
+    try std.testing.expectEqual(@as(u32, 1), ctx_state.deinit_calls);
+}
+
 test "isRetryable classifies transient errors" {
     try std.testing.expect(isRetryable(error.DeadlockDetected));
     try std.testing.expect(isRetryable(error.SerializationFailure));
@@ -606,12 +680,16 @@ test "isRetryable classifies transient errors" {
     // The pool's own errors are capacity, and retrying is the right answer to
     // them (the report's consumers had no way to ask this).
     try std.testing.expect(isRetryable(error.PoolExhausted));
+    try std.testing.expect(isRetryable(error.PoolWaitTimeout));
     try std.testing.expect(isRetryable(error.PoolClosed));
     try std.testing.expect(isRetryable(error.PingFailed));
     try std.testing.expect(isRetryable(error.TxFailed));
     // `classify` answers the 503-vs-500 question, which is a different one:
     // `OutOfMemory` is capacity for a status code without being retryable.
     try std.testing.expectEqual(Class.capacity, classify(error.PoolExhausted));
+    // A budget that ran out is capacity, not a bug: the request is worth
+    // retrying, the same way a saturated pool is.
+    try std.testing.expectEqual(Class.capacity, classify(error.PoolWaitTimeout));
     try std.testing.expectEqual(Class.capacity, classify(error.ConnectionFailed));
     try std.testing.expectEqual(Class.capacity, classify(error.OutOfMemory));
     try std.testing.expectEqual(Class.transient, classify(error.DeadlockDetected));

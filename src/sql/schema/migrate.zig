@@ -1118,6 +1118,7 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
                 error.UnsupportedDialect => unreachable, // The dialect was checked immediately above.
                 error.OutOfMemory => return error.OutOfMemory,
                 error.PoolExhausted => return error.PoolExhausted,
+                error.PoolWaitTimeout => return error.PoolWaitTimeout,
                 error.PoolClosed => return error.PoolClosed,
                 error.ConnectionFailed => return error.ConnectionFailed,
                 error.ExecFailed => return error.ExecFailed,
