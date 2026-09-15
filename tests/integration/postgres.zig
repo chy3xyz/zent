@@ -3093,3 +3093,91 @@ test "Postgres: createAllTables keeps a UUID primary key typed as UUID" {
     defer zent.codegen.deinitEntity(infos, doc_info, &saved, allocator);
     try testing.expectEqualStrings("01920000-0000-7000-8000-0000000000f1", saved.id);
 }
+
+test "Postgres: the caller's arena is the only release for AllIn/FirstIn/SaveIn/queryRowsIn" {
+    // PostgreSQL counterpart of the SQLite case: one arena owns the page — the
+    // row slice, the strings, the JSONB payload and the eager-loaded edge —
+    // so `arena.deinit()` is the entire teardown. The ownership assertion is
+    // the leak check at the end of the test: `std.testing.allocator` backs
+    // both the client and the arena, so a byte the arena claims but that the
+    // client allocator actually allocated is reported as a leak.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const Settings = struct { theme: []const u8 };
+
+    const ArenaChildBase = schema("PgArenaChildRow", .{
+        .fields = &.{ field.Int("parent_id"), field.String("name") },
+    });
+    const ArenaParentBase = schema("PgArenaParentRow", .{
+        .fields = &.{ field.String("name"), field.JSON("settings", Settings) },
+        .edges = &.{edge.To("children", ArenaChildBase).Field("parent_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ ArenaParentBase, ArenaChildBase });
+    const infos = graph.types;
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_arena_child_row CASCADE", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_arena_parent_row CASCADE", &.{});
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_arena_child_row CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_arena_parent_row CASCADE", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var parent_id: i64 = 0;
+    {
+        var b = try client.pg_arena_parent_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "parent");
+        _ = try b.setFieldValue("settings", Settings{ .theme = "dark" });
+        const e = try b.SaveIn(&arena);
+        try testing.expectEqualStrings("parent", e.name);
+        try testing.expectEqualStrings("dark", e.settings.theme);
+        parent_id = e.id;
+    }
+    {
+        var b = try client.pg_arena_child_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", parent_id);
+        _ = try b.setFieldValue("name", "child");
+        const e = try b.SaveIn(&arena);
+        try testing.expectEqualStrings("child", e.name);
+    }
+
+    {
+        var q = client.pg_arena_parent_row.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("children");
+        const page = try q.AllIn(&arena);
+        try testing.expectEqual(@as(usize, 1), page.len);
+        try testing.expectEqualStrings("parent", page[0].name);
+        try testing.expectEqualStrings("dark", page[0].settings.theme);
+        const children = page[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 1), children.len);
+        try testing.expectEqualStrings("child", children[0].name);
+    }
+
+    {
+        var q = client.pg_arena_child_row.Query();
+        defer q.deinit();
+        const one = try q.FirstIn(&arena);
+        try testing.expect(one != null);
+        try testing.expectEqualStrings("child", one.?.name);
+    }
+
+    {
+        const Row = struct { id: i64, name: []const u8 };
+        const rows = try zent.crud_helpers.queryRowsIn(Row, drv.asDriver(), "SELECT id, name FROM pg_arena_parent_row ORDER BY id", &.{}, &arena, struct {
+            fn f(a: std.mem.Allocator, row: zent.sql_driver.Row) !Row {
+                return .{ .id = row.getInt(0) orelse 0, .name = try a.dupe(u8, row.getText(1) orelse "") };
+            }
+        }.f);
+        try testing.expectEqual(@as(usize, 1), rows.len);
+        try testing.expectEqualStrings("parent", rows[0].name);
+    }
+}

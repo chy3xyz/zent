@@ -5,6 +5,19 @@ const Rows = driver_mod.Rows;
 const Driver = driver_mod.Driver;
 const Value = @import("value.zig").Value;
 
+/// Parse options for every JSON column this file scans.
+///
+/// `.alloc_always`, not the `.alloc_if_needed` default. The default leaves a
+/// JSON string that needs no unescaping as a slice of the input text, and the
+/// input text here is the driver's column buffer — memory the statement owns
+/// and frees at `rows.deinit()`. The scanned value outlives the rows, so those
+/// strings used to dangle and be silently overwritten by the next statement on
+/// the same connection (found via `{"theme":"dark"}` reading back as bytes of
+/// a later query's SQL text). Allocating unconditionally is what makes the
+/// ownership statements around this file true: whoever the value was parsed
+/// with owns every string in it.
+const json_parse_options: std.json.ParseOptions = .{ .allocate = .alloc_always };
+
 /// Scan a database row into a value of type T.
 /// Supports primitives, optional primitives, and structs.
 /// String slices are duplicated using the provided allocator.
@@ -538,7 +551,7 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
             // back to the caller's allocator, so those strings stay
             // caller-owned (unfreed by deinitEntity).
             const a = if (json_arena) |arena| arena.allocator() else allocator;
-            return std.json.parseFromSliceLeaky(T, a, text, .{}) catch return error.TypeMismatch;
+            return std.json.parseFromSliceLeaky(T, a, text, json_parse_options) catch return error.TypeMismatch;
         },
         .@"union" => {
             // Only std.json.Value (field.JSONValue) is supported as an
@@ -547,7 +560,7 @@ fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: u
                 @compileError("Unsupported union type for scanning: " ++ @typeName(T));
             const text = row.getText(index) orelse return error.TypeMismatch;
             const a = if (json_arena) |arena| arena.allocator() else allocator;
-            return std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return error.TypeMismatch;
+            return std.json.parseFromSliceLeaky(std.json.Value, a, text, json_parse_options) catch return error.TypeMismatch;
         },
         .@"enum" => {
             if (row.getInt(index)) |v| {

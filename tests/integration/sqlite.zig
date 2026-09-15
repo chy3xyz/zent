@@ -4659,3 +4659,100 @@ test "SQLite: nested eager loading batches each level into one query" {
         try testing.expectEqualStrings(owner.name, notes[0].body);
     }
 }
+
+test "SQLite: the caller's arena is the only release for AllIn/FirstIn/SaveIn/queryRowsIn" {
+    // One arena owns the page: the row slice, every string field, the JSON
+    // payload and the eager-loaded edge. `arena.deinit()` is the whole
+    // teardown — no `deinitRows`, no per-entity `deinitEntity`. Which is why
+    // the assertions below are backed by the leak check rather than written
+    // as frees: `std.testing.allocator` is both the client's allocator and
+    // the arena's backing allocator, so a byte that landed on the client
+    // allocator while the arena claims to own it is reported as a leak when
+    // the test ends. Reading `page.items[0].name` only pins that the memory
+    // survived; the leak detector pins who owns it.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const Settings = struct { theme: []const u8 };
+
+    const ArenaChildBase = schema("ArenaChildRow", .{
+        .fields = &.{ field.Int("parent_id"), field.String("name") },
+    });
+    const ArenaParentBase = schema("ArenaParentRow", .{
+        .fields = &.{ field.String("name"), field.JSON("settings", Settings) },
+        .edges = &.{edge.To("children", ArenaChildBase).Field("parent_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ ArenaParentBase, ArenaChildBase });
+    const infos = graph.types;
+    try Client.createAllTables(testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // SaveIn: the created entity comes back arena-owned, so a handler that
+    // owns one arena can write and read through it without a second owner.
+    var parent_id: i64 = 0;
+    {
+        var b = try client.arena_parent_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "parent");
+        _ = try b.setFieldValue("settings", Settings{ .theme = "dark" });
+        const e = try b.SaveIn(&arena);
+        try testing.expectEqualStrings("parent", e.name);
+        try testing.expectEqualStrings("dark", e.settings.theme);
+        parent_id = e.id;
+    }
+    {
+        var b = try client.arena_child_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("parent_id", parent_id);
+        _ = try b.setFieldValue("name", "child");
+        const e = try b.SaveIn(&arena);
+        try testing.expectEqualStrings("child", e.name);
+    }
+
+    // AllIn with an eager-loaded edge: rows, strings, JSON and the edge slice
+    // all belong to `arena`. Deliberately no `deinitRows` — the arena is the
+    // release, and a second free here would be a double free.
+    {
+        var q = client.arena_parent_row.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("children");
+        const page = try q.AllIn(&arena);
+        try testing.expectEqual(@as(usize, 1), page.len);
+        try testing.expectEqualStrings("parent", page[0].name);
+        try testing.expectEqualStrings("dark", page[0].settings.theme);
+        try testing.expectEqual(1, page[0].id);
+        const children = page[0].edges.children.?;
+        try testing.expectEqual(@as(usize, 1), children.len);
+        try testing.expectEqualStrings("child", children[0].name);
+        try testing.expectEqual(parent_id, children[0].parent_id);
+    }
+
+    // FirstIn: the same contract for a single row.
+    {
+        var q = client.arena_child_row.Query();
+        defer q.deinit();
+        const one = try q.FirstIn(&arena);
+        try testing.expect(one != null);
+        try testing.expectEqualStrings("child", one.?.name);
+    }
+
+    // queryRowsIn: the bare-DTO path. `mapRow` is handed the arena's own
+    // allocator, so its dupes are owned by the arena too — the hand-written
+    // mapper that motivated this stops needing a `deinitXxx` of its own.
+    {
+        const Row = struct { id: i64, name: []const u8 };
+        const rows = try zent.crud_helpers.queryRowsIn(Row, drv.asDriver(), "SELECT id, name FROM arena_parent_row ORDER BY id", &.{}, &arena, struct {
+            fn f(a: std.mem.Allocator, row: zent.sql_driver.Row) !Row {
+                return .{ .id = row.getInt(0) orelse 0, .name = try a.dupe(u8, row.getText(1) orelse "") };
+            }
+        }.f);
+        try testing.expectEqual(@as(usize, 1), rows.len);
+        try testing.expectEqualStrings("parent", rows[0].name);
+    }
+}

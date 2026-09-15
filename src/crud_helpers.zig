@@ -211,6 +211,43 @@ pub fn queryRows(
     return .{ .items = try list.toOwnedSlice(), .allocator = allocator };
 }
 
+/// `queryRows` into the caller's arena. The row slice and everything
+/// `mapRow` hands back belong to `arena`: `mapRow` receives
+/// `arena.allocator()` as its allocator, so a `try a.dupe(u8, row.getText(n))`
+/// inside it lands in the arena like every other row value.
+///
+/// There is nothing to free — `arena.deinit()` is the release. In particular
+/// do **not** call `freeOwnedStrings` on the result, and do not hand it to a
+/// `deinitXxx` written for `Rows(T)`: both would free the arena's memory a
+/// second time.
+///
+/// Scope and error contract are those of `queryRows` — see its doc comment
+/// for why a raw statement needs `zent.scope` spliced in by the caller.
+/// ```zig
+/// const r = try zent.crud_helpers.queryRowsIn(ProductRow, driver, stmt, args, &arena,
+///     struct { fn f(a: std.mem.Allocator, row: sql_driver.Row) !ProductRow {
+///         return .{ .id = row.getInt(0) orelse 0, .name = try a.dupe(u8, row.getText(1) orelse "") };
+///     } }.f);
+/// // r is []ProductRow owned by `arena`; nothing to free.
+/// ```
+pub fn queryRowsIn(
+    comptime T: type,
+    driver: anytype,
+    sql: []const u8,
+    args: []const Value,
+    arena: *std.heap.ArenaAllocator,
+    comptime mapRow: anytype,
+) ![]T {
+    const allocator = arena.allocator();
+    var rows = try driver.query(sql, args);
+    defer rows.deinit();
+    var list = std.array_list.Managed(T).init(allocator);
+    while (rows.next()) |row| {
+        try list.append(try mapRow(allocator, row));
+    }
+    return try list.toOwnedSlice();
+}
+
 /// Delete (or soft-delete) rows matching `predicates`. Returns rows affected.
 pub fn delete(accessor: anytype, predicates: anytype) !usize {
     var del = accessor.Delete();
@@ -1029,6 +1066,56 @@ test "crud_helpers: queryRows collects mapped rows into owned Rows(T)" {
     try std.testing.expectEqual(@as(i64, 1), result.items[0].item_id);
     try std.testing.expectEqualStrings("a", result.items[0].name);
     try std.testing.expectEqualStrings("b", result.items[1].name);
+}
+
+test "crud_helpers: queryRowsIn hands the slice and the mapper's strings to the caller's arena" {
+    // The arena is the release: the row slice and everything `mapRow` dupes
+    // belong to it, so there is no `Rows(T).deinit()` to remember. The leak
+    // check is the assertion — `std.testing.allocator` backs the arena, so a
+    // string the mapper allocated outside it would be reported when the test
+    // ends, after `arena.deinit()` has already run.
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Item = Schema("Item", .{
+        .table_name = "zigshop_item",
+        .pk = "item_id",
+        .fields = &.{ field.Int("item_id"), field.String("name") },
+    });
+    const info = comptime fromSchema(Item);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    _ = try driver.exec("INSERT INTO zigshop_item (item_id, name) VALUES (1, 'a'), (2, 'b')", &.{});
+
+    const RowT = struct { item_id: i64, name: []const u8 };
+    const Mapper = struct {
+        var seen: ?std.mem.Allocator = null;
+
+        fn map(a: std.mem.Allocator, row: sql_driver.Row) !RowT {
+            seen = a;
+            return .{ .item_id = row.getInt(0) orelse 0, .name = try a.dupe(u8, row.getText(1) orelse "") };
+        }
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const rows = try queryRowsIn(RowT, driver, "SELECT item_id, name FROM zigshop_item ORDER BY item_id", &.{}, &arena, Mapper.map);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].item_id);
+    try std.testing.expectEqualStrings("a", rows[0].name);
+    try std.testing.expectEqualStrings("b", rows[1].name);
+    // The mapper was handed the arena's allocator — that is what makes the
+    // strings it duplicates arena-owned rather than merely "some allocator's".
+    try std.testing.expect(std.meta.eql(arena.allocator(), Mapper.seen.?));
 }
 
 test "crud_helpers: queryRows error mid-collection leaks no strings" {
