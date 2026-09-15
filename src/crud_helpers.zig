@@ -884,6 +884,26 @@ pub fn SaveOrUpdateResult(comptime Accessor: type) type {
 /// Checks if records matching `predicates` exist.
 /// If matched, performs `update(accessor, values, predicates)` returning `.updated = rows_affected`.
 /// If no match, performs `create(accessor, values)` returning `.created = entity`.
+///
+/// **Known limitation — the check and the write are two statements.** `exists`
+/// and `create` are separate round trips with nothing holding the key in
+/// between, so two writers can both read "no match" and both insert. What
+/// happens then is decided by the schema, not by this helper:
+///
+///   * a **unique index** over the predicate's columns turns the loser's
+///     insert into `error.UniqueViolation` — no duplicate row, but a caller
+///     that only meant "save this row" gets a conflict to handle;
+///   * **no unique index** leaves two rows sharing the business key. Nothing
+///     here can prevent it: `predicates` is an arbitrary predicate, so this
+///     helper cannot name a conflict target, and the atomic upsert
+///     (`CreateBuilder.SaveOrUpdateOn`) needs one.
+///
+/// With a unique business key, prefer the upsert
+/// (`client.<entity>.Create()` → `SaveOrUpdateOn(&.{ "key", "app_id" })`),
+/// which resolves the conflict inside the database. Without one, serialize
+/// the writers above this helper — a transaction holding the key, or an
+/// application-level lock. Re-checking after the insert would not fix it: the
+/// second writer's check can still land before the first writer's commit.
 pub fn saveOrUpdate(accessor: anytype, values: anytype, predicates: anytype) !SaveOrUpdateResult(@TypeOf(accessor)) {
     if (try exists(accessor, predicates)) {
         const n = try update(accessor, values, predicates);
@@ -934,6 +954,13 @@ pub fn updateWithVersion(
 
 /// Batch save or update a slice of struct items (`items`) matching a business key field `match_field`.
 /// For each item, checks if a matching record exists on `match_field`, updating if found or creating if new.
+///
+/// Per item this is `saveOrUpdate`, so it inherits that helper's
+/// exists-then-create window (see its doc comment): two writers racing on one
+/// `match_field` value both insert unless the field carries a unique index, in
+/// which case the loser gets a `UniqueViolation` instead of a duplicate row.
+/// The `created_count` / `updated_count` split is why the item-wise path is
+/// kept — an upsert cannot tell an insert from an update.
 pub fn batchSaveOrUpdate(
     accessor: anytype,
     items: anytype,

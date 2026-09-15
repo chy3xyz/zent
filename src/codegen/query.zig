@@ -963,7 +963,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     .sql = q.sql,
                     .args = q.args,
                     .duration_us = duration_us,
+                    // No row has been read yet — the iterator the caller gets
+                    // back has not run — so there is no count to report. `0`
+                    // here would read as "the query matched nothing".
                     .rows_affected = 0,
+                    .rows_affected_known = false,
                     .table_name = info.table_name,
                 });
             }
@@ -2045,6 +2049,105 @@ test "Query builder Explain prefixes SQL" {
     defer plan.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("EXPLAIN QUERY PLAN SELECT \"user\".\"id\", \"user\".\"name\", \"user\".\"age\" FROM \"user\"", plan.sql);
+}
+
+test "an unread streaming page reaches the log without a row count" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGenerator = @import("entity.zig").Entity;
+    const sql_logger = @import("../sql/logger.zig");
+
+    // What the logger saw lives at container level: the callbacks carry no
+    // user pointer (same shape as `client.zig`'s SqlSink).
+    const Seen = struct {
+        var calls: usize = 0;
+        var rows: usize = 0;
+        var known: bool = false;
+
+        fn onQuery(ctx: sql_logger.LogContext) void {
+            calls += 1;
+            rows = ctx.rows_affected;
+            known = ctx.rows_affected_known;
+        }
+    };
+
+    const EmptyRows = struct {
+        fn next(_: *anyopaque) ?sql_driver.Row {
+            return null;
+        }
+        fn deinit(_: *anyopaque) void {}
+        const vtable = sql_driver.Rows.VTable{ .next = next, .deinit = deinit };
+    };
+
+    const MockDriver = struct {
+        pub fn asDriver(self: *@This()) sql_driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn mockExec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+            unreachable;
+        }
+        fn mockQuery(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+            return .{ .ptr = ptr, .vtable = &EmptyRows.vtable };
+        }
+        fn mockBeginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) sql_driver.Error!void {
+            unreachable;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            unreachable;
+        }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+            unreachable;
+        }
+
+        const vtable = sql_driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
+        };
+    };
+
+    var mock = MockDriver{};
+
+    const User = schema("User", .{ .fields = &.{ field.String("name"), field.Int("age") } });
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGenerator(infos, info);
+    const UserQuery = QueryBuilder(infos, info, UserEntity);
+
+    var q = UserQuery.init(std.testing.allocator, mock.asDriver(), null);
+    defer q.deinit();
+    q.logger = .{ .onQuery = Seen.onQuery };
+
+    Seen.calls = 0;
+    Seen.known = true;
+
+    // `Iterate` hands the caller a stream that has not been read yet, so no
+    // row count exists at the moment of the log call. Shipping the `0`
+    // placeholder as a known count is the "statement matched nothing" claim
+    // the drivers stopped making in v0.63.0, and the log is the last layer
+    // that still made it.
+    var it = try q.Iterate();
+    defer it.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), Seen.calls);
+    try std.testing.expect(!Seen.known);
+    try std.testing.expectEqual(@as(usize, 0), Seen.rows);
 }
 
 test "CursorKeyset composite pagination does not drop rows on ties" {

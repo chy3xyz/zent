@@ -841,7 +841,12 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                     .sql = q.sql,
                     .args = log_args,
                     .duration_us = duration_us,
+                    // The driver's own count plus its "did I obtain one?"
+                    // flag: a statement whose count was never obtained has a
+                    // placeholder in the number, and a log line printing it as
+                    // `0` claims the UPDATE matched nothing.
                     .rows_affected = res.rows_affected,
+                    .rows_affected_known = res.rows_affected_known,
                     .table_name = info.table_name,
                 });
             }
@@ -1123,6 +1128,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     .args = q.args,
                     .duration_us = duration_us,
                     .rows_affected = res.rows_affected,
+                    .rows_affected_known = res.rows_affected_known,
                     .table_name = info.table_name,
                 });
             }
@@ -1221,6 +1227,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     .args = q.args,
                     .duration_us = duration_us,
                     .rows_affected = res.rows_affected,
+                    .rows_affected_known = res.rows_affected_known,
                     .table_name = info.table_name,
                 });
             }
@@ -2644,5 +2651,90 @@ test "a versioned UPDATE the driver could not count is not reported as a lost up
         _ = try u.setFieldValue("title", "edited");
         _ = try u.setFieldValue("version", @as(i64, 3));
         try std.testing.expectEqual(@as(usize, 7), try u.Save());
+    }
+}
+
+test "a write the driver could not count reaches the log without a row count" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    // What the logger saw lives at container level: the callbacks carry no
+    // user pointer (same shape as `client.zig`'s SqlSink).
+    const Seen = struct {
+        var calls: usize = 0;
+        var known: bool = true;
+
+        fn onExec(ctx: LogContext) void {
+            calls += 1;
+            known = ctx.rows_affected_known;
+        }
+
+        fn reset() void {
+            calls = 0;
+            known = true;
+        }
+    };
+
+    const Doc = Schema("UncountedLogDoc", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("title"),
+            field.Version("version"),
+        },
+    });
+    const doc_info = comptime fromSchema(Doc);
+    const Upd = UpdateBuilder(&.{doc_info}, doc_info);
+    const Del = DeleteBuilder(doc_info);
+
+    const Post = Schema("UncountedLogPost", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("title"),
+        },
+        .mixins = &.{@import("../core/mixin.zig").SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const post_info = comptime fromSchema(Post);
+    const PostDel = DeleteBuilder(post_info);
+
+    // The three `onExec` sinks carry `Result.rows_affected_known` through: a
+    // statement whose count the driver never obtained has a placeholder in the
+    // number, and a log line printing it as `0` claims the write matched
+    // nothing.
+    {
+        Seen.reset();
+        var mock = UncountedDriver{};
+        var u = Upd.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer u.deinit();
+        u.logger = .{ .onExec = Seen.onExec };
+        _ = try u.setFieldValue("title", "edited");
+        _ = try u.setFieldValue("version", @as(i64, 3));
+        _ = try u.Save();
+
+        try std.testing.expectEqual(@as(usize, 1), Seen.calls);
+        try std.testing.expect(!Seen.known);
+    }
+    {
+        Seen.reset();
+        var mock = UncountedDriver{};
+        var d = PostDel.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer d.deinit();
+        d.logger = .{ .onExec = Seen.onExec };
+        _ = try d.Exec();
+
+        try std.testing.expectEqual(@as(usize, 1), Seen.calls);
+        try std.testing.expect(!Seen.known);
+    }
+    {
+        Seen.reset();
+        var mock = UncountedDriver{};
+        var d = Del.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer d.deinit();
+        d.logger = .{ .onExec = Seen.onExec };
+        _ = try d.Exec();
+
+        try std.testing.expectEqual(@as(usize, 1), Seen.calls);
+        try std.testing.expect(!Seen.known);
     }
 }

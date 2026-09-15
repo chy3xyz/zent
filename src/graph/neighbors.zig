@@ -10,6 +10,13 @@ const Step = @import("step.zig").Step;
 /// parent id lists are chunked so eager loads never exceed the driver
 /// parameter limit (e.g. SQLite 999).
 ///
+/// `parent_ids` must be non-empty: a caller has already written the `WHERE `
+/// this clause belongs to, so an empty list would leave a bare `WHERE ` and
+/// the statement would fail to prepare on every dialect.
+/// `appendSetNeighborsFiltered` rejects an empty list with
+/// `error.EmptyParentIds` before it writes anything, so this helper is never
+/// reached with one.
+///
 /// The column predicate is repeated for every chunk: `col IN (a, b) OR (c, d)`
 /// is not valid SQL (PostgreSQL rejects a record as an OR operand, SQLite
 /// reports "row value misused"), so a two-chunk eager load would fail.
@@ -81,6 +88,12 @@ fn writeEagerLoadColumns(b: *sql.Builder, step: Step, include_select: bool) !voi
 ///
 /// The caller owns `b` and is responsible for calling `b.query()` and
 /// `b.deinit()`.
+///
+/// `parent_ids` must not be empty — callers short-circuit an empty page
+/// themselves (`loadEdgePath` for eager loading, `queryTargetsImpl` for the
+/// traversal helpers). An empty slice is rejected with
+/// `error.EmptyParentIds` instead of emitting a statement with a bare
+/// `WHERE `; nothing is written to `b` then.
 pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.Value) !void {
     return appendSetNeighborsFiltered(b, step, parent_ids, &.{});
 }
@@ -92,12 +105,19 @@ pub fn appendSetNeighbors(b: *sql.Builder, step: Step, parent_ids: []const sql.V
 /// foreign-tenant row consuming a limit slot. Predicates are rendered
 /// through the caller's builder, so dialect placeholders and bound args
 /// stay in text order.
+///
+/// An empty `parent_ids` returns `error.EmptyParentIds` before anything is
+/// written: the statement already carries the `WHERE ` this clause fills, so
+/// an empty list would otherwise produce unparsable SQL rather than the
+/// empty result set an empty parent page means.
 pub fn appendSetNeighborsFiltered(
     b: *sql.Builder,
     step: Step,
     parent_ids: []const sql.Value,
     extra_preds: []const sql.Predicate,
 ) !void {
+    if (parent_ids.len == 0) return error.EmptyParentIds;
+
     const use_window = step.limit != null;
     if (use_window and step.edge_rel != .o2m and step.edge_rel != .o2o) {
         return error.UnsupportedEdgeLimit;
@@ -598,6 +618,31 @@ test "appendSetNeighbors chunks parent ids and repeats the column predicate" {
     // The second chunk must still be a plain parenthesised list, never a
     // bare row-value constructor.
     try testing.expect(std.mem.indexOf(u8, result.sql, " OR (") == null);
+}
+
+test "appendSetNeighbors rejects an empty parent id list" {
+    const step = Step{
+        .from_table = "user",
+        .from_column = "id",
+        .to_table = "car",
+        .to_column = "id",
+        .edge_rel = .o2m,
+        .edge_table = "car",
+        .edge_columns = &[_][]const u8{"owner_id"},
+        .inverse = false,
+    };
+    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+
+    // No parents means "no neighbors", and the clause this function writes
+    // hangs off a `WHERE ` the caller already emitted — so an empty list is
+    // refused up front rather than leaving a bare `WHERE ` behind.
+    try testing.expectError(error.EmptyParentIds, appendSetNeighbors(&b, step, &.{}));
+    try testing.expectError(error.EmptyParentIds, appendSetNeighborsFiltered(&b, step, &.{}, &.{}));
+
+    // "Up front" is part of the contract: nothing may have been written, so a
+    // caller that ignores the error cannot end up with half a statement.
+    try testing.expectEqual(@as(usize, 0), b.query().sql.len);
 }
 
 test "appendSetNeighbors rejects limit on m2m" {
