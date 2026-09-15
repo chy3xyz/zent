@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.55.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.56.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (329 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (341 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -72,6 +72,7 @@ Entities and queries are explicitly owned by the caller. See the contract:
 
 - `q.All()` etc. returns `std.array_list.Managed(Entity)`. Free a page with `q.deinitRows(&rows)` or `client.<entity>.deinitRows(&rows)` (page + list, one call, list comes back empty so a second call is a no-op), a single with `client.<entity>.deinitRow(&e)`, and a `QueryEdge` page with `client.<source>.deinitEdgeRows("edge", &rows)`. The explicit `deinitEntity(infos, info, &entity, alloc)` per item + `users.deinit()` remains valid for generic code that already holds the graph; all of the shortcuts funnel into `codegen.entity.deinitEntityList`.
 - `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) MUST be `deinit`'d.
+- **Arena pages are one-way.** `AllIn` / `FirstIn` / `SaveIn` / `queryRowsIn` take `*std.heap.ArenaAllocator` and return a plain slice owned by that arena. The release is `arena.deinit()` and **nothing else** — never call `deinitEntity` / `deinitRow` / `deinitRows` / `freeOwnedStrings` on such a page (double free). Do not mix the two shapes on one page.
 - `driver.Tx` MUST be `deinit`'d exactly once, regardless of `commit`/`rollback`.
 - `sql.QueryResult` (`{ sql, args }`) borrows from the builder; `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) transfers ownership and MUST be `deinit`'d.
 - The root `Client` lazily heap-allocates its `InterceptorChain` on first `client_mod.UseInterceptor(infos, &client, i)`; release it with `client_mod.DeinitClient(infos, &client)` **once, on the value that registered**. Value copies (helpers, `withContext`, tx clients) borrow the same chain and must not be deinit'd; `withInterceptors(chain)` borrows a caller-owned chain, which `DeinitClient` leaves alone. `StoreEnv`/`PooledEnv`/`ShardedEnv` release the clients they created on `deinit` (each shard client individually). Register before `beginTx` — the tx client borrows the same chain.

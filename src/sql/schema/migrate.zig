@@ -1631,10 +1631,15 @@ fn alterColumnTypeSQL(
 ///
 /// SQLite has no `ALTER COLUMN` — the only way is a full table rebuild — so it
 /// is unsupported. MySQL changes a column only through `MODIFY COLUMN`, which
-/// replaces the whole definition: the introspection available here reports a
-/// bare `data_type` with no `DEFAULT` and no `AUTO_INCREMENT`, so the rewrite
-/// would silently drop attributes it never saw. It fails closed, like the type
-/// change above.
+/// replaces the whole definition. `getExistingColumns` does fetch
+/// `column_default` from `information_schema.columns`, but `ExistingColumn`
+/// keeps only name / type / nullability, and the definition carries more that
+/// no query here asks for: `EXTRA` (`AUTO_INCREMENT`, `ON UPDATE
+/// CURRENT_TIMESTAMP`), charset, collation, comment, generated-column
+/// expressions. A `MODIFY COLUMN` rebuilt from what this layer knows would
+/// silently drop every one of them, so it fails closed, like the type change
+/// above. Widening this is a matter of introspecting `EXTRA` and the rest
+/// first — not of changing the SQL below.
 fn alterColumnNullabilitySQL(
     allocator: std.mem.Allocator,
     table_name: []const u8,

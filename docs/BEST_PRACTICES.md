@@ -70,6 +70,7 @@ shapes:
 | `create` → `Entity` | caller | `client.<entity>.deinitRow(&created)` |
 | `q.All()` → `Managed(Entity)` | caller | `q.deinitRows(&rows)` (or `client.<entity>.deinitRows(&rows)`) |
 | `QueryEdge` → `Managed(Target)` | caller | `client.<source>.deinitEdgeRows("edge", &rows)` |
+| `q.AllIn(arena)` → `[]Entity` | **arena** | `arena.deinit()` — and nothing else |
 | raw `driver.query` → `Rows` | caller | `rows.deinit()` (iterator) |
 | `crud_helpers.Rows(T)` | caller | `rows.deinit()` (frees strings + slice) |
 
@@ -79,6 +80,27 @@ and `deinitRows` frees the page **and** the list in one line (the list comes
 back empty and reusable, so calling it twice is a no-op). `deinitEntity` /
 `codegen.deinitEntityList` / `crud_helpers.deinitRows` remain as the explicit
 forms for generic code that already holds the graph.
+
+**One page, one release mechanism.** A page from `AllIn` / `FirstIn` / `SaveIn` /
+`queryRowsIn` belongs to the arena that was passed in, and `arena.deinit()` is the
+**only** thing that frees it. Do not call `deinitEntity`, `deinitRow`,
+`deinitRows` or `freeOwnedStrings` on such rows — the arena already owns them and
+those calls free the same memory twice. The `*In` calls return a plain slice for
+exactly this reason: a slice has no `deinit` to be reached for out of habit. If
+you need per-row release instead, use the non-arena form (`All()` + `deinitRows`);
+never mix the two on one page.
+
+```zig
+// (a) arena: one release for the whole page
+var arena = std.heap.ArenaAllocator.init(alloc);
+defer arena.deinit();
+const users = try client.user.Query().Where(...).AllIn(&arena);
+// no deinitRows, no deinitEntity — arena.deinit() at scope exit is all of it
+
+// (b) explicit: per-item, then the list
+var users = try client.user.Query().Where(...).All();
+defer client.user.deinitRows(&users);
+```
 
 **Rules that prevent the classic bugs:**
 
@@ -630,18 +652,23 @@ enough for a gauge plus a counter that says "the pool is too small, or the
 database is gone". Size the pool against the server:
 *instances × max_connections + reserved roles ≤ the server's `max_connections`.*
 
-**Draining vs overloading.** `error.PoolExhausted` means the pool reached
-`max_connections` with everything lent out — a capacity signal, and the one worth
-mapping to 503. A connection that could not be *opened* surfaces as the driver's
-own error (`ConnectionFailed`, `PingFailed`), i.e. a configuration or
-connectivity fault, which `driver.isRetryable` also classifies for you. The
-give-up path logs a `warn` naming the reason, and `Metrics.onError` gets the real
-error rather than a constant.
+**Draining vs overloading vs a spent budget.** `error.PoolExhausted` means the
+pool reached `max_connections` with everything lent out — a capacity signal, and
+the one worth mapping to 503. A connection that could not be *opened* surfaces as
+the driver's own error (`ConnectionFailed`, `PingFailed`), i.e. a configuration
+or connectivity fault, which `driver.isRetryable` also classifies for you.
+`error.PoolWaitTimeout` is the third case: the budget ran out while parking, so
+the pool may well have capacity moments later — it is retryable, where
+`PoolExhausted` with `max_wait_ms = 0` is not. `driver.classify` maps all three
+for you. The give-up path logs a `warn` naming the reason, and `Metrics.onError`
+gets the real error rather than a constant.
 
 Whether that health check runs on *borrow* is a separate knob:
-`health_check_on_borrow` pings under the pool mutex, which serialises concurrent
-borrows (and deadlocks against a fiber-based IO runtime), so it is off by
-default. The `dead` flag is what makes turning it off safe.
+`health_check_on_borrow` pings the selected connection **outside** the pool mutex
+— a borrow picks a candidate under the lock and pings it after unlocking, taking
+the lock again only to close a connection that failed. Concurrent borrows
+therefore do not queue behind each other's round trips. It remains off by
+default; the `dead` flag is what makes turning it off safe.
 
 ### `rows_affected` is not portable
 
@@ -672,15 +699,25 @@ defer pool.deinit();
 const drv = pool.asDriver();
 ```
 
-- **`max_wait_ms`** is the total budget for one `borrow` when every connection
-  is checked out: the caller parks on the pool condition and is woken by a
-  `release`, then falls back to the retry/backoff path on expiry. `0` (the
-  default) keeps the non-blocking behaviour — immediate `error.PoolExhausted`.
+- **`max_wait_ms`** is a **hard ceiling** on how long one `borrow` may wait when
+  every connection is checked out: the caller parks on the pool condition and is
+  woken by a `release`. `0` (the default) keeps the non-blocking behaviour —
+  immediate `error.PoolExhausted`. Expiry reports `error.PoolWaitTimeout`.
   Fairness is best-effort: later arrivals defer to older tickets, but there is
   no wake-up forwarding, so do not rely on strict FIFO.
-- **`health_check_on_borrow` runs inside the pool mutex**, so it serialises
-  concurrent borrows. With a fast local server the ping is usually cheaper than
-  the tail latency it adds; measure before enabling it on a remote database.
+- **A request deadline can shorten the wait, never lengthen it.** Use
+  `borrowWithTimeout(ms)`, `borrowCtx(&ctx)` or `borrowWithBudget(ms, &ctx)`
+  when the caller has its own budget: the effective wait is
+  `min(requested, max_wait_ms)`, so the pool's ceiling still applies. A statement
+  or transaction deadline covers the wait for a connection as well as the run —
+  `execCtx`/`queryCtx` merge the context before borrowing, and `beginTxCtx` does
+  the same for transactions (drivers without that hook fall back to `beginTx`).
+- **`health_check_on_borrow` pings outside the pool mutex** — a borrow selects a
+  candidate under the lock and pings it after unlocking, re-taking the lock only
+  to close a connection that failed. Concurrent borrows do not serialise behind
+  each other's round trips. Still off by default: with a fast local server the
+  ping is usually cheaper than the tail latency it adds, so measure before
+  enabling it on a remote database.
 - **Metrics callbacks run outside the mutex** and may re-enter the pool.
 - **`deinit` requires quiescence**: no thread may be inside
   `borrow`/`release`/`asDriver`, *including threads parked waiting for a
@@ -768,8 +805,8 @@ migration ran, so the shape is right" and being surprised later:
 
 | Not done | Consequence | What to do |
 |---|---|---|
-| An added column is **never `NOT NULL`** (`ALTER TABLE … ADD COLUMN` emits the type and any `DEFAULT`, and the code comment says why: SQLite rejects `NOT NULL` without a default) | `migrateSchema` **creates** the drift `checkNullability` then reports — an "optional" column where the schema says otherwise | backfill, then `ALTER COLUMN … SET NOT NULL` yourself, or make the field `Optional()` |
-| An existing column's nullability is **never** changed | the database keeps whatever it had, silently | see `checkSchema`/`assertSchema` above |
+| An added column is **`NOT NULL` only with `allow_nullability_change`** (the default emits the type and any `DEFAULT`, and the code comment says why: SQLite rejects `NOT NULL` without a default) | by default `migrateSchema` **creates** the drift `checkNullability` then reports — an "optional" column where the schema says otherwise | turn on `allow_nullability_change` (below), or backfill and `ALTER COLUMN … SET NOT NULL` yourself, or make the field `Optional()` |
+| An existing column's nullability is changed **only with `allow_nullability_change`** (and only on PostgreSQL) | the database keeps whatever it had, silently | see `checkSchema`/`assertSchema` above |
 | **Unique** on an added column is not emitted (SQLite cannot, and the `CREATE TABLE` path carries it for PG/MySQL) | an old table gains the column without the constraint | add the constraint in a real migration |
 | **Foreign keys** exist only in `CREATE TABLE`; `ALTER` never adds one | old tables stay unconstrained | same |
 | A **changed `view_sql` never takes effect** — views are `CREATE VIEW IF NOT EXISTS` | the definition you upgraded to is not the one in the database | `DROP VIEW` then re-run, or version the view name |
@@ -778,8 +815,45 @@ migration ran, so the shape is right" and being surprised later:
 Everything in that table is also what `checkSchema` reports, which is the point:
 the migration path is not a substitute for the check.
 
-`migrateSchema` never alters an existing column's nullability as a *deliberate*
-omission: existing NULLs have to go somewhere, so it is reported, not applied.
+#### Converging nullability (`allow_nullability_change`)
+
+The first two rows of that table are the drift a long-lived deployment can never
+get out of on its own. `MigrateOptions.allow_nullability_change` (default
+`false`) adds both halves of the fix:
+
+```zig
+try zent.sql_schema.migrateSchemaWithOptions(alloc, drv.asDriver(), infos, .{
+    .allow_nullability_change = true,   // opt-in: SET NOT NULL may hit live data
+    .check_nullability = true,          // report whatever is still left
+});
+```
+
+- An **added** column the schema declares `NOT NULL` is emitted
+  `NOT NULL DEFAULT …`, using the field's own default or the audit-timestamp
+  one. A non-optional field with **neither** fails the migration with
+  `error.NotNullNeedsDefault` — the value that backfills the rows already in the
+  table is your decision, not this layer's, and guessing it silently is how you
+  end up with a column full of zeros. The whole batch rolls back.
+- An **existing** column whose nullability differs is altered: `SET NOT NULL` /
+  `DROP NOT NULL` on **PostgreSQL**.
+
+Dialect differences are not smoothed over, because each one is a real
+constraint rather than an implementation gap:
+
+| Dialect | Added `NOT NULL` column | Existing column nullability |
+|---|---|---|
+| PostgreSQL | yes, with the backfill `DEFAULT` | `SET`/`DROP NOT NULL` |
+| SQLite | yes, with the backfill `DEFAULT` | **not possible** — no `ALTER COLUMN`; `check_nullability` reports it |
+| MySQL | yes, with the backfill `DEFAULT` | **fails closed** with `error.MySQLNullabilityChangeUnsafe` |
+
+The MySQL refusal is deliberate. `MODIFY COLUMN` replaces the entire column
+definition, and this layer does not introspect enough to reproduce one: it reads
+`column_default` (then drops it — `ExistingColumn` keeps only name, type and
+nullability) and nothing at all of `EXTRA` (`AUTO_INCREMENT`,
+`ON UPDATE CURRENT_TIMESTAMP`), charset, collation, comment, or generated-column
+expressions. A rewrite would silently drop every one of those, which is the same
+reason `MySQLTypeChangeUnsafe` already fails closed for type changes. Widening
+it means introspecting those attributes first.
 
 For the same reason, and covering everything a schema can drift on rather than
 just NULL:

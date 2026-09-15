@@ -57,6 +57,11 @@ cross-cutting:
 - **Rows** — `q.All()` returns `std.array_list.Managed(Entity)`; each
   item's strings are owned by the caller: `deinitEntity(infos, info,
   &entity, alloc)` per item, then `users.deinit()`.
+- **Arena rows** — `AllIn` / `FirstIn` / `SaveIn` / `queryRowsIn` return a
+  **plain slice owned by the arena** the caller passed in. The release is
+  `arena.deinit()` and **only** that; a per-item `deinitEntity`, `deinitRow`,
+  `deinitRows` or `freeOwnedStrings` on such a page is a double free. A slice
+  was chosen over a list precisely because it has no `deinit` to get wrong.
 - **QueryResult / OwnedQuery** — `sql.QueryResult` (`{ sql, args }`)
   borrows from the builder; `OwnedQuery` (from `Builder.takeQuery()`)
   transfers ownership and MUST be `deinit`'d.

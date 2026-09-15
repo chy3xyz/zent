@@ -4,6 +4,99 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Arena scanning: the caller's arena owns the page** (Z27). `All()` hands back
+  a `std.array_list.Managed(Entity)` that the caller must dismantle item by item
+  (`deinitEntity` per row, then `deinit()`) — 607 call sites in the reporting
+  consumer did exactly that by hand, and `managedEntity`/`dupeEntityTo` were used
+  zero times, so the four-argument dismantling was the shape that won. The
+  arena variants make freeing a single call:
+
+  ```zig
+  var arena = std.heap.ArenaAllocator.init(alloc);
+  defer arena.deinit();
+  const users = try client.user.Query().AllIn(&arena);
+  // no per-row deinit, no list deinit — arena.deinit() is the whole release
+  ```
+
+  `AllIn` / `FirstIn` / `SaveIn` / `queryRowsIn` return a plain slice, not a
+  `Managed` list: a slice has no `deinit`, which is the strongest available
+  signal that there is nothing to free by hand. `All()` and `First()` were
+  refactored onto the same `readAll`/`readFirst` core, so the two paths cannot
+  drift.
+
+  **Ownership rule, and it is a hard one**: a page from an `*In` call is released
+  by `arena.deinit()` and by **nothing else**. Calling `deinitEntity`,
+  `deinitRow`, `deinitRows` or `freeOwnedStrings` on rows an arena owns is a
+  double free. One page, one release mechanism — `docs/ARCHITECTURE.md` and
+  `BEST_PRACTICES.md` both carry the rule.
+
+- **Request-level borrow budget** (Z24). `borrowWithTimeout(ms)` /
+  `borrowCtx(&ctx)` / `borrowWithBudget(ms, ctx)` take the waiting time as an
+  argument, and the effective budget is `min(requested, max_wait_ms)` — so a
+  request deadline can no longer be shortened by a pool-configured ceiling, and
+  `max_wait_ms` is a hard upper bound rather than a value that the retry/backoff
+  path could walk past. A statement or transaction deadline now covers **waiting
+  for a connection**, not just running on one: `driverExec`/`driverQuery` merge
+  the context before borrowing, and an optional `beginTxCtx` was added to the
+  driver vtable and `Driver` (drivers without the hook fall back to `beginTx`).
+
+### Changed
+- **`PoolWaitTimeout` is what a spent budget returns** (Z24). `borrow()` used to
+  report `PoolExhausted` when the wait ran out and `PoolWaitTimeout` did not
+  exist. The two are now distinct — `PoolExhausted` is "the pool is at capacity
+  and retrying is pointless", `PoolWaitTimeout` is "time ran out, retrying may
+  work" — which also puts the second one in the retryable set for
+  `driver.classify`. A caller matching on `PoolExhausted` to detect a timeout
+  must add the new error.
+
+- **BREAKING for exhaustive switches: `driver.Error` gained
+  `PoolWaitTimeout`.** Error sets are not extensible, so a `switch` over
+  `driver.Error` with no `else` stops compiling. The one exhaustive switch in
+  the tree (`migrate.zig`) was updated in the same commit.
+
+- **The health check no longer runs under the pool mutex** (Z23). With
+  `health_check_on_borrow = true` the `ping` ran while the mutex was held, which
+  serialized every borrow behind a network round trip. A borrow now selects a
+  candidate under the lock and pings it outside; only a failed ping takes the
+  lock again, to close the connection and signal. The cost is that a candidate
+  can be handed out stale, which `Selection.fresh` keeps track of so the old
+  retry granularity is preserved.
+
+### Fixed
+- **JSON scanning returned a slice into the driver's column buffer.** The
+  scanner used `std.json`'s default `.alloc_if_needed`, which for a string that
+  needs no unescaping returns a slice of the **input** — the driver's row buffer,
+  freed by `rows.deinit()`. A JSON column read into an owned string dangled, and
+  the next statement to reuse that buffer overwrote it (observed as
+  `expected "dark", found "ena_"`, the tail of another query's SQL text). Now
+  `.alloc_always`, so the result is always owned by the caller's allocator.
+
+- **`migrateSchema` can converge nullability, opt-in** (Z31). The gap the
+  previous release documented rather than fixed: an added `NOT NULL` column
+  arrived nullable and an existing column's nullability was never altered, so a
+  deployment could run migrations forever and stay in the drift
+  `check_nullability` warns about. `MigrateOptions.allow_nullability_change`
+  (default `false`) adds the two halves:
+
+  - an **added** column the schema declares `NOT NULL` is emitted with
+    `NOT NULL DEFAULT …` — the field's own default, or the audit-timestamp one;
+    a non-optional field with neither fails the migration with
+    `error.NotNullNeedsDefault` rather than guessing the value that backfills
+    the rows already present;
+  - an **existing** column whose nullability differs is altered
+    (`SET NOT NULL` / `DROP NOT NULL` on PostgreSQL).
+
+  Dialect behaviour is not smoothed over: PostgreSQL does both; SQLite has no
+  `ALTER COLUMN` at all, so only the added-column half converges and
+  `check_nullability` reports the rest; **MySQL fails closed** with
+  `error.MySQLNullabilityChangeUnsafe` — `MODIFY COLUMN` replaces the whole
+  definition and this layer introspects neither `EXTRA` (so `AUTO_INCREMENT` and
+  `ON UPDATE CURRENT_TIMESTAMP` would vanish) nor charset, collation or comment.
+  Failing is the honest answer where the rewrite would be lossy; the existing
+  type-change path already fails closed for the same reason. Off by default, so
+  no existing deployment changes behaviour.
+
 ## [0.55.0] - 2026-09-15
 
 ### Docs
@@ -108,7 +201,7 @@ All notable changes to this project will be documented in this file.
 ## [0.51.0] - 2026-09-15
 
 ### Fixed
-- **`error.PoolExhausted` now means capacity, and nothing else** (Z27).
+- **`error.PoolExhausted` now means capacity, and nothing else** (Z24).
   `tryBorrowNoLock` folds every reason it cannot produce a connection into
   `null` — a refused connection, bad credentials, an OOM, a failed health check —
   and `borrow` reported the constant `PoolExhausted` for all of them. A consumer
