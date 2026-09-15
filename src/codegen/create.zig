@@ -156,7 +156,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self;
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
 
         /// Run the interceptor chain (`.create`). `whereEq` fills omitted
         /// columns; already-set fields are left alone. Errors collapse to
@@ -190,6 +190,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             try self.values.append(.{ .name = field_name, .value = value });
         }
 
+        /// Insert the row and return it with its primary key filled in.
+        ///
+        /// `error.MissingLastInsertId` means the statement ran but the driver
+        /// reported no id for it, so the row's key is unknown. The row is not
+        /// re-read to find it (`Save` has no unique key to look it up by), and
+        /// `0` would name a row that does not exist.
         pub fn Save(self: *Self) SaveError!Entity {
             return self.saveInternal(false, false, null, self.allocator);
         }
@@ -429,7 +435,13 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const res = try self.driver.execCtx(&self.execution_context, full_sql, q.args);
                 const duration_us: u64 = nowUs() - start;
                 if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
-                    @field(entity, info.pk_field) = @intCast(res.last_insert_id orelse 0);
+                    // `last_insert_id` is `?i64` because a driver may have no
+                    // id to give, and a `0` written here is indistinguishable
+                    // from a real key — the entity would look like a row that
+                    // exists, with the caller's own insert hidden behind it.
+                    // (The in-tree MySQL driver always answers `Some`; a
+                    // wrapper or a custom driver need not.)
+                    @field(entity, info.pk_field) = @intCast(res.last_insert_id orelse return error.MissingLastInsertId);
                 } else {
                     // Textual primary key (uuid) on MySQL: no RETURNING — keep
                     // the caller-provided id from the values.
@@ -1039,7 +1051,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             return try self.setValue(field_name, field_value.toSqlValue(value));
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
 
         fn runInterceptors(self: *Self) error{InterceptFailed}!void {
             const chain = self.interceptors orelse return;
@@ -1083,8 +1095,12 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         /// SQLite/PostgreSQL (single-row SaveOrUpdate uses INSERT OR REPLACE
         /// on SQLite; the bulk path prefers ON CONFLICT so unspecified
         /// columns are preserved), ON DUPLICATE KEY UPDATE for MySQL. Returns
-        /// one id per row (RETURNING where supported; last_insert_id chain on
-        /// MySQL).
+        /// one id per row — `RETURNING` where the dialect has it, and one
+        /// statement per row on MySQL, whose `last_insert_id` is the id of the
+        /// row it just wrote (the emitted `id=LAST_INSERT_ID(id)` is what makes
+        /// an updated row answer its existing id). A driver that reports none
+        /// makes the call `error.MissingLastInsertId` rather than a fabricated
+        /// run of ids.
         pub fn SaveOrUpdate(self: *Self) SaveError!std.array_list.Managed(i64) {
             return self.saveInternal(true, null);
         }
@@ -1206,10 +1222,10 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                     }
                 }
 
-                const query = sql.MultiInsert(self.allocator, dialect, info.table_name, columns.items, rows_in_chunk, chunk_values) catch |err| return mapBuildError(err);
-                defer query.deinit();
-
                 if (supports_returning) {
+                    const query = sql.MultiInsert(self.allocator, dialect, info.table_name, columns.items, rows_in_chunk, chunk_values) catch |err| return mapBuildError(err);
+                    defer query.deinit();
+
                     // SQLite / PostgreSQL: append RETURNING clause and query.
                     const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{pk_col});
                     defer self.allocator.free(ret_suffix);
@@ -1230,18 +1246,33 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                         try ids.append(id);
                     }
                 } else {
-                    // MySQL: no RETURNING. Execute then compute IDs from
-                    // last_insert_id and rows_affected.
-                    const full_sql_len = query.sql.len + upsert_suffix.len;
-                    const full_sql = try self.allocator.alloc(u8, full_sql_len);
-                    defer self.allocator.free(full_sql);
-                    @memcpy(full_sql[0..query.sql.len], query.sql);
-                    @memcpy(full_sql[query.sql.len..], upsert_suffix);
-                    self.ensureDeadline();
-                    const res = try self.driver.execCtx(&self.execution_context, full_sql, query.args);
-                    const base_id = res.last_insert_id orelse 0;
-                    for (0..rows_in_chunk) |ci| {
-                        try ids.append(base_id + @as(i64, @intCast(ci)));
+                    // MySQL has no RETURNING, and one statement cannot answer a
+                    // per-row id either: `LAST_INSERT_ID()` answers the
+                    // statement's *first generated* value, while the ODKU arm
+                    // that the suffix emits (`id=LAST_INSERT_ID(id)`) answers the
+                    // existing id for a row it updated. Deriving `base + i` from
+                    // one statement invents ids as soon as a chunk collides —
+                    // measured on MySQL 9.3, a 3-row ODKU whose first row
+                    // collided reported `base = 2` for true ids [1, 2, 3], so
+                    // every fabricated id was wrong and the last (4) named no
+                    // row at all. Send the chunk one statement at a time and
+                    // keep the id the driver reports for each row: the batch then
+                    // answers exactly what the single-row path answers,
+                    // including the error for a driver that reports no id —
+                    // which `0` cannot express.
+                    for (0..rows_in_chunk) |ri| {
+                        const row_values = chunk_values[ri * cols_per_row ..][0..cols_per_row];
+                        const query = sql.MultiInsert(self.allocator, dialect, info.table_name, columns.items, 1, row_values) catch |err| return mapBuildError(err);
+                        defer query.deinit();
+
+                        const full_sql = try self.allocator.alloc(u8, query.sql.len + upsert_suffix.len);
+                        defer self.allocator.free(full_sql);
+                        @memcpy(full_sql[0..query.sql.len], query.sql);
+                        @memcpy(full_sql[query.sql.len..], upsert_suffix);
+
+                        self.ensureDeadline();
+                        const res = try self.driver.execCtx(&self.execution_context, full_sql, query.args);
+                        try ids.append(res.last_insert_id orelse return error.MissingLastInsertId);
                     }
                 }
 
@@ -1433,8 +1464,8 @@ test "Create builders expose explicit driver error unions" {
     const UserEntity = comptime EntityGen(infos, info);
     const Builder = CreateBuilder(infos, info, UserEntity);
     const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
-    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
-    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
+    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
 
     comptime {
         const save_return = @typeInfo(@TypeOf(Builder.Save)).@"fn".return_type.?;
@@ -1516,4 +1547,223 @@ test "create with edges schema setFieldValue compiles" {
     var b = Builder.init(std.testing.allocator, undefined, &.{}, null);
     defer b.deinit();
     _ = try b.setFieldValue("title", "hello");
+}
+
+/// A driver whose `exec` answers the ids in `script`, one call at a time, and
+/// `null` where it has none to give. `driver.Result.last_insert_id` is `?i64`
+/// *because* a driver may have nothing to report — the in-tree MySQL driver
+/// always answers `Some`, so only a driver that says "no id" on purpose can
+/// reach those branches, the same way `UncountedDriver` reaches the
+/// unknown-row-count one.
+const IdScriptDriver = struct {
+    /// One entry per `exec` call; a `null` entry is a driver with no id.
+    script: []const ?i64,
+    /// Answered by calls past the end of `script`.
+    repeat: ?i64 = null,
+    exec_calls: usize = 0,
+    /// Copy of the statement the last `exec` saw — copied because the builder
+    /// that produced it is deinit'd before the test can look at it.
+    last_sql_owned: ?[]u8 = null,
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = exec,
+        .query = query,
+        .beginTx = beginTx,
+        .beginSavepoint = beginSavepoint,
+        .close = close,
+        .dialect = dialect,
+        .ping = ping,
+        .inTransaction = inTransaction,
+    };
+
+    fn asDriver(self: *IdScriptDriver) sql_driver.Driver {
+        return sql_driver.Driver{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn freeCapture(self: *IdScriptDriver) void {
+        if (self.last_sql_owned) |s| std.testing.allocator.free(s);
+        self.last_sql_owned = null;
+    }
+
+    fn exec(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        const self: *IdScriptDriver = @ptrCast(@alignCast(ptr));
+        const id = if (self.exec_calls < self.script.len) self.script[self.exec_calls] else self.repeat;
+        self.exec_calls += 1;
+        self.freeCapture();
+        self.last_sql_owned = std.testing.allocator.dupe(u8, query_sql) catch null;
+        return .{ .rows_affected = 1, .last_insert_id = id };
+    }
+
+    fn query(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        return error.QueryFailed;
+    }
+
+    fn beginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn beginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn dialect(_: *anyopaque) Dialect {
+        return .mysql;
+    }
+
+    fn ping(_: *anyopaque) sql_driver.Error!void {}
+
+    fn inTransaction(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+test "create: a driver that reports no last_insert_id is an error, not a key of 0" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, UserEntity);
+
+    var drv = IdScriptDriver{ .script = &.{null} };
+    defer drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+
+    // The row was written (the driver ran the statement); the id is what is
+    // missing, and `0` is not a report of it.
+    try std.testing.expectError(error.MissingLastInsertId, b.Save());
+    try std.testing.expectEqual(@as(usize, 1), drv.exec_calls);
+}
+
+test "create: an integer key still comes from last_insert_id, unchanged" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, UserEntity);
+
+    var drv = IdScriptDriver{ .script = &.{7} };
+    defer drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+
+    var entity = try b.Save();
+    defer deinitEntity(infos, info, &entity, std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 7), entity.id);
+    try std.testing.expectEqualStrings("alice", entity.name);
+}
+
+test "bulk insert: one statement per row on MySQL, ids as reported" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
+
+    // A server handing out consecutive keys: the batch answers 7, 8, 9 — what
+    // the old `base_id + i` derivation answered too, so a caller sees no
+    // change here.
+    var consecutive = IdScriptDriver{ .script = &.{ 7, 8, 9 } };
+    defer consecutive.freeCapture();
+    var b = try BulkBuilder.init(std.testing.allocator, consecutive.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "bob");
+    _ = try b.setFieldValue("age", @as(i64, 25));
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "carol");
+    _ = try b.setFieldValue("age", @as(i64, 40));
+
+    const ids = try b.Save();
+    defer ids.deinit();
+    try std.testing.expectEqualSlices(i64, &.{ 7, 8, 9 }, ids.items);
+    try std.testing.expectEqual(@as(usize, 3), consecutive.exec_calls);
+
+    // ... and an upsert whose rows collide answers each row's own id rather
+    // than a run offset by the collision (the third is not 3, and not 2 + i).
+    var colliding = IdScriptDriver{ .script = &.{ 1, 5, 6 } };
+    defer colliding.freeCapture();
+    var u = try BulkBuilder.init(std.testing.allocator, colliding.asDriver(), &.{}, null);
+    defer u.deinit();
+    _ = try u.setFieldValue("name", "alice");
+    _ = try u.setFieldValue("age", @as(i64, 30));
+    _ = try u.Next();
+    _ = try u.setFieldValue("name", "bob");
+    _ = try u.setFieldValue("age", @as(i64, 25));
+    _ = try u.Next();
+    _ = try u.setFieldValue("name", "carol");
+    _ = try u.setFieldValue("age", @as(i64, 40));
+
+    const upsert_ids = try u.SaveOrUpdate();
+    defer upsert_ids.deinit();
+    try std.testing.expectEqualSlices(i64, &.{ 1, 5, 6 }, upsert_ids.items);
+    try std.testing.expectEqual(@as(usize, 3), colliding.exec_calls);
+    // Each statement carries one row, and still carries the ODKU suffix.
+    const sql_text = colliding.last_sql_owned orelse return error.MissingCapture;
+    try std.testing.expect(std.mem.indexOf(u8, sql_text, "ON DUPLICATE KEY UPDATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql_text, "), (") == null);
+}
+
+test "bulk insert: a driver that reports no last_insert_id is an error, not a run of ids" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
+
+    var drv = IdScriptDriver{ .script = &.{null} };
+    defer drv.freeCapture();
+    var b = try BulkBuilder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "bob");
+    _ = try b.setFieldValue("age", @as(i64, 25));
+
+    try std.testing.expectError(error.MissingLastInsertId, b.Save());
+    // It stops at the first unanswerable row rather than writing the batch and
+    // reporting ids for it afterwards.
+    try std.testing.expectEqual(@as(usize, 1), drv.exec_calls);
 }

@@ -91,6 +91,11 @@ const MockDriver = struct {
     last_sql: ?[]const u8 = null,
     last_sql_owned: ?[]u8 = null,
     dialect_override: ?Dialect = null,
+    /// The id `exec` reports. A server answers one for every row it inserts, so
+    /// the default is an id rather than `null`: a driver that reports none is
+    /// the case `create.zig`'s `IdScriptDriver` pins, where the statement ran
+    /// and the key is unknown.
+    last_insert_id: ?i64 = 1,
 
     const vtable = sql_driver.Driver.VTable{
         .exec = exec,
@@ -113,7 +118,7 @@ const MockDriver = struct {
             self.last_sql_owned = std.testing.allocator.dupe(u8, sql_text) catch null;
             self.last_sql = self.last_sql_owned;
         }
-        return .{ .rows_affected = 0, .last_insert_id = null };
+        return .{ .rows_affected = 0, .last_insert_id = self.last_insert_id };
     }
 
     fn query(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, sql_text: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
