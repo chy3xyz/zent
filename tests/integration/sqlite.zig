@@ -3567,6 +3567,84 @@ test "SQLite: checkSchema reports every kind of schema/DDL drift" {
     try testing.expectEqualStrings("typed_col", nulls[1].column);
 }
 
+test "SQLite: checkSchema reports a UNIQUE column and a foreign key the database lacks" {
+    // The two gaps a `.sql`-file consumer never hears about: `Unique()` is
+    // inlined into CREATE TABLE (it is not one of `info.indexes`, so the index
+    // comparison cannot see it) and a foreign key is added to `CREATE TABLE`
+    // only — `migrateSchema` never ALTERs an existing table to add a
+    // constraint, by design.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // The names avoid the `sqlite_` prefix: SQLite reserves it for itself and
+    // refuses to create the table at all.
+    const SqDriftOwner = schema("SqDriftOwner", .{ .fields = &.{field.String("name")} });
+
+    // The table as it was built: no UNIQUE on `vin`, and no edge yet.
+    const SqDriftCarBefore = schema("SqDriftCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ SqDriftOwner, SqDriftCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    // The schema as it is now: `vin` declared UNIQUE, the edge declared.
+    const SqDriftCarAfter = schema("SqDriftCar", .{
+        .fields = &.{ field.String("model"), field.String("vin").Unique() },
+        .edges = &.{edge.From("owner", SqDriftOwner)},
+    });
+    const after_graph = comptime buildGraph(&.{ SqDriftOwner, SqDriftCarAfter });
+    const infos = after_graph.types;
+
+    // The edge's column exists (added out of band, matching type and
+    // nullability), the constraint does not.
+    _ = try drv.exec("ALTER TABLE sq_drift_car ADD COLUMN owner_id INTEGER", &.{});
+
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+
+        var unique_drift: ?migrate.SchemaDrift = null;
+        var fk_drift: ?migrate.SchemaDrift = null;
+        for (drifts) |d| {
+            try testing.expectEqualStrings("sq_drift_car", d.table);
+            if (d.kind == .unique_constraint) unique_drift = d;
+            if (d.kind == .missing_foreign_key) fk_drift = d;
+        }
+        try testing.expectEqual(@as(usize, 2), drifts.len);
+        try testing.expect(unique_drift != null);
+        try testing.expectEqualStrings("vin", unique_drift.?.column);
+        try testing.expectEqualStrings(
+            "schema declares the column UNIQUE, database has no unique constraint covering it",
+            unique_drift.?.index_detail,
+        );
+        try testing.expect(fk_drift != null);
+        try testing.expectEqualStrings("owner_id", fk_drift.?.column);
+        try testing.expectEqualStrings(
+            "schema declares FOREIGN KEY (owner_id) REFERENCES sq_drift_owner (id), database has none",
+            fk_drift.?.index_detail,
+        );
+        try testing.expect(!unique_drift.?.breaksReads());
+        try testing.expect(!fk_drift.?.breaksReads());
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The same declarations on a table the schema built itself: `migrateSchema`
+    // emits both the inline UNIQUE and the FOREIGN KEY clause, `checkSchema`
+    // reads them back, and the pair agrees.
+    const SqDriftCarOk = schema("SqDriftCarOk", .{
+        .fields = &.{ field.String("model"), field.String("vin").Unique() },
+        .edges = &.{edge.From("owner", SqDriftOwner)},
+    });
+    const ok_graph = comptime buildGraph(&.{ SqDriftOwner, SqDriftCarOk });
+    try migrate.migrateSchema(allocator, drv.asDriver(), ok_graph.types);
+
+    const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), ok_graph.types);
+    defer migrate.freeSchemaDrift(allocator, agreeing);
+    try testing.expectEqual(@as(usize, 0), agreeing.len);
+}
+
 test "SQLite: a scan failure names the table and the offending column" {
     // `error.TypeMismatch` on its own names neither, which is the third of four
     // consumer reports in this batch. The diagnosis is emitted through

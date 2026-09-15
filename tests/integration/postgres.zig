@@ -3354,6 +3354,104 @@ test "Postgres: introspection binds the table name instead of interpolating it" 
     try testing.expectEqualStrings("email", found.?.columns[0]);
 }
 
+test "Postgres: checkSchema reports a UNIQUE column and a foreign key the database lacks" {
+    // The two silent gaps this covers: a `Unique()` field is inlined into
+    // CREATE TABLE and is not one of `info.indexes`, so nothing compared it;
+    // and a foreign key the edge generates is never added to a table that
+    // already exists (`migrateSchema` does not ALTER TABLE ADD CONSTRAINT), so
+    // the application's "the database rejects orphans" was an assumption.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const PgDriftOwner = schema("PgDriftOwner", .{ .fields = &.{field.String("name")} });
+
+    // Leftovers from an interrupted run, and the child dropped before its
+    // parent (the defers run in reverse, so these two are registered owner
+    // first): a foreign key makes the parent's own DROP TABLE fail.
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_drift_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_drift_owner CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_drift_owner CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_drift_car", &.{}) catch {};
+
+    // The table as it was built: no UNIQUE on `vin`, and no edge yet. Building
+    // it with `migrateSchema` is what keeps the columns themselves out of the
+    // report — this test is about the two constraints.
+    const PgDriftCarBefore = schema("PgDriftCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ PgDriftOwner, PgDriftCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    // The schema as it is now.
+    const PgDriftCarAfter = schema("PgDriftCar", .{
+        .fields = &.{ field.String("model"), field.String("vin").Unique() },
+        .edges = &.{edge.From("owner", PgDriftOwner)},
+    });
+    const after_graph = comptime buildGraph(&.{ PgDriftOwner, PgDriftCarAfter });
+    const infos = after_graph.types;
+
+    // The edge's column exists (added out of band, matching type and
+    // nullability), the constraint does not.
+    _ = try drv.exec("ALTER TABLE pg_drift_car ADD COLUMN owner_id INTEGER", &.{});
+
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+
+        var unique_drift: ?migrate.SchemaDrift = null;
+        var fk_drift: ?migrate.SchemaDrift = null;
+        for (drifts) |d| {
+            try testing.expectEqualStrings("pg_drift_car", d.table);
+            if (d.kind == .unique_constraint) unique_drift = d;
+            if (d.kind == .missing_foreign_key) fk_drift = d;
+        }
+        try testing.expectEqual(@as(usize, 2), drifts.len);
+        try testing.expect(unique_drift != null);
+        try testing.expectEqualStrings("vin", unique_drift.?.column);
+        try testing.expect(fk_drift != null);
+        try testing.expectEqualStrings("owner_id", fk_drift.?.column);
+        try testing.expectEqualStrings(
+            "schema declares FOREIGN KEY (owner_id) REFERENCES pg_drift_owner (id), database has none",
+            fk_drift.?.index_detail,
+        );
+        // Neither is a broken read: the database accepts a duplicate `vin` and
+        // an orphan `owner_id`, and returns every row it returned before.
+        try testing.expect(!unique_drift.?.breaksReads());
+        try testing.expect(!fk_drift.?.breaksReads());
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // Both constraints, in the shapes the schema declares: silence. The foreign
+    // key is compared by shape, so the name PostgreSQL invents is irrelevant.
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_pg_drift_car_vin ON pg_drift_car (vin)", &.{});
+    _ = try drv.exec(
+        "ALTER TABLE pg_drift_car ADD CONSTRAINT pg_drift_car_owner_fk FOREIGN KEY (owner_id) REFERENCES pg_drift_owner (id)",
+        &.{},
+    );
+
+    const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, agreeing);
+    try testing.expectEqual(@as(usize, 0), agreeing.len);
+
+    // `getExistingForeignKeys` read that constraint back: the columns, in
+    // constraint order, and the table they point at.
+    var keys = try migrate.getExistingForeignKeys(allocator, drv.asDriver(), "pg_drift_car");
+    defer migrate.freeExistingForeignKeys(allocator, &keys);
+    try testing.expectEqual(@as(usize, 1), keys.items.len);
+    try testing.expectEqualStrings("owner_id", keys.items[0].columns[0]);
+    try testing.expectEqualStrings("pg_drift_owner", keys.items[0].ref_table);
+    try testing.expect(keys.items[0].ref_columns_comparable);
+    try testing.expectEqualStrings("id", keys.items[0].ref_columns[0]);
+
+    // The table name is bound, and a table that does not exist is an empty
+    // answer rather than an error.
+    var absent = try migrate.getExistingForeignKeys(allocator, drv.asDriver(), "pg_drift_absent");
+    defer migrate.freeExistingForeignKeys(allocator, &absent);
+    try testing.expectEqual(@as(usize, 0), absent.items.len);
+}
+
 // ------------------------------------------------------------------
 // checkStatement: prepare-and-discard validation of a raw statement
 // ------------------------------------------------------------------
