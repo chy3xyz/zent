@@ -10,7 +10,8 @@ fn toDriverError(err: anyerror) driver.Error {
         error.OutOfMemory => error.OutOfMemory,
         error.MySQLInitFailed, error.MySQLConnectFailed, error.MySQLConfigFailed => error.ConnectionFailed,
         error.MySQLExecFailed => error.ExecFailed,
-        error.MySQLStmtFailed, error.MySQLBindResultFailed, error.MySQLParamCountMismatch, error.MySQLNotAQuery => error.QueryFailed,
+        error.MySQLParamCountMismatch => error.ParamCountMismatch,
+        error.MySQLStmtFailed, error.MySQLBindResultFailed, error.MySQLNotAQuery => error.QueryFailed,
         error.MySQLPingFailed => error.PingFailed,
         error.MySQLDataTruncated => error.ProtocolError,
         error.MySQLFetchFailed => error.ProtocolError,
@@ -511,7 +512,11 @@ pub const MySQLDriver = struct {
         // Bind parameters
         const n_params = c.mysql_stmt_param_count(stmt);
         if (n_params != args.len) {
-            std.log.err("mysql: expected {d} params, got {d}", .{ n_params, args.len });
+            // `warn`, not `err`: the caller gets the error back and has to
+            // handle it, and a test that pins this path could not run at all if
+            // the log level made the test runner fail (same reason the SQLite
+            // driver logs its statement failures at warn).
+            std.log.warn("mysql: expected {d} params, got {d}", .{ n_params, args.len });
             return error.MySQLParamCountMismatch;
         }
 
@@ -579,7 +584,11 @@ pub const MySQLDriver = struct {
         // Bind parameters
         const n_params = c.mysql_stmt_param_count(stmt);
         if (n_params != args.len) {
-            std.log.err("mysql: expected {d} params, got {d}", .{ n_params, args.len });
+            // `warn`, not `err`: the caller gets the error back and has to
+            // handle it, and a test that pins this path could not run at all if
+            // the log level made the test runner fail (same reason the SQLite
+            // driver logs its statement failures at warn).
+            std.log.warn("mysql: expected {d} params, got {d}", .{ n_params, args.len });
             return error.MySQLParamCountMismatch;
         }
 
@@ -1245,6 +1254,10 @@ test "MySQL toDriverError maps native errors to the unified set" {
     try std.testing.expectEqual(driver.Error.ConnectionFailed, toDriverError(error.MySQLConnectFailed));
     try std.testing.expectEqual(driver.Error.ExecFailed, toDriverError(error.MySQLExecFailed));
     try std.testing.expectEqual(driver.Error.QueryFailed, toDriverError(error.MySQLStmtFailed));
+    // Not `QueryFailed`: the caller can now tell "my argument list is wrong"
+    // from "the query failed", and the same name is what SQLite reports for
+    // the same mistake.
+    try std.testing.expectEqual(driver.Error.ParamCountMismatch, toDriverError(error.MySQLParamCountMismatch));
     try std.testing.expectEqual(driver.Error.ProtocolError, toDriverError(error.MySQLDataTruncated));
     try std.testing.expectEqual(driver.Error.QueryTimeout, toDriverError(error.QueryTimeout));
     try std.testing.expectEqual(driver.Error.UniqueViolation, toDriverError(error.UniqueViolation));

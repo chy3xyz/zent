@@ -2891,6 +2891,53 @@ test "MySQL: migration lock times out while another session holds it" {
     try testing.expectError(error.MigrationLockTimeout, res);
 }
 
+test "MySQL: a binding list of the wrong length is a param count mismatch, not a query failure" {
+    // The count is compared on the client side (`mysql_stmt_param_count`), so
+    // this behaves identically on MySQL and MariaDB and needs no `isMariaDB`
+    // branch. What it pins is the mapping: this used to arrive as
+    // `QueryFailed`, which is the same name a syntax error gets, so a caller
+    // could not tell "I built the argument list wrong" from "the query is
+    // wrong". The direct (`MySQLDriver.exec`) entry point still reports its
+    // own `MySQLParamCountMismatch`; the unified name is what the driver
+    // interface — and so the ORM — returns.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_my_params", &.{});
+    _ = try drv.exec(
+        \\CREATE TABLE zent_my_params (
+        \\  id INT AUTO_INCREMENT PRIMARY KEY,
+        \\  name VARCHAR(255) NOT NULL,
+        \\  score INT
+        \\)
+    , &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_my_params", &.{}) catch {};
+
+    const d = drv.asDriver();
+    const insert = "INSERT INTO zent_my_params (name, score) VALUES (?, ?)";
+
+    try testing.expectError(error.ParamCountMismatch, d.exec(insert, &.{.{ .string = "alice" }}));
+    try testing.expectError(
+        error.ParamCountMismatch,
+        d.exec(insert, &.{ .{ .string = "alice" }, .{ .int = 1 }, .{ .int = 2 } }),
+    );
+    try testing.expectError(
+        error.ParamCountMismatch,
+        d.query("SELECT id FROM zent_my_params WHERE name = ? AND score = ?", &.{.{ .string = "alice" }}),
+    );
+
+    // Neither rejected statement wrote anything, and the list that fits still
+    // works.
+    {
+        var rows = try d.query("SELECT COUNT(*) FROM zent_my_params", &.{});
+        defer rows.deinit();
+        try testing.expectEqual(@as(i64, 0), rows.next().?.getInt(0).?);
+    }
+    const ok = try d.exec(insert, &.{ .{ .string = "alice" }, .{ .int = 1 } });
+    try testing.expectEqual(@as(usize, 1), ok.rows_affected);
+}
+
 // ---------------------------------------------------------------------------
 // TLS / mTLS
 //

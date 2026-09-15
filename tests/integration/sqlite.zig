@@ -3945,6 +3945,49 @@ test "SQLite: zent.scope composes with crud_helpers.queryRows on raw SQL" {
     }
 }
 
+test "SQLite: a raw statement bound with the wrong number of arguments is refused" {
+    // The quiet failure: SQLite reads an unbound parameter as NULL, so
+    // `WHERE code = ? AND app_id = ?` with a single binding answered *some*
+    // rows (matching nothing, since `app_id = NULL` is never true) — the
+    // caller sees an empty page, which reads exactly like "no such row". The
+    // surplus direction was dropped on the floor. Both are now refused before
+    // the statement runs, on the layer consumers reach for.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE zent_pc_rows (code TEXT, app_id INTEGER)", &.{});
+    _ = try drv.exec("INSERT INTO zent_pc_rows (code, app_id) VALUES (?, ?)", &.{ .{ .string = "i1" }, .{ .int = 1 } });
+
+    const Row = struct { code: []const u8 };
+    const mapper = struct {
+        fn f(a: std.mem.Allocator, row: zent.sql_driver.Row) !Row {
+            return .{ .code = try a.dupe(u8, row.getText(0) orelse "") };
+        }
+    }.f;
+    const stmt = "SELECT code FROM zent_pc_rows WHERE code = ? AND app_id = ?";
+
+    // The list that fits is answered as before.
+    {
+        var r = try zent.crud_helpers.queryRows(Row, drv.asDriver(), stmt, &.{ .{ .string = "i1" }, .{ .int = 1 } }, allocator, mapper);
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 1), r.items.len);
+        try testing.expectEqualStrings("i1", r.items[0].code);
+    }
+    try testing.expectError(
+        error.ParamCountMismatch,
+        zent.crud_helpers.queryRows(Row, drv.asDriver(), stmt, &.{.{ .string = "i1" }}, allocator, mapper),
+    );
+    try testing.expectError(
+        error.ParamCountMismatch,
+        zent.crud_helpers.queryRows(Row, drv.asDriver(), stmt, &.{
+            .{ .string = "i1" },
+            .{ .int = 1 },
+            .{ .int = 2 },
+        }, allocator, mapper),
+    );
+}
+
 test "SQLite: Update edge writes maintain M2M and O2M associations" {
     const allocator = testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");
