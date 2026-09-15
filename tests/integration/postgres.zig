@@ -3705,6 +3705,130 @@ test "Postgres: checkSchema reports a missing M2M junction table" {
     try testing.expectEqual(@as(usize, 0), healed.len);
 }
 
+test "Postgres: checkSchema reports a present M2M junction table whose shape is wrong" {
+    // The other half of the junction check: a relation of the right *name* is
+    // not a junction table. A missing column fails the relation query with
+    // `column … does not exist`, and a table with nothing keying the pair
+    // accepts the same link twice. Both were silent while only existence was
+    // compared.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Leftovers from an interrupted run. The junction table goes first: it
+    // holds foreign keys to both entity tables. The cleanup `defer`s are
+    // registered in the opposite order for the same reason — they run in
+    // reverse, so the junction table (registered last) is dropped first.
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_pg_shape_zent_jc_pg_tag", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_pg_shape", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_pg_tag", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_tag", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_shape", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_shape_zent_jc_pg_tag", &.{}) catch {};
+
+    const ZentJcPgShapeBase = schema("ZentJcPgShape", .{ .fields = &.{field.String("name")} });
+    const ZentJcPgTagBase = schema("ZentJcPgTag", .{ .fields = &.{field.String("label")} });
+    const ZentJcPgShape = struct {
+        pub const schema_name = ZentJcPgShapeBase.schema_name;
+        pub const fields = ZentJcPgShapeBase.fields;
+        pub const edges = &.{edge.To("tags", ZentJcPgTagBase)};
+        pub const indexes = ZentJcPgShapeBase.indexes;
+    };
+    const ZentJcPgTag = struct {
+        pub const schema_name = ZentJcPgTagBase.schema_name;
+        pub const fields = ZentJcPgTagBase.fields;
+        pub const edges = &.{edge.To("shapes", ZentJcPgShapeBase)};
+        pub const indexes = ZentJcPgTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ ZentJcPgShape, ZentJcPgTag });
+    const infos = graph.types;
+
+    // The junction table `migrateSchema` builds is the reference shape, and it
+    // has to satisfy all three comparisons: PostgreSQL reports the composite
+    // primary key as `…_pkey` in `pg_index` and the two foreign keys through
+    // `pg_constraint`, and both must read as the shape the schema derives.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // Hand-created with neither the columns nor the keys: two missing columns,
+    // the pair nothing forces unique, two foreign keys that are not there.
+    _ = try drv.exec("DROP TABLE zent_jc_pg_shape_zent_jc_pg_tag", &.{});
+    _ = try drv.exec("CREATE TABLE zent_jc_pg_shape_zent_jc_pg_tag (id INTEGER PRIMARY KEY)", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 5), drifts.len);
+
+        var missing_columns: usize = 0;
+        var pair_uniqueness: usize = 0;
+        var missing_fks: usize = 0;
+        for (drifts) |d| {
+            try testing.expectEqualStrings("zent_jc_pg_shape_zent_jc_pg_tag", d.table);
+            switch (d.kind) {
+                .missing_column => {
+                    missing_columns += 1;
+                    try testing.expect(d.breaksReads());
+                },
+                .junction_pair_uniqueness => pair_uniqueness += 1,
+                .missing_foreign_key => missing_fks += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try testing.expectEqual(@as(usize, 2), missing_columns);
+        try testing.expectEqual(@as(usize, 1), pair_uniqueness);
+        try testing.expectEqual(@as(usize, 2), missing_fks);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // Right columns, no key over the pair and no foreign keys: the relation
+    // query runs, so `read_breaking_only` passes while `.any` reports.
+    _ = try drv.exec("DROP TABLE zent_jc_pg_shape_zent_jc_pg_tag", &.{});
+    _ = try drv.exec("CREATE TABLE zent_jc_pg_shape_zent_jc_pg_tag (zent_jc_pg_shape_id INTEGER NOT NULL, zent_jc_pg_tag_id INTEGER NOT NULL)", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 3), drifts.len);
+        for (drifts) |d| {
+            try testing.expect(d.kind == .junction_pair_uniqueness or d.kind == .missing_foreign_key);
+            try testing.expect(!d.breaksReads());
+        }
+        // The relation query really does run — the stake behind `breaksReads`
+        // being false for these two kinds. The error name is the driver's
+        // business, so only the failure itself is asserted.
+        if (drv.query("SELECT zent_jc_pg_shape_id, zent_jc_pg_tag_id FROM zent_jc_pg_shape_zent_jc_pg_tag", &.{})) |rows| {
+            var r = rows;
+            r.deinit();
+        } else |_| return error.TestUnexpectedResult;
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The shape the junction should have had, created by hand — the only thing
+    // that makes the check green again, since `migrateSchema` never reshapes a
+    // junction table.
+    _ = try drv.exec("DROP TABLE zent_jc_pg_shape_zent_jc_pg_tag", &.{});
+    _ = try drv.exec(
+        "CREATE TABLE zent_jc_pg_shape_zent_jc_pg_tag (" ++
+            "zent_jc_pg_shape_id INTEGER NOT NULL, zent_jc_pg_tag_id INTEGER NOT NULL, " ++
+            "PRIMARY KEY (zent_jc_pg_shape_id, zent_jc_pg_tag_id), " ++
+            "FOREIGN KEY (zent_jc_pg_shape_id) REFERENCES zent_jc_pg_shape (id) ON DELETE CASCADE ON UPDATE CASCADE, " ++
+            "FOREIGN KEY (zent_jc_pg_tag_id) REFERENCES zent_jc_pg_tag (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+        &.{},
+    );
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+}
+
 // ------------------------------------------------------------------
 // checkStatement: prepare-and-discard validation of a raw statement
 // ------------------------------------------------------------------

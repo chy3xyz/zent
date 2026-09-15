@@ -3825,6 +3825,126 @@ test "SQLite: checkSchema reports a missing M2M junction table" {
     try testing.expectEqual(@as(usize, 0), healed.len);
 }
 
+test "SQLite: checkSchema reports a present M2M junction table whose shape is wrong" {
+    // The other half of the junction check, and the failure that motivated it:
+    // a table of the right *name* is not a junction table. Columns the relation
+    // query names but the table does not have fail the query with
+    // `no such column`, and a table with no key over the pair accepts the same
+    // link twice — so the relation query answers with the same neighbour twice.
+    // Both were silent: the v0.62.0 check compared the relation's existence and
+    // nothing else.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const SqJsMemberBase = schema("SqJsMember", .{ .fields = &.{field.String("name")} });
+    const SqJsTagBase = schema("SqJsTag", .{ .fields = &.{field.String("label")} });
+    const SqJsMember = struct {
+        pub const schema_name = SqJsMemberBase.schema_name;
+        pub const fields = SqJsMemberBase.fields;
+        pub const edges = &.{edge.To("tags", SqJsTagBase)};
+        pub const indexes = SqJsMemberBase.indexes;
+    };
+    const SqJsTag = struct {
+        pub const schema_name = SqJsTagBase.schema_name;
+        pub const fields = SqJsTagBase.fields;
+        pub const edges = &.{edge.To("members", SqJsMemberBase)};
+        pub const indexes = SqJsTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ SqJsMember, SqJsTag });
+    const infos = graph.types;
+
+    // The junction table `migrateSchema` builds is the reference shape: its two
+    // columns, its composite primary key and its two foreign keys satisfy all
+    // three comparisons. (If they did not, every consumer with an M2M edge would
+    // see a drift the moment they upgraded.)
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // A hand-created table under the junction's name with neither the columns
+    // nor the keys.
+    _ = try drv.exec("DROP TABLE sq_js_member_sq_js_tag", &.{});
+    _ = try drv.exec("CREATE TABLE sq_js_member_sq_js_tag (id INTEGER PRIMARY KEY)", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 5), drifts.len);
+
+        var missing_columns: usize = 0;
+        var pair_uniqueness: usize = 0;
+        var missing_fks: usize = 0;
+        var read_breaking: usize = 0;
+        for (drifts) |d| {
+            try testing.expectEqualStrings("sq_js_member_sq_js_tag", d.table);
+            switch (d.kind) {
+                .missing_column => {
+                    missing_columns += 1;
+                    try testing.expect(d.breaksReads());
+                    read_breaking += 1;
+                },
+                .junction_pair_uniqueness => pair_uniqueness += 1,
+                .missing_foreign_key => missing_fks += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try testing.expectEqual(@as(usize, 2), missing_columns);
+        try testing.expectEqual(@as(usize, 1), pair_uniqueness);
+        try testing.expectEqual(@as(usize, 2), missing_fks);
+        try testing.expectEqual(@as(usize, 2), read_breaking);
+        // The two constraint kinds are write-side: only the missing columns may
+        // stop a deploy, and they are why `read_breaking_only` fails here.
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The columns are right, so every query over the edge runs — but nothing
+    // keys the pair and nothing points the columns at the two entity tables.
+    // `read_breaking_only` now passes and `.any` still reports, which is the
+    // split this check is built on.
+    _ = try drv.exec("DROP TABLE sq_js_member_sq_js_tag", &.{});
+    _ = try drv.exec("CREATE TABLE sq_js_member_sq_js_tag (sq_js_member_id INTEGER NOT NULL, sq_js_tag_id INTEGER NOT NULL)", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 3), drifts.len);
+        for (drifts) |d| {
+            try testing.expect(d.kind == .junction_pair_uniqueness or d.kind == .missing_foreign_key);
+            try testing.expect(!d.breaksReads());
+        }
+        // The relation query really does run: the stake behind `breaksReads`
+        // being false for these two kinds.
+        var rows = try drv.query("SELECT sq_js_member_id, sq_js_tag_id FROM sq_js_member_sq_js_tag", &.{});
+        rows.deinit();
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The shape the junction should have had, created by hand the way a consumer
+    // with a `.sql` DDL would create it — and the only thing that makes the
+    // check green again. `migrateSchema` deliberately does not reshape a junction
+    // table, so nothing else would.
+    _ = try drv.exec("DROP TABLE sq_js_member_sq_js_tag", &.{});
+    _ = try drv.exec(
+        "CREATE TABLE sq_js_member_sq_js_tag (" ++
+            "sq_js_member_id INTEGER NOT NULL, sq_js_tag_id INTEGER NOT NULL, " ++
+            "PRIMARY KEY (sq_js_member_id, sq_js_tag_id), " ++
+            "FOREIGN KEY (sq_js_member_id) REFERENCES sq_js_member (id) ON DELETE CASCADE ON UPDATE CASCADE, " ++
+            "FOREIGN KEY (sq_js_tag_id) REFERENCES sq_js_tag (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+        &.{},
+    );
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+}
+
 test "SQLite: a scan failure names the table and the offending column" {
     // `error.TypeMismatch` on its own names neither, which is the third of four
     // consumer reports in this batch. The diagnosis is emitted through
