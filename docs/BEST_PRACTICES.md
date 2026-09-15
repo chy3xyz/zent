@@ -59,6 +59,24 @@ truncation. MySQL pads to the declared scale (`19.99` reads back as
 `19.9900000000`); parse to cents/fixed-point in application code before
 arithmetic.
 
+**`field.String` vs `field.Text` on MySQL — pick by whether you need to index
+it.** `String`/`Enum` map to `VARCHAR(255)` on MySQL (and `TEXT` on PostgreSQL
+and SQLite); `Text`/`JSON`/`Other` map to `TEXT` everywhere. The reason is that
+MySQL will not let a `TEXT` column be `UNIQUE` (errno 1170), carry a `DEFAULT`
+(errno 1101), or take an index without a key length — so a `field.Text` field
+declared `.Unique()`, `.Default(x)`, or with an index over it fails `CREATE
+TABLE` outright, while the same declarations on `field.String` work.
+
+The catch runs the other way: `VARCHAR(255)` is a 255-**character** cap that
+`String` does not express in its API, so a longer value that PostgreSQL and
+SQLite accept errors on MySQL under a strict `sql_mode` (the default) and is
+truncated silently under a permissive one. Choose `String` for anything
+indexed, unique or defaulted (emails, slugs, statuses, names), and `Text` for
+genuinely unbounded content — accepting that MySQL will then refuse to make it
+unique or defaulted. Existing MySQL tables created before v0.57.0 hold `TEXT`
+where the schema now says `VARCHAR(255)`; see `UPGRADING.md` §12 for the
+conversion and the length check to run first.
+
 ## 2. Memory contract (the one thing to get right)
 
 zent results are **owned**; the caller frees exactly once. Three ownership

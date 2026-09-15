@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.56.1** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.57.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (341 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (343 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -106,6 +106,15 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - **Positional row scans are column-count guarded.** `scanRow*` rejects a
   result set narrower than the struct with `error.ColumnCountMismatch`; the
   drivers do not all bounds-check. Keep that check when adding a scanner.
+- **MySQL `String`/`Enum` are `VARCHAR(255)`, not `TEXT`.** MySQL will not make
+  a `TEXT` column `UNIQUE` (errno 1170), give it a `DEFAULT` (errno 1101), or
+  index it without a key length — so a schema declaring
+  `field.String(…).Unique()`, `.Default(…)` or an index over such a field fails
+  `CREATE TABLE` outright. Do not "simplify" the mapping back to `TEXT` for
+  parity with PostgreSQL/SQLite, and do not switch to a key-length prefix
+  (`col(255)`): that makes `UNIQUE` constrain only the first 255 characters.
+  `field.Text` keeps `TEXT` deliberately — it is the unbounded type, and MySQL
+  restrictions on it are reported, not worked around.
 
 ## Layout
 

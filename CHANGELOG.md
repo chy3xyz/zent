@@ -4,6 +4,59 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING for MySQL schemas: `field.String` and `field.Enum` map to
+  `VARCHAR(255)` instead of `TEXT`.** MySQL refuses the three things a string
+  column is normally asked to do when that column is `TEXT`:
+
+  | Declaration | Emitted DDL | MySQL result |
+  |---|---|---|
+  | `field.String("email").Unique()` | `` `email` TEXT NOT NULL UNIQUE `` | `ERROR 1170` — no key length |
+  | `field.String("status").Default("new")` | `` `status` TEXT DEFAULT 'new' `` | `ERROR 1101` — no DEFAULT on TEXT |
+  | an index over a `String` column | `` CREATE INDEX … (`status`) `` | `ERROR 1170` — no key length |
+
+  All three are **hard failures of table creation**, so a MySQL schema using any
+  of them could not be built at all. `VARCHAR(255)` is indexable, `UNIQUE`-able
+  and defaultable, and 255 is the length ent uses. A key-length prefix
+  (`email(255)`) was deliberately **not** used to keep TEXT: for `UNIQUE` it
+  would silently constrain only the first 255 characters, so two distinct values
+  sharing a 255-character prefix would collide and the constraint would no longer
+  mean what the schema says.
+
+  This mirrors the existing MySQL special cases for `.uuid` (`CHAR(36)`, for the
+  same errno 1170) and `.decimal` (`DECIMAL(38,10)`); the project had already hit
+  this class of problem on UUID primary keys and fixed only that case.
+
+  `field.Text`, `field.JSON` and `field.Other` keep `TEXT` — the restriction is
+  MySQL's own and lands on a deliberately unbounded column (ent behaves the same
+  way; a `Text` column still cannot be `UNIQUE`, indexed without a key length, or
+  defaulted on MySQL). PostgreSQL and SQLite are **unchanged**: both still map to
+  `TEXT`.
+
+  **MySQL consumers must convert existing columns by hand.** A table created
+  before this release holds `TEXT` where the schema now says `VARCHAR(255)`:
+  `sql_schema.checkSchema` reports each such column as `type_mismatch`
+  (`normalizeSqlType` strips the `(255)`, so it compares `text` against
+  `varchar`), and `migrateSchemaWithOptions(.{ .allow_data_loss = true })` fails
+  closed with `error.MySQLTypeChangeUnsafe`, because MySQL's `MODIFY COLUMN`
+  replaces the whole definition and can silently strip `NOT NULL` / `DEFAULT` /
+  `UNIQUE`. `migrateSchema` **without** that flag performs no type change and
+  keeps working, so nothing breaks unbidden — the drift is reported, not applied.
+  Convert explicitly, restating every attribute:
+
+  ```sql
+  ALTER TABLE t MODIFY col VARCHAR(255) NOT NULL DEFAULT 'new';
+  ```
+
+  **Check the length first.** `VARCHAR(255)` is 255 *characters* under
+  `utf8mb4`, and `field.String` is unbounded in the API — so a value longer than
+  255 characters that PostgreSQL and SQLite accept is an error on MySQL under a
+  strict `sql_mode` (the default) or a silent truncation under a permissive one.
+  Run `SELECT MAX(CHAR_LENGTH(col)) FROM t` before converting. A column that
+  legitimately holds more than 255 characters stays `TEXT` — use `field.Text` and
+  accept that MySQL will not let it be unique, prefix-free indexed, or defaulted.
+  `docs/UPGRADING.md` §12 and `docs/BEST_PRACTICES.md` carry the same note.
+
 ## [0.56.1] - 2026-09-15
 
 ### Fixed

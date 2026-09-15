@@ -200,3 +200,52 @@ client's `privacy_ctx`/`interceptors`, so it scopes exactly like
   the original six-argument signature. The explicit name is the point: it is
   now visible at the call site that the ids were scoped elsewhere.
 
+## 12. MySQL string columns are now `VARCHAR(255)`
+
+`field.String` and `field.Enum` map to `VARCHAR(255)` on MySQL instead of
+`TEXT`. PostgreSQL and SQLite are unchanged (still `TEXT`).
+
+**Why.** MySQL refuses all three things a string column is normally asked to do
+when that column is `TEXT`:
+
+| Declaration | Emitted DDL | MySQL |
+|---|---|---|
+| `field.String("email").Unique()` | `` `email` TEXT NOT NULL UNIQUE `` | `ERROR 1170` — no key length |
+| `field.String("status").Default("new")` | `` `status` TEXT DEFAULT 'new' `` | `ERROR 1101` — no DEFAULT on TEXT |
+| an index over a `String` column | `` CREATE INDEX … (`status`) `` | `ERROR 1170` — no key length |
+
+Each is a hard failure of table creation, so such a schema could not be built at
+all. `VARCHAR(255)` has none of the restrictions. The key-length prefix
+(`email(255)`) was **not** used to keep `TEXT`: for `UNIQUE` it constrains only
+the first 255 characters, which is not the constraint the schema declares.
+
+`field.Text` still maps to `TEXT` on MySQL, and keeps all three limitations —
+that is the type to reach for when the content is genuinely unbounded.
+
+**What to do.** An existing MySQL table holds `TEXT` where the schema now says
+`VARCHAR(255)`. Nothing changes unbidden: `migrateSchema` without
+`.allow_data_loss` performs no type change, and drift is reported rather than
+applied. To converge, convert each column by hand, restating every attribute —
+MySQL's `MODIFY COLUMN` replaces the whole definition, which is why
+`migrateSchemaWithOptions(.{ .allow_data_loss = true })` fails closed with
+`error.MySQLTypeChangeUnsafe` here:
+
+```sql
+ALTER TABLE t MODIFY col VARCHAR(255) NOT NULL DEFAULT 'new';
+```
+
+**Measure before you convert.**
+
+```sql
+SELECT MAX(CHAR_LENGTH(col)) FROM t;
+```
+
+255 is 255 *characters* under `utf8mb4`. On a strict `sql_mode` (the default in
+MySQL 8) a longer value errors; on a permissive one it is silently truncated. If
+the column really does hold longer values, keep it `TEXT` by declaring the field
+`field.Text` and accept that MySQL will not let it be unique, indexed without a
+key length, or defaulted.
+
+After converting, `sql_schema.checkSchema` stops reporting those columns. It
+compares normalized types (`varchar(255)` → `varchar`, `text` → `text`), so
+before the conversion each such column appears as `type_mismatch`.

@@ -271,7 +271,17 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
         .bool => return "BOOLEAN",
         .int => return "INTEGER",
         .float => return "REAL",
-        .string => return "TEXT",
+        .string => {
+            // MySQL refuses the three things a primary string column is
+            // normally asked to do when that column is TEXT: it cannot be
+            // indexed or UNIQUE without a key length (errno 1170), and it
+            // cannot carry a DEFAULT (errno 1101). VARCHAR(255) — the same
+            // length ent uses — has none of those restrictions. A prefix index
+            // (`name(255)`) is not the fix: for UNIQUE it would silently
+            // constrain only the first 255 characters.
+            if (std.mem.eql(u8, dialect.name, "mysql")) return "VARCHAR(255)";
+            return "TEXT";
+        },
         .text => return "TEXT",
         .bytes => {
             if (std.mem.eql(u8, dialect.name, "postgres")) return "BYTEA";
@@ -289,7 +299,15 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
             if (std.mem.eql(u8, dialect.name, "postgres")) return "JSONB";
             return "TEXT";
         },
-        .enum_ => return "TEXT",
+        .enum_ => {
+            // Same MySQL BLOB/TEXT restrictions as `.string` (errno 1170 for
+            // indexes and UNIQUE, errno 1101 for DEFAULT). The value set is
+            // fixed and finite, so VARCHAR(255) is the right width; MySQL's
+            // native ENUM(...) would put the value list into the DDL and its
+            // semantics differ between MySQL and MariaDB.
+            if (std.mem.eql(u8, dialect.name, "mysql")) return "VARCHAR(255)";
+            return "TEXT";
+        },
         .uuid => {
             if (std.mem.eql(u8, dialect.name, "postgres")) return "UUID";
             // MySQL cannot index TEXT without a key length, so a UUID primary
@@ -353,4 +371,58 @@ test "SQL type mapping" {
     try std.testing.expectEqualStrings("DECIMAL(38,10)", sqlType(.decimal, .{ .name = "mysql" }));
     try std.testing.expectEqualStrings("TEXT", sqlType(.decimal, .{ .name = "sqlite3" }));
     try std.testing.expectEqual([]const u8, zigType(.decimal, null));
+}
+
+test "SQL type mapping: String/Enum are VARCHAR on MySQL, TEXT elsewhere" {
+    const mysql = Dialect{ .name = "mysql" };
+    const postgres = Dialect{ .name = "postgres" };
+    const sqlite = Dialect{ .name = "sqlite3" };
+
+    // MySQL rejects a TEXT column that is indexed/UNIQUE (errno 1170) or
+    // defaulted (errno 1101), so the indexable primary string type is VARCHAR.
+    try std.testing.expectEqualStrings("VARCHAR(255)", sqlType(.string, mysql));
+    try std.testing.expectEqualStrings("VARCHAR(255)", sqlType(.enum_, mysql));
+
+    // PostgreSQL and SQLite keep TEXT — this change is MySQL-only.
+    try std.testing.expectEqualStrings("TEXT", sqlType(.string, postgres));
+    try std.testing.expectEqualStrings("TEXT", sqlType(.string, sqlite));
+    try std.testing.expectEqualStrings("TEXT", sqlType(.enum_, postgres));
+    try std.testing.expectEqualStrings("TEXT", sqlType(.enum_, sqlite));
+
+    // `.text` stays unbounded TEXT even on MySQL: the DEFAULT/UNIQUE
+    // restrictions are MySQL's own and apply to an intentionally unbounded
+    // column (ent behaves the same way).
+    try std.testing.expectEqualStrings("TEXT", sqlType(.text, mysql));
+    try std.testing.expectEqualStrings("TEXT", sqlType(.json, mysql));
+    try std.testing.expectEqualStrings("TEXT", sqlType(.other, mysql));
+}
+
+test "MySQL CREATE TABLE emits an indexable, defaultable unique String column" {
+    const migrate = @import("../sql/schema/migrate.zig");
+
+    const table = migrate.TableDef{
+        .name = "account",
+        .columns = &.{
+            .{ .name = "id", .sql_type = "INTEGER", .logical_type = .int, .primary_key = true },
+            .{ .name = "email", .sql_type = "TEXT", .logical_type = .string, .not_null = true, .unique = true },
+            .{ .name = "status", .sql_type = "TEXT", .logical_type = .enum_, .not_null = true, .default_value = "'new'" },
+        },
+        .primary_keys = &.{"id"},
+    };
+
+    const sql = try migrate.createTableSQL(table, Dialect{ .name = "mysql" });
+    defer std.heap.page_allocator.free(sql);
+
+    // UNIQUE and DEFAULT are emitted inline by createTableSQL; both are only
+    // legal because the column is VARCHAR rather than TEXT.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "`email` VARCHAR(255) NOT NULL UNIQUE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "`status` VARCHAR(255) NOT NULL DEFAULT 'new'") != null);
+
+    // A TEXT column would reproduce the two errno failures on this dialect.
+    try std.testing.expect(std.mem.indexOf(u8, sql, "TEXT NOT NULL UNIQUE") == null);
+
+    // PostgreSQL is untouched: the same schema still produces TEXT.
+    const pg_sql = try migrate.createTableSQL(table, Dialect{ .name = "postgres" });
+    defer std.heap.page_allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"email\" TEXT NOT NULL UNIQUE") != null);
 }

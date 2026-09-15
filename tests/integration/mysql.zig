@@ -214,9 +214,10 @@ test "MySQL: SaveOrUpdateOn uses business-key conflict target" {
     try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
     defer _ = drv.exec("DROP TABLE IF EXISTS my_setting", &.{}) catch {};
 
-    // Business-key unique index required by ON CONFLICT / ODKU.
-    // MySQL requires a length prefix on TEXT columns used in indexes.
-    _ = try drv.exec("CREATE UNIQUE INDEX idx_my_setting_key_app ON my_setting(`key`(255), app_id)", &.{});
+    // Business-key unique index required by ON CONFLICT / ODKU. `key` is a
+    // VARCHAR(255) now, so the index needs no key length — a prefix index
+    // would have made the uniqueness only cover the first 255 characters.
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_my_setting_key_app ON my_setting(`key`, app_id)", &.{});
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
@@ -3294,4 +3295,76 @@ test "MySQL: createAllTables keeps a UUID primary key typed as UUID" {
     var saved = try b.Save();
     defer zent.codegen.deinitEntity(infos, doc_info, &saved, allocator);
     try testing.expectEqualStrings("01920000-0000-7000-8000-0000000000f2", saved.id);
+}
+
+test "MySQL: unique/defaulted/indexed String columns build a usable table" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Every MySQL BLOB/TEXT restriction lands on this schema at once: a TEXT
+    // column cannot be UNIQUE without a key length (errno 1170), cannot carry
+    // a DEFAULT (errno 1101), and cannot be indexed without a key length
+    // (errno 1170 again). `field.String` maps to VARCHAR(255) on MySQL, so
+    // createAllTables must now succeed with the declarations as written.
+    const StrAccountBase = schema("MyStrAccount", .{
+        .fields = &.{
+            field.String("email").Unique(),
+            field.String("status").Default("new"),
+        },
+        .indexes = &.{
+            index.Named("idx_my_str_account_status", &.{"status"}),
+        },
+    });
+    const infos = comptime buildGraph(&.{StrAccountBase}).types;
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_str_account", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_str_account", &.{}) catch {};
+
+    try Client.createAllTables(allocator, infos, drv.asDriver());
+
+    for ([_][]const u8{ "email", "status" }) |column| {
+        var rows = try drv.query(
+            "SELECT column_type FROM information_schema.columns " ++
+                "WHERE table_name = 'my_str_account' AND table_schema = DATABASE() AND column_name = ?",
+            &.{.{ .string = column }},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        // VARCHAR, not TEXT: that is what made UNIQUE and DEFAULT legal.
+        try testing.expectEqualStrings("varchar(255)", row.getText(0).?);
+    }
+
+    // The declared index exists and covers the whole column (no key length).
+    {
+        var rows = try drv.query(
+            "SELECT sub_part FROM information_schema.statistics " ++
+                "WHERE table_name = 'my_str_account' AND table_schema = DATABASE() " ++
+                "AND index_name = 'idx_my_str_account_status'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expect(row.getText(0) == null);
+    }
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    {
+        var b = try client.my_str_account.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("email", "a@b.com");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+    {
+        // `status` was never set, so the server-side DEFAULT supplied it —
+        // the row is also proof the UNIQUE key is enforceable on this column.
+        var rows = try drv.query(
+            "SELECT COUNT(*) FROM my_str_account WHERE email = ? AND status = ?",
+            &.{ .{ .string = "a@b.com" }, .{ .string = "new" } },
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+    }
 }
