@@ -3261,3 +3261,52 @@ test "Postgres: the caller's arena is the only release for AllIn/FirstIn/SaveIn/
         try testing.expectEqualStrings("parent", rows[0].name);
     }
 }
+
+test "Postgres: getExistingIndexes reads plain key columns and skips the rest" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_idx_probe CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_idx_probe CASCADE", &.{}) catch {};
+    _ = try drv.exec(
+        "CREATE TABLE zent_idx_probe (id BIGINT PRIMARY KEY, a TEXT NOT NULL, b TEXT, payload JSONB)",
+        &.{},
+    );
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_zent_inspect_ab ON zent_idx_probe (a, b)", &.{});
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_b ON zent_idx_probe (b)", &.{});
+    // Four shapes whose key list is not a plain column list, and which must
+    // therefore never be compared against a declared index.
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_expr ON zent_idx_probe (lower(a))", &.{});
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_partial ON zent_idx_probe (b) WHERE b IS NOT NULL", &.{});
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_gin ON zent_idx_probe USING gin (payload)", &.{});
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_include ON zent_idx_probe (a) INCLUDE (b)", &.{});
+
+    var indexes = try migrate.getExistingIndexes(allocator, drv.asDriver(), "zent_idx_probe");
+    defer migrate.freeExistingIndexes(allocator, &indexes);
+
+    var composite: ?migrate.ExistingIndex = null;
+    for (indexes.items) |i| {
+        if (std.mem.eql(u8, i.name, "idx_zent_inspect_ab")) composite = i;
+    }
+    try testing.expect(composite != null);
+    try testing.expect(composite.?.unique);
+    try testing.expect(composite.?.columns_comparable);
+    try testing.expectEqual(@as(usize, 2), composite.?.columns.len);
+    try testing.expectEqualStrings("a", composite.?.columns[0]);
+    try testing.expectEqualStrings("b", composite.?.columns[1]);
+
+    for ([_][]const u8{
+        "idx_zent_inspect_expr",
+        "idx_zent_inspect_partial",
+        "idx_zent_inspect_gin",
+        "idx_zent_inspect_include",
+    }) |unreadable| {
+        var found: ?migrate.ExistingIndex = null;
+        for (indexes.items) |i| {
+            if (std.mem.eql(u8, i.name, unreadable)) found = i;
+        }
+        try testing.expect(found != null);
+        try testing.expect(!found.?.columns_comparable);
+    }
+}
