@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //!   const Shards = zent.shard.ShardSet(infos);
-//!   var router = zent.shard.ShardRouter.init(allocator, 2);
+//!   var router = try zent.shard.ShardRouter.init(allocator, 2);
 //!   defer router.deinit();
 //!   try router.assignTenant(1, 0);   // explicit
 //!   try router.assignTenant(2, 1);
@@ -23,7 +23,12 @@ pub const ShardRouter = struct {
     shard_count: usize,
     tenant_map: std.AutoHashMap(i64, usize),
 
-    pub fn init(allocator: std.mem.Allocator, shard_count: usize) ShardRouter {
+    /// A router must own at least one shard: `route` computes
+    /// `hash % shard_count`, so a zero count would divide by zero (panic in
+    /// Debug/ReleaseSafe, UB in ReleaseFast). Rejecting it here keeps every
+    /// constructed router well-formed, so `route` can stay infallible.
+    pub fn init(allocator: std.mem.Allocator, shard_count: usize) !ShardRouter {
+        if (shard_count == 0) return error.InvalidShardCount;
         return .{
             .allocator = allocator,
             .shard_count = shard_count,
@@ -45,6 +50,10 @@ pub const ShardRouter = struct {
     /// Route a tenant: explicit mapping wins, otherwise a stable hash.
     pub fn route(self: *const ShardRouter, tenant_id: i64) usize {
         if (self.tenant_map.get(tenant_id)) |idx| return idx;
+        // `init` rejects shard_count == 0; this assert documents the
+        // invariant the modulo relies on for instances forged by struct
+        // literal, which would otherwise be silent UB in ReleaseFast.
+        std.debug.assert(self.shard_count > 0);
         // @intCast panics (Debug/ReleaseSafe) or is UB (ReleaseFast) for
         // negative ids; @bitCast gives a deterministic two's-complement
         // modulo for any value. Negative tenant ids remain unsupported
@@ -99,8 +108,10 @@ pub fn ShardSet(comptime infos: []const TypeInfo) type {
             return &self.clients[self.shardOf(tenant_id)];
         }
 
-        /// Client by shard index.
+        /// Client by shard index. Asserts `index < shard_count`: internal
+        /// callers derive the index from `route`, which is always in range.
         pub fn clientAt(self: *Self, index: usize) *RootClient {
+            std.debug.assert(index < self.clients.len);
             return &self.clients[index];
         }
 
@@ -119,7 +130,7 @@ pub fn ShardSet(comptime infos: []const TypeInfo) type {
 const testing = std.testing;
 
 test "ShardRouter explicit map + hash fallback" {
-    var router = ShardRouter.init(testing.allocator, 3);
+    var router = try ShardRouter.init(testing.allocator, 3);
     defer router.deinit();
     try router.assignTenant(10, 1);
     try router.assignTenant(20, 2);
@@ -132,7 +143,7 @@ test "ShardRouter explicit map + hash fallback" {
 }
 
 test "ShardRouter moveTenant is idempotent" {
-    var router = ShardRouter.init(testing.allocator, 3);
+    var router = try ShardRouter.init(testing.allocator, 3);
     defer router.deinit();
     try router.assignTenant(10, 1);
     // Already explicit -> no-op.
@@ -182,7 +193,7 @@ test "ShardSet routes writes to the tenant's shard" {
     const client_a = client_mod.makeClient(infos, allocator, shard_a.asDriver());
     const client_b = client_mod.makeClient(infos, allocator, shard_b.asDriver());
 
-    var router = ShardRouter.init(allocator, 2);
+    var router = try ShardRouter.init(allocator, 2);
     try router.assignTenant(1, 0);
     try router.assignTenant(2, 1);
     const clients: []const Shards.RootClient = &.{ client_a, client_b };
@@ -222,7 +233,7 @@ test "ShardSet routes writes to the tenant's shard" {
 }
 
 test "ShardRouter routes negative tenant ids without crashing" {
-    var router = ShardRouter.init(testing.allocator, 4);
+    var router = try ShardRouter.init(testing.allocator, 4);
     defer router.deinit();
     // Negative ids must not panic/UB: route() uses @bitCast (two's-complement)
     // rather than @intCast so routing stays deterministic for any i64.
@@ -247,8 +258,15 @@ test "ShardSet.init rejects shard count mismatch" {
     const infos = comptime buildGraph(&.{Account}).types;
     const Shards = ShardSet(infos);
 
-    var router = ShardRouter.init(allocator, 2);
+    var router = try ShardRouter.init(allocator, 2);
     defer router.deinit();
     const empty: []const Shards.RootClient = &.{};
     try testing.expectError(error.ShardCountMismatch, Shards.init(allocator, router, empty));
+}
+
+test "ShardRouter.init rejects zero shards" {
+    // Fail-closed: a 0-shard router would make `route` divide by zero
+    // (panic in Debug/ReleaseSafe, UB in ReleaseFast), so construction is
+    // the only place that can reject it — `route` itself stays infallible.
+    try testing.expectError(error.InvalidShardCount, ShardRouter.init(testing.allocator, 0));
 }
