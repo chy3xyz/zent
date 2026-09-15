@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-09-15
+
 ### Added
 - **Arena scanning: the caller's arena owns the page** (Z27). `All()` hands back
   a `std.array_list.Managed(Entity)` that the caller must dismantle item by item
