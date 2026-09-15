@@ -4,6 +4,64 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (security): an empty `dept_ids` list on a `.dept_custom` /
+  `.dept_and_child` data scope now denies instead of widening** (Z33, reported by
+  a consumer). It left the filter rule's predicate `null`, and `null` is how this
+  module spells "no restriction" — so a request carrying no departments read
+  **every** row, while the adjacent branch (over `max_dept_ids`, differing only in
+  length) denied. The module contradicted its own `deny_pred` comment, which says
+  in as many words that a scope which cannot be built must never come out looking
+  like `.all`.
+
+  An empty list is now a "cannot be built" like the over-long one: it
+  materializes the always-false `1 = 0` and warns why. **`.all` is untouched** and
+  remains the way to say "no restriction", which is why the empty list has no
+  information to lose. **Migration:** code that meant "unrestricted" passes
+  `.all`; code that meant a real scope passes the real department ids. This bites
+  on reads and on the `WHERE` of scoped updates/deletes; creates are unaffected
+  (they are gated by the policy *decision*, not the filter predicate).
+
+  Amplification found while checking call sites: **`.dept_and_child` is a synonym
+  for `.dept_custom`** — same switch arm — and never reads `self_dept_id`, which
+  only `.dept_only` does. A caller using it with `self_dept_id` alone therefore
+  *always* passed an empty list, which is exactly the path that used to become a
+  full-table read.
+
+- **BREAKING: `BulkDelete().Exec()` with no predicate is now
+  `error.NoPredicate`** (Z34, same consumer). It did one of two things depending on
+  the entity's schema rather than on the call: a soft-deleting entity silently did
+  nothing and returned `0` — which a caller reads as "no rows matched" — while a
+  hard-deleting entity deleted the **whole table**. `BulkDeleteBuilder.query` /
+  `takeQuery` now refuse a call that constrains no rows, the rule v0.45.0 applied
+  to a `SET`-less `UPDATE` (`error.NoFieldsToUpdate`): the shape is named rather
+  than resolved in either direction, because which reading a caller got depended on
+  someone else's schema. The two duplicated implementations were merged into one
+  `writeStatement` — the drift between those copies is the defect class this is
+  about.
+
+  **Migration** for callers who used it to clear a table: say so with
+  `.Where(&.{sql.Raw("1 = 1")})` (renders `DELETE FROM t WHERE (1 = 1)`), or use
+  raw SQL. A scoped delete with no caller `Where` still works when an interceptor
+  or a privacy policy supplies the predicate, because the check runs after both.
+  The two dead guards (`groups.items.len == 0`, unreachable because `init` always
+  appends a group) are gone, so the code no longer looks guarded where it was not.
+
+- **A predicate group with no predicate is skipped instead of rendering a dangling
+  `OR`.** A `Next()` before the first `Where` — what a `Next(); Where(…);` loop
+  produces — used to emit `DELETE FROM t WHERE  OR "id" = ?`, which is not SQL.
+  The soft-delete path already skipped such a group; now both paths delete the
+  same rows.
+
+### Fixed
+- **The bulk soft-delete path applies the privacy policy's row filters.** It
+  checked `decision == .deny` and then dropped `result.getFilters()`, while the
+  bulk **hard** delete and the single-row `DeleteBuilder.execSoftDelete` both
+  append them — so a soft-deleting entity whose policy scopes rows by a filter
+  could **soft-delete rows outside that scope**. Found while verifying Z34;
+  falsified by dropping the filters again, which turns a scoped delete of 2 rows
+  into one of 3.
+
 ## [0.65.0] - 2026-09-15
 
 ### Added

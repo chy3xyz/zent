@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.65.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.66.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (423 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (431 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -51,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 423, integration 227 passed + 3 skipped
+`baseline` counts move with this: unit 431, integration 227 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -219,6 +219,21 @@ Entities and queries are explicitly owned by the caller. See the contract:
   `planMigrateStatements`; a second, hand-rolled "what would we do" branch is how
   a preview starts disagreeing with the run it is previewing. Anything added to
   the migration has to be added to the plan, once.
+- **An empty `dept_ids` list is a "cannot be built", not a "no restriction".**
+  `DataScopeFilter` returns the always-false `deny_pred` for a list longer than
+  `max_dept_ids`, for an **empty** list, and for a `PrivacyContext` without
+  `.extra`. `.all` is the first-class way to spell "unrestricted", so an empty list
+  has no other meaning — and `IN ()` is not portable (PostgreSQL and MySQL reject
+  it; SQLite accepts it and matches nothing). A filter rule returning `null` means
+  *"not applicable"*; never return it for a failure, because the policy layer reads
+  it as "no restriction" and runs the query over every row.
+- **A bulk write that constrains nothing is a named error, and a policy's filters
+  belong on every delete path.** `BulkDeleteBuilder` answers `error.NoPredicate`
+  when no group holds a predicate — do not "resolve" it into either a full-table
+  delete or a silent `0`, since which one a caller got used to depend on the
+  entity's `soft_delete`. And every delete path must append
+  `result.getFilters()`, not only check `decision == .deny`: the bulk soft-delete
+  path dropped them and could delete rows outside the policy's scope.
 - **EntQL must consume the whole input.** `entql.parse` is a prefix parser, so
   without the EOF check `age > 1 age < 5` parses as `age > 1` and the rest is
   silently dropped — a filter with fewer conditions than was written, i.e. more

@@ -247,6 +247,22 @@ here were reachable only through documentation this project wrote.
 
 ---
 
+### Z33–Z34 — the "two readings" report (2 items, v0.65.0 baseline)
+
+A consumer sent a file of items that are **not** "somewhere is wrong" but "the
+same thing has two readings and the code picked one for the caller", asking zent
+to decide the semantics. Both were verified line by line here before acting; the
+IDs are assigned as they proposed.
+
+| # | Item | Verdict |
+|---|---|---|
+| A | **Z33** — an empty `dept_ids` list on a `.dept_custom` / `.dept_and_child` data scope widened instead of denying | **Confirmed and fixed** (v0.66.0). `ensurePred` returned early for `dept_ids.len == 0`, leaving `pred` null — and `null` is how this module spells "no restriction" (`deny_pred`'s own doc says a scope that cannot be built "must never come out looking like `.all`"). The adjacent branch, over `max_dept_ids` and differing only in **length**, materialized the deny. Fixed by treating the empty list as a "cannot be built" too: `1 = 0` plus a `warn`, with `.all` untouched as the way to say "unrestricted". Their evidence was exact, including the amplification they did not have: **`.dept_and_child` is a synonym for `.dept_custom`** (same switch arm; only `.dept_only` reads `self_dept_id`), so a caller using it with `self_dept_id` alone *always* passed an empty list — the very path that became a full-table read. Falsified five ways; their exposure was 0, so this was found by reading, not by being bitten. |
+| B | **Z34** — `BulkDelete().Exec()` with no predicate: a silent `0` on a soft-deleting entity, a **full-table `DELETE`** on a hard-deleting one | **Confirmed and fixed** (v0.66.0). `BulkDeleteBuilder.init` always appends a group, so the two `groups.items.len == 0` guards in `codegen` were **unreachable** — the code looked guarded and was not; the soft path's loop then skipped the empty group and returned 0 without executing anything, and the hard path emitted `DELETE FROM t` with no `WHERE`. Fixed in the shape v0.45.0 used for a `SET`-less `UPDATE`: `error.NoPredicate`, named rather than resolved. The two duplicated implementations (`query` / `takeQuery`) were merged so the rule has one home. Their `Next()`-before-`Where` observation is a separate fix: that shape used to render `WHERE  OR …`. Verified the two further defects they could not see: the bulk soft-delete path **dropped the policy's row filters** (fixed, with its own test and falsification), and it re-stamps an already-soft-deleted row's timestamp and counts it (reported, not fixed). |
+
+Both items were judged worth acting on despite a **zero** exposure for the
+reporting consumer, because the shape they share is the one this ledger keeps
+recording: a value that carries two meanings, resolved silently in one direction.
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -282,6 +298,8 @@ here were reachable only through documentation this project wrote.
 | Z29 | Error classification invisible; pool has no stats or capacity guidance | P2 | **Fixed** v0.53.0 — `driver.classify`, `ConnPool.stats()`, capacity formula |
 | Z30 | `CrudService.create` filled the tenant column from the caller's entity | P2 | **Fixed** v0.54.0 — `create(entity, tenant_id)` |
 | Z31 | `migrateSchema` creates the drift it later warns about | P2 | **Reporting complete; repair still opt-in or absent** — v0.56.0 nullability behind `allow_nullability_change`; v0.58.0 `ExistingIndex.columns` + `index_columns` drift and MySQL BLOB/TEXT DDL diagnosis; v0.59.0 `index_uniqueness` drift, the ALTER ADD COLUMN half of the diagnosis, bound/validated introspection names; v0.60.0 `unique_constraint` (field-level `UNIQUE`) and `missing_foreign_key` (by shape); v0.61.0 `missing_view` (`breaksReads` **true**) plus `getExistingViews`, and **PostgreSQL can create a view at all now** (`CREATE VIEW IF NOT EXISTS` is not PostgreSQL syntax — 42601 — so a schema with a view entity could not be migrated on PG since views were added). v0.62.0 adds `missing_junction_table` (**M2M junction tables were the last declared surface nothing checked** — found this round by enumerating what the schema declares against what `checkSchema` compares) and fixes two driver failures that were being read as a default (SQLite step failures read as end-of-rows, PostgreSQL's `rows_affected` count). v0.65.0 adds the junction **shape** comparison (`missing_column` / `junction_pair_uniqueness` / `missing_foreign_key` for a present junction) and the EntQL end-of-input requirement. Still open: `migrateSchema` does not add `UNIQUE`/FK with `ALTER`; view *definitions* are deliberately not compared; a junction name colliding with an entity table is unchecked |
+| Z33 | Empty `dept_ids` widens a data scope instead of denying | P1 | **Fixed** v0.66.0 — an empty list is a "cannot be built": `1 = 0` + warn; `.all` is the way to say "unrestricted" |
+| Z34 | No-predicate `BulkDelete` is a silent `0` or a full-table delete | P1 | **Fixed** v0.66.0 — `error.NoPredicate`, the shape v0.45.0 chose for a `SET`-less UPDATE; the duplicated bodies were merged |
 | Z32 | Sub-query predicates do not scope the inner table | P2 | **Partly fixed** v0.52.0 — `Has*` targets scoped; bare `sql.InSelect` documented as out of reach |
 
 **On IDs.** `Z<n>` numbers are allocated once and never reused; before v0.56.0 the

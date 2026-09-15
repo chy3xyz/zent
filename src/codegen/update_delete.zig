@@ -1576,6 +1576,19 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 ctx.op = .delete;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                // The policy's row filters are part of the delete, not only its
+                // allow/deny verdict. The hard path and the single-row
+                // `DeleteBuilder.execSoftDelete` both append them; this path
+                // checked the decision and dropped the filters, so a
+                // soft-deleting entity whose policy scopes rows by a filter
+                // could soft-delete rows outside that scope.
+                const filters = result.getFilters();
+                for (filters) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    for (self.b.groups.items) |*group| {
+                        try group.append(pred.*);
+                    }
+                }
             }
             try self.runInterceptors(.delete);
             // Asked after the policy and the interceptor chain, not before: an
@@ -2929,5 +2942,90 @@ test "a write the driver could not count reaches the log without a row count" {
 
         try std.testing.expectEqual(@as(usize, 1), Seen.calls);
         try std.testing.expect(!Seen.known);
+    }
+}
+
+/// File scope so the opaque pointer `privacy.Filter` hands back stays valid for
+/// the duration of the eval (the same contract `codegen/scope.zig` documents).
+var bulk_soft_delete_scope_pred: sql.Predicate = undefined;
+
+fn bulkSoftDeleteOwnerFilter(ctx: privacy.PrivacyContext) ?*const anyopaque {
+    const owner = ctx.user_id orelse return null;
+    bulk_soft_delete_scope_pred = sql.EQ("owner_id", .{ .int = @intCast(owner) });
+    return @ptrCast(&bulk_soft_delete_scope_pred);
+}
+
+test "BulkDelete on a soft-deleting entity applies the policy's row filters" {
+    // The bulk *hard* delete appended `result.getFilters()`; the bulk soft path
+    // checked only `decision == .deny` and dropped them, so a soft-deleting
+    // entity whose policy scopes rows could soft-delete rows outside that scope.
+    // The single-row `DeleteBuilder.execSoftDelete` always appended them, which
+    // is what makes the omission look like an oversight rather than a choice.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const SoftDeleteMixin = @import("../core/mixin.zig").SoftDeleteMixin;
+    const ScopedSoftRow = schema("ScopedSoftRow", .{
+        .table_name = "scoped_soft_row",
+        .fields = &.{ field.Int("owner_id"), field.String("title") },
+        .mixins = &.{SoftDeleteMixin},
+        .soft_delete = true,
+        .policy = privacy.Policy{ .rules = &.{ privacy.Allow, privacy.Filter(bulkSoftDeleteOwnerFilter) } },
+    });
+    const info = comptime fromSchema(ScopedSoftRow);
+    const infos = &[_]TypeInfo{info};
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = client_mod.EntityClient(infos, info);
+    const base = Client.init(allocator, driver.asDriver());
+
+    // No user_id: the filter rule answers null, i.e. "not applicable", so the
+    // seed writes carry no scope.
+    const seed_client = base.withContext(privacy.PrivacyContext{ .user_id = null });
+    for ([_]i64{ 1, 1, 2 }) |owner| {
+        var b = try seed_client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("owner_id", owner);
+        _ = try b.setFieldValue("title", "row");
+        var row = try b.Save();
+        deinitEntity(infos, info, &row, allocator);
+    }
+
+    // The caller's predicate matches all three rows; the policy says user 1.
+    // Only two may be soft-deleted — three means the filter was dropped.
+    const scoped = base.withContext(privacy.PrivacyContext{ .user_id = 1 });
+    {
+        var d = try scoped.BulkDelete();
+        defer d.deinit();
+        _ = try d.Where(.{sql.Raw("1 = 1")});
+        try std.testing.expectEqual(@as(usize, 2), try d.Exec());
+    }
+
+    // Raw SQL, so the count is not itself filtered by the row scopes above.
+    var rows = try driver.query("SELECT owner_id FROM scoped_soft_row WHERE deleted_at IS NULL", &.{});
+    defer rows.deinit();
+    const live = rows.next() orelse return error.NoRow;
+    try std.testing.expectEqual(@as(i64, 2), live.getInt(0).?);
+    try std.testing.expect(rows.next() == null);
+
+    // And the same context now sees nothing: its row scope is soft-deleted.
+    {
+        var q = scoped.Query();
+        defer q.deinit();
+        var all = try q.All();
+        defer {
+            for (all.items) |*e| deinitEntity(infos, info, e, allocator);
+            all.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 0), all.items.len);
     }
 }
