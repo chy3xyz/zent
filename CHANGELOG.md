@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING: `CrudService.create(entity)` is now
+  `create(entity, tenant_id)`** (Z30). The write loop copied *every* field from
+  the caller's entity, the tenant column included, while the interceptor that
+  scopes creates only fills a column it finds **missing** — so an entity whose
+  tenant field held the zero value (the default of a freshly built one) beat the
+  bound tenant and wrote `0`. Every other method on the service already takes
+  `tenant_id`; `create` was the one that read it from data the caller may not
+  have set, which contradicted the documented "enforced on every op" claim and
+  made the write depend on a value nobody had to provide. The tenant column is
+  excluded from the field loop and written from the argument.
+
+  Migration: `svc.create(e)` → `svc.create(e, tenant_id)`. The entity's tenant
+  field is now ignored, so a zero value there is harmless.
+
 ## [0.53.0] - 2026-09-15
 
 ### Added

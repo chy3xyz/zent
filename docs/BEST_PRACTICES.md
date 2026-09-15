@@ -33,9 +33,15 @@ you need side effects:
 |---|---|---|
 | Shape | Stateless free functions | Stateful `CrudService(infos, info, tenant_col)` |
 | Derives from | the typed accessor (`client.order`) | `(infos, info)` + an explicit `tenant_col` |
-| Tenant isolation | opt-in via `scoped`/`scopedBy` | enforced on every op (bound at construction) |
+| Tenant isolation | opt-in via `scoped`/`scopedBy` | `tenant_id` is a **parameter** on every op, including `create` |
 | Events | none | publishes `CrudEvent{created,updated,deleted}` to a listener (the after-hook surface) |
 | Use when | plain CRUD, or when you already filter manually | you need an audit trail / outbox trigger / a uniform tenant boundary |
+
+`CrudService.create(entity, tenant_id)` takes the tenant as an argument rather
+than reading it from `entity`: the write loop used to copy every field, tenant
+column included, and the interceptor that scopes creates only fills a column it
+finds *missing* — so a freshly built entity (whose tenant field is the zero
+value) wrote `0` while the service was bound to a real tenant.
 
 Rule of thumb: default to `crud_helpers` for terse reads/writes; reach for
 `CrudService` when several entities share the same tenant column and you want

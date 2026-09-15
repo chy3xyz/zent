@@ -88,13 +88,28 @@ pub fn CrudService(
         }
 
         /// Create from a scalar-field entity; publishes CrudEvent.created.
-        pub fn create(self: *Self, entity: Entity) !i64 {
+        ///
+        /// `tenant_id` is a **parameter**, like every other method on this
+        /// service, and it is the value that gets written to `tenant_col`. It is
+        /// deliberately not read from `entity`: the write loop used to copy every
+        /// field including the tenant column, and the interceptor that scopes
+        /// creates only fills a column it finds *missing* — so a caller-supplied
+        /// entity with the zero value (the default of a freshly built one) won
+        /// the race against the bound tenant and wrote `0`. Taking it as an
+        /// argument removes the ambiguity rather than documenting it.
+        pub fn create(self: *Self, entity: Entity, tenant_id: i64) !i64 {
             var b = try self.client.Create();
             defer b.deinit();
+            _ = try b.setFieldValue(tenant_col, tenant_id);
             inline for (info.fields) |f| {
-                // id is auto-generated; audit fields (created_by/updated_by)
-                // are owned by fillAuditUser from the privacy context.
-                if (!f.is_id and !std.mem.eql(u8, f.name, "created_by") and !std.mem.eql(u8, f.name, "updated_by")) {
+                // id is auto-generated; the tenant column comes from the
+                // parameter above; audit fields (created_by/updated_by) are owned
+                // by fillAuditUser from the privacy context.
+                if (!f.is_id and
+                    !std.mem.eql(u8, f.name, "created_by") and
+                    !std.mem.eql(u8, f.name, "updated_by") and
+                    !std.mem.eql(u8, f.name, tenant_col))
+                {
                     _ = try b.setFieldValue(f.name, @field(entity, f.name));
                 }
             }
@@ -237,9 +252,9 @@ test "CrudService list/get/create/update/delete with events and tenant isolation
     var svc = Service.init(allocator, client);
     svc.setEventListener(&Recorder.on);
 
-    const a_id = try svc.create(.{ .id = 0, .tenant_id = 1, .name = "a", .price_cents = 100 });
-    const b_id = try svc.create(.{ .id = 0, .tenant_id = 1, .name = "b", .price_cents = 200 });
-    const c_id = try svc.create(.{ .id = 0, .tenant_id = 2, .name = "c", .price_cents = 300 });
+    const a_id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "a", .price_cents = 100 }, 1);
+    const b_id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "b", .price_cents = 200 }, 1);
+    const c_id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "c", .price_cents = 300 }, 2);
     try std.testing.expectEqual(@as(i64, 3), Recorder.created);
     try std.testing.expectEqual(@as(usize, 3), Recorder.count);
 
@@ -295,13 +310,20 @@ test "CrudService get with mismatched allocator (arena copy)" {
     const Client = codegen.EntityClient(infos, info);
     const client = Client.init(allocator, driver.asDriver());
     var svc = Service.init(allocator, client);
-    const id = try svc.create(.{ .id = 0, .tenant_id = 7, .name = "hello-world" });
+    const id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "hello-world" }, 7);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var got = (try svc.get(arena.allocator(), 7, id)).?;
     defer deinitEntity(infos, info, &got, arena.allocator());
     try std.testing.expectEqualStrings("hello-world", got.name);
+
+    // The entity above carries `tenant_id = 0`, and the row belongs to 7: the
+    // parameter is what is written, not the caller's entity. Before this both
+    // reads below found the row, because the write loop copied the entity's
+    // tenant column and the interceptor only fills a column it finds missing.
+    try std.testing.expect((try svc.get(arena.allocator(), 8, id)) == null);
+    try std.testing.expect((try svc.get(arena.allocator(), 0, id)) == null);
 }
 
 test "CrudService insertMany/upsertMany batch writes" {
@@ -396,8 +418,8 @@ test "CrudService handles optional string fields in create/get" {
     const client = codegen.EntityClient(infos, info).init(allocator, driver.asDriver());
     var svc = Service.init(allocator, client);
 
-    const a_id = try svc.create(.{ .id = 0, .tenant_id = 1, .name = "a", .description = null });
-    const b_id = try svc.create(.{ .id = 0, .tenant_id = 1, .name = "b", .description = "desc" });
+    const a_id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "a", .description = null }, 1);
+    const b_id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "b", .description = "desc" }, 1);
 
     var got_a = (try svc.get(allocator, 1, a_id)).?;
     defer deinitEntity(infos, info, &got_a, allocator);
