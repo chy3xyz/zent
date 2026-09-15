@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-09-15
+
 ### Changed
 - **BREAKING: `CrudService.create(entity)` is now
   `create(entity, tenant_id)`** (Z30). The write loop copied *every* field from
