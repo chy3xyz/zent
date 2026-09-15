@@ -169,8 +169,10 @@ pub fn CrudService(
             return affected > 0;
         }
 
-        /// Batch insert in one statement (id auto-generated). Caller deinits
-        /// the returned id list. Emits one CrudEvent.created per row.
+        /// Batch insert (id auto-generated): one multi-row statement per chunk
+        /// on SQLite/PostgreSQL, one statement per row on MySQL, which has no
+        /// `RETURNING`. Caller deinits the returned id list. Emits one
+        /// CrudEvent.created per row.
         pub fn insertMany(self: *Self, entities: []const Entity) !std.array_list.Managed(i64) {
             var b = try self.client.BulkInsert();
             defer b.deinit();
@@ -188,10 +190,12 @@ pub fn CrudService(
             return ids;
         }
 
-        /// Batch upsert in one statement (`INSERT … ON CONFLICT DO UPDATE` /
-        /// `ON DUPLICATE KEY UPDATE`). The conflict key (id) is written, so
-        /// rows with an existing id update and new ids insert. Caller deinits
-        /// the returned id list. No CrudEvent is emitted (insert-vs-update is
+        /// Batch upsert (`INSERT … ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY
+        /// UPDATE`): one multi-row statement per chunk on SQLite/PostgreSQL,
+        /// one statement per row on MySQL. The conflict key (id) is written, so
+        /// rows with an existing id update and new ids insert, and the returned
+        /// ids are the ones each row actually got. Caller deinits the returned
+        /// id list. No CrudEvent is emitted (insert-vs-update is
         /// indistinguishable from the returned ids).
         pub fn upsertMany(self: *Self, entities: []const Entity) !std.array_list.Managed(i64) {
             var b = try self.client.BulkInsert();

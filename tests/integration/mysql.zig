@@ -1876,9 +1876,10 @@ test "MySQL: privacy filter restricts rows by owner_id" {
 }
 
 test "MySQL: BulkInsert multi-row derives ids from last_insert_id" {
-    // Oracle MySQL 8.0 has no INSERT ... RETURNING: the codegen falls back to
-    // driver.exec and derives one id per row from last_insert_id (see
-    // src/codegen/create.zig, BulkInsert Save). This test pins that fallback.
+    // Oracle MySQL 8.0 has no INSERT ... RETURNING: the codegen sends one
+    // statement per row and takes each id from that statement's
+    // last_insert_id (see src/codegen/create.zig, BulkInsert Save). This test
+    // pins that fallback, ids and rows alike.
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -1897,7 +1898,7 @@ test "MySQL: BulkInsert multi-row derives ids from last_insert_id" {
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
 
-    // Insert 3 rows in a single round-trip.
+    // Insert 3 rows.
     var b = try client.my_bulk_entity.BulkInsert();
     defer b.deinit();
     _ = try b.setFieldValue("name", "alpha");
@@ -1913,7 +1914,8 @@ test "MySQL: BulkInsert multi-row derives ids from last_insert_id" {
     defer ids.deinit();
 
     try testing.expectEqual(@as(usize, 3), ids.items.len);
-    // AUTO_INCREMENT ids from a single multi-row INSERT are consecutive.
+    // Nothing else writes to the table, so the session hands out consecutive
+    // AUTO_INCREMENT ids.
     try testing.expect(ids.items[0] > 0);
     try testing.expectEqual(ids.items[0] + 1, ids.items[1]);
     try testing.expectEqual(ids.items[0] + 2, ids.items[2]);
@@ -4383,4 +4385,84 @@ test "MySQL: exec maps the client's missing count to unknown, not to 18446744073
     const selected = try d.exec("SELECT * FROM my_rowcount WHERE id > ?", &.{.{ .int = 0 }});
     try testing.expectEqual(@as(usize, 0), selected.rows_affected);
     try testing.expect(!selected.rows_affected_known);
+}
+
+test "MySQL: bulk upsert ids name the rows that were written, collisions included" {
+    // Oracle MySQL 8.0/9.x has no `INSERT ... RETURNING`, so the bulk path
+    // sends one statement per row and takes each id from that statement's
+    // `last_insert_id`. A multi-row statement cannot answer this: the server
+    // reports the statement's *first generated* value, while an
+    // `ON DUPLICATE KEY UPDATE` arm that updates a row answers that row's
+    // existing id — so the ids of every row after a collision shift. Measured
+    // on MySQL 9.3 through this driver: a 3-row ODKU whose first row collided
+    // reported `last_insert_id = 2` for true ids [1, 2, 3], so all three
+    // derived ids were wrong and the last one (4) named no row at all.
+    //
+    // The `id=LAST_INSERT_ID(id)` idiom the generated suffix carries is what
+    // makes an updated row answer its own id. That is the same mechanism the
+    // single-row "SaveOrUpdate preserves auto-increment id" test above pins,
+    // and that one runs against MariaDB 10.11 in CI as well as MySQL.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyBulkUpsert = schema("MyBulkUpsert", .{
+        .fields = &.{
+            field.String("sku"),
+            field.Int("score"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{MyBulkUpsert});
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_bulk_upsert", &.{}) catch {};
+
+    // Business key the batch collides on. `sku` is a VARCHAR(255) on MySQL, so
+    // the index needs no key length.
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_my_bulk_upsert_sku ON my_bulk_upsert(sku)", &.{});
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Seed: id 1, and the row the first row of the batch below collides with.
+    _ = try drv.exec("INSERT INTO my_bulk_upsert (sku, score) VALUES (?, ?)", &.{ .{ .string = "seed" }, .{ .int = 1 } });
+
+    var b = try client.my_bulk_upsert.BulkInsert();
+    defer b.deinit();
+    _ = try b.setFieldValue("sku", "seed");
+    _ = try b.setFieldValue("score", @as(i64, 2));
+    _ = try b.Next();
+    _ = try b.setFieldValue("sku", "b");
+    _ = try b.setFieldValue("score", @as(i64, 3));
+    _ = try b.Next();
+    _ = try b.setFieldValue("sku", "c");
+    _ = try b.setFieldValue("score", @as(i64, 4));
+
+    const ids = try b.SaveOrUpdateOn(&.{"sku"});
+    defer ids.deinit();
+
+    try testing.expectEqual(@as(usize, 3), ids.items.len);
+
+    // Each returned id must name the row its own input row wrote — the first
+    // one updated the seed in place, the other two were inserted.
+    const expected_skus = [_][]const u8{ "seed", "b", "c" };
+    for (ids.items, expected_skus) |id, sku| {
+        var rows = try drv.query("SELECT sku FROM my_bulk_upsert WHERE id = ?", &.{.{ .int = id }});
+        defer rows.deinit();
+        const r = rows.next() orelse {
+            std.debug.print("returned id {d} names no row\n", .{id});
+            return error.NoRow;
+        };
+        try testing.expectEqualStrings(sku, r.getText(0).?);
+    }
+
+    // The premise, checked rather than assumed: the collision was an update,
+    // not a second insert.
+    var seed_rows = try drv.query("SELECT score FROM my_bulk_upsert WHERE sku = ?", &.{.{ .string = "seed" }});
+    defer seed_rows.deinit();
+    const seed_row = seed_rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 2), seed_row.getInt(0).?);
+    const total = try drv.query("SELECT COUNT(*) FROM my_bulk_upsert", &.{});
+    defer total.deinit();
+    try testing.expectEqual(@as(i64, 3), (total.next() orelse return error.NoRow).getInt(0).?);
 }
