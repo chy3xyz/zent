@@ -418,11 +418,11 @@ pub fn checkSchema(
                         // exactly this comparison (the ALTER TYPE path uses it).
                         var schema_buf: [128]u8 = undefined;
                         var db_buf: [128]u8 = undefined;
-                        const schema_norm = normalizeSqlType(columnSQLType(col, dialect), &schema_buf) catch null;
-                        const db_norm = normalizeSqlType(db_col.sql_type, &db_buf) catch null;
-                        if (schema_norm != null and db_norm != null and
-                            !std.mem.eql(u8, schema_norm.?, db_norm.?))
-                        {
+                        const schema_norm = try normalizeTypeForCompare(allocator, columnSQLType(col, dialect), &schema_buf);
+                        defer schema_norm.deinit(allocator);
+                        const db_norm = try normalizeTypeForCompare(allocator, db_col.sql_type, &db_buf);
+                        defer db_norm.deinit(allocator);
+                        if (!std.mem.eql(u8, schema_norm.text, db_norm.text)) {
                             try drifts.append(.{
                                 .table = table.name,
                                 .column = col.name,
@@ -3117,6 +3117,46 @@ fn dropColumnSQL(
     };
 }
 
+/// `normalizeSqlType` into a caller-provided stack buffer, falling back to the
+/// heap when the declared type does not fit.
+///
+/// The fallback is the point. This comparison used to read
+/// `normalizeSqlType(...) catch null` with a 128-byte stack buffer, so a type
+/// longer than that — a hand-written `sql_type`, a `longtext CHARACTER SET …
+/// COLLATE …`, an `ENUM` dump — made the whole comparison **disappear**, and
+/// "no `type_mismatch` reported" is indistinguishable from "the types agree".
+/// That is the one outcome a drift check must never fake, so a type that does
+/// not fit is normalized on the heap rather than skipped.
+fn normalizeTypeForCompare(
+    allocator: std.mem.Allocator,
+    sql_type: []const u8,
+    stack_buf: *[128]u8,
+) error{OutOfMemory}!NormalizedType {
+    if (normalizeSqlType(sql_type, stack_buf)) |norm| {
+        return .{ .text = norm, .owned = null };
+    } else |err| switch (err) {
+        error.NoSpaceLeft => {},
+    }
+
+    const heap = try allocator.alloc(u8, sql_type.len);
+    if (normalizeSqlType(sql_type, heap)) |norm| {
+        return .{ .text = norm, .owned = heap };
+    } else |_| {
+        allocator.free(heap);
+        return error.OutOfMemory;
+    }
+}
+
+const NormalizedType = struct {
+    text: []const u8,
+    /// Set when `text` came from the heap and the caller must free it.
+    owned: ?[]u8,
+
+    fn deinit(self: NormalizedType, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
+    }
+};
+
 /// Generate ALTER COLUMN SQL to change a column's type.
 ///
 /// SQLite has no native ALTER TYPE. MySQL's `MODIFY COLUMN name type` replaces
@@ -5390,4 +5430,38 @@ test "getExistingViews reads the stored definition and answers an empty list oth
     var hostile = try getExistingViews(std.testing.allocator, drv.asDriver(), "vw_flag_view' OR 1=1 --");
     defer freeExistingViews(std.testing.allocator, &hostile);
     try std.testing.expectEqual(@as(usize, 0), hostile.items.len);
+}
+
+test "a declared type longer than the stack buffer is still compared" {
+    // `catch null` used to make the whole comparison vanish for a type longer
+    // than 128 bytes, and "no type_mismatch reported" cannot be told apart from
+    // "the types agree" — a drift check must never fake that. A long declared
+    // type reaches the comparison through a hand-built TableDef or a synthetic
+    // `sql_type`, which is how a consumer with a long `ENUM`/`CHARSET`
+    // declaration gets one.
+    const alloc = std.testing.allocator;
+
+    var long_buf: [256]u8 = undefined;
+    @memset(&long_buf, 'x');
+
+    var schema_buf: [128]u8 = undefined;
+    var db_buf: [128]u8 = undefined;
+
+    // Short types still use the stack buffer, so the common path allocates
+    // nothing.
+    const short = try normalizeTypeForCompare(alloc, "VARCHAR(255)", &schema_buf);
+    defer short.deinit(alloc);
+    try std.testing.expect(short.owned == null);
+    try std.testing.expectEqualStrings("varchar", short.text);
+
+    // A long one is normalized on the heap instead of being skipped.
+    const long = try normalizeTypeForCompare(alloc, &long_buf, &schema_buf);
+    defer long.deinit(alloc);
+    try std.testing.expect(long.owned != null);
+    try std.testing.expectEqual(@as(usize, 256), long.text.len);
+
+    // The comparison therefore still happens, and still reports a difference.
+    const db = try normalizeTypeForCompare(alloc, "INTEGER", &db_buf);
+    defer db.deinit(alloc);
+    try std.testing.expect(!std.mem.eql(u8, long.text, db.text));
 }
