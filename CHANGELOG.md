@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.65.0] - 2026-09-15
+
 ### Added
 - **`check_sql`: the Z28 CLI entry point for raw SQL** (`examples/check_sql`,
   installed as `zig-out/bin/check_sql`, `zig build run-check-sql`). Z28's last
