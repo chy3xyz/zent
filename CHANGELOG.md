@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.58.1] - 2026-09-15
+
 ### Fixed
 - **MySQL prefix indexes are no longer treated as comparable** in index
   introspection. `getMySQLIndexes` read `column_name` and marked an index
