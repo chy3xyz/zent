@@ -3496,6 +3496,95 @@ test "MySQL: unique/defaulted/indexed String columns build a usable table" {
     }
 }
 
+test "MySQL: checkSchema reports a UNIQUE column and a foreign key the database lacks" {
+    // Portable on both servers: plain column-level UNIQUE, a plain
+    // `ADD CONSTRAINT … FOREIGN KEY`, and standard `information_schema` — no
+    // functional index, no MySQL-only syntax, no server-behaviour assertion.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyDriftOwner = schema("MyDriftOwner", .{ .fields = &.{field.String("name")} });
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_drift_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_drift_owner", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_drift_owner", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_drift_car", &.{}) catch {};
+
+    // The table as it was built: no UNIQUE on `vin`, and no edge yet.
+    const MyDriftCarBefore = schema("MyDriftCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ MyDriftOwner, MyDriftCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    // The schema as it is now: `vin` declared UNIQUE, the edge declared.
+    const MyDriftCarAfter = schema("MyDriftCar", .{
+        .fields = &.{ field.String("model"), field.String("vin").Unique() },
+        .edges = &.{edge.From("owner", MyDriftOwner)},
+    });
+    const after_graph = comptime buildGraph(&.{ MyDriftOwner, MyDriftCarAfter });
+    const infos = after_graph.types;
+
+    // The edge's column exists (added out of band, matching type and
+    // nullability), the constraint does not.
+    _ = try drv.exec("ALTER TABLE my_drift_car ADD COLUMN owner_id INTEGER", &.{});
+
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+
+        var unique_drift: ?migrate.SchemaDrift = null;
+        var fk_drift: ?migrate.SchemaDrift = null;
+        for (drifts) |d| {
+            try testing.expectEqualStrings("my_drift_car", d.table);
+            if (d.kind == .unique_constraint) unique_drift = d;
+            if (d.kind == .missing_foreign_key) fk_drift = d;
+        }
+        try testing.expectEqual(@as(usize, 2), drifts.len);
+        try testing.expect(unique_drift != null);
+        try testing.expectEqualStrings("vin", unique_drift.?.column);
+        try testing.expect(fk_drift != null);
+        try testing.expectEqualStrings("owner_id", fk_drift.?.column);
+        try testing.expectEqualStrings(
+            "schema declares FOREIGN KEY (owner_id) REFERENCES my_drift_owner (id), database has none",
+            fk_drift.?.index_detail,
+        );
+        try testing.expect(!unique_drift.?.breaksReads());
+        try testing.expect(!fk_drift.?.breaksReads());
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // Both constraints in the shapes the schema declares: silence, whatever the
+    // server called them (`idx_…` for the index, `my_drift_car_ibfk_1` for the
+    // foreign key — the comparison is by shape on both sides).
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_my_drift_car_vin ON my_drift_car (vin)", &.{});
+    _ = try drv.exec(
+        "ALTER TABLE my_drift_car ADD CONSTRAINT my_drift_car_owner_fk FOREIGN KEY (owner_id) REFERENCES my_drift_owner (id)",
+        &.{},
+    );
+
+    const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, agreeing);
+    try testing.expectEqual(@as(usize, 0), agreeing.len);
+
+    // `getExistingForeignKeys` read that constraint back. MySQL auto-created an
+    // index for it too; that index is not unique and does not affect the
+    // column check above.
+    var keys = try migrate.getExistingForeignKeys(allocator, drv.asDriver(), "my_drift_car");
+    defer migrate.freeExistingForeignKeys(allocator, &keys);
+    try testing.expectEqual(@as(usize, 1), keys.items.len);
+    try testing.expectEqualStrings("owner_id", keys.items[0].columns[0]);
+    try testing.expectEqualStrings("my_drift_owner", keys.items[0].ref_table);
+    try testing.expect(keys.items[0].ref_columns_comparable);
+    try testing.expectEqualStrings("id", keys.items[0].ref_columns[0]);
+
+    var absent = try migrate.getExistingForeignKeys(allocator, drv.asDriver(), "my_drift_absent");
+    defer migrate.freeExistingForeignKeys(allocator, &absent);
+    try testing.expectEqual(@as(usize, 0), absent.items.len);
+}
+
 test "MySQL: getExistingIndexes reads the key columns in order" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);

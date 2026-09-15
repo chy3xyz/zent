@@ -162,7 +162,14 @@ pub const SchemaDrift = struct {
     /// describing the difference, **owned** — the database's answer is released
     /// before the drift list reaches the caller, so the difference has to be
     /// copied out. Both index kinds allocate it, and `freeSchemaDrift` frees it
-    /// for both; every other kind leaves it empty.
+    /// for both.
+    ///
+    /// `.missing_foreign_key` borrows the same field for the same reason (the
+    /// shape it names — `(user_id)` → `user (id)` — is built at runtime) and is
+    /// freed with the two index kinds; `.unique_constraint` points it at a
+    /// `const` literal, which must **not** be freed. `ownsIndexDetail` is the
+    /// single place that decides which is which. Every other kind leaves it
+    /// empty.
     index_name: []const u8 = "",
     index_detail: []const u8 = "",
 
@@ -192,6 +199,41 @@ pub const SchemaDrift = struct {
         /// fail that the schema never promised would, which is loud — reported
         /// for the same reason, since it is the same disagreement.
         index_uniqueness,
+        /// The schema declares a **column** UNIQUE (`ColumnDef.unique`, from
+        /// `field.String(…).Unique()`) and the database has no constraint that
+        /// forces that column, on its own, to be unique.
+        ///
+        /// This is not `index_uniqueness`, and the two must not be folded
+        /// together: that one compares *an index the schema declares* against
+        /// the database's index of the same name, while this one asks whether
+        /// anything at all enforces the declaration — the column's `UNIQUE` is
+        /// inlined into `CREATE TABLE` and is not a named index of the schema,
+        /// so nothing else can see it. A duplicate then lands where the
+        /// application believed it could not.
+        ///
+        /// Reported only when the answer is a fact rather than a guess: a
+        /// composite `UNIQUE (a, b)` does **not** satisfy `a`, and a table with
+        /// an unreadable *unique* index (`lower(email)`, `email(10)`) is skipped
+        /// entirely, because such an index does constrain the column and the
+        /// check could not tell. See `checkSchema`.
+        unique_constraint,
+        /// The schema declares a foreign key (`TableDef.foreign_keys`, built
+        /// from the entity's own `From` edges and the other entities' `To`
+        /// edges) and the database has no foreign key with the same shape.
+        ///
+        /// `migrateSchema` never adds one — an `ALTER TABLE ADD CONSTRAINT`
+        /// against a table that already holds rows can fail, and it is
+        /// deliberately non-destructive — so a table created before the edge
+        /// existed never gets the constraint, and every dangling reference the
+        /// application expects the database to reject is accepted.
+        ///
+        /// Compared **by shape, never by name**: PostgreSQL and MySQL invent the
+        /// names (`t_col_fkey`, `t_ibfk_1`) and SQLite keeps none at all.
+        /// `ON DELETE` / `ON UPDATE` are **not** compared (see `checkSchema`).
+        ///
+        /// The reverse direction — a foreign key the database has and the schema
+        /// does not — is deliberately **not** reported; see `checkSchema`.
+        missing_foreign_key,
     };
 
     /// Whether this drift makes a *read* fail — the kinds worth blocking a
@@ -203,32 +245,44 @@ pub const SchemaDrift = struct {
     /// non-optional fails on the first row that actually holds a NULL. An extra
     /// column and a type difference do not fail reads by themselves.
     ///
-    /// Neither index kind does either: a different key list changes how fast a
-    /// query runs, and a different uniqueness changes whether a *write* is
-    /// rejected — a read returns the rows it always returned. So neither may
-    /// fail `DriftStrictness.read_breaking_only`: that mode exists to stop a
-    /// deploy that would break reads, and widening it into "every index must
-    /// match" would convert a performance note, or a write that now fails
-    /// loudly, into an outage. They fail only under `.any`.
+    /// None of the four constraint kinds does either: a different key list
+    /// changes how fast a query runs, a different uniqueness changes whether a
+    /// *write* is rejected, a missing column constraint changes whether a
+    /// duplicate is rejected, and a missing foreign key changes whether an
+    /// orphan is rejected — a read returns the rows it always returned. So none
+    /// of them may fail `DriftStrictness.read_breaking_only`: that mode exists
+    /// to stop a deploy that would break reads, and widening it into "every
+    /// constraint must match" would convert a performance note, or a write that
+    /// now fails loudly, into an outage. They fail only under `.any`.
     pub fn breaksReads(self: SchemaDrift) bool {
         return switch (self.kind) {
             .missing_table, .missing_column => true,
             .nullability => !self.schema_optional and self.db_nullable,
-            .extra_column, .type_mismatch, .index_columns, .index_uniqueness => false,
+            .extra_column,
+            .type_mismatch,
+            .index_columns,
+            .index_uniqueness,
+            .unique_constraint,
+            .missing_foreign_key,
+            => false,
         };
     }
 };
 
 /// Every non-view entity, compared against the live database: a missing table, a
-/// missing or extra column, a type or nullability difference, and — for a
-/// declared index the database already has under the same name — a different
-/// key list or a different uniqueness.
+/// missing or extra column, a type or nullability difference, a **column** the
+/// schema declares UNIQUE with nothing enforcing it, a **foreign key** the schema
+/// declares the database does not have, and — for a declared index the database
+/// already has under the same name — a different key list or a different
+/// uniqueness.
 ///
 /// Returns a caller-owned slice (`freeSchemaDrift`); names and types borrow from
-/// `infos` or from comptime literals, so freeing is one call (the detail of the
-/// two index kinds is the exception, see `SchemaDrift.index_detail`).
-/// Foreign keys and primary keys are **not** compared — PG/MySQL introspection
-/// does not read them yet (see `ISSUES_FROM_ZAPI.md` Z28).
+/// `infos` or from comptime literals, so freeing is one call (the details of the
+/// two index kinds and of `.missing_foreign_key` are the exceptions, see
+/// `SchemaDrift.index_detail`).
+/// Primary keys are **not** compared (see `ISSUES_FROM_ZAPI.md` Z28), and views
+/// are skipped entirely: a view has no shape a `TableDef` describes, and its SQL
+/// is not compared either.
 ///
 /// Index comparison is deliberately narrow: only indexes the schema declares
 /// **and** the database already has by name are looked at. An index that exists
@@ -244,6 +298,31 @@ pub const SchemaDrift = struct {
 /// boolean in every catalog and is reported whenever the two exist. They are
 /// separate kinds and separate conditions for exactly that reason — neither may
 /// suppress the other.
+///
+/// **Column `UNIQUE`** (`.unique_constraint`) is a third, unrelated question:
+/// not "does the index we declare agree with the database's" but "does anything
+/// at all force this column to be unique". The declaration is inlined into
+/// `CREATE TABLE` and is not one of `info.indexes`, so the index path cannot see
+/// it. A column is satisfied when it *is* the primary key (a PK is unique by
+/// construction) or when some unique index forces it **alone** — its comparable
+/// key list is exactly `[column]`. A composite `UNIQUE (a, b)` does not satisfy
+/// `a`, a non-unique index forces nothing, and no index at all forces nothing.
+/// The report is suppressed for the whole table while any index with
+/// `unique = true` and `columns_comparable = false` exists: `lower(email)` and
+/// `email(10)` are both unreadable *and* both do constrain the column, so the
+/// answer is unknown rather than negative. An unreadable **non-unique** index
+/// does not suppress it — it enforces nothing either way.
+///
+/// **Foreign keys** (`.missing_foreign_key`) are compared **by shape**: the
+/// local column list, the target table, and the target column list must all
+/// match some foreign key in the database. Names are not compared — PostgreSQL
+/// and MySQL generate them (`t_col_fkey`, `t_ibfk_1`) and SQLite keeps none —
+/// and neither are `ON DELETE` / `ON UPDATE`, which `migrateSchema` does not
+/// converge and this does not read: **the actions are not compared at all.**
+/// A foreign key the database has and the schema does not is *not* reported: it
+/// can only reject writes the schema never promised, so a table with a
+/// hand-added constraint stays green, and `migrateSchema` already ignores
+/// database-only indexes for the same reason.
 ///
 /// The point is the class of failure this cannot survive silently: a column the
 /// schema believes in but the database does not have makes every query that
@@ -346,40 +425,105 @@ pub fn checkSchema(
             // way `assertSchema` turns every reported drift into a decision, so
             // a false one is a blocked deploy — strictly worse than a missing
             // warning. That is the reason for the gates, not for silence.
-            if (comptime info.indexes.len > 0) {
+            if (comptime info.indexes.len > 0 or wantsUniqueColumnCheck(table)) {
                 if (existing.items.len > 0) {
                     var existing_idxs = try getExistingIndexes(allocator, driver, table.name);
                     defer freeExistingIndexes(allocator, &existing_idxs);
 
-                    inline for (info.indexes) |idx| {
-                        if (getExistingIndexByName(existing_idxs.items, idx.name)) |db_idx| {
-                            if (db_idx.columns_comparable and !columnsEqual(db_idx.columns, idx.columns)) {
+                    if (comptime info.indexes.len > 0) {
+                        inline for (info.indexes) |idx| {
+                            if (getExistingIndexByName(existing_idxs.items, idx.name)) |db_idx| {
+                                if (db_idx.columns_comparable and !columnsEqual(db_idx.columns, idx.columns)) {
+                                    try drifts.append(.{
+                                        .table = table.name,
+                                        .kind = .index_columns,
+                                        .index_name = idx.name,
+                                        .index_detail = try indexColumnsDetailAlloc(allocator, idx.columns, db_idx.columns),
+                                    });
+                                }
+                                // Uniqueness, on its own gate. It is deliberately
+                                // *not* nested in the `columns_comparable` branch
+                                // above: that flag answers "can the key list be
+                                // read", and uniqueness can always be read, so
+                                // coupling the two would drop this drift for
+                                // exactly the indexes a comparison found hardest
+                                // to see (expression keys, partial indexes,
+                                // non-btree access methods). The reverse coupling
+                                // matters too: a difference in uniqueness must
+                                // never make `index_columns` report a key list it
+                                // could not compare.
+                                if (db_idx.unique != idx.unique) {
+                                    try drifts.append(.{
+                                        .table = table.name,
+                                        .kind = .index_uniqueness,
+                                        .index_name = idx.name,
+                                        .index_detail = try indexUniquenessDetailAlloc(allocator, idx.unique, db_idx.unique),
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Field-level UNIQUE: the declaration is inlined into
+                    // `CREATE TABLE` and is not one of `info.indexes`, so the
+                    // loop above cannot see it and a table built before the
+                    // field was declared UNIQUE never gets the constraint.
+                    //
+                    // The whole table is skipped while a unique index is
+                    // unreadable: `lower(email)` and `email(10)` both have no
+                    // comparable key list *and* both do force the column — so
+                    // the answer is unknown, and a report would be a guess. An
+                    // unreadable **non**-unique index is not part of that
+                    // judgement; it enforces nothing, so it answers nothing.
+                    if (comptime wantsUniqueColumnCheck(table)) {
+                        const undecidable = hasUnreadableUniqueIndex(existing_idxs.items);
+                        inline for (table.columns) |col| {
+                            // Three reasons not to look at this column at all:
+                            // the declaration already enforces it (the PK is
+                            // unique by construction), the database does not
+                            // have the column (already reported as
+                            // `missing_column`), or an unreadable unique index
+                            // makes the answer unknown.
+                            //
+                            // Written as one condition rather than a chain of
+                            // `continue`s: the filter above is comptime-known
+                            // and `continue` inside it is comptime control flow
+                            // in a runtime block, which 0.17 rejects.
+                            if (uniqueColumnChecked(col, table) and
+                                getExistingColumnByName(existing.items, col.name) != null and
+                                !undecidable and
+                                !indexForcesColumnAlone(existing_idxs.items, col.name))
+                            {
                                 try drifts.append(.{
                                     .table = table.name,
-                                    .kind = .index_columns,
-                                    .index_name = idx.name,
-                                    .index_detail = try indexColumnsDetailAlloc(allocator, idx.columns, db_idx.columns),
+                                    .column = col.name,
+                                    .kind = .unique_constraint,
+                                    .index_detail = uniqueColumnDriftDetail,
                                 });
                             }
-                            // Uniqueness, on its own gate. It is deliberately
-                            // *not* nested in the `columns_comparable` branch
-                            // above: that flag answers "can the key list be
-                            // read", and uniqueness can always be read, so
-                            // coupling the two would drop this drift for
-                            // exactly the indexes a comparison found hardest
-                            // to see (expression keys, partial indexes,
-                            // non-btree access methods). The reverse coupling
-                            // matters too: a difference in uniqueness must
-                            // never make `index_columns` report a key list it
-                            // could not compare.
-                            if (db_idx.unique != idx.unique) {
-                                try drifts.append(.{
-                                    .table = table.name,
-                                    .kind = .index_uniqueness,
-                                    .index_name = idx.name,
-                                    .index_detail = try indexUniquenessDetailAlloc(allocator, idx.unique, db_idx.unique),
-                                });
-                            }
+                        }
+                    }
+                }
+            }
+
+            // Foreign keys the schema declares and the database does not have.
+            // Shape, not name (see `foreignKeyPresent`), and only in that
+            // direction: a constraint the database has and the schema does not
+            // can only reject writes the schema never promised, so reporting it
+            // would turn a table somebody hardened by hand into a red deploy.
+            if (comptime table.foreign_keys.len > 0) {
+                if (existing.items.len > 0) {
+                    var existing_fks = try getExistingForeignKeys(allocator, driver, table.name);
+                    defer freeExistingForeignKeys(allocator, &existing_fks);
+
+                    inline for (table.foreign_keys) |fk| {
+                        if (!foreignKeyPresent(existing_fks.items, fk)) {
+                            try drifts.append(.{
+                                .table = table.name,
+                                .column = if (fk.columns.len > 0) fk.columns[0] else "",
+                                .kind = .missing_foreign_key,
+                                .index_detail = try foreignKeyDetailAlloc(allocator, fk),
+                            });
                         }
                     }
                 }
@@ -387,6 +531,113 @@ pub fn checkSchema(
         }
     }
     return drifts.toOwnedSlice();
+}
+
+/// True when the table has any column the field-level UNIQUE check must look at
+/// (see `uniqueColumnChecked`). Decides whether the index introspection — one
+/// query for PostgreSQL and MySQL, two for SQLite — is worth running at all.
+fn wantsUniqueColumnCheck(table: TableDef) bool {
+    for (table.columns) |col| {
+        if (uniqueColumnChecked(col, table)) return true;
+    }
+    return false;
+}
+
+/// True when `col` is a column the schema declares UNIQUE and that the
+/// declaration does not already enforce on its own.
+///
+/// The exception is the primary key: it is unique by construction, so a `UNIQUE`
+/// on it says nothing the PK does not. It has to be *the* PK though, not one
+/// part of a composite one — `PRIMARY KEY (a, b)` does not make `a` unique, and
+/// the schema can express a composite PK (`field.Int("a").Unique()` on two
+/// `is_id` fields), which is why the check falls through here rather than
+/// assuming `primary_key` implies single-column.
+fn uniqueColumnChecked(col: ColumnDef, table: TableDef) bool {
+    if (!col.unique) return false;
+    if (col.primary_key and table.primary_keys.len <= 1) return false;
+    return true;
+}
+
+/// True when some index on the table is unique but its key list could not be
+/// read — an expression (`lower(email)`), a prefix (`email(10)`), a `WHERE`, a
+/// non-btree access method, `INCLUDE` columns. Both example shapes genuinely do
+/// force the column, so while one is present "is this column constrained?" has
+/// no answer at all and the check must stay silent rather than report a guess.
+///
+/// A **non**-unique index that cannot be read is deliberately not part of this
+/// judgement: whatever it covers, it enforces no uniqueness, so it cannot make
+/// the question unanswerable.
+fn hasUnreadableUniqueIndex(indexes: []const ExistingIndex) bool {
+    for (indexes) |idx| {
+        if (idx.unique and !idx.columns_comparable) return true;
+    }
+    return false;
+}
+
+/// Whether some unique index forces exactly `column`, and nothing else, to be
+/// unique. A composite `UNIQUE (a, b)` does **not**: two rows may share `a`.
+fn indexForcesColumnAlone(indexes: []const ExistingIndex, column: []const u8) bool {
+    for (indexes) |idx| {
+        if (!idx.unique or !idx.columns_comparable) continue;
+        if (idx.columns.len == 1 and std.mem.eql(u8, idx.columns[0], column)) return true;
+    }
+    return false;
+}
+
+/// Whether the database enforces the declared foreign key — compared **by
+/// shape**, never by name. An auto-generated name is all PostgreSQL
+/// (`t_col_fkey`) and MySQL (`t_ibfk_1`) leave behind, SQLite keeps none at all,
+/// and `migrateSchema`'s own `FOREIGN KEY (…)` clause names nothing, so a
+/// comparison by name would report every constraint in every database.
+///
+/// The local column list (ordered) and the target table must both match. The
+/// target *columns* must match too, **unless the database did not record any**:
+/// SQLite renders `REFERENCES t` with no column list as a NULL `to`, which means
+/// the other table's primary key — an unreadable answer is not evidence of a
+/// difference, and a false "missing" blocks a deploy. `ON DELETE` / `ON UPDATE`
+/// are not compared; see `checkSchema`.
+fn foreignKeyPresent(existing: []const ExistingForeignKey, fk: ForeignKeyDef) bool {
+    for (existing) |db_fk| {
+        if (!columnsEqual(db_fk.columns, fk.columns)) continue;
+        // Case-insensitive on the table name alone: SQLite and MySQL compare
+        // table names case-insensitively and PostgreSQL folds an unquoted one
+        // to lower case, so `Cars` and `cars` are the same table on all three.
+        // Column names stay exact, like every other comparison here.
+        if (!std.ascii.eqlIgnoreCase(db_fk.ref_table, fk.ref_table)) continue;
+        if (db_fk.ref_columns_comparable and !columnsEqual(db_fk.ref_columns, fk.ref_columns)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// The `.unique_constraint` report in one sentence. A `const` literal — nothing
+/// is allocated for this kind (see `ownsIndexDetail`).
+const uniqueColumnDriftDetail = "schema declares the column UNIQUE, database has no unique constraint covering it";
+
+/// "schema declares FOREIGN KEY (user_id) REFERENCES user (id), database has
+/// none" — **owned** (see `indexColumnsDetailAlloc`).
+///
+/// The shape is spelled out because a table can carry several foreign keys: a
+/// report that only says "a foreign key is missing" sends the reader back to the
+/// database to find out which one.
+fn foreignKeyDetailAlloc(allocator: std.mem.Allocator, fk: ForeignKeyDef) ![]const u8 {
+    var detail = std.array_list.Managed(u8).init(allocator);
+    errdefer detail.deinit();
+
+    try detail.appendSlice("schema declares FOREIGN KEY (");
+    for (fk.columns, 0..) |col, i| {
+        if (i > 0) try detail.appendSlice(", ");
+        try detail.appendSlice(col);
+    }
+    try detail.appendSlice(") REFERENCES ");
+    try detail.appendSlice(fk.ref_table);
+    try detail.appendSlice(" (");
+    for (fk.ref_columns, 0..) |col, i| {
+        if (i > 0) try detail.appendSlice(", ");
+        try detail.appendSlice(col);
+    }
+    try detail.appendSlice("), database has none");
+    return detail.toOwnedSlice();
 }
 
 fn columnsEqual(a: []const []const u8, b: []const []const u8) bool {
@@ -432,14 +683,26 @@ fn indexUniquenessDetailAlloc(allocator: std.mem.Allocator, schema_unique: bool,
         "schema declares a non-unique index, database index is UNIQUE");
 }
 
+/// Which kinds carry an **allocated** `index_detail`, and so must be freed —
+/// the two index kinds, whose sentence describes a difference read from the
+/// database, and `.missing_foreign_key`, whose sentence names a shape built at
+/// runtime. `.unique_constraint` points the field at a `const` literal instead
+/// and must not be freed; every other kind leaves it empty.
+fn ownsIndexDetail(kind: SchemaDrift.Kind) bool {
+    return switch (kind) {
+        .index_columns, .index_uniqueness, .missing_foreign_key => true,
+        else => false,
+    };
+}
+
 /// Frees the slice, the `.extra_column` names it duplicated, and the detail
-/// carried by the two index kinds (`.index_columns`, `.index_uniqueness`);
-/// every other entry borrows from `infos` or from comptime literals (see
-/// `SchemaDrift.column_owned` / `SchemaDrift.index_detail`).
+/// carried by the kinds `ownsIndexDetail` names; every other entry borrows from
+/// `infos` or from comptime literals (see `SchemaDrift.column_owned` /
+/// `SchemaDrift.index_detail`).
 pub fn freeSchemaDrift(allocator: std.mem.Allocator, drifts: []SchemaDrift) void {
     for (drifts) |d| {
         if (d.column_owned) allocator.free(d.column);
-        if (d.kind == .index_columns or d.kind == .index_uniqueness) allocator.free(d.index_detail);
+        if (ownsIndexDetail(d.kind)) allocator.free(d.index_detail);
     }
     allocator.free(drifts);
 }
@@ -2110,6 +2373,306 @@ pub fn freeExistingIndexes(allocator: std.mem.Allocator, indexes: *std.array_lis
     indexes.deinit();
 }
 
+/// A foreign key as the *database* reports it. Owned: `ref_table` and every
+/// string in `columns` / `ref_columns` are allocated, release the list with
+/// `freeExistingForeignKeys`.
+///
+/// There is deliberately **no name**: the comparison is by shape (see
+/// `checkSchema`), and a name is the one thing the three catalogs do not agree
+/// on — PostgreSQL and MySQL generate one, SQLite keeps none. `ON DELETE` /
+/// `ON UPDATE` are not read either.
+pub const ExistingForeignKey = struct {
+    /// Local columns, in constraint order.
+    columns: []const []const u8,
+    /// The referenced table, as the database spells it.
+    ref_table: []const u8,
+    /// Referenced columns, in constraint order. Empty unless
+    /// `ref_columns_comparable`.
+    ref_columns: []const []const u8 = &.{},
+    /// Whether `ref_columns` may be compared at all. False for exactly one
+    /// shape: SQLite's `REFERENCES t` with no column list, where
+    /// `PRAGMA foreign_key_list` reports a NULL `to` because the target is the
+    /// other table's primary key. The constraint is real and its shape is not
+    /// wrong — it is *unreadable*, and a caller that reads that as a difference
+    /// blocks a deploy over its own guess.
+    ref_columns_comparable: bool = true,
+};
+
+/// Query the foreign keys a table declares, using dialect-specific catalogs.
+///
+/// Every dialect reads a **structured catalog** — PostgreSQL's `pg_constraint`
+/// (`contype = 'f'`) with its `conkey`/`confkey` arrays, MySQL/MariaDB's
+/// `information_schema.key_column_usage`, SQLite's
+/// `PRAGMA foreign_key_list(<table>)` — and never the `REFERENCES` clause out of
+/// rendered DDL text, for the same reason `getExistingIndexes` does not parse
+/// `indexdef`.
+///
+/// The table name is **bound** on PostgreSQL (`$1`) and MySQL (`?`), never
+/// interpolated into a string literal. SQLite is the exception and cannot be:
+/// `PRAGMA` takes no placeholders, so the name is checked first
+/// (`sqlitePragmaNameUsable`) and refused with `error.InvalidTableName` rather
+/// than emitted into a statement it would break.
+///
+/// A table that does not exist answers an **empty list**, not an error — on
+/// SQLite because `PRAGMA` has no opinion about a name it cannot find, and on
+/// the other two because a `WHERE table_name = …` over a catalog that does not
+/// contain the table matches no rows. That is why `checkSchema` calls this only
+/// after `getExistingColumns` has said the table is there: "no foreign keys" and
+/// "no table at all" are different answers, and only the caller knows which
+/// question it asked.
+pub fn getExistingForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingForeignKey) {
+    const dialect = driver_drv.dialect();
+    if (std.mem.eql(u8, dialect.name, "sqlite3")) return getSQLiteForeignKeys(allocator, driver_drv, table_name);
+    if (std.mem.eql(u8, dialect.name, "postgres")) return getPostgresForeignKeys(allocator, driver_drv, table_name);
+    if (std.mem.eql(u8, dialect.name, "mysql")) return getMySQLForeignKeys(allocator, driver_drv, table_name);
+    return error.UnsupportedDialect;
+}
+
+/// Hand the accumulated columns to the foreign key at `current` and reset the
+/// accumulators for the next one. A no-op before the first key.
+///
+/// `comparable` is the caller's verdict about the *referenced* column list,
+/// which is only ever false when the database did not record one. A key that
+/// came back with fewer referenced columns than local ones is not comparable
+/// either: the two lists are positional, and a short one cannot be lined up.
+fn closeExistingForeignKey(
+    result: *std.array_list.Managed(ExistingForeignKey),
+    current: ?usize,
+    columns: *std.array_list.Managed([]const u8),
+    ref_columns: *std.array_list.Managed([]const u8),
+    comparable: bool,
+) !void {
+    const idx = current orelse return;
+    result.items[idx].columns = try columns.toOwnedSlice();
+    result.items[idx].ref_columns = try ref_columns.toOwnedSlice();
+    result.items[idx].ref_columns_comparable = comparable and
+        result.items[idx].ref_columns.len == result.items[idx].columns.len;
+}
+
+/// `information_schema.key_column_usage`, filtered to foreign keys by
+/// `referenced_table_name IS NOT NULL` — the same row shape every other
+/// constraint kind would have, minus the reference, so that one predicate is
+/// what keeps only the constraints asked for.
+///
+/// `ordinal_position` restarts at 1 for each constraint and the rows arrive
+/// ordered by it, which is what groups them without a name to group on.
+///
+/// This is standard `information_schema`, not a server-specific view: the same
+/// statement runs unchanged on MySQL and MariaDB.
+fn getMySQLForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingForeignKey) {
+    var result = std.array_list.Managed(ExistingForeignKey).init(allocator);
+    errdefer freeExistingForeignKeys(allocator, &result);
+
+    var cols = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        // Reached on an error path only: `toOwnedSlice` hands each finished
+        // list to the constraint it belongs to.
+        for (cols.items) |c| allocator.free(c);
+        cols.deinit();
+    }
+    var refs = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (refs.items) |c| allocator.free(c);
+        refs.deinit();
+    }
+
+    var rows = try driver_drv.query(
+        "SELECT column_name, referenced_table_name, referenced_column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name = ? AND table_schema = DATABASE() AND referenced_table_name IS NOT NULL ORDER BY constraint_name, ordinal_position",
+        &.{.{ .string = table_name }},
+    );
+    defer rows.deinit();
+
+    var current: ?usize = null;
+    var comparable = true;
+    while (rows.next()) |row| {
+        const position = row.getInt(3) orelse continue;
+        if (current == null or position == 1) {
+            try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+            try result.append(.{
+                .columns = &.{},
+                .ref_table = try allocator.dupe(u8, row.getText(1) orelse ""),
+            });
+            current = result.items.len - 1;
+            comparable = true;
+        }
+        if (row.getText(0)) |column| {
+            try cols.append(try allocator.dupe(u8, column));
+        } else {
+            comparable = false; // no local column: not a shape to compare
+        }
+        if (row.getText(2)) |ref_column| {
+            try refs.append(try allocator.dupe(u8, ref_column));
+        } else {
+            comparable = false; // referenced column not recorded
+        }
+    }
+    if (rows.nextError()) |err| return err;
+    try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+    return result;
+}
+
+/// PostgreSQL, from `pg_constraint` alone — no `pg_get_constraintdef()` text,
+/// which would have to be parsed back into a shape and is exactly the kind of
+/// comparison that starts lying.
+///
+/// `conkey` and `confkey` are the local and referenced attribute numbers **in
+/// constraint order**, so `generate_subscripts` walks the two in step and each
+/// `pg_attribute` join resolves one position of each side to a name. `contype =
+/// 'f'` is the foreign-key filter; the namespace join keeps a same-named table
+/// in another schema out of the answer.
+fn getPostgresForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingForeignKey) {
+    var result = std.array_list.Managed(ExistingForeignKey).init(allocator);
+    errdefer freeExistingForeignKeys(allocator, &result);
+
+    // The table name is bound (`$1`), not interpolated: a name carrying a
+    // quote would otherwise end the predicate early. `contype` and the schema
+    // predicate stay literal — they are this function's own constants.
+    const sql_text =
+        \\SELECT con.conname,
+        \\       a.attname,
+        \\       rc.relname,
+        \\       ra.attname,
+        \\       k.ord
+        \\FROM pg_constraint con
+        \\JOIN pg_class t ON t.oid = con.conrelid
+        \\JOIN pg_class rc ON rc.oid = con.confrelid
+        \\JOIN pg_namespace n ON n.oid = t.relnamespace
+        \\JOIN generate_subscripts(con.conkey, 1) AS k(ord) ON true
+        \\JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = con.conkey[k.ord]
+        \\JOIN pg_attribute ra ON ra.attrelid = rc.oid AND ra.attnum = con.confkey[k.ord]
+        \\WHERE con.contype = 'f'
+        \\  AND t.relname = $1
+        \\  AND n.nspname = current_schema()
+        \\ORDER BY con.conname, k.ord
+    ;
+
+    var rows = try driver_drv.query(sql_text, &.{.{ .string = table_name }});
+    defer rows.deinit();
+
+    var cols = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (cols.items) |c| allocator.free(c);
+        cols.deinit();
+    }
+    var refs = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (refs.items) |c| allocator.free(c);
+        refs.deinit();
+    }
+
+    var current: ?usize = null;
+    var comparable = true;
+    while (rows.next()) |row| {
+        // `generate_subscripts` counts from 1, so a position of 1 is the start
+        // of the next constraint.
+        const position = row.getInt(4) orelse continue;
+        if (current == null or position == 1) {
+            try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+            try result.append(.{
+                .columns = &.{},
+                .ref_table = try allocator.dupe(u8, row.getText(2) orelse ""),
+            });
+            current = result.items.len - 1;
+            comparable = true;
+        }
+        if (row.getText(1)) |column| {
+            try cols.append(try allocator.dupe(u8, column));
+        } else {
+            comparable = false;
+        }
+        if (row.getText(3)) |ref_column| {
+            try refs.append(try allocator.dupe(u8, ref_column));
+        } else {
+            comparable = false;
+        }
+    }
+    if (rows.nextError()) |err| return err;
+    try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+    return result;
+}
+
+/// SQLite, from `PRAGMA foreign_key_list(<table>)`: one row per (constraint,
+/// column) shaped `(id, seq, "table", "from", "to", on_update, on_delete,
+/// match)`.
+///
+/// There is no constraint name and no `ORDER BY`, so the rows are grouped by
+/// `seq` restarting at 0 — SQLite emits one constraint's rows consecutively,
+/// outermost loop over the constraint. `to` is NULL when the DDL said
+/// `REFERENCES t` with no column list, which is recorded as *unreadable* rather
+/// than as an empty list (see `ExistingForeignKey`).
+///
+/// Column 2 is the table **referenced**, not the table being asked about: the
+/// pragma is a list of outgoing references.
+///
+/// `PRAGMA` takes no placeholders, so the table name is interpolated and checked
+/// first (`sqlitePragmaNameUsable`); a name for a table that does not exist
+/// answers an empty list, exactly like a table with no foreign keys.
+fn getSQLiteForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingForeignKey) {
+    var result = std.array_list.Managed(ExistingForeignKey).init(allocator);
+    errdefer freeExistingForeignKeys(allocator, &result);
+
+    if (!sqlitePragmaNameUsable(table_name)) {
+        reportUnusableSqliteName("foreign_key_list", table_name);
+        return error.InvalidTableName;
+    }
+
+    const sql_text = try std.fmt.allocPrint(allocator, "PRAGMA foreign_key_list(\"{s}\")", .{table_name});
+    defer allocator.free(sql_text);
+
+    var rows = try driver_drv.query(sql_text, &.{});
+    defer rows.deinit();
+
+    var cols = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (cols.items) |c| allocator.free(c);
+        cols.deinit();
+    }
+    var refs = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (refs.items) |c| allocator.free(c);
+        refs.deinit();
+    }
+
+    var current: ?usize = null;
+    var comparable = true;
+    while (rows.next()) |row| {
+        const seq = row.getInt(1) orelse continue;
+        if (current == null or seq == 0) {
+            try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+            try result.append(.{
+                .columns = &.{},
+                .ref_table = try allocator.dupe(u8, row.getText(2) orelse ""),
+            });
+            current = result.items.len - 1;
+            comparable = true;
+        }
+        if (row.getText(3)) |column| {
+            try cols.append(try allocator.dupe(u8, column));
+        } else {
+            comparable = false;
+        }
+        if (row.getText(4)) |ref_column| {
+            try refs.append(try allocator.dupe(u8, ref_column));
+        } else {
+            comparable = false;
+        }
+    }
+    if (rows.nextError()) |err| return err;
+    try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+    return result;
+}
+
+pub fn freeExistingForeignKeys(allocator: std.mem.Allocator, foreign_keys: *std.array_list.Managed(ExistingForeignKey)) void {
+    for (foreign_keys.items) |fk| {
+        for (fk.columns) |c| allocator.free(c);
+        allocator.free(fk.columns);
+        allocator.free(fk.ref_table);
+        for (fk.ref_columns) |c| allocator.free(c);
+        allocator.free(fk.ref_columns);
+    }
+    foreign_keys.deinit();
+}
+
 fn columnExists(columns: []const ExistingColumn, name: []const u8) bool {
     for (columns) |c| {
         if (std.mem.eql(u8, c.name, name)) return true;
@@ -3757,6 +4320,9 @@ test "SQLite introspection refuses a table name that would break the PRAGMA" {
     for ([_][]const u8{ "we'ird", "we\"ird", "we`ird", "we\x00ird", "'; DROP TABLE t; --" }) |name| {
         try std.testing.expectError(error.InvalidTableName, getExistingColumns(std.testing.allocator, drv.asDriver(), name));
         try std.testing.expectError(error.InvalidTableName, getExistingIndexes(std.testing.allocator, drv.asDriver(), name));
+        // The foreign-key pragma interpolates the name the same way, so it
+        // carries the same guard — `PRAGMA foreign_key_list("…")`.
+        try std.testing.expectError(error.InvalidTableName, getExistingForeignKeys(std.testing.allocator, drv.asDriver(), name));
     }
 
     // The guard is about the statement, not about names one would not have
@@ -3777,6 +4343,10 @@ test "SQLite introspection refuses a table name that would break the PRAGMA" {
     var absent = try getExistingColumns(std.testing.allocator, drv.asDriver(), "no such table here");
     defer freeExistingColumns(std.testing.allocator, &absent);
     try std.testing.expectEqual(@as(usize, 0), absent.items.len);
+
+    var fks = try getExistingForeignKeys(std.testing.allocator, drv.asDriver(), "space name");
+    defer freeExistingForeignKeys(std.testing.allocator, &fks);
+    try std.testing.expectEqual(@as(usize, 0), fks.items.len);
 }
 
 test "getExistingIndexes reports key columns in order (SQLite)" {
@@ -4040,6 +4610,389 @@ test "checkSchema reports uniqueness drift on an index it cannot compare by key 
         drifts[0].index_detail,
     );
     try std.testing.expect(!drifts[0].breaksReads());
+    try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
+    try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+}
+
+test "getExistingForeignKeys reads local and referenced columns in order (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)", &.{});
+    _ = try drv.exec(
+        \\CREATE TABLE fk_child (
+        \\  id INTEGER PRIMARY KEY,
+        \\  a_id INTEGER,
+        \\  b_id INTEGER,
+        \\  FOREIGN KEY (a_id) REFERENCES fk_parent (id),
+        \\  FOREIGN KEY (b_id) REFERENCES fk_parent (code)
+        \\)
+    , &.{});
+    // `REFERENCES t` with no column list: SQLite records the constraint and
+    // reports no target column at all, so the shape is unreadable rather than
+    // empty.
+    _ = try drv.exec("CREATE TABLE fk_implicit (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_parent)", &.{});
+
+    var keys = try getExistingForeignKeys(std.testing.allocator, drv.asDriver(), "fk_child");
+    defer freeExistingForeignKeys(std.testing.allocator, &keys);
+
+    // `PRAGMA foreign_key_list` emits the constraints in its own order (not the
+    // declaration's), so the entries are found by shape here.
+    try std.testing.expectEqual(@as(usize, 2), keys.items.len);
+    var saw_a = false;
+    var saw_b = false;
+    for (keys.items) |fk| {
+        try std.testing.expectEqualStrings("fk_parent", fk.ref_table);
+        try std.testing.expectEqual(@as(usize, 1), fk.columns.len);
+        try std.testing.expect(fk.ref_columns_comparable);
+        try std.testing.expectEqual(@as(usize, 1), fk.ref_columns.len);
+        if (std.mem.eql(u8, fk.columns[0], "a_id")) {
+            saw_a = true;
+            try std.testing.expectEqualStrings("id", fk.ref_columns[0]);
+        } else if (std.mem.eql(u8, fk.columns[0], "b_id")) {
+            saw_b = true;
+            try std.testing.expectEqualStrings("code", fk.ref_columns[0]);
+        }
+    }
+    try std.testing.expect(saw_a and saw_b);
+
+    var implicit = try getExistingForeignKeys(std.testing.allocator, drv.asDriver(), "fk_implicit");
+    defer freeExistingForeignKeys(std.testing.allocator, &implicit);
+    try std.testing.expectEqual(@as(usize, 1), implicit.items.len);
+    try std.testing.expectEqualStrings("fk_parent", implicit.items[0].ref_table);
+    try std.testing.expectEqualStrings("parent_id", implicit.items[0].columns[0]);
+    try std.testing.expect(!implicit.items[0].ref_columns_comparable);
+    try std.testing.expectEqual(@as(usize, 0), implicit.items[0].ref_columns.len);
+
+    // A table with none, and a table that does not exist: the same empty answer,
+    // which is why `checkSchema` asks this only once it knows the table is there.
+    _ = try drv.exec("CREATE TABLE fk_bare (id INTEGER PRIMARY KEY, body TEXT)", &.{});
+    var none = try getExistingForeignKeys(std.testing.allocator, drv.asDriver(), "fk_bare");
+    defer freeExistingForeignKeys(std.testing.allocator, &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+
+    var missing = try getExistingForeignKeys(std.testing.allocator, drv.asDriver(), "fk_absent");
+    defer freeExistingForeignKeys(std.testing.allocator, &missing);
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+}
+
+test "checkSchema reports a declared foreign key the database does not have (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    const FkOwner = schema("FkOwner", .{ .fields = &.{field.String("name")} });
+    const FkCar = schema("FkCar", .{
+        .fields = &.{field.String("model")},
+        .edges = &.{edge.From("owner", FkOwner)},
+    });
+    const info = comptime fromSchema(FkCar);
+    const infos = &[_]TypeInfo{info};
+
+    // The legacy table: the column the edge generated is there, the constraint
+    // is not. This is the shape a table created before the edge existed has, and
+    // `migrateSchema` will never add the constraint to it.
+    _ = try drv.exec(
+        "CREATE TABLE fk_car (id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, owner_id INTEGER)",
+        &.{},
+    );
+
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+
+        // Nothing else about the table differs, so this is the whole report.
+        try std.testing.expectEqual(@as(usize, 1), drifts.len);
+        try std.testing.expectEqual(SchemaDrift.Kind.missing_foreign_key, drifts[0].kind);
+        try std.testing.expectEqualStrings("fk_car", drifts[0].table);
+        try std.testing.expectEqualStrings("owner_id", drifts[0].column);
+        try std.testing.expectEqualStrings(
+            "schema declares FOREIGN KEY (owner_id) REFERENCES fk_owner (id), database has none",
+            drifts[0].index_detail,
+        );
+        // `assertSchema` prints the column *and* this sentence: a table can carry
+        // several foreign keys, and "one is missing" does not say which.
+        try std.testing.expect(!drifts[0].breaksReads());
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+    }
+
+    // Rebuild the table with the constraint — under a name SQLite invents, which
+    // is the whole point: the comparison is by shape, so the name is irrelevant.
+    _ = try drv.exec("DROP TABLE fk_car", &.{});
+    _ = try drv.exec(
+        "CREATE TABLE fk_car (id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, owner_id INTEGER, FOREIGN KEY (owner_id) REFERENCES fk_owner (id))",
+        &.{},
+    );
+
+    const agreeing = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, agreeing);
+    try std.testing.expectEqual(@as(usize, 0), agreeing.len);
+
+    // A constraint the database has and the schema does not is **not** drift:
+    // it can only reject writes the schema never promised, so a table somebody
+    // hardened by hand must not turn the deploy red.
+    _ = try drv.exec("DROP TABLE fk_car", &.{});
+    _ = try drv.exec(
+        "CREATE TABLE fk_car (id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, owner_id INTEGER, FOREIGN KEY (owner_id) REFERENCES fk_owner (id), FOREIGN KEY (model) REFERENCES fk_owner (name))",
+        &.{},
+    );
+
+    const extra = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, extra);
+    try std.testing.expectEqual(@as(usize, 0), extra.len);
+}
+
+test "foreignKeyPresent compares by shape, not by name or position (SQLite)" {
+    // The comparison itself, without a database: a constraint that matches on
+    // the local columns, the target table and the target columns is present even
+    // though nothing records a name, and one that disagrees on any of the three
+    // is not.
+    const declared = ForeignKeyDef{
+        .columns = &[_][]const u8{"user_id"},
+        .ref_table = "app_user",
+        .ref_columns = &[_][]const u8{"id"},
+    };
+
+    const matching = [_]ExistingForeignKey{.{
+        .columns = &[_][]const u8{"user_id"},
+        .ref_table = "app_user",
+        .ref_columns = &[_][]const u8{"id"},
+    }};
+    try std.testing.expect(foreignKeyPresent(&matching, declared));
+
+    // Unquoted DDL reaches PostgreSQL as lower case and SQLite/MySQL compare
+    // table names case-insensitively, so a case difference is not a shape
+    // difference. Column names stay exact.
+    const other_case = [_]ExistingForeignKey{.{
+        .columns = &[_][]const u8{"user_id"},
+        .ref_table = "APP_USER",
+        .ref_columns = &[_][]const u8{"id"},
+    }};
+    try std.testing.expect(foreignKeyPresent(&other_case, declared));
+
+    // `REFERENCES app_user` with no column list: unreadable, not wrong.
+    const unreadable = [_]ExistingForeignKey{.{
+        .columns = &[_][]const u8{"user_id"},
+        .ref_table = "app_user",
+        .ref_columns = &.{},
+        .ref_columns_comparable = false,
+    }};
+    try std.testing.expect(foreignKeyPresent(&unreadable, declared));
+
+    // A different target column is a different constraint …
+    const wrong_ref = [_]ExistingForeignKey{.{
+        .columns = &[_][]const u8{"user_id"},
+        .ref_table = "app_user",
+        .ref_columns = &[_][]const u8{"code"},
+    }};
+    try std.testing.expect(!foreignKeyPresent(&wrong_ref, declared));
+
+    // … and so is a different target table, or a different local column list.
+    const wrong_table = [_]ExistingForeignKey{.{
+        .columns = &[_][]const u8{"user_id"},
+        .ref_table = "other_user",
+        .ref_columns = &[_][]const u8{"id"},
+    }};
+    try std.testing.expect(!foreignKeyPresent(&wrong_table, declared));
+
+    const wrong_local = [_]ExistingForeignKey{.{
+        .columns = &[_][]const u8{"other_id"},
+        .ref_table = "app_user",
+        .ref_columns = &[_][]const u8{"id"},
+    }};
+    try std.testing.expect(!foreignKeyPresent(&wrong_local, declared));
+
+    // No constraint at all: the drift.
+    try std.testing.expect(!foreignKeyPresent(&[_]ExistingForeignKey{}, declared));
+}
+
+test "uniqueColumnChecked exempts only a primary key's own uniqueness" {
+    const single = TableDef{
+        .name = "t",
+        .columns = &.{.{ .name = "id", .sql_type = "INTEGER", .primary_key = true, .unique = true }},
+        .primary_keys = &.{"id"},
+    };
+    try std.testing.expect(!uniqueColumnChecked(single.columns[0], single));
+
+    // One part of a composite key is not unique on its own, so a `UNIQUE` on it
+    // is still a declaration that needs something enforcing it.
+    const composite = TableDef{
+        .name = "t",
+        .columns = &.{.{ .name = "a", .sql_type = "INTEGER", .primary_key = true, .unique = true }},
+        .primary_keys = &.{ "a", "b" },
+    };
+    try std.testing.expect(uniqueColumnChecked(composite.columns[0], composite));
+
+    const plain = TableDef{
+        .name = "t",
+        .columns = &.{.{ .name = "email", .sql_type = "TEXT", .unique = true }},
+        .primary_keys = &.{"id"},
+    };
+    try std.testing.expect(uniqueColumnChecked(plain.columns[0], plain));
+
+    const not_unique = TableDef{
+        .name = "t",
+        .columns = &.{.{ .name = "email", .sql_type = "TEXT" }},
+        .primary_keys = &.{"id"},
+    };
+    try std.testing.expect(!uniqueColumnChecked(not_unique.columns[0], not_unique));
+
+    try std.testing.expect(wantsUniqueColumnCheck(plain));
+    try std.testing.expect(!wantsUniqueColumnCheck(not_unique));
+    try std.testing.expect(!wantsUniqueColumnCheck(single));
+}
+
+test "checkSchema reports a UNIQUE column nothing forces, and only then (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    // No declared index at all: the `UNIQUE` is inlined into `CREATE TABLE` and
+    // is invisible to the index comparison, which is exactly the gap.
+    _ = try drv.exec(
+        "CREATE TABLE uq_item (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, tenant TEXT NOT NULL)",
+        &.{},
+    );
+
+    const UqItem = schema("UqItem", .{
+        .fields = &.{ field.String("email").Unique(), field.String("tenant") },
+    });
+    const info = comptime fromSchema(UqItem);
+    const infos = &[_]TypeInfo{info};
+
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+
+        try std.testing.expectEqual(@as(usize, 1), drifts.len);
+        try std.testing.expectEqual(SchemaDrift.Kind.unique_constraint, drifts[0].kind);
+        try std.testing.expectEqualStrings("uq_item", drifts[0].table);
+        try std.testing.expectEqualStrings("email", drifts[0].column);
+        try std.testing.expectEqualStrings(
+            "schema declares the column UNIQUE, database has no unique constraint covering it",
+            drifts[0].index_detail,
+        );
+        // The detail is a literal, not an allocation: freeing the report must
+        // leave it alone (a double free here would show up as a leak check
+        // failure on the freeing allocator, not as a test assertion).
+        try std.testing.expect(!ownsIndexDetail(drifts[0].kind));
+        // A duplicate row is a *write* the database accepts, not a broken read.
+        try std.testing.expect(!drifts[0].breaksReads());
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+    }
+
+    // A unique index over exactly that column satisfies it — whatever the
+    // database chose to call it.
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_uq_item_email ON uq_item (email)", &.{});
+    {
+        const satisfied = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, satisfied);
+        try std.testing.expectEqual(@as(usize, 0), satisfied.len);
+    }
+
+    // A **composite** unique index does not: `UNIQUE (tenant, email)` still
+    // permits two rows with the same `email`.
+    _ = try drv.exec("DROP INDEX idx_uq_item_email", &.{});
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_uq_item_tenant_email ON uq_item (tenant, email)", &.{});
+    {
+        const composite = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, composite);
+        try std.testing.expectEqual(@as(usize, 1), composite.len);
+        try std.testing.expectEqual(SchemaDrift.Kind.unique_constraint, composite[0].kind);
+        try std.testing.expectEqualStrings("email", composite[0].column);
+    }
+
+    // A non-unique index over it forces nothing either.
+    _ = try drv.exec("DROP INDEX idx_uq_item_tenant_email", &.{});
+    _ = try drv.exec("CREATE INDEX idx_uq_item_email ON uq_item (email)", &.{});
+    {
+        const non_unique = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, non_unique);
+        try std.testing.expectEqual(@as(usize, 1), non_unique.len);
+        try std.testing.expectEqual(SchemaDrift.Kind.unique_constraint, non_unique[0].kind);
+    }
+
+    // A column of the database's own primary key is unique by construction, so
+    // the declaration on it needs nothing else — SQLite gives `INTEGER PRIMARY
+    // KEY` no entry in `PRAGMA index_list` at all, which is why the exemption
+    // has to come from the declaration rather than from an index.
+    _ = try drv.exec("CREATE TABLE uq_pk (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)", &.{});
+    const UqPk = schema("UqPk", .{ .fields = &.{ field.Int("id").Unique(), field.String("body") } });
+    const pk_info = comptime fromSchema(UqPk);
+    const pk_infos = &[_]TypeInfo{pk_info};
+    const pk_drifts = try checkSchema(std.testing.allocator, drv.asDriver(), pk_infos);
+    defer freeSchemaDrift(std.testing.allocator, pk_drifts);
+    try std.testing.expectEqual(@as(usize, 0), pk_drifts.len);
+}
+
+test "checkSchema stays silent about a UNIQUE column a unique index it cannot read may force (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec(
+        "CREATE TABLE uq_expr_item (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL)",
+        &.{},
+    );
+    // `lower(email)` is a unique constraint on the column that the key list
+    // cannot describe, so "is this column constrained?" has no answer — and a
+    // report would be a guess that blocks a deploy.
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_uq_expr_item_email ON uq_expr_item (lower(email))", &.{});
+
+    const UqExprItem = schema("UqExprItem", .{ .fields = &.{field.String("email").Unique()} });
+    const info = comptime fromSchema(UqExprItem);
+    const infos = &[_]TypeInfo{info};
+
+    const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, drifts);
+    try std.testing.expectEqual(@as(usize, 0), drifts.len);
+    try assertSchema(std.testing.allocator, drv.asDriver(), infos, .any);
+}
+
+test "checkSchema still reports a UNIQUE column when the unreadable index is not unique (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec(
+        "CREATE TABLE uq_plain_item (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL)",
+        &.{},
+    );
+    // Unreadable, but not unique: whatever it covers, it enforces no
+    // uniqueness, so it cannot stand in the way of the answer. Only an
+    // unreadable *unique* index makes the question unanswerable.
+    _ = try drv.exec("CREATE INDEX idx_uq_plain_item_email ON uq_plain_item (lower(email))", &.{});
+
+    const UqPlainItem = schema("UqPlainItem", .{ .fields = &.{field.String("email").Unique()} });
+    const info = comptime fromSchema(UqPlainItem);
+    const infos = &[_]TypeInfo{info};
+
+    const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, drifts);
+    try std.testing.expectEqual(@as(usize, 1), drifts.len);
+    try std.testing.expectEqual(SchemaDrift.Kind.unique_constraint, drifts[0].kind);
+    try std.testing.expectEqualStrings("email", drifts[0].column);
     try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
     try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
 }
