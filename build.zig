@@ -233,6 +233,51 @@ pub fn build(b: *std.Build) void {
     interceptor_step.dependOn(&run_interceptor.step);
 
     // -------------------------------------------------------------
+    // Example: check_sql (validate raw SQL without running it)
+    // -------------------------------------------------------------
+    // The tool body is its own module so `tests/integration/check_sql_cli.zig`
+    // can drive it in-process — no subprocess, no second test harness.
+    const check_sql_cli_mod = b.createModule(.{
+        .root_source_file = b.path("examples/check_sql/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    check_sql_cli_mod.addImport("zent", zent_mod);
+    check_sql_cli_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (pg_c_mod) |m| check_sql_cli_mod.addImport("pg_c", m);
+    if (my_c_mod) |m| check_sql_cli_mod.addImport("mysql_c", m);
+    check_sql_cli_mod.addImport("build_options", build_options_mod);
+    linkSqlite(check_sql_cli_mod);
+    if (pg_include_dir) |inc| linkPg(check_sql_cli_mod, inc, pg_lib_dir.?);
+    if (my_include_dir) |inc| linkMySQL(check_sql_cli_mod, inc, my_lib_dir.?);
+
+    const check_sql_mod = b.createModule(.{
+        .root_source_file = b.path("examples/check_sql/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    check_sql_mod.addImport("check_sql_cli", check_sql_cli_mod);
+    linkSqlite(check_sql_mod);
+    if (pg_include_dir) |inc| linkPg(check_sql_mod, inc, pg_lib_dir.?);
+    if (my_include_dir) |inc| linkMySQL(check_sql_mod, inc, my_lib_dir.?);
+
+    const check_sql_exe = b.addExecutable(.{
+        .name = "check_sql",
+        .root_module = check_sql_mod,
+    });
+    b.installArtifact(check_sql_exe);
+
+    const run_check_sql = b.addRunArtifact(check_sql_exe);
+    // A smoke run over the sample: every statement in it is clean, so the step
+    // is green. The DSN is pinned so a developer's $ZENT_DSN cannot change it.
+    run_check_sql.addFileArg(b.path("examples/check_sql/sample.sql"));
+    run_check_sql.setEnvironmentVariable("ZENT_DSN", "sqlite::memory:");
+    const check_sql_step = b.step("run-check-sql", "Check examples/check_sql/sample.sql without executing it");
+    check_sql_step.dependOn(&run_check_sql.step);
+
+    // -------------------------------------------------------------
     // Benchmarks
     // -------------------------------------------------------------
     const bench_mod = b.createModule(.{
@@ -273,6 +318,9 @@ pub fn build(b: *std.Build) void {
     if (pg_c_mod) |m| integ_mod.addImport("pg_c", m);
     if (my_c_mod) |m| integ_mod.addImport("mysql_c", m);
     integ_mod.addImport("build_options", build_options_mod);
+    // The check_sql CLI is a consumer of the library, so its end-to-end test
+    // lives with the other integration tests and drives the real tool body.
+    integ_mod.addImport("check_sql_cli", check_sql_cli_mod);
     linkSqlite(integ_mod);
     if (pg_include_dir) |inc| linkPg(integ_mod, inc, pg_lib_dir.?);
     if (my_include_dir) |inc| linkMySQL(integ_mod, inc, my_lib_dir.?);
