@@ -1099,6 +1099,16 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             for (self.predicates.items) |pred| {
                 _ = try builder.where(pred);
             }
+            // A row that is already trashed is not deleted a second time: the
+            // statement answers "how many live rows this call moved to the
+            // trash", which is what a DELETE's count means. Without it, a
+            // repeat call rewrote `deleted_at` — losing the timestamp of when
+            // the row was actually trashed — and counted the row again, so the
+            // same call answered 1 where the hard path answers 0 (the row is
+            // gone). The edge-write helpers above (`buildTargetDetachQuery`,
+            // `buildTargetAttachQuery`) have always applied the same `IS NULL`
+            // to "a trashed target row is not a live one".
+            _ = try builder.where(sql.IsNull("deleted_at"));
 
             const q = builder.query() catch |err| return mapBuildError(err);
             self.ensureDeadline();
@@ -1608,6 +1618,15 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 for (g.items) |p| {
                     _ = try builder.where(p);
                 }
+                // Only live rows. The count is "rows this call moved to the
+                // trash" — the same statement the hard path's DELETE makes —
+                // so a row an earlier call (or another group) already trashed
+                // must neither be rewritten to a fresh `deleted_at` nor
+                // counted again. It also keeps a row matched by two ORed
+                // groups from being counted twice. Added to the statement, not
+                // into `g`, so `requirePredicate` above still refuses a call
+                // that constrains nothing.
+                _ = try builder.where(sql.IsNull("deleted_at"));
                 const q = builder.query() catch |err| return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.ExecFailed,
@@ -3027,5 +3046,199 @@ test "BulkDelete on a soft-deleting entity applies the policy's row filters" {
             all.deinit();
         }
         try std.testing.expectEqual(@as(usize, 0), all.items.len);
+    }
+}
+
+test "a second soft delete neither rewrites deleted_at nor counts the row" {
+    // What both soft-delete paths used to do: `UPDATE … SET deleted_at = <now>
+    // WHERE <preds>` also matched a row that was *already* trashed, so a repeat
+    // call pushed the timestamp forward — the row lost the moment it was really
+    // trashed — and counted it again, where the hard-deleting twin answers 0 for
+    // that call (there is no row left to delete). Each path is one statement, so
+    // both are pinned here.
+    //
+    // The already-trashed row's timestamp is written by hand rather than by a
+    // first `Exec`: `deleted_at` holds epoch *seconds*, so two soft deletes in
+    // the same second write the same value and "unchanged" would hold even while
+    // the timestamp was being rewritten. The sentinel is what makes that
+    // assertion able to fail.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const trashed_at: i64 = 1000;
+
+    const SoftRow = Schema("SoftRepeatRow", .{
+        .table_name = "soft_repeat_row",
+        .fields = &.{field.String("title")},
+        .mixins = &.{@import("../core/mixin.zig").SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const info = comptime fromSchema(SoftRow);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const client = client_mod.EntityClient(infos, info).init(allocator, driver.asDriver());
+    const preds = client.predicates;
+
+    const Path = enum { single, bulk };
+
+    inline for (.{ Path.single, Path.bulk }) |path| {
+        var live_id: i64 = undefined;
+        var trashed_id: i64 = undefined;
+        for ([_]*i64{ &live_id, &trashed_id }) |out| {
+            var b = try client.Create();
+            defer b.deinit();
+            _ = try b.setFieldValue("title", "row");
+            var row = try b.Save();
+            defer deinitEntity(infos, info, &row, allocator);
+            out.* = row.id;
+        }
+        _ = try driver.exec("UPDATE soft_repeat_row SET deleted_at = ? WHERE id = ?", &.{
+            .{ .int = trashed_at },
+            .{ .int = trashed_id },
+        });
+
+        // The trashed row alone: nothing left to delete, so nothing counted and
+        // nothing written.
+        const repeat = switch (path) {
+            .single => blk: {
+                var d = client.Delete();
+                defer d.deinit();
+                _ = try d.Where(.{preds.idEQ(.{ .int = trashed_id })});
+                break :blk try d.Exec();
+            },
+            .bulk => blk: {
+                var d = try client.BulkDelete();
+                defer d.deinit();
+                _ = try d.Where(.{preds.idEQ(.{ .int = trashed_id })});
+                break :blk try d.Exec();
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 0), repeat);
+
+        // Read back with raw SQL: the row still carries the timestamp it was
+        // given, not a fresh one.
+        {
+            var rows = try driver.query("SELECT deleted_at FROM soft_repeat_row WHERE id = ?", &.{
+                .{ .int = trashed_id },
+            });
+            defer rows.deinit();
+            const row = rows.next() orelse return error.NoRow;
+            try std.testing.expectEqual(@as(?i64, trashed_at), row.getInt(0));
+        }
+
+        // A live row is still trashed by the same call, counted once and given a
+        // timestamp: the change narrows *which* rows the statement matches, not
+        // what it does to them.
+        const first = switch (path) {
+            .single => blk: {
+                var d = client.Delete();
+                defer d.deinit();
+                _ = try d.Where(.{preds.idEQ(.{ .int = live_id })});
+                break :blk try d.Exec();
+            },
+            .bulk => blk: {
+                var d = try client.BulkDelete();
+                defer d.deinit();
+                _ = try d.Where(.{preds.idEQ(.{ .int = live_id })});
+                break :blk try d.Exec();
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 1), first);
+        {
+            var rows = try driver.query("SELECT deleted_at FROM soft_repeat_row WHERE id = ?", &.{
+                .{ .int = live_id },
+            });
+            defer rows.deinit();
+            const row = rows.next() orelse return error.NoRow;
+            try std.testing.expect(row.getInt(0) != null);
+            try std.testing.expect(row.getInt(0).? > trashed_at);
+        }
+    }
+}
+
+test "a soft delete counts only the rows it trashes, like the hard path" {
+    // `Exec` answers "rows this call deleted", so a row that is already trashed
+    // must not be counted again: on a fixture where the hard-deleting entity
+    // answers 3, the soft-deleting one used to answer 4 — the "soft 3, hard 2"
+    // shape seen while verifying Z34 — and a second identical batch answered the
+    // whole row count again instead of 0.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    // Two schemas that differ in exactly one thing — `soft_delete` — so the
+    // numbers below are the two paths' answers about the same fixture.
+    const HardRow = Schema("CountHardRow", .{
+        .table_name = "count_hard_row",
+        .fields = &.{field.String("title")},
+    });
+    const SoftRow = Schema("CountSoftRow", .{
+        .table_name = "count_soft_row",
+        .fields = &.{field.String("title")},
+        .mixins = &.{@import("../core/mixin.zig").SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+
+    inline for (.{ HardRow, SoftRow }) |S| {
+        const info = comptime fromSchema(S);
+        const infos = &[_]TypeInfo{info};
+        try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+        const client = client_mod.EntityClient(infos, info).init(allocator, driver.asDriver());
+        const preds = client.predicates;
+
+        var ids: [4]i64 = undefined;
+        for (&ids) |*out| {
+            var b = try client.Create();
+            defer b.deinit();
+            _ = try b.setFieldValue("title", "row");
+            var row = try b.Save();
+            defer deinitEntity(infos, info, &row, allocator);
+            out.* = row.id;
+        }
+
+        // One row goes first, so the batch below holds a row that is already
+        // gone: physically on the hard entity, trashed-but-present on the soft
+        // one. The single-row path counts it once either way.
+        {
+            var d = client.Delete();
+            defer d.deinit();
+            _ = try d.Where(.{preds.idEQ(.{ .int = ids[0] })});
+            try std.testing.expectEqual(@as(usize, 1), try d.Exec());
+        }
+
+        // The batch matches all four rows; only the three live ones go.
+        {
+            var d = try client.BulkDelete();
+            defer d.deinit();
+            _ = try d.Where(.{sql.Raw("1 = 1")});
+            try std.testing.expectEqual(@as(usize, 3), try d.Exec());
+        }
+
+        // A second identical batch has nothing left to delete on either entity —
+        // the soft one still *holds* four rows, all of them trashed.
+        {
+            var d = try client.BulkDelete();
+            defer d.deinit();
+            _ = try d.Where(.{sql.Raw("1 = 1")});
+            try std.testing.expectEqual(@as(usize, 0), try d.Exec());
+        }
     }
 }
