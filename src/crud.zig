@@ -14,6 +14,8 @@ const codegen = @import("codegen/client.zig");
 const EntityGen = @import("codegen/entity.zig").Entity;
 const QueryGen = @import("codegen/query.zig").QueryBuilder;
 const sql = @import("sql/builder.zig");
+const sql_driver = @import("sql/driver.zig");
+const Dialect = @import("sql/dialect.zig").Dialect;
 
 pub fn CrudEvent(comptime infos: []const graph_mod.TypeInfo, comptime info: graph_mod.TypeInfo) type {
     _ = infos;
@@ -120,7 +122,10 @@ pub fn CrudService(
         }
 
         /// Update a tenant-scoped row (id + tenant fixed); publishes
-        /// CrudEvent.updated. Returns false when the row is missing.
+        /// CrudEvent.updated. Returns false when the row is missing — "missing"
+        /// meaning the (id, tenant) pair matches no row, not "nothing changed":
+        /// an idempotent PUT that writes the fetched values back must answer
+        /// true on every dialect.
         pub fn update(self: *Self, entity: Entity, tenant_id: i64) !bool {
             var b = self.client.Update();
             defer b.deinit();
@@ -131,10 +136,25 @@ pub fn CrudService(
             }
             _ = try b.Where(.{ self.tenantPred(tenant_id), self.idPred(entity.id) });
             const affected = try b.Save();
-            if (affected > 0) {
+            var found = affected > 0;
+            if (!found) {
+                // MySQL reports *changed* rows (CLIENT_FOUND_ROWS is off), so an
+                // idempotent PUT answers 0 although the row exists; SQLite and
+                // PostgreSQL report *matched* rows and never reach this branch.
+                // The contract above is "false = row missing", so the zero path
+                // re-checks existence with the same (tenant, id) scope instead
+                // of trusting the count — the shape updateWithVersion already
+                // uses for its optimistic-lock zero. One extra query, only on
+                // the zero path, only on MySQL in practice.
+                var q = self.client.Query();
+                defer q.deinit();
+                _ = try q.Where(.{ self.tenantPred(tenant_id), self.idPred(entity.id) });
+                found = (try q.Count()) > 0;
+            }
+            if (found) {
                 if (self.on_event) |cb| cb(.{ .updated = entity.id });
             }
-            return affected > 0;
+            return found;
         }
 
         /// Delete a tenant-scoped row; publishes CrudEvent.deleted.
@@ -428,4 +448,237 @@ test "CrudService handles optional string fields in create/get" {
     var got_b = (try svc.get(allocator, 1, b_id)).?;
     defer deinitEntity(infos, info, &got_b, allocator);
     try std.testing.expectEqualStrings("desc", got_b.description.?);
+}
+
+/// A driver that answers every statement with the shape MySQL produces for an
+/// idempotent write: the UPDATE reports **0 changed rows** (CLIENT_FOUND_ROWS
+/// is off) while the row exists, and the existence re-check `Count()` query
+/// reports a configurable row count. Lets the zero path of
+/// `CrudService.update` be observed without a MySQL server.
+const ChangedRowsDriver = struct {
+    /// What the count query answers: 1 = row exists, 0 = row missing.
+    count_value: i64 = 0,
+    update_calls: usize = 0,
+    count_queries: usize = 0,
+    row_consumed: bool = false,
+
+    fn execFn(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        const self: *ChangedRowsDriver = @ptrCast(@alignCast(ptr));
+        if (std.mem.startsWith(u8, query_sql, "UPDATE")) self.update_calls += 1;
+        return .{ .rows_affected = 0, .rows_affected_known = true, .last_insert_id = null };
+    }
+
+    fn queryFn(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        const self: *ChangedRowsDriver = @ptrCast(@alignCast(ptr));
+        self.count_queries += 1;
+        self.row_consumed = false;
+        return .{ .ptr = self, .vtable = &rows_vtable };
+    }
+
+    fn beginTxFn(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn closeFn(_: *anyopaque) void {}
+
+    fn dialectFn(_: *anyopaque) Dialect {
+        return .mysql;
+    }
+
+    fn pingFn(_: *anyopaque) sql_driver.Error!void {}
+
+    fn inTxFn(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn savepointFn(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = execFn,
+        .query = queryFn,
+        .beginTx = beginTxFn,
+        .close = closeFn,
+        .dialect = dialectFn,
+        .ping = pingFn,
+        .inTransaction = inTxFn,
+        .beginSavepoint = savepointFn,
+    };
+
+    fn asDriver(self: *ChangedRowsDriver) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const rows_vtable = sql_driver.Rows.VTable{
+        .next = rowsNext,
+        .deinit = rowsDeinit,
+    };
+
+    fn rowsNext(ptr: *anyopaque) ?sql_driver.Row {
+        const self: *ChangedRowsDriver = @ptrCast(@alignCast(ptr));
+        if (self.row_consumed) return null;
+        self.row_consumed = true;
+        return .{ .ptr = self, .vtable = &row_vtable };
+    }
+
+    fn rowsDeinit(_: *anyopaque) void {}
+
+    const row_vtable = sql_driver.Row.VTable{
+        .columnCount = rowColumnCount,
+        .columnName = rowColumnName,
+        .getBool = rowGetBool,
+        .getInt = rowGetInt,
+        .getFloat = rowGetFloat,
+        .getText = rowGetText,
+        .getBlob = rowGetBlob,
+        .isNull = rowIsNull,
+    };
+
+    fn rowColumnCount(_: *anyopaque) usize {
+        return 1;
+    }
+    fn rowColumnName(_: *anyopaque, _: usize) []const u8 {
+        return "count";
+    }
+    fn rowGetBool(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+    fn rowGetInt(ptr: *anyopaque, _: usize) ?i64 {
+        const self: *ChangedRowsDriver = @ptrCast(@alignCast(ptr));
+        return self.count_value;
+    }
+    fn rowGetFloat(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+    fn rowGetText(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+    fn rowGetBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+    fn rowIsNull(_: *anyopaque, _: usize) bool {
+        return false;
+    }
+};
+
+test "CrudService update answers true for an idempotent write (0 changed rows, row exists)" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+
+    const Product = Schema("ChangedRowsProduct", .{ .fields = &.{
+        field.Int("tenant_id"),
+        field.String("name"),
+        field.Int("price_cents"),
+    } });
+    const info = comptime fromSchema(Product);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    const Recorder = struct {
+        var updated: i64 = -1;
+        fn on(e: CrudEvent(infos, info)) void {
+            switch (e) {
+                .updated => |id| updated = id,
+                else => {},
+            }
+        }
+    };
+
+    var mock = ChangedRowsDriver{ .count_value = 1 };
+    const client = codegen.EntityClient(infos, info).init(allocator, mock.asDriver());
+    var svc = Service.init(allocator, client);
+    svc.setEventListener(&Recorder.on);
+
+    // The UPDATE reports 0 changed rows — MySQL's answer when the values are
+    // written back unchanged — but the row exists. The answer must be true
+    // (what SQLite/PostgreSQL already answer with their matched-rows count),
+    // and the updated event must fire exactly as it does on those dialects.
+    try std.testing.expect(try svc.update(.{ .id = 7, .tenant_id = 0, .name = "a", .price_cents = 100 }, 1));
+    try std.testing.expectEqual(@as(i64, 7), Recorder.updated);
+    try std.testing.expectEqual(@as(usize, 1), mock.update_calls);
+    // The zero path cost exactly one existence query.
+    try std.testing.expectEqual(@as(usize, 1), mock.count_queries);
+}
+
+test "CrudService update answers false when the row is missing (0 changed rows, no row)" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+
+    const Product = Schema("MissingRowProduct", .{ .fields = &.{
+        field.Int("tenant_id"),
+        field.String("name"),
+    } });
+    const info = comptime fromSchema(Product);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    const Recorder = struct {
+        var fired: bool = false;
+        fn on(e: CrudEvent(infos, info)) void {
+            switch (e) {
+                .updated => fired = true,
+                else => {},
+            }
+        }
+    };
+
+    var mock = ChangedRowsDriver{ .count_value = 0 };
+    const client = codegen.EntityClient(infos, info).init(allocator, mock.asDriver());
+    var svc = Service.init(allocator, client);
+    svc.setEventListener(&Recorder.on);
+
+    // 0 changed rows and the existence re-check finds nothing: false, and no
+    // updated event — the 404 answer the doc comment promises.
+    try std.testing.expect(!(try svc.update(.{ .id = 42, .tenant_id = 0, .name = "a" }, 1)));
+    try std.testing.expect(!Recorder.fired);
+}
+
+test "CrudService update idempotent write-back on sqlite returns true; missing row returns false" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+
+    const Product = Schema("IdempotentProduct", .{ .fields = &.{
+        field.Int("tenant_id"),
+        field.String("name"),
+        field.Int("price_cents"),
+    } });
+    const info = comptime fromSchema(Product);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const client = codegen.EntityClient(infos, info).init(allocator, driver.asDriver());
+    var svc = Service.init(allocator, client);
+
+    const id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "a", .price_cents = 100 }, 1);
+
+    var got = (try svc.get(allocator, 1, id)).?;
+    defer deinitEntity(infos, info, &got, allocator);
+    // Idempotent PUT: the fetched row written back unchanged. On MySQL the
+    // UPDATE counts 0 changed rows; on SQLite it counts the matched row —
+    // either way the answer is true (the MySQL-shaped case is pinned against
+    // a real server in tests/integration/mysql.zig and against
+    // ChangedRowsDriver above).
+    try std.testing.expect(try svc.update(got, 1));
+
+    // Missing row: false, through the same zero path with a real driver.
+    var gone = got;
+    gone.id = 999999;
+    try std.testing.expect(!(try svc.update(gone, 1)));
 }

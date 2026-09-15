@@ -15,7 +15,7 @@
 //! // insert from a field-value struct
 //! var created = try zent.crud_helpers.create(client.coupon, .{ .name = n, .status = 20 });
 //!
-//! // partial update (rows affected)
+//! // partial update (rows matched)
 //! const n = try zent.crud_helpers.update(client.coupon, .{ .status = 20 }, .{ preds.coupon_idEQ(...) });
 //!
 //! // delete / soft-delete (rows affected)
@@ -104,8 +104,16 @@ pub fn create(accessor: anytype, values: anytype) CreateResult(@TypeOf(accessor)
 }
 
 /// Update rows matching `predicates` from a struct of field values.
-/// Returns rows affected. Example:
+/// Returns the number of rows the update **matched**. Example:
 /// `update(client.coupon, .{ .status = 20 }, .{ preds.coupon_idEQ(...) })`.
+///
+/// The count means "matched", not "changed", on every dialect: MySQL reports
+/// *changed* rows (CLIENT_FOUND_ROWS is off), so an update that writes the
+/// values back unchanged would read as 0 while SQLite and PostgreSQL report
+/// the matched row. The zero path re-checks with a count query and reports
+/// the rows the predicate actually matches — the same shape
+/// `updateWithVersion` uses for its optimistic-lock zero. The common path is
+/// still the single UPDATE statement.
 pub fn update(accessor: anytype, values: anytype, predicates: anytype) !usize {
     var upd = accessor.Update();
     defer upd.deinit();
@@ -113,7 +121,14 @@ pub fn update(accessor: anytype, values: anytype, predicates: anytype) !usize {
         _ = try upd.setFieldValue(name, @field(values, name));
     }
     _ = try upd.Where(predicates);
-    return try upd.Save();
+    const affected = try upd.Save();
+    if (affected == 0) {
+        // Distinguish "predicate matched nothing" from "matched but nothing
+        // changed", which only MySQL's changed-rows count cannot tell apart.
+        const matched = try count(accessor, predicates);
+        return @intCast(matched);
+    }
+    return affected;
 }
 
 /// Owned row slice returned by raw-driver query helpers. Caller frees with
@@ -702,9 +717,27 @@ fn getEntityCursorVal(comptime Entity: type, entity: *const Entity, col_name: []
     return null;
 }
 
+/// True when `field_name` is an entity field whose Zig type is an integer
+/// (an optional integer counts). The cursor value is bound as `Value.int`
+/// and compared with `<`/`>`, so a non-integer cursor column would silently
+/// filter nothing (`after=3` against a text column returns the whole table,
+/// with `has_more`/`next_cursor` contradicting each other); `cursorPage`
+/// rejects such a column up front instead.
+fn isIntegerCursorField(comptime Entity: type, field_name: []const u8) bool {
+    inline for (@typeInfo(Entity).@"struct".field_names, @typeInfo(Entity).@"struct".field_types) |fname, FType| {
+        if (std.mem.eql(u8, fname, field_name)) {
+            const T = if (@typeInfo(FType) == .optional) @typeInfo(FType).optional.child else FType;
+            return @typeInfo(T) == .int;
+        }
+    }
+    return false;
+}
+
 /// Keyset cursor-based pagination helper.
 /// Performs fast cursor pagination without OFFSET overhead.
-/// Whitelist-checks `options.cursor_col` against entity schema fields.
+/// Whitelist-checks `options.cursor_col` against entity schema fields and
+/// requires it to be an integer field — the cursor binds as an integer, so
+/// anything else would fail open (see `isIntegerCursorField`).
 pub fn cursorPage(
     accessor: anytype,
     predicates: anytype,
@@ -712,7 +745,10 @@ pub fn cursorPage(
     limit: usize,
 ) CursorPageResult(@TypeOf(accessor)) {
     const opts = try parseCursorOptions(options);
-    if (!isValidField(@TypeOf(accessor).entity_info, opts.cursor_col)) {
+    const Entity = @typeInfo(CreateResult(@TypeOf(accessor))).error_union.payload;
+    if (!isValidField(@TypeOf(accessor).entity_info, opts.cursor_col) or
+        !isIntegerCursorField(Entity, opts.cursor_col))
+    {
         return error.InvalidCursorColumn;
     }
 
@@ -751,7 +787,6 @@ pub fn cursorPage(
     var has_more = false;
     var next_cursor: ?i64 = null;
 
-    const Entity = @typeInfo(CreateResult(@TypeOf(accessor))).error_union.payload;
     if (items.items.len > safe_limit) {
         has_more = true;
         const pop_idx = safe_limit;
@@ -1049,6 +1084,47 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     var gone = try first(client.product, .{client.product.predicates.product_idEQ(.{ .int = created.product_id })});
     defer if (gone) |*e| deinitEntity(infos, PRODUCT_INFO, e, allocator);
     try std.testing.expect(gone == null);
+}
+
+test "crud_helpers: update returns matched rows, not changed rows" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Product = Schema("MatchedProduct", .{
+        .fields = &.{
+            field.String("name"),
+            field.Int("stock"),
+        },
+    });
+    const info = comptime fromSchema(Product);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    var client = client_mod.makeClient(infos, allocator, driver);
+
+    var created = try create(client.matched_product, .{ .name = "coffee", .stock = 10 });
+    defer deinitEntity(infos, info, &created, allocator);
+    const id_pred = client.matched_product.predicates.idEQ(.{ .int = created.id });
+
+    // A real change: one row matched on every dialect.
+    try std.testing.expectEqual(@as(usize, 1), try update(client.matched_product, .{ .stock = 5 }, .{id_pred}));
+
+    // Idempotent write-back: SQLite/PostgreSQL count the matched row (1);
+    // MySQL would count 0 changed rows and the zero path re-checks, so the
+    // answer is 1 there too (pinned against a real server in
+    // tests/integration/mysql.zig). The value must not silently become the
+    // changed-rows count, which `update(...) == 0` callers read as "missing".
+    try std.testing.expectEqual(@as(usize, 1), try update(client.matched_product, .{ .stock = 5 }, .{id_pred}));
+
+    // Predicate matches nothing: 0 on every dialect, through the same path.
+    try std.testing.expectEqual(@as(usize, 0), try update(client.matched_product, .{ .stock = 1 }, .{client.matched_product.predicates.idEQ(.{ .int = 999999 })}));
 }
 
 test "crud_helpers: queryRows collects mapped rows into owned Rows(T)" {
@@ -1644,6 +1720,57 @@ test "crud_helpers: cursorPage keyset pagination" {
 
     // Invalid cursor col error
     try std.testing.expectError(error.InvalidCursorColumn, cursorPage(client.feed_item, .{}, .{ .cursor_col = "invalid_col" }, 2));
+}
+
+test "crud_helpers: cursorPage rejects a non-integer cursor column" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    // `title` is a string column: the cursor value binds as an integer, so a
+    // text cursor would filter nothing and return the whole table (measured:
+    // 5 rows for `after=3`, with has_more=true beside next_cursor=null).
+    // That silent truncation is now an explicit error.
+    const Doc = Schema("CursorDoc", .{
+        .fields = &.{
+            field.String("title"),
+            field.Int("seq").Optional(),
+        },
+    });
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+
+    inline for (1..4) |idx| {
+        var item = try create(client.cursor_doc, .{ .title = "doc", .seq = @as(?i64, @intCast(idx)) });
+        deinitEntity(infos, info, &item, allocator);
+    }
+
+    // The string column is a real field but not a legal cursor.
+    try std.testing.expectError(error.InvalidCursorColumn, cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "title" }, 2));
+    // So is an unknown name (unchanged).
+    try std.testing.expectError(error.InvalidCursorColumn, cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "nope" }, 2));
+    // A missing `after` on a non-integer column is still rejected: the column
+    // choice, not the bound value, is what the comparison cannot support.
+    try std.testing.expectError(error.InvalidCursorColumn, cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "title", .after = null }, 2));
+
+    // Integer and optional-integer columns stay legal.
+    var by_id = try cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "id", .after = 1 }, 2);
+    defer by_id.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(usize, 2), by_id.items.items.len);
+    try std.testing.expectEqual(@as(?i64, 3), by_id.next_cursor);
+
+    var by_seq = try cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "seq" }, 2);
+    defer by_seq.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(usize, 2), by_seq.items.items.len);
 }
 
 test "crud_helpers: updateWithVersion optimistic locking and batchSaveOrUpdate" {
