@@ -2497,17 +2497,28 @@ const UncountedDriver = struct {
     /// caller has already deinit'd by the time a test looks at it.
     sql_prefix: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     exec_calls: usize = 0,
+    /// Whether `exec` claims to have obtained a count. The default is the case
+    /// this driver exists for: a statement whose count the driver could not
+    /// read, which `driver.Result` says must answer `0` but which a driver may
+    /// answer with a placeholder.
+    known: bool = false,
+    /// The count `exec` reports when `known`.
+    rows: usize = 0,
     /// What the driver puts in `rows_affected` while saying it has no count.
-    /// `driver.Result` documents 0 for that, and a conforming driver only ever
-    /// answers 0 here; a non-zero placeholder is the single case in which
-    /// reading the count alone and reading the flag disagree.
+    /// A conforming driver only ever answers 0 here; a non-zero placeholder is
+    /// the single case in which reading the count alone and reading the flag
+    /// disagree.
     rows_while_unknown: usize = 0,
 
     fn execFn(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
         const self: *UncountedDriver = @ptrCast(@alignCast(ptr));
         self.exec_calls += 1;
         @memcpy(self.sql_prefix[0..@min(query_sql.len, self.sql_prefix.len)], query_sql[0..@min(query_sql.len, self.sql_prefix.len)]);
-        return .{ .rows_affected = self.rows_while_unknown, .rows_affected_known = false, .last_insert_id = null };
+        return .{
+            .rows_affected = if (self.known) self.rows else self.rows_while_unknown,
+            .rows_affected_known = self.known,
+            .last_insert_id = null,
+        };
     }
 
     fn queryFn(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
@@ -2592,7 +2603,7 @@ test "a versioned UPDATE the driver could not count is not reported as a lost up
     // The same statement with a count the driver *did* obtain keeps its meaning:
     // this is the direction the versioned path must not lose.
     {
-        var counted = CountingZeroDriver{};
+        var counted = UncountedDriver{ .known = true, .rows = 0 };
         var u = Upd.init(std.testing.allocator, counted.asDriver(), &.{}, null);
         defer u.deinit();
         _ = try u.setFieldValue("title", "edited");
@@ -2635,51 +2646,3 @@ test "a versioned UPDATE the driver could not count is not reported as a lost up
         try std.testing.expectEqual(@as(usize, 7), try u.Save());
     }
 }
-
-/// The same "zero rows" as `UncountedDriver`, but counted: this is the result a
-/// real UPDATE that matched nothing produces on all three dialects, and it must
-/// keep turning into `error.OptimisticLockConflict`.
-const CountingZeroDriver = struct {
-    fn execFn(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
-        return .{ .rows_affected = 0, .rows_affected_known = true, .last_insert_id = null };
-    }
-
-    fn queryFn(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
-        return error.QueryFailed;
-    }
-
-    fn beginTxFn(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
-        return error.TxFailed;
-    }
-
-    fn savepointFn(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
-        return error.TxFailed;
-    }
-
-    fn closeFn(_: *anyopaque) void {}
-
-    fn dialectFn(_: *anyopaque) Dialect {
-        return .sqlite;
-    }
-
-    fn pingFn(_: *anyopaque) sql_driver.Error!void {}
-
-    fn inTxFn(_: *anyopaque) bool {
-        return false;
-    }
-
-    const vtable = sql_driver.Driver.VTable{
-        .exec = execFn,
-        .query = queryFn,
-        .beginTx = beginTxFn,
-        .close = closeFn,
-        .dialect = dialectFn,
-        .ping = pingFn,
-        .inTransaction = inTxFn,
-        .beginSavepoint = savepointFn,
-    };
-
-    fn asDriver(self: *CountingZeroDriver) sql_driver.Driver {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-};
