@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.66.0] - 2026-09-15
+
 ### Changed
 - **BREAKING (security): an empty `dept_ids` list on a `.dept_custom` /
   `.dept_and_child` data scope now denies instead of widening** (Z33, reported by
