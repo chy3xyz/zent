@@ -75,6 +75,34 @@ pub const MigrateOptions = struct {
     /// are silently ignored.
     allow_data_loss: bool = false,
 
+    /// If true, the migration also converges **nullability** instead of only
+    /// adding what is missing:
+    ///
+    ///   - An **added** column the schema declares NOT NULL is emitted
+    ///     `NOT NULL DEFAULT …`, so it does not arrive nullable and become the
+    ///     drift `check_nullability` warns about one statement later. The
+    ///     default is the field's own (or the audit-timestamp one); a
+    ///     non-optional field with neither fails the migration with
+    ///     `error.NotNullNeedsDefault`, because the value that fills the rows
+    ///     already in the table is the caller's decision, not this layer's.
+    ///   - An **existing** column whose nullability differs from the schema is
+    ///     altered (`SET NOT NULL` / `DROP NOT NULL`). `SET NOT NULL` fails on
+    ///     rows that already hold a NULL, so this is opt-in, next to
+    ///     `drop_columns` / `allow_data_loss`.
+    ///
+    /// Dialects differ, and the differences are not hidden: PostgreSQL does
+    /// both; SQLite has no `ALTER COLUMN` at all, so only the added-column half
+    /// converges there and an existing column stays as it is (`check_nullability`
+    /// reports it); MySQL fails closed with `error.MySQLNullabilityChangeUnsafe`,
+    /// because `MODIFY COLUMN` replaces the whole column definition and this
+    /// layer does not introspect enough to reproduce it — the same reason its
+    /// type changes fail closed.
+    ///
+    /// False by default: an existing deployment keeps the behaviour it has, and
+    /// turning this on is a statement that `SET NOT NULL` may be attempted
+    /// against live data.
+    allow_nullability_change: bool = false,
+
     /// How long to wait for the cross-process migration lock before giving up
     /// with `error.MigrationLockTimeout`. `0` disables locking entirely.
     /// SQLite ignores this (single-writer database, see `lockMigration`).
@@ -1469,7 +1497,17 @@ fn getExistingColumnByName(columns: []const ExistingColumn, name: []const u8) ?E
 }
 
 /// Generate ALTER TABLE ADD COLUMN SQL for a single column.
-fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, col: ColumnDef, dialect: Dialect) ![]const u8 {
+///
+/// `converge_not_null` is `MigrateOptions.allow_nullability_change`: with it a
+/// NOT NULL column is *added* NOT NULL (and a DEFAULT is then mandatory), rather
+/// than arriving nullable and becoming the drift `check_nullability` reports.
+fn alterTableAddColumnSQL(
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    col: ColumnDef,
+    dialect: Dialect,
+    converge_not_null: bool,
+) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
 
@@ -1480,10 +1518,29 @@ fn alterTableAddColumnSQL(allocator: std.mem.Allocator, table_name: []const u8, 
     try buf.print(" {s}", .{columnSQLType(col, dialect)});
 
     // For ALTER ADD COLUMN, avoid NOT NULL without a default to keep SQLite happy.
-    if (col.default_value) |dv| {
+    const backfill = col.default_value orelse auditTimestampDefault(col, dialect);
+
+    if (converge_not_null and col.not_null) {
+        // SQLite rejects `ADD COLUMN … NOT NULL` with no DEFAULT outright, and
+        // the other backends need a value for the rows the table already holds.
+        // An explicit (or audit-timestamp) default is the only backfill this
+        // layer is entitled to pick, so without one it refuses instead of
+        // adding the nullable column the schema disagrees with — the drift this
+        // option exists to stop creating.
+        const dv = backfill orelse {
+            // `warn`, like the drift report: an `err` line is what a failing
+            // migration says, and the error this returns is the signal — the
+            // log only adds the column name an error tag cannot carry.
+            std.log.warn(
+                "zent: cannot add NOT NULL column {s}.{s} without a DEFAULT — the rows already in the table have no value to take; give the field a default, or make it Optional() and backfill it yourself",
+                .{ table_name, col.name },
+            );
+            return error.NotNullNeedsDefault;
+        };
+        try buf.appendSlice(" NOT NULL");
         try buf.print(" DEFAULT {s}", .{dv});
-    } else if (auditTimestampDefault(col, dialect)) |dv2| {
-        try buf.print(" DEFAULT {s}", .{dv2});
+    } else if (backfill) |dv| {
+        try buf.print(" DEFAULT {s}", .{dv});
     }
 
     // UNIQUE is intentionally NOT appended: SQLite's ALTER TABLE ADD
@@ -1567,9 +1624,129 @@ fn alterColumnTypeSQL(
     };
 }
 
+/// Generate ALTER COLUMN SQL to change a column's nullability, the operation
+/// `migrateSchema` used to never issue (so the schema and the database stayed
+/// disagreed about NULL for the life of the deployment).
+///
+/// SQLite has no `ALTER COLUMN` — the only way is a full table rebuild — so it
+/// is unsupported. MySQL changes a column only through `MODIFY COLUMN`, which
+/// replaces the whole definition: the introspection available here reports a
+/// bare `data_type` with no `DEFAULT` and no `AUTO_INCREMENT`, so the rewrite
+/// would silently drop attributes it never saw. It fails closed, like the type
+/// change above.
+fn alterColumnNullabilitySQL(
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    column_name: []const u8,
+    not_null: bool,
+    dialect: Dialect,
+) ![]const u8 {
+    return switch (dialect.name[0]) {
+        'p' => std.fmt.allocPrint(
+            allocator,
+            "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" {s} NOT NULL",
+            .{ table_name, column_name, if (not_null) "SET" else "DROP" },
+        ),
+        'm' => error.MySQLNullabilityChangeUnsafe,
+        else => error.UnsupportedDialect,
+    };
+}
+
+test "ALTER ADD COLUMN is NOT NULL only when nullability convergence is asked for" {
+    const alloc = std.testing.allocator;
+
+    const col = ColumnDef{
+        .name = "status",
+        .sql_type = "TEXT",
+        .logical_type = .string,
+        .not_null = true,
+        .default_value = "'pending'",
+    };
+
+    // Default: the column arrives nullable, which is the drift `checkNullability`
+    // then reports — the behaviour every existing caller has.
+    const loose = try alterTableAddColumnSQL(alloc, "t", col, Dialect.sqlite, false);
+    defer alloc.free(loose);
+    try std.testing.expectEqualStrings(
+        "ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT DEFAULT 'pending'",
+        loose,
+    );
+
+    // Opted in: the default is what the rows already in the table take.
+    const strict = try alterTableAddColumnSQL(alloc, "t", col, Dialect.sqlite, true);
+    defer alloc.free(strict);
+    try std.testing.expectEqualStrings(
+        "ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT NOT NULL DEFAULT 'pending'",
+        strict,
+    );
+
+    // An audit timestamp column's epoch default is a backfill like any other.
+    const audit = ColumnDef{
+        .name = "created_at",
+        .sql_type = "INTEGER",
+        .logical_type = .time,
+        .not_null = true,
+    };
+    const audit_sql = try alterTableAddColumnSQL(alloc, "t", audit, Dialect.sqlite, true);
+    defer alloc.free(audit_sql);
+    try std.testing.expectEqualStrings(
+        "ALTER TABLE \"t\" ADD COLUMN \"created_at\" BIGINT NOT NULL DEFAULT (unixepoch())",
+        audit_sql,
+    );
+
+    // An optional column has nothing to converge: no NOT NULL, no backfill.
+    var optional_col = col;
+    optional_col.not_null = false;
+    optional_col.default_value = null;
+    const optional_sql = try alterTableAddColumnSQL(alloc, "t", optional_col, Dialect.sqlite, true);
+    defer alloc.free(optional_sql);
+    try std.testing.expectEqualStrings("ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT", optional_sql);
+}
+
+test "a NOT NULL column with no DEFAULT refuses instead of arriving nullable" {
+    const col = ColumnDef{
+        .name = "status",
+        .sql_type = "TEXT",
+        .logical_type = .string,
+        .not_null = true,
+    };
+
+    try std.testing.expectError(
+        error.NotNullNeedsDefault,
+        alterTableAddColumnSQL(std.testing.allocator, "t", col, Dialect.sqlite, true),
+    );
+
+    // Without the option the column is still added — the old behaviour is only
+    // ever left behind by an explicit decision.
+    const sql = try alterTableAddColumnSQL(std.testing.allocator, "t", col, Dialect.sqlite, false);
+    defer std.testing.allocator.free(sql);
+    try std.testing.expectEqualStrings("ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT", sql);
+}
+
+test "ALTER COLUMN nullability renders on PostgreSQL, refuses elsewhere" {
+    const alloc = std.testing.allocator;
+
+    const set_sql = try alterColumnNullabilitySQL(alloc, "t", "c", true, Dialect.postgres);
+    defer alloc.free(set_sql);
+    try std.testing.expectEqualStrings("ALTER TABLE \"t\" ALTER COLUMN \"c\" SET NOT NULL", set_sql);
+
+    const drop_sql = try alterColumnNullabilitySQL(alloc, "t", "c", false, Dialect.postgres);
+    defer alloc.free(drop_sql);
+    try std.testing.expectEqualStrings("ALTER TABLE \"t\" ALTER COLUMN \"c\" DROP NOT NULL", drop_sql);
+
+    try std.testing.expectError(
+        error.UnsupportedDialect,
+        alterColumnNullabilitySQL(alloc, "t", "c", true, Dialect.sqlite),
+    );
+    try std.testing.expectError(
+        error.MySQLNullabilityChangeUnsafe,
+        alterColumnNullabilitySQL(alloc, "t", "c", true, Dialect.mysql),
+    );
+}
+
 /// Migrate schema: create missing tables, add missing columns, create missing
-/// indexes, and — when requested via `opts` — drop orphaned columns and/or
-/// alter column types.
+/// indexes, and — when requested via `opts` — drop orphaned columns, alter
+/// column types, and/or converge nullability.
 ///
 /// Phase 2 Task 8: every operation is recorded in `zent_schema_migrations`
 /// with a deterministic CRC32 version, and the entire run is wrapped in a
@@ -1579,7 +1756,10 @@ fn alterColumnTypeSQL(
 ///
 /// Phase 3 Task 12: DROP COLUMN is gated behind `opts.drop_columns`; ALTER
 /// TYPE is gated behind `opts.allow_data_loss`. Both are opt-in to prevent
-/// accidental schema destruction.
+/// accidental schema destruction. `opts.allow_nullability_change` is the third
+/// of the family: a NOT NULL column that has to be added, or an existing
+/// column whose nullability differs, is a data decision — see its doc comment
+/// for what each dialect can actually do with it.
 ///
 /// Concurrency: a cross-process advisory lock (`opts.lock_timeout_ms`, see
 /// `lockMigration`) is taken before any introspection so two instances
@@ -1788,7 +1968,7 @@ pub fn migrateSchemaWithOptions(
         inline for (table.columns) |col| {
             const version = computeMigrationVersion(info.table_name, "add_column", col.name);
             if (!columnExists(existing_cols.items, col.name)) {
-                const sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect);
+                const sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect, opts.allow_nullability_change);
                 defer allocator.free(sql);
                 _ = try tx_drv.exec(sql, &.{});
                 try recordMigration(tx_drv, version, null);
@@ -1836,6 +2016,27 @@ pub fn migrateSchemaWithOptions(
                                 try recordMigration(tx_drv, version, null);
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Nullability of an **existing** column. `migrateSchema` used to leave
+        // it alone whatever the schema said, so the two stayed disagreed for the
+        // life of the deployment; `checkNullability` reports it, and this is the
+        // opt-in that fixes it. Gated next to `drop_columns`/`allow_data_loss`
+        // because `SET NOT NULL` fails on the rows that already hold a NULL —
+        // which way the data goes is the caller's decision.
+        //
+        // SQLite is skipped: it has no `ALTER COLUMN` at all, so the drift stays
+        // and the `check_nullability` report at the end of the run names it.
+        if (opts.allow_nullability_change and dialect.name[0] != 's') {
+            inline for (table.columns) |col| {
+                if (getExistingColumnByName(existing_cols.items, col.name)) |existing_col| {
+                    if (db_nullableOf(existing_col) != !col.not_null) {
+                        const sql = try alterColumnNullabilitySQL(allocator, table.name, col.name, col.not_null, dialect);
+                        defer allocator.free(sql);
+                        _ = try tx_drv.exec(sql, &.{});
                     }
                 }
             }

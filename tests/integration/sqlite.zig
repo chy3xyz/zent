@@ -1400,6 +1400,115 @@ test "SQLite: migrateSchema dry-run outputs SQL without executing" {
     try testing.expectEqual(@as(usize, 0), table_count);
 }
 
+/// `PRAGMA table_info` column 3 (`notnull`) for one column, or null when the
+/// column does not exist at all.
+fn sqliteColumnNotNull(drv: *SQLiteDriver, table: []const u8, column: []const u8) !?bool {
+    var buf: [128]u8 = undefined;
+    const pragma = try std.fmt.bufPrint(&buf, "PRAGMA table_info(\"{s}\")", .{table});
+    var rows = try drv.query(pragma, &.{});
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        if (std.mem.eql(u8, row.getText(1) orelse "", column)) return (row.getInt(3) orelse 0) != 0;
+    }
+    return null;
+}
+
+test "SQLite: migrateSchema creates the NOT NULL column it used to leave nullable" {
+    const allocator = testing.allocator;
+
+    // A legacy table that agrees with the schema about `name`, and does not
+    // have `status` at all. Adding that column nullable is what made
+    // `migrateSchema` create the drift its own `check_nullability` reported.
+    const NnDoc = schema("NnDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("status").Default("pending"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{NnDoc});
+    const infos = graph.types;
+
+    const legacy =
+        "CREATE TABLE nn_doc (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)";
+
+    // Default (no option): the column arrives nullable — the old behaviour,
+    // pinned so the opt-in is the only thing that changes it.
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    _ = try drv.exec(legacy, &.{});
+    _ = try drv.exec("INSERT INTO nn_doc (name) VALUES ('before')", &.{});
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    try testing.expectEqual(false, (try sqliteColumnNotNull(&drv, "nn_doc", "status")).?);
+
+    // The migration created the drift it warns about: `status` is NOT NULL in
+    // the schema and nullable in the database.
+    {
+        const drifts = try migrate.checkNullability(allocator, drv.asDriver(), infos);
+        defer migrate.freeNullabilityDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqualStrings("status", drifts[0].column);
+        try testing.expect(drifts[0].breaksReads());
+    }
+
+    // The same shape with the option on, on a fresh database of the same age.
+    var strict_drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer strict_drv.close();
+    _ = try strict_drv.exec(legacy, &.{});
+    _ = try strict_drv.exec("INSERT INTO nn_doc (name) VALUES ('before')", &.{});
+
+    try migrate.migrateSchemaWithOptions(allocator, strict_drv.asDriver(), infos, migrate.MigrateOptions{
+        .allow_nullability_change = true,
+    });
+    try testing.expectEqual(true, (try sqliteColumnNotNull(&strict_drv, "nn_doc", "status")).?);
+
+    // The rows already in the table were backfilled from the field's default,
+    // not left NULL — and nothing is left for `checkNullability` to report.
+    {
+        var rows = try strict_drv.query("SELECT status FROM nn_doc", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("pending", row.getText(0).?);
+
+        const drifts = try migrate.checkNullability(allocator, strict_drv.asDriver(), infos);
+        defer migrate.freeNullabilityDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+}
+
+test "SQLite: a NOT NULL column with no DEFAULT refuses to be added" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE nnd_doc (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)", &.{});
+    _ = try drv.exec("INSERT INTO nnd_doc (name) VALUES ('before')", &.{});
+
+    // `status` is non-optional and has no default, so there is no value to fill
+    // the existing row with. Choosing one is the caller's decision — inventing
+    // `''`/`0`, or silently adding the column nullable, are both wrong answers.
+    const NndDoc = schema("NndDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.String("status"),
+        },
+    });
+
+    const graph = comptime buildGraph(&.{NndDoc});
+    const infos = graph.types;
+
+    try testing.expectError(error.NotNullNeedsDefault, migrate.migrateSchemaWithOptions(
+        allocator,
+        drv.asDriver(),
+        infos,
+        migrate.MigrateOptions{ .allow_nullability_change = true },
+    ));
+
+    // The refusal is a whole-migration failure: nothing was half-applied.
+    try testing.expect(try sqliteColumnNotNull(&drv, "nnd_doc", "status") == null);
+}
+
 // Module-level storage for the filter predicate so the opaque pointer
 // returned by the Filter rule remains valid through injectPrivacyFilters.
 var filter_pred: zent.sql.Predicate = undefined;
