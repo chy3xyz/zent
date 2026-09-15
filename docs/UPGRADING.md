@@ -1,8 +1,17 @@
 # Upgrading zent
 
-This guide covers the API changes you are likely to hit when upgrading a
-consumer from older releases (v0.12 era) to v0.28. It focuses on source
-compatibility; the full change history lives in `CHANGELOG.md`.
+This guide covers the changes you are likely to hit when upgrading a consumer
+to the current release. It focuses on the two kinds of change that need action
+from you — a call-site edit, or a database migration — rather than listing every
+release; the full change history lives in `CHANGELOG.md`, and the version this
+guide is written against is the one in `build.zig.zon` / `src/version.zig`.
+
+The sections are cumulative. §1–§9 are the standing API notes —
+`std.array_list`, `std.json`, time, JSON ownership, edges, privacy, queries,
+the comptime budget, the build, and the outbox/helpers — and a consumer coming
+from the v0.12 era needs all of them. §10 onwards are the per-release breaking
+changes and required migrations, so a consumer already on a recent version can
+start there.
 
 ## 1. std.array_list / Managed API
 
