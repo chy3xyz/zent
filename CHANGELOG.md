@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.60.1] - 2026-09-15
+
 ### Fixed
 - **A connection whose leaked transaction cannot be rolled back is dropped
   instead of pooled.** `ConnPool.release` rolls back a connection that comes
