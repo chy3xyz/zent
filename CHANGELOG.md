@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-09-15
+
 ### Docs
 - **What `migrateSchema` deliberately does not converge** (Z31). Item 8 of the
   report, verified line by line and recorded rather than fixed. Confirmed: an
