@@ -66,6 +66,8 @@ pub const SQLiteDriver = struct {
             error.SqliteOpenFailed => error.ConnectionFailed,
             error.SqlitePrepareFailed => error.PrepareFailed,
             error.SqliteExecFailed => error.ExecFailed,
+            error.SqliteBindFailed => error.BindFailed,
+            error.SqliteParamCountMismatch => error.ParamCountMismatch,
             error.SqliteInterrupt => error.QueryTimeout,
             error.TxNotActive => error.TxFailed,
             error.QueryTimeout => error.QueryTimeout,
@@ -702,28 +704,55 @@ fn prepareStmtQuery(db: *c.sqlite3, sql: []const u8) !*c.sqlite3_stmt {
     return out.?;
 }
 
+/// Bind `args` positionally to `stmt`, refusing both halves of a mismatch
+/// instead of letting SQLite paper over them.
+///
+/// SQLite tolerates a wrong argument count in silence, and in both directions:
+/// a binding past the last parameter only returns `SQLITE_RANGE` (the surplus
+/// value disappears), and a parameter left unbound reads as NULL, so the
+/// statement runs and answers a different question than the caller asked —
+/// "the query returned nothing" months before anyone notices. Neither the
+/// return codes nor the count were looked at before, so `error.ParamCountMismatch`
+/// is new behavior for every caller of this driver.
+///
+/// The count rule is `sqlite3_bind_parameter_count(stmt) == args.len`, the same
+/// one `prepareCheck` already applies to a statement it never executes — a
+/// runtime path that disagreed with the diagnostic path would be worse than
+/// either. What that number counts, and where the rule is only approximately
+/// right:
+///  - A repeated named parameter (`:x … :x`) is **one** slot, so `args.len`
+///    counts it once too. Positional binding addresses slots in order of first
+///    appearance; zent's builder emits only `?`, so named parameters here are a
+///    compatibility path for raw SQL, not a claim that the driver resolves
+///    names.
+///  - An explicit index that leaves a gap reports the **highest** slot number:
+///    `… WHERE a = ?5` alone answers 5, not 1. A positional list cannot address
+///    slot 5 from position 1 anyway, so rejecting a 1-element list is the right
+///    answer — but the error says "count mismatch" where "you used `?NNN`" would
+///    be more precise. `?NNN` is not something the builder generates.
+///  - A statement with no parameters (`bind_parameter_count == 0`) therefore
+///    requires `args.len == 0` and is otherwise unaffected: DDL and argument-less
+///    SELECTs pass exactly as before.
 fn bindArgs(stmt: *c.sqlite3_stmt, args: []const Value) !void {
+    if (c.sqlite3_bind_parameter_count(stmt) != @as(c_int, @intCast(args.len))) {
+        return error.SqliteParamCountMismatch;
+    }
     for (args, 0..) |arg, i| {
         const idx: c_int = @intCast(i + 1);
-        switch (arg) {
-            .null => {
-                _ = c.sqlite3_bind_null(stmt, idx);
-            },
-            .bool => |v| {
-                _ = c.sqlite3_bind_int64(stmt, idx, if (v) 1 else 0);
-            },
-            .int => |v| {
-                _ = c.sqlite3_bind_int64(stmt, idx, v);
-            },
-            .float => |v| {
-                _ = c.sqlite3_bind_double(stmt, idx, v);
-            },
-            .string => |v| {
-                _ = c.sqlite3_bind_text(stmt, idx, v.ptr, @intCast(v.len), null);
-            },
-            .bytes => |v| {
-                _ = c.sqlite3_bind_blob(stmt, idx, v.ptr, @intCast(v.len), null);
-            },
+        const rc = switch (arg) {
+            .null => c.sqlite3_bind_null(stmt, idx),
+            .bool => |v| c.sqlite3_bind_int64(stmt, idx, if (v) 1 else 0),
+            .int => |v| c.sqlite3_bind_int64(stmt, idx, v),
+            .float => |v| c.sqlite3_bind_double(stmt, idx, v),
+            .string => |v| c.sqlite3_bind_text(stmt, idx, v.ptr, @intCast(v.len), null),
+            .bytes => |v| c.sqlite3_bind_blob(stmt, idx, v.ptr, @intCast(v.len), null),
+        };
+        if (rc != c.SQLITE_OK) {
+            // `SQLITE_RANGE` cannot reach here (the count was just compared), so
+            // what is left is a binding that genuinely failed — `SQLITE_NOMEM`,
+            // or a value SQLite refuses to store.
+            if (c.sqlite3_db_handle(stmt)) |db| SQLiteDriver.logSqliteError(db, "bind");
+            return error.SqliteBindFailed;
         }
     }
 }
@@ -758,6 +787,102 @@ test "SQLite driver basic operations" {
 
     // No more rows
     try std.testing.expect(rows.next() == null);
+}
+
+test "SQLite refuses a binding list the statement's parameter count does not fit" {
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("CREATE TABLE t (a INTEGER, b INTEGER)", &.{});
+    _ = try d.exec("INSERT INTO t (a, b) VALUES (?, ?)", &.{ .{ .int = 1 }, .{ .int = 2 } });
+
+    // Too few: SQLite reads the missing parameter as NULL, so this used to run
+    // and insert (3, NULL) rather than report anything.
+    try std.testing.expectError(
+        error.ParamCountMismatch,
+        d.exec("INSERT INTO t (a, b) VALUES (?, ?)", &.{.{ .int = 3 }}),
+    );
+    // Too many: SQLITE_RANGE was discarded, so the surplus value vanished.
+    try std.testing.expectError(
+        error.ParamCountMismatch,
+        d.exec("INSERT INTO t (a, b) VALUES (?, ?)", &.{ .{ .int = 3 }, .{ .int = 4 }, .{ .int = 5 } }),
+    );
+    // The query path is the one that used to answer a different question
+    // quietly (no rows) instead of failing.
+    try std.testing.expectError(
+        error.ParamCountMismatch,
+        d.query("SELECT a FROM t WHERE a = ? AND b = ?", &.{.{ .int = 1 }}),
+    );
+    // The direct (vtable-free) entry point refuses it as well; it reports the
+    // driver's own error name, the way SqlitePrepareFailed does.
+    try std.testing.expectError(
+        error.SqliteParamCountMismatch,
+        drv.query("SELECT a FROM t WHERE a = ? AND b = ?", &.{.{ .int = 1 }}),
+    );
+
+    // Neither rejected INSERT wrote anything.
+    var rows = try d.query("SELECT COUNT(*) FROM t", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rows.next().?.getInt(0).?);
+}
+
+test "SQLite statements that take no parameters still run with no bindings" {
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const d = drv.asDriver();
+
+    // DDL and an argument-free SELECT both report 0 parameters, and 0 bindings
+    // has to stay the normal case for them.
+    _ = try d.exec("CREATE TABLE t (a INTEGER)", &.{});
+    _ = try d.exec("INSERT INTO t (a) VALUES (1)", &.{});
+    var rows = try d.query("SELECT a FROM t", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), rows.next().?.getInt(0).?);
+    try std.testing.expect(rows.next() == null);
+
+    // A parameterless statement is a 0 == args.len comparison like any other,
+    // so a binding it cannot use is refused rather than dropped.
+    try std.testing.expectError(
+        error.ParamCountMismatch,
+        d.exec("INSERT INTO t (a) VALUES (1)", &.{.{ .int = 9 }}),
+    );
+    var count = try d.query("SELECT COUNT(*) FROM t", &.{});
+    defer count.deinit();
+    try std.testing.expectEqual(@as(i64, 1), count.next().?.getInt(0).?);
+}
+
+test "SQLite counts a repeated name once and a gapped ?NNN by its number" {
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("CREATE TABLE t (a INTEGER, b INTEGER)", &.{});
+    _ = try d.exec("INSERT INTO t (a, b) VALUES (?, ?)", &.{ .{ .int = 1 }, .{ .int = 1 } });
+
+    // `:x` twice is one slot, so one positional binding is right — and is what
+    // sqlite3_bind_parameter_count reports.
+    var named = try d.query("SELECT a FROM t WHERE a = :x AND b = :x", &.{.{ .int = 1 }});
+    defer named.deinit();
+    try std.testing.expectEqual(@as(i64, 1), named.next().?.getInt(0).?);
+    try std.testing.expect(named.next() == null);
+
+    // `?5` alone is slot 5, so a one-element list is refused: position 1 is not
+    // the slot the statement reads. The comparison can only say the list does
+    // not fit, not that `?NNN` was used.
+    try std.testing.expectError(
+        error.ParamCountMismatch,
+        d.query("SELECT a FROM t WHERE a = ?5", &.{.{ .int = 1 }}),
+    );
+    // Five bindings do fit; slots 1-4 go unused and slot 5 carries the value.
+    var gapped = try d.query("SELECT a FROM t WHERE a = ?5", &.{
+        .{ .int = 0 }, .{ .int = 0 }, .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 },
+    });
+    defer gapped.deinit();
+    try std.testing.expectEqual(@as(i64, 1), gapped.next().?.getInt(0).?);
 }
 
 test "SQLite transaction" {

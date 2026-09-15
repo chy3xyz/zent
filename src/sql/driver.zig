@@ -75,6 +75,14 @@ pub const Error = error{
     PrepareFailed,
     ProtocolError,
     DriverFailed,
+    /// The statement and the argument list disagree on the number of
+    /// parameters: the caller supplied more bindings than the statement has
+    /// parameters, or fewer. One name for every dialect that can tell (SQLite,
+    /// MySQL), so a caller can distinguish "I got the arguments wrong" from
+    /// "the query failed" without switching on the driver. PostgreSQL does not
+    /// report it here: libpq answers the same mistake from its own Bind error
+    /// (`QueryFailed`), and its diagnostics are not folded into this name.
+    ParamCountMismatch,
     /// Retained for source compatibility; pooled operations no longer synthesize
     /// timeout errors after a driver operation has already completed.
     QueryTimeout,
@@ -159,6 +167,11 @@ pub fn classify(err: anyerror) Class {
         error.ExecFailed,
         error.QueryFailed,
         error.NotFound,
+        // The statement and the binding list are both the caller's; a count
+        // mismatch is a caller bug that no amount of retrying fixes, and the
+        // same input would fail identically — but it is the caller's to fix,
+        // not a driver fault, so it must not answer as 500/`.bug`.
+        error.ParamCountMismatch,
         => .client,
 
         else => .bug,
@@ -766,6 +779,11 @@ test "isRetryable classifies transient errors" {
     try std.testing.expectEqual(Class.transient, classify(error.DeadlockDetected));
     try std.testing.expectEqual(Class.client, classify(error.UniqueViolation));
     try std.testing.expectEqual(Class.client, classify(error.NotNullViolation));
+    // A binding list of the wrong length is the caller's statement to fix, and
+    // repeating the call changes nothing: the same answer as the other
+    // caller-side errors, and it must not read as a driver fault (`.bug`).
+    try std.testing.expectEqual(Class.client, classify(error.ParamCountMismatch));
+    try std.testing.expect(!isRetryable(error.ParamCountMismatch));
     try std.testing.expectEqual(Class.bug, classify(error.PrepareFailed));
     // An error from outside this library (a caller's own) is not ours to
     // classify as anything but a bug.

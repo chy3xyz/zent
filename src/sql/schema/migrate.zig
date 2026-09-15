@@ -1494,6 +1494,7 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
                 error.PrepareFailed => return error.PrepareFailed,
                 error.ProtocolError => return error.ProtocolError,
                 error.DriverFailed => return error.DriverFailed,
+                error.ParamCountMismatch => return error.ParamCountMismatch,
                 error.QueryTimeout => return error.QueryTimeout,
                 error.UniqueViolation, error.NotNullViolation, error.ForeignKeyViolation => return error.ExecFailed,
                 error.OptimisticLockConflict => return error.OptimisticLockConflict,
