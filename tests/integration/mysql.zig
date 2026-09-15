@@ -3585,6 +3585,97 @@ test "MySQL: checkSchema reports a UNIQUE column and a foreign key the database 
     try testing.expectEqual(@as(usize, 0), absent.items.len);
 }
 
+test "MySQL: checkSchema reports a view the database does not have, and getExistingViews reads one it does" {
+    // Views were the one declared shape `checkSchema` never looked at. The
+    // failure that let through: the view is declared, `migrateSchema` records
+    // `create_view`, the view is later dropped out of band — and nothing
+    // re-checked it, so `SELECT … FROM the view` errored while `assertSchema`
+    // stayed green.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // Leftovers from an interrupted run. The view is dropped first: a table
+    // cannot be dropped while a view still selects from it.
+    _ = try drv.exec("DROP VIEW IF EXISTS zent_vw_my_probe", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_vw_my_base", &.{});
+    defer _ = drv.exec("DROP VIEW IF EXISTS zent_vw_my_probe", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_vw_my_base", &.{}) catch {};
+
+    const ZentVwMyBase = schema("ZentVwMyBase", .{ .fields = &.{field.String("name")} });
+    const ZentVwMyProbe = schema("ZentVwMyProbe", .{
+        .view = true,
+        .view_sql = "SELECT id, name FROM zent_vw_my_base",
+        .fields = &.{field.String("name")},
+    });
+    const graph = comptime buildGraph(&.{ ZentVwMyBase, ZentVwMyProbe });
+    const infos = graph.types;
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The view `migrateSchema` built (`CREATE VIEW IF NOT EXISTS`) is a
+    // relation `checkSchema` can see, on both gates.
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+
+        var views = try migrate.getExistingViews(allocator, drv.asDriver(), "zent_vw_my_probe");
+        defer migrate.freeExistingViews(allocator, &views);
+        try testing.expectEqual(@as(usize, 1), views.items.len);
+        try testing.expectEqualStrings("zent_vw_my_probe", views.items[0].name);
+        // `information_schema.views.view_definition` is a **normalized** SELECT
+        // on both servers this file runs against — backticked identifiers, `AS`
+        // aliases, and MariaDB strips the newlines MySQL keeps — so it is never
+        // the text the schema wrote. Only that inequality is asserted: the
+        // *text* differs between MySQL and MariaDB, and nothing here depends on
+        // its shape, which is exactly why no comparison uses it.
+        try testing.expect(views.items[0].definition.len > 0);
+        try testing.expect(!std.mem.eql(u8, views.items[0].definition, ZentVwMyProbe.view_sql.?));
+        try testing.expect(std.mem.indexOf(u8, views.items[0].definition, "zent_vw_my_base") != null);
+
+        // A table of that name is not a view; a name that is not there is an
+        // empty answer, not an error.
+        var base_is_not_a_view = try migrate.getExistingViews(allocator, drv.asDriver(), "zent_vw_my_base");
+        defer migrate.freeExistingViews(allocator, &base_is_not_a_view);
+        try testing.expectEqual(@as(usize, 0), base_is_not_a_view.items.len);
+
+        var absent = try migrate.getExistingViews(allocator, drv.asDriver(), "zent_vw_my_absent");
+        defer migrate.freeExistingViews(allocator, &absent);
+        try testing.expectEqual(@as(usize, 0), absent.items.len);
+    }
+
+    // Dropped out of band: reported, and the read-breaking gate fails on it.
+    _ = try drv.exec("DROP VIEW zent_vw_my_probe", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_view, drifts[0].kind);
+        try testing.expectEqualStrings("zent_vw_my_probe", drifts[0].table);
+        try testing.expect(drifts[0].breaksReads());
+        // The read really does fail; that is the stake behind `breaksReads`.
+        // The error name is the driver's business, so only the failure itself
+        // is asserted here.
+        if (drv.query("SELECT id, name FROM zent_vw_my_probe", &.{})) |rows| {
+            var r = rows;
+            r.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // `migrateSchema` heals it: the recorded `create_view` version is present
+    // but the relation is gone, so the view is re-created — the same
+    // out-of-band-drop path it has for tables.
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const healed = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, healed);
+    try testing.expectEqual(@as(usize, 0), healed.len);
+}
+
 test "MySQL: getExistingIndexes reads the key columns in order" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
