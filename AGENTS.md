@@ -29,6 +29,30 @@
 fmt → build → unit tests → version consistency → integration tests
 (SQLite/PostgreSQL/MySQL) + a standalone dead-code baseline job.
 
+### Two servers, one file: MySQL tests run on MariaDB in CI
+
+**CI's `mysql` service is MariaDB 10.11; a development machine usually has
+MySQL 8/9.** They share the wire protocol and the errno numbering, so the same
+driver passes on both, but they are *not* behaviour-compatible — and a test that
+asserts one server's behaviour passes locally and fails in CI. This has shipped
+a red tag **three times**:
+
+| Pinned MySQL, broke on MariaDB | What actually differs |
+|---|---|
+| `column_default == "kept"` | MySQL 8+ strips the quoting; MariaDB returns the literal expression text (`'kept'`) |
+| `CREATE INDEX … ((lower(c)))` | MySQL 8.0.13+ only; MariaDB rejects the syntax (errno 1064) |
+| `BEGIN` through `mysql_stmt_prepare` | MySQL errno 1295; MariaDB prepares it fine |
+
+So: for every new MySQL assertion, ask **"does this hold on MariaDB too?"**
+before pushing. When the two genuinely differ, branch on
+`isMariaDB(&drv)` (in `tests/integration/mysql.zig`, `SELECT VERSION()`) and
+keep a meaningful assertion on *both* branches — do not weaken it into
+something both happen to satisfy, and do not delete the case. If a case cannot
+be set up at all on one server, create it only there and say why in a comment.
+
+`baseline` counts move with this: unit 364, integration 190 passed + 3 skipped
+(the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
+
 ## Repository conventions
 
 - **Commit and push proactively** after meaningful code changes.

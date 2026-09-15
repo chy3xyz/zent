@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **MySQL prefix indexes are no longer treated as comparable** in index
+  introspection. `getMySQLIndexes` read `column_name` and marked an index
+  not-comparable only when that was NULL (a functional index) — the doc comment
+  asserted that was the only case, "since MySQL has no partial indexes". That
+  missed `KEY (c(10))`: a **prefix index** does constrain the column, so its key
+  list read as a match for a schema index over the full column, and
+  `SchemaDrift.Kind.index_columns` stayed silent about a real difference.
+  `sub_part` is now selected and a non-NULL value marks the index not
+  comparable. Falsified by ignoring `sub_part` again, which fails
+  `getExistingIndexes reads the key columns in order`.
+
+- **Two new MySQL integration tests no longer pin MySQL-only behaviour.**
+  CI's service is MariaDB 10.11 while a development machine usually has MySQL
+  8/9, and both tests passed locally while failing the v0.58.0 tag's CI job:
+
+  - `getExistingIndexes reads the key columns in order` created a functional
+    index (`(lower(c))`) to be the not-comparable case. MySQL 8.0.13+ only —
+    MariaDB has no functional indexes and rejects the syntax (errno 1064). The
+    portable case is now a **prefix** index, which both servers accept, and the
+    functional index is created on MySQL alone.
+  - `a statement the prepared protocol rejects is not_checkable, not failed`
+    asserted MySQL's errno 1295 for `BEGIN`. MariaDB's
+    `mysql_stmt_prepare("BEGIN")` succeeds, so it now asserts the invariant that
+    holds on both — a valid statement is never reported as `failed` — and then
+    the server-specific answer on each branch (`ok` on MariaDB, `not_checkable`
+    with errno 1295 on MySQL).
+
+  `AGENTS.md` now records the two-server reality with all three escapes, since
+  this is the third release to ship a red tag from an assertion that only held
+  on one of them.
+
 ## [0.58.0] - 2026-09-15
 
 ### Added

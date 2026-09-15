@@ -1768,9 +1768,17 @@ fn closeExistingIndex(
 /// `information_schema.statistics` is one row per (index, column), so
 /// `seq_in_index` is what orders a multi-column index's key list.
 ///
-/// `column_name` is NULL for a functional index (MySQL 8+), which is exactly
-/// the case where the key list cannot be compared; no other flag is needed,
-/// since MySQL has no partial indexes and InnoDB has only btree ones.
+/// Two shapes cannot be compared against the schema's key list:
+///
+///   - `column_name` is NULL for a **functional index** (MySQL 8.0.13+): the
+///     key is an expression, not a column.
+///   - `sub_part` is non-NULL for a **prefix index** (`KEY (c(10))`): the key
+///     covers the first N characters, so reporting its column list as equal to
+///     a schema index over the full column would claim a match that does not
+///     exist — a prefix index is not the index the schema asked for.
+///
+/// MySQL has no partial indexes and InnoDB only btree access methods, so those
+/// two cases are the whole of it here.
 fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
     errdefer freeExistingIndexes(allocator, &result);
@@ -1784,7 +1792,7 @@ fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, 
     }
 
     var rows = try driver_drv.query(
-        "SELECT index_name, non_unique, column_name FROM information_schema.statistics WHERE table_name = ? AND table_schema = DATABASE() ORDER BY index_name, seq_in_index",
+        "SELECT index_name, non_unique, column_name, sub_part FROM information_schema.statistics WHERE table_name = ? AND table_schema = DATABASE() ORDER BY index_name, seq_in_index",
         &.{.{ .string = table_name }},
     );
     defer rows.deinit();
@@ -1805,8 +1813,9 @@ fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, 
         if (row.getText(2)) |column| {
             try keys.append(try allocator.dupe(u8, column));
         } else {
-            comparable = false;
+            comparable = false; // functional index: the key is an expression
         }
+        if (row.getText(3) != null) comparable = false; // prefix index: partial coverage
     }
     if (rows.nextError()) |err| return err;
     try closeExistingIndex(&result, current, &keys, comparable);

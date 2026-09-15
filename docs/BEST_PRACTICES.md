@@ -893,6 +893,7 @@ guessed whenever the database's key list cannot be read reliably:
 | Skipped | Why |
 |---|---|
 | expression keys (`lower(email)`, PG attnum 0) | the key is not a column, so "the columns differ" is not a statement about this index |
+| prefix keys (`KEY (c(10))`, MySQL `sub_part`) | the key covers part of the column — its name reads as a match for a full-column index, so this is the case where a naive column comparison lies |
 | partial indexes (`WHERE …`) | same key list, different coverage — not comparable by name+columns |
 | non-btree access methods (`USING gin`/`hash`/…) | column order and meaning do not map onto the schema's list |
 | `indisvalid = false` | a half-built index is not a definition to compare against |

@@ -63,6 +63,24 @@ fn skipIfNoServer(e: anyerror) anyerror!void {
     }
 }
 
+/// True when the server is MariaDB rather than MySQL.
+///
+/// The two share the wire protocol and the errno numbering but are not
+/// behaviour-compatible, and this file is run against both: CI's service is
+/// MariaDB 10.11, while a development machine usually has MySQL 8/9. A test
+/// that asserts one server's behaviour fails on the other — which has twice
+/// shipped a red tag (MySQL's stripped `column_default` quoting; MariaDB having
+/// no functional indexes, and accepting `BEGIN` through its prepared-statement
+/// protocol). Where the two genuinely differ, branch on this rather than
+/// weakening the assertion to something both happen to satisfy.
+fn isMariaDB(drv: *MySQLDriver) !bool {
+    var rows = try drv.query("SELECT VERSION()", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return false;
+    const version = row.getText(0) orelse return false;
+    return std.mem.indexOf(u8, version, "MariaDB") != null;
+}
+
 test "MySQL: ping and basic CRUD" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
@@ -3383,20 +3401,30 @@ test "MySQL: getExistingIndexes reads the key columns in order" {
     );
     _ = try drv.exec("CREATE UNIQUE INDEX idx_zent_inspect_ab ON zent_idx_probe (a, b)", &.{});
     _ = try drv.exec("CREATE INDEX idx_zent_inspect_b ON zent_idx_probe (b)", &.{});
-    // A functional index has no `column_name` in information_schema.statistics
-    // — the case that must come back as not comparable rather than as an empty
-    // key list that then compares unequal to everything.
-    _ = try drv.exec("CREATE INDEX idx_zent_inspect_fn ON zent_idx_probe ((lower(c)))", &.{});
+    // A prefix index does not constrain the whole column, so its key list must
+    // come back as not comparable. It is also the only not-comparable case
+    // creatable on both servers, which is why it carries the portable assertion.
+    _ = try drv.exec("CREATE INDEX idx_zent_inspect_pre ON zent_idx_probe (c(10))", &.{});
+
+    // A functional index has no `column_name` in information_schema.statistics.
+    // MySQL 8.0.13+ only: MariaDB has no functional indexes and rejects the
+    // syntax outright (errno 1064), so it is created on MySQL alone.
+    const maria = try isMariaDB(&drv);
+    if (!maria) {
+        _ = try drv.exec("CREATE INDEX idx_zent_inspect_fn ON zent_idx_probe ((lower(c)))", &.{});
+    }
 
     var indexes = try migrate.getExistingIndexes(allocator, drv.asDriver(), "zent_idx_probe");
     defer migrate.freeExistingIndexes(allocator, &indexes);
 
     var composite: ?migrate.ExistingIndex = null;
     var single: ?migrate.ExistingIndex = null;
+    var prefixed: ?migrate.ExistingIndex = null;
     var functional: ?migrate.ExistingIndex = null;
     for (indexes.items) |i| {
         if (std.mem.eql(u8, i.name, "idx_zent_inspect_ab")) composite = i;
         if (std.mem.eql(u8, i.name, "idx_zent_inspect_b")) single = i;
+        if (std.mem.eql(u8, i.name, "idx_zent_inspect_pre")) prefixed = i;
         if (std.mem.eql(u8, i.name, "idx_zent_inspect_fn")) functional = i;
     }
 
@@ -3412,8 +3440,17 @@ test "MySQL: getExistingIndexes reads the key columns in order" {
     try testing.expect(single.?.columns_comparable);
     try testing.expectEqualStrings("b", single.?.columns[0]);
 
-    try testing.expect(functional != null);
-    try testing.expect(!functional.?.columns_comparable);
+    // Prefix index: the column names would read as a match for a schema index
+    // over `c`, so `columns_comparable` is the only thing standing between this
+    // and a false "the index is fine".
+    try testing.expect(prefixed != null);
+    try testing.expectEqualStrings("c", prefixed.?.columns[0]);
+    try testing.expect(!prefixed.?.columns_comparable);
+
+    if (!maria) {
+        try testing.expect(functional != null);
+        try testing.expect(!functional.?.columns_comparable);
+    }
 }
 
 // ------------------------------------------------------------------
@@ -3539,9 +3576,11 @@ test "MySQL: a checked INSERT adds no row" {
 }
 
 test "MySQL: a statement the prepared protocol rejects is not_checkable, not failed" {
-    // `BEGIN` is valid SQL that MySQL's prepared-statement protocol refuses
-    // (errno 1295). Reporting it as a broken statement would be a false alarm:
-    // `exec` runs it through mysql_real_query, where it works.
+    // `BEGIN` is valid SQL and the two servers differ about it: MySQL's
+    // prepared-statement protocol refuses it (errno 1295) while MariaDB's
+    // accepts it. The invariant that holds on both is the one that matters —
+    // a valid statement is never reported as broken — and `exec` runs it
+    // through mysql_real_query, where it works either way.
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -3549,8 +3588,16 @@ test "MySQL: a statement the prepared protocol rejects is not_checkable, not fai
     var d = try sql_statement.checkStatement(allocator, drv.asDriver(), "BEGIN", &.{});
     defer sql_statement.freeStatementDiagnosis(allocator, &d);
 
-    try testing.expectEqual(sql_statement.Status.not_checkable, d.status());
-    try testing.expectEqual(sql_statement.Problem.not_checkable, d.problem);
-    try testing.expectEqual(@as(i32, 1295), d.native_code);
-    try testing.expect(std.mem.indexOf(u8, d.message.?, "not supported in the prepared statement protocol") != null);
+    try testing.expect(d.status() != .failed);
+    if (try isMariaDB(&drv)) {
+        // MariaDB prepped it, so the channel could judge it and it is clean.
+        try testing.expectEqual(sql_statement.Status.ok, d.status());
+    } else {
+        // MySQL could not judge it. Saying "broken" would be a false alarm, so
+        // the answer must be not_checkable, with the server's own reason.
+        try testing.expectEqual(sql_statement.Status.not_checkable, d.status());
+        try testing.expectEqual(sql_statement.Problem.not_checkable, d.problem);
+        try testing.expectEqual(@as(i32, 1295), d.native_code);
+        try testing.expect(std.mem.indexOf(u8, d.message.?, "not supported in the prepared statement protocol") != null);
+    }
 }
