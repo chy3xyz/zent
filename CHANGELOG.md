@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.56.1] - 2026-09-15
+
 ### Fixed
 - **The new nullability test no longer pins MySQL's rendering of
   `column_default`.** CI runs MariaDB 10.11 while the development machine has
