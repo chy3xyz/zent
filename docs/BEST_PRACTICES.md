@@ -763,6 +763,48 @@ A no-op `UPDATE` (all values already equal) therefore returns `0` on MySQL and
 `1` on the others. Never write `if (affected == 0) return error.NotFound` —
 use an explicit `SELECT`/`Count()` or check a genuinely changing column.
 
+This is one of the findings the audit above turned up, and it is the reason
+`crud.update`'s `!bool` currently reverses meaning on MySQL: it returns
+`affected > 0`, so an idempotent PUT that writes the values back unchanged
+answers `false` and the caller turns that into a 404. `crud_helpers.updateWithVersion`
+is the correct shape to copy — it re-checks existence on the `0` path instead of
+trusting the count.
+
+### "0 rows" and "no count" are different answers
+
+`rows_affected` is a `usize`, which cannot express *unknown*, so since v0.63.0
+there is a second field:
+
+```zig
+if (res.rows_affected_known and res.rows_affected == 0) {
+    // the statement really matched nothing
+}
+```
+
+**Read the flag before the count.** Without it, a driver that never obtained a
+count answers `0`, and `if (affected == 0) return error.NotFound` — or the
+optimistic-lock check — reads "I don't know" as "nothing matched".
+
+Which statements report a count is not uniform, and the differences are real
+rather than smoothed over:
+
+| Statement | SQLite | PostgreSQL | MySQL |
+|---|---|---|---|
+| `INSERT`/`UPDATE`/`DELETE` | known | known | known |
+| `SELECT` through `exec` | **unknown** | known (rows returned) | known (unprepared) / **unknown** (prepared) |
+| DDL, `BEGIN`/`COMMIT`, `SET` | **unknown** | **unknown** | known (`0`) |
+
+SQLite has no count for anything but DML — `sqlite3_changes` is the *previous*
+DML's number, which is why it is no longer handed back for a `SELECT`, a
+`PRAGMA` or a DDL statement. PostgreSQL publishes no count for a command that
+returns no `PQcmdTuples` tag. MySQL reports a genuine `0` for DDL, and its
+prepared path never drains the result set, so it cannot count a parameterised
+`SELECT`.
+
+In-tree, the three optimistic-lock checks and `DeleteBuilder.Restore` read the
+flag. `UPDATE`/`DELETE` counts are known on all three dialects, so that changed
+nothing — it is there for the driver that one day cannot count.
+
 ## 5f. Connection pool
 
 `ConnPool(D)` wraps any driver implementing `asDriver()` + `close()` and

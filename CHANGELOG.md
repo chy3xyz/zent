@@ -4,6 +4,91 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`driver.Result.rows_affected_known`** — a non-breaking additional field,
+  defaulting to `true`, saying whether `rows_affected` is a count the driver
+  actually obtained. `rows_affected` is a `usize` and so cannot express
+  "unknown", which made a statement that reports no count and a driver that could
+  not read one both arrive as `0` — indistinguishable from "matched no rows",
+  which the optimistic-lock check and the `NotFound` paths read at face value.
+  The default is what keeps it non-breaking: every in-tree construction compiles
+  and keeps its meaning unchanged.
+
+  The three dialects now answer honestly, and the differences are left visible:
+
+  | Statement | SQLite | PostgreSQL | MySQL |
+  |---|---|---|---|
+  | `INSERT`/`UPDATE`/`DELETE` | known | known | known |
+  | `SELECT` via `exec` | **unknown** | known (rows returned) | known (unprepared) / **unknown** (prepared) |
+  | DDL, `BEGIN`/`COMMIT`, `SET` | **unknown** | **unknown** | known (`0`) |
+
+### Changed
+- **Four in-tree decision points now read the flag:** the three optimistic-lock
+  checks (`UpdateBuilder.Save`, `execSoftDelete`, `execHardDelete`) and
+  `DeleteBuilder.Restore`. `UPDATE`/`DELETE` counts are obtained on all three
+  dialects, so **no existing behaviour moves** — pinned by the existing
+  three-dialect optimistic-lock tests plus a new mock-driver test that drives both
+  sides of the guard.
+
+- **Consumers should start checking the flag.** `rows_affected == 0` asks "did the
+  driver count zero rows?"; if the question is "did the statement match nothing?",
+  read `rows_affected_known and rows_affected == 0`.
+
+### Fixed
+- **A driver step failure is no longer reported as a short page.**
+  `Rows.next()` returns `null` both when the scan finished and when it broke;
+  `nextError()` is the only way to tell, and three bulk readers never asked:
+  `crud_helpers.queryRows` and `queryRowsIn` returned an **empty page as a
+  successful result**, and `outbox.claim` returned **half a batch as the rows it
+  had reserved** — which the dispatcher then treated as all of them. The rest of
+  the tree (`codegen`, `scan.zig`, `schema`) already asked; these three were the
+  miss.
+
+- **A data-scope policy that cannot be built now denies instead of widening.**
+  This one is a **security bug**. `privacy/data_scope` left its predicate `null`
+  when it could not build one — a `dept_ids` list longer than `max_dept_ids`, or a
+  `PrivacyContext` whose `.extra` carries no filter — and a `null` predicate is how
+  a filter rule says *"not applicable"*, so the policy layer read "cannot scope" as
+  "no scope" and the query ran over **every row**. A context set up with
+  `withContext(.{ .user_id = 1 })` and no filter was therefore wide open. Both
+  cases now materialize an always-false predicate (`1 = 0`) and log a warning,
+  following the precedent already in `runtime/privacy.zig` for a filter array that
+  overflows.
+
+- **SQLite no longer reports the previous statement's row count.** `exec` on a
+  `SELECT`, a `PRAGMA`, or a DDL statement returned `sqlite3_changes` — the
+  *previous* DML's count. The predicate is a conjunction, because a probe showed
+  `sqlite3_stmt_readonly` alone is not enough: it reports `0` for
+  `CREATE`/`ALTER`/`DROP`/`ANALYZE`/`VACUUM` and for a `PRAGMA` write, none of
+  which touch the counter. Requiring `SQLITE_DONE` also fixes a bug found in
+  passing: a DML with `RETURNING` ran, inserted its row, and still reported the
+  previous count, because SQLite settles the counter only at completion. Without
+  that the new field would have lied, which is worse than not having it.
+
+- **MySQL maps the `(my_ulonglong)-1` sentinel to `0` plus unknown** instead of
+  storing `18446744073709551615`, and **PostgreSQL reports the empty `PQcmdTuples`
+  tag as unknown** (that is what libpq returns for DDL, `BEGIN`/`COMMIT`, `SET`,
+  `VACUUM`, `ANALYZE`, `TRUNCATE`).
+
+### Notes
+- **`outbox.dispatch` and `crud_helpers.withTx` no longer destroy the reason.**
+  A failed publish logs the row id, event, attempt count and the publisher's error
+  name — a batch where *every* publish failed looked exactly like an empty queue —
+  and a failed rollback after a failed callback is logged. Neither changes a
+  return value, so both are declared **unfalsifiable rather than claimed**: this
+  repo has no `logFn` to capture, and no assertion can pin them.
+- **Nine further findings reported, not fixed**, each with its blast radius
+  (`docs/ISSUES_FROM_ZAPI.md`-adjacent detail in the lane's audit table):
+  `crud.update`'s `!bool` **reverses meaning on MySQL** (it reports *changed*, not
+  *matched* rows, so an idempotent PUT returns `false` → a 404); `cursorPage`
+  silently truncates when the cursor column is not an integer (measured: 5 rows
+  returned with `after=3`, and `has_more=true` beside `next_cursor=null`);
+  `ShardRouter.route` divides by zero at `shard_count == 0`; `ShardedEnv.open`
+  leaks the drivers opened before a failure; `requeueStale`'s age overflow
+  saturates in the wrong direction; `outbox.nowMs` falls back to `0` (unreachable);
+  `crud.ownedCopy` has no `errdefer`; `ShardSet.clientAt` is unchecked;
+  `saveOrUpdate`'s exists-then-create is a TOCTOU window.
+
 ## [0.62.0] - 2026-09-15
 
 ### Added
