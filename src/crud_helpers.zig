@@ -157,6 +157,9 @@ pub fn freeOwnedStrings(allocator: std.mem.Allocator, comptime T: type, val: T) 
 }
 
 /// Run a raw driver query and collect the rows into an owned `Rows(T)` slice.
+/// A driver step failure during the scan is **reported, not folded into the
+/// result**: the call returns the driver's error instead of a short page (see
+/// `sql.driver.Rows.nextError`).
 /// `mapRow(allocator, row)` returns one `T` per result row and **must** return
 /// an error union (`!T`) — the result is `try`-ed, so a plain `T` is a compile
 /// error. (The doc used to say "MAY", which never matched the code.) Contract: every string field of the returned `T` must
@@ -206,6 +209,12 @@ pub fn queryRows(
     while (rows.next()) |row| {
         try list.append(try mapRow(allocator, row));
     }
+    // `next()` answers null for a step failure exactly as it does for the end
+    // of the result set, so without this check a query that broke halfway came
+    // back as a shorter (or empty) page and the caller had no way to tell. Ask
+    // the driver which of the two it was, before the rows are handed over as
+    // "everything the statement returned".
+    if (rows.nextError()) |err| return err;
     // toOwnedSlice detaches the backing; errdefer is skipped on success, so the
     // caller owns every string + the slice via Rows(T).deinit().
     return .{ .items = try list.toOwnedSlice(), .allocator = allocator };
@@ -245,6 +254,10 @@ pub fn queryRowsIn(
     while (rows.next()) |row| {
         try list.append(try mapRow(allocator, row));
     }
+    // A step failure ends the scan through `nextError`, not through a row, so
+    // it has to be read from there or the caller sees a short page (see
+    // `queryRows`).
+    if (rows.nextError()) |err| return err;
     return try list.toOwnedSlice();
 }
 
@@ -495,6 +508,12 @@ fn execTxCallback(tx_fn: anytype, tx_ptr: anytype) !void {
 /// Execute a transaction callback within an automatically managed transaction lifecycle.
 /// Resolves root client/driver from `client_or_accessor`.
 /// Automatically commits on success and rolls back on error. `tx.deinit()` is always called.
+///
+/// The callback's error is the one returned. A *failing* rollback is logged
+/// (`warn`) rather than folded away: it cannot replace the callback's error, but
+/// it does mean the transaction may still be open on the connection, and a
+/// caller that reads `withTx`'s error as "everything was rolled back" would
+/// otherwise never learn that.
 pub fn withTx(
     client_or_accessor: anytype,
     tx_fn: anytype,
@@ -506,7 +525,12 @@ pub fn withTx(
     defer tx.deinit();
 
     execTxCallback(tx_fn, &tx) catch |err| {
-        _ = tx.rollback() catch {};
+        tx.rollback() catch |rb_err| {
+            std.log.warn(
+                "crud_helpers.withTx: rollback failed after the callback returned '{s}' ({s}); the transaction may still be open on the connection",
+                .{ @errorName(err), @errorName(rb_err) },
+            );
+        };
         return err;
     };
     try tx.commit();
@@ -1151,6 +1175,40 @@ test "crud_helpers: queryRows error mid-collection leaks no strings" {
     // First row's string is duped, then row 2 errors -> the partial row's
     // string must be freed by the errdefer (std.testing.allocator detects leaks).
     try std.testing.expectError(error.Stop, queryRows(RowT, driver, "SELECT item_id, name FROM zigshop_item ORDER BY item_id", &.{}, allocator, FailingMapper.map));
+}
+
+test "crud_helpers: queryRows reports a step failure instead of a short page" {
+    // SQLITE_FULL during `step`, induced with a page ceiling too small for the
+    // row being written. `INSERT ... RETURNING` produces its rows through
+    // `step` just like a SELECT, and the driver ends the scan the same way it
+    // ends a complete result set — `next()` answers null — so only
+    // `nextError()` distinguishes "finished" from "broke". A helper that stops
+    // at `next()` hands back an empty (or short) page where the statement
+    // failed, and `INSERT` is precisely the case where "no rows" reads as
+    // "nothing was written".
+    const allocator = std.testing.allocator;
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    _ = try driver.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)", &.{});
+    _ = try driver.exec("PRAGMA max_page_count = 2", &.{});
+
+    const RowT = struct { id: i64 };
+    const Mapper = struct {
+        fn map(_: std.mem.Allocator, row: sql_driver.Row) !RowT {
+            return .{ .id = row.getInt(0) orelse 0 };
+        }
+    };
+    const stmt = "INSERT INTO t (v) VALUES (randomblob(200000)) RETURNING id";
+
+    try std.testing.expectError(error.ExecFailed, queryRows(RowT, driver, stmt, &.{}, allocator, Mapper.map));
+
+    // Same contract on the arena variant.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ExecFailed, queryRowsIn(RowT, driver, stmt, &.{}, &arena, Mapper.map));
 }
 
 test "crud_helpers: first with no match returns null (not error)" {

@@ -34,6 +34,13 @@ pub const DataScope = enum {
 /// Max departments supported in one IN-list without allocation.
 pub const max_dept_ids = 32;
 
+/// The always-false predicate every fail-closed path in this module shares: a
+/// scope that cannot be built denies, and it must never come out looking like
+/// "no restriction" (`.all`) — `null` is how the filter rule spells that. `1 = 0`
+/// is valid on all three dialects, and carrying no column reference keeps it
+/// unambiguous in the joins the predicate is spliced into.
+const deny_pred: sql.Predicate = sql.Raw("1 = 0");
+
 /// Per-request data-scope decision. Build one per request (stack or arena),
 /// pass its address via `PrivacyContext.extra`, and keep it alive for the
 /// duration of the queries - the injected predicate borrows from it.
@@ -79,16 +86,34 @@ pub const DataScopeFilter = struct {
             .self_ => self.pred = sql.EQ(self.user_column, .{ .int = self.user_id }),
             .dept_only => self.pred = sql.EQ(self.dept_column, .{ .int = self.self_dept_id }),
             .dept_and_child, .dept_custom => {
-                if (self.dept_ids.len > 0 and self.dept_ids.len <= max_dept_ids) {
-                    for (self.dept_ids, 0..) |d, i| self.value_buf[i] = .{ .int = d };
-                    self.pred = sql.In(self.dept_column, self.value_buf[0..self.dept_ids.len]);
+                // An empty list means "no restriction" (documented): `.all`
+                // in effect, and the one shape with no predicate to build.
+                if (self.dept_ids.len == 0) return;
+                if (self.dept_ids.len > max_dept_ids) {
+                    // Over capacity. Truncating to the first `max_dept_ids`
+                    // would silently widen the scope, and leaving `pred` null
+                    // would widen it entirely — null is the value that means
+                    // "no restriction", so the over-long list used to come out
+                    // as an unrestricted query. Deny instead and say why, the
+                    // same way `runtime.privacy.evalPolicy` handles a policy
+                    // with more filters than it can hold.
+                    std.log.warn(
+                        "data scope: {d} dept ids exceed max_dept_ids ({d}); denying the scope rather than truncating or dropping it",
+                        .{ self.dept_ids.len, max_dept_ids },
+                    );
+                    self.pred = deny_pred;
+                    return;
                 }
+                for (self.dept_ids, 0..) |d, i| self.value_buf[i] = .{ .int = d };
+                self.pred = sql.In(self.dept_column, self.value_buf[0..self.dept_ids.len]);
             },
         }
     }
 
     /// Ensure the predicate is materialized and return it (null = no
-    /// restriction, e.g. `.all` or an empty dept list).
+    /// restriction, e.g. `.all` or an empty dept list). A `.dept_custom` /
+    /// `.dept_and_child` list longer than `max_dept_ids` is never "no
+    /// restriction": it materializes the always-false predicate instead.
     pub fn predicate(self: *DataScopeFilter) ?*const sql.Predicate {
         self.ensurePred();
         if (self.pred) |*p| return p;
@@ -97,8 +122,20 @@ pub const DataScopeFilter = struct {
 
     /// Filter-rule predicate used by the policy: returns the materialized
     /// predicate pointer, or null for `.all` / empty dept lists.
+    ///
+    /// A context that carries no filter at all (no `.extra`) denies rather
+    /// than returning null: null means "this filter does not apply", and for a
+    /// policy that promises a per-request scope it would read as "no
+    /// restriction" — an unscoped query over every row.
     fn call(ctx: rtp.PrivacyContext) ?*const anyopaque {
-        const self: *DataScopeFilter = @ptrCast(@alignCast(ctx.extra orelse return null));
+        const extra = ctx.extra orelse {
+            std.log.warn(
+                "data scope: the privacy context carries no DataScopeFilter; denying the scope instead of leaving the query unscoped",
+                .{},
+            );
+            return &deny_pred;
+        };
+        const self: *DataScopeFilter = @ptrCast(@alignCast(extra));
         if (self.predicate()) |p| return p;
         return null;
     }
@@ -289,4 +326,158 @@ test "DataScopePolicy filters queries at the SQL layer" {
     var q4 = base.Query();
     defer q4.deinit();
     try testing.expectError(error.PrivacyDenied, q4.All());
+}
+
+test "DataScopeFilter over-long dept list fails closed, not open" {
+    // max_dept_ids is 32. A longer list left `pred` null, and null is the value
+    // that means "no restriction" (`.all`, an empty list) — so a request
+    // carrying more departments than the inline buffer holds came out as an
+    // unrestricted query over every row. Dropping the extra ids would be just
+    // as wrong in the other direction, so the scope must deny.
+    var many: [max_dept_ids + 1]i64 = undefined;
+    for (&many, 0..) |*d, i| d.* = @intCast(i + 1);
+
+    var wide = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &many });
+    var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+    defer b.deinit();
+    const pred = wide.predicate() orelse return error.ScopeDropped;
+    try pred.appendTo(&b);
+    const out = b.query();
+    try testing.expectEqualStrings("(1 = 0)", out.sql);
+    try testing.expectEqual(@as(usize, 0), out.args.len);
+
+    // The boundary is inclusive: exactly max_dept_ids still builds the IN list.
+    var fits: [max_dept_ids]i64 = undefined;
+    for (&fits, 0..) |*d, i| d.* = @intCast(i + 1);
+    var ok = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &fits });
+    var b2 = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+    defer b2.deinit();
+    try ok.predicate().?.appendTo(&b2);
+    const out2 = b2.query();
+    try testing.expect(std.mem.startsWith(u8, out2.sql, "\"dept_id\" IN ("));
+    try testing.expectEqual(@as(usize, max_dept_ids), out2.args.len);
+}
+
+test "DataScopePolicy applies the over-long dept list as a deny, not as no filter" {
+    // The end-to-end shape of the above: through the client, an over-long
+    // `.dept_custom` scope must return no rows rather than every row.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+
+    const WideDoc = Schema("WideDoc", .{
+        .table_name = "wide_doc",
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.Int("owner_id"),
+            field.Int("dept_id"),
+            field.String("title"),
+        },
+        .policy = Policy,
+    });
+    const info = comptime fromSchema(WideDoc);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = @import("../codegen/client.zig").EntityClient(infos, info);
+    const base = Client.init(allocator, driver.asDriver());
+
+    var seed_scope = DataScopeFilter.init("dept_id", "owner_id", .all, .{});
+    const seed_client = base.withContext(seed_scope.context(.{ .tenant_id = 1 }));
+    {
+        var b = try seed_client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("tenant_id", @as(i64, 1));
+        _ = try b.setFieldValue("owner_id", @as(i64, 1));
+        // Dept 3 is inside the over-long list below, so a truncated IN list
+        // would still have matched it — only a deny excludes it.
+        _ = try b.setFieldValue("dept_id", @as(i64, 3));
+        _ = try b.setFieldValue("title", "seed");
+        var row = try b.Save();
+        deinitEntity(infos, info, &row, allocator);
+    }
+
+    var many: [max_dept_ids + 1]i64 = undefined;
+    for (&many, 0..) |*d, i| d.* = @intCast(i + 1);
+    var wide = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &many });
+    const wide_client = base.withContext(wide.context(.{ .tenant_id = 1 }));
+    var q = wide_client.Query();
+    defer q.deinit();
+    var rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), rows.items.len);
+}
+
+test "DataScopePolicy denies a context that carries no filter" {
+    // A context built without `.extra = &filter` (`withContext(.{ … })`) is a
+    // caller that set up the tenant/user but forgot the scope. The rule used to
+    // answer "the filter does not apply" — null — and null is how a filter rule
+    // says "nothing to add", so the query ran with no scope predicate at all
+    // and returned every row. A schema carrying this policy is a promise that a
+    // scope is always present, so the missing filter has to deny.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+
+    const ScopedDoc = Schema("ScopedDoc", .{
+        .table_name = "scoped_doc",
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.Int("owner_id"),
+            field.Int("dept_id"),
+            field.String("title"),
+        },
+        .policy = Policy,
+    });
+    const info = comptime fromSchema(ScopedDoc);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = @import("../codegen/client.zig").EntityClient(infos, info);
+    const base = Client.init(allocator, driver.asDriver());
+
+    var seed_scope = DataScopeFilter.init("dept_id", "owner_id", .all, .{});
+    const seed_client = base.withContext(seed_scope.context(.{ .tenant_id = 1 }));
+    {
+        var b = try seed_client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("tenant_id", @as(i64, 1));
+        _ = try b.setFieldValue("owner_id", @as(i64, 1));
+        _ = try b.setFieldValue("dept_id", @as(i64, 3));
+        _ = try b.setFieldValue("title", "seed");
+        var row = try b.Save();
+        deinitEntity(infos, info, &row, allocator);
+    }
+
+    // The seeded row belongs to owner 1 / dept 3 in tenant 1. A context that
+    // names that tenant and user but carries no filter must not see it (nor
+    // anything else).
+    const bare = base.withContext(.{ .user_id = 1, .tenant_id = 1 });
+    var q = bare.Query();
+    defer q.deinit();
+    var rows = try q.All();
+    defer {
+        for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), rows.items.len);
 }
