@@ -383,10 +383,54 @@ splice it in.
 | `crud_helpers.queryRows` | no | same (it is a mapper over `driver.query`) |
 | `driver.queryCtx` / `execCtx` | no | same — the context carries a deadline only |
 | `sql.Explain` (`explainSql`) | n/a | diagnostic only: it wraps the statement in `EXPLAIN` and never executes it |
+| `sql_statement.checkStatement` | n/a | diagnostic only: it prepares the statement with the driver and discards it — no `step`/`execute`, and it takes the args, so it catches what `EXPLAIN` cannot |
 | `QueryBuilder` / `QueryEdge` / `WithEdge` | **yes** | nothing to do |
 | `crud_helpers` entity helpers (`first`/`all`/…) | **yes** | they go through a builder |
 | `entql` (`Parse`) | **yes** | it lowers to builder predicates |
 | `PreparedCache` | n/a | keyed on the final SQL text, byte-compared — two tenants produce two entries, never a shared statement |
+
+### Validating a raw statement before you run it (`checkStatement`)
+
+Raw SQL is written by hand, and until v0.58.0 there was no way to ask "will this
+even run?" other than running it:
+
+```zig
+var d = try zent.sql_statement.checkStatement(alloc, drv, sql, args);
+defer zent.sql_statement.freeStatementDiagnosis(alloc, &d);
+
+switch (d.problem) {
+    .none => {},                                  // prepared cleanly
+    .syntax => return error.BadSql,
+    .missing_relation, .missing_column => return error.SchemaDrift,
+    .parameter_mismatch => return error.WrongArgs,
+    .not_checkable => {},                         // this driver/statement cannot say
+    else => std.log.warn("{s}", .{d.message orelse "?"}),
+}
+```
+
+It **prepares and discards** — `sqlite3_prepare_v2`, `PQprepare`,
+`mysql_stmt_prepare`, with no `step`/`execute` — so a checked `INSERT`,
+`UPDATE` or `DELETE` changes nothing. `d.message` is the driver's own text
+(plus `native_code`, and PostgreSQL's `sqlstate`), which is the part you cannot
+get from an errno.
+
+Three things it deliberately does not do:
+
+- **It does not flatten the dialects.** SQLite reports every prepare failure as
+  `SQLITE_ERROR`, so its label is read from the message and flagged
+  `problem_heuristic = true`; MySQL and PostgreSQL have structured codes. A
+  constraint violation is invisible to all three — that happens at execution.
+- **`not_checkable` is not a failure.** PostgreSQL's `25P02`/`0A000` and MySQL's
+  errno `1295` (`BEGIN`, `LOCK TABLES`, `PREPARE` — the prepared protocol does
+  not take them) mean *this channel cannot judge the statement*, not that the
+  statement is broken. A driver with no prepare channel answers the same way, so
+  a bulk audit runs to the end instead of stopping at the first unsupported
+  statement.
+- **It does not execute to find out.** There is no "run it inside a rolled-back
+  transaction" path; the only thing it touches is the parse/bind phase.
+
+Use `explainSql` instead when you want the *plan*; it accepts no parameters, so
+it cannot answer the bound-parameter question this exists for.
 
 ### Scoping raw SQL (`zent.scope`)
 
@@ -828,10 +872,40 @@ migration ran, so the shape is right" and being surprised later:
 | **Unique** on an added column is not emitted (SQLite cannot, and the `CREATE TABLE` path carries it for PG/MySQL) | an old table gains the column without the constraint | add the constraint in a real migration |
 | **Foreign keys** exist only in `CREATE TABLE`; `ALTER` never adds one | old tables stay unconstrained | same |
 | A **changed `view_sql` never takes effect** — views are `CREATE VIEW IF NOT EXISTS` | the definition you upgraded to is not the one in the database | `DROP VIEW` then re-run, or version the view name |
-| Index comparison is **by name only** (`ExistingIndex` carries no columns) | an index whose definition changed is left as-is | drop and recreate it by hand |
+| A **changed index definition is reported but not repaired** — `ExistingIndex.columns` now carries the key list, but `migrateSchema` still only asks whether the name exists | a declared index the database holds under the same name with different columns stays as it is | drop and recreate it by hand; `checkSchema` names the difference |
 
 Everything in that table is also what `checkSchema` reports, which is the point:
 the migration path is not a substitute for the check.
+
+#### Index drift: reported only when it can be read reliably
+
+`ExistingIndex.columns` carries the ordered key columns from all three dialects
+(MySQL `information_schema.statistics`, PostgreSQL `pg_index` + `pg_attribute`,
+SQLite `PRAGMA index_info`), so a declared index that the database holds under
+the same name with a different key list is reported as
+`SchemaDrift.Kind.index_columns` with a detail like
+`schema wants (a, b), database has (a)`.
+
+The comparison **errs towards silence**, on purpose. A false drift blocks a
+deploy; a missed one is a warning nobody reads. So it is skipped rather than
+guessed whenever the database's key list cannot be read reliably:
+
+| Skipped | Why |
+|---|---|
+| expression keys (`lower(email)`, PG attnum 0) | the key is not a column, so "the columns differ" is not a statement about this index |
+| partial indexes (`WHERE …`) | same key list, different coverage — not comparable by name+columns |
+| non-btree access methods (`USING gin`/`hash`/…) | column order and meaning do not map onto the schema's list |
+| `indisvalid = false` | a half-built index is not a definition to compare against |
+| `INCLUDE` columns, key-count mismatch, empty key list | the introspection would be comparing different things |
+
+Two consequences worth knowing:
+
+- **`breaksReads()` is `false` for `index_columns`.** An index cannot break a
+  read, only slow it down, so `DriftStrictness.read_breaking_only` — the mode
+  that gates a deploy — never fails on it. Only `.any` does.
+- **`migrateSchema` does not repair it.** Non-destructiveness is deliberate: it
+  creates missing indexes and leaves differing ones alone. The report is the
+  deliverable; the `DROP INDEX` + `CREATE INDEX` is yours.
 
 #### Converging nullability (`allow_nullability_change`)
 

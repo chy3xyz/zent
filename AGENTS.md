@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.57.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.58.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (343 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (364 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -115,6 +115,25 @@ Entities and queries are explicitly owned by the caller. See the contract:
   (`col(255)`): that makes `UNIQUE` constrain only the first 255 characters.
   `field.Text` keeps `TEXT` deliberately — it is the unbounded type, and MySQL
   restrictions on it are reported, not worked around.
+- **The DDL guards for those restrictions must stay generation-time and
+  fail-closed.** `createTableSQLAlloc` and `createIndexSQLForTableAlloc` call
+  `findMySqlTextRestriction` (pure, no allocation, MySQL-only) before emitting
+  anything, and return `MySQLTextColumnCannotHaveDefault` /
+  `MySQLTextColumnCannotBeIndexed`. Never let this degrade into a raw server
+  error, and never "fix" it with a key-length prefix.
+- **Index drift is reported only when it can be read reliably.** A false
+  `index_columns` drift blocks a deploy; a missed one is a warning nobody reads,
+  so the comparison errs towards silence: expression keys, partial indexes,
+  non-btree access methods, invalid indexes and `INCLUDE` columns all set
+  `columns_comparable = false` and are skipped. `breaksReads()` is **false** for
+  `index_columns`, so `read_breaking_only` never fails on it — keep it that way.
+  On PostgreSQL read the key columns from `pg_index` + `pg_attribute`, never by
+  parsing `indexdef` text.
+- **`checkStatement` must never execute.** It prepares and discards, on all
+  three dialects (`sqlite3_prepare_v2`, `PQprepare`, `mysql_stmt_prepare`) — no
+  `step`/`execute`/`Bind+Execute`, no "run then roll back". A driver that cannot
+  prepare answers `not_checkable` rather than erroring, so a bulk audit does not
+  stop halfway; that is a normal result, not a failure.
 
 ## Layout
 

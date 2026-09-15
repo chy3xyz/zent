@@ -4,6 +4,74 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`zent.sql_statement.checkStatement`** (Z28). Raw SQL had no way to be
+  validated before it ran, so a consumer with ~476 hand-written call sites kept
+  its own audit scripts to answer "will this even run". The statement is
+  **prepared and discarded** — nothing is executed, so a checked `INSERT`,
+  `UPDATE` or `DELETE` touches no rows (one test per dialect proves it). It
+  returns a `StatementDiagnosis` that separates a syntax error, a missing table,
+  a missing column, a parameter-list mismatch and a clean statement, and it
+  carries the driver's own text (`message`, `native_code`, PostgreSQL's
+  `sqlstate`) instead of leaving the caller to reverse-engineer an errno.
+  `freeStatementDiagnosis` releases it.
+
+  The dialects do not see the same things at prepare time, and the diagnosis
+  says so rather than flattening them: SQLite reports every prepare failure as
+  `SQLITE_ERROR`, so its label comes from the message and is flagged
+  `problem_heuristic`; PostgreSQL's `25P02`/`0A000` and MySQL's errno `1295`
+  (`BEGIN`, `LOCK TABLES`) are `not_checkable` — a statement the prepare channel
+  cannot judge, not a broken one — and a driver with no prepare channel answers
+  the same way instead of erroring, so a bulk audit does not stop halfway.
+  Constraint violations are out of reach for all three, because they happen at
+  execution. `driver.Driver.VTable.prepareCheck` is the optional driver-side
+  capability behind it; `ConnPool` forwards it, so a pooled driver answers
+  instead of degrading to `not_checkable`.
+
+- **`codegen.beginTxCtx` / `codegen.beginTxFromDriverCtx`** (Z24, the codegen
+  half). The pool learned to bound waiting for a connection by the caller's
+  deadline, and `driver.Driver` gained `beginTxCtx`, but the layer consumers
+  actually use had no context entry — a request budget could only be applied by
+  dropping to `pool.asDriver().beginTxCtx(&ctx)`. Pure addition: `beginTx` and
+  `beginTxFromDriver` keep their signatures and now delegate with a null
+  context, and the explicit null branch still calls `Driver.beginTx` rather than
+  `Driver.beginTxCtx(null)`, so a third-party driver with that hook sees exactly
+  the calls it saw before.
+
+- **`ExistingIndex.columns` / `ExistingIndex.columns_comparable`** (Z31). Index
+  introspection now reads the key columns on all three dialects — MySQL
+  `information_schema.statistics`, PostgreSQL **`pg_index` + `pg_attribute`**
+  (not `indexdef` text), SQLite `PRAGMA index_info`.
+
+- **`SchemaDrift.Kind.index_columns`** (Z31). A declared index the database has
+  under the same name with a different, ordered key list is now reported, with a
+  `schema wants (a, b), database has (a)` detail. It is reported **only when the
+  database's key list is reliably readable**: expression keys, partial indexes,
+  non-btree access methods, invalid indexes and `INCLUDE` columns are skipped
+  rather than guessed. The reasoning is that a false drift blocks a deploy while
+  a missed one is a warning nobody reads, so the comparison errs towards
+  silence. `breaksReads()` is `false` for this kind — `read_breaking_only` never
+  fails on it; only `.any` does.
+
+- `sql_schema.findMySqlTextRestriction` / `MySqlTextRestriction` /
+  `MySqlTextError` and `sql_schema.createIndexSQLForTableAlloc`: the MySQL
+  BLOB/TEXT/JSON restrictions are a pure, dialect-gated check callable before
+  any DDL is generated.
+
+### Fixed
+- **MySQL: a `field.Text` (or `.Json`/`.Other`/`.Bytes`) column declared
+  `Unique()`, `Default()` or a primary key, or used as an index column, now
+  fails with a named error instead of a raw server error.** Those types stay
+  `TEXT` on MySQL (only `String`/`Enum` became `VARCHAR(255)`), so MySQL's
+  errno 1170 and 1101 apply to them. DDL generation fails closed with
+  `error.MySQLTextColumnCannotBeIndexed` or
+  `error.MySQLTextColumnCannotHaveDefault`, logging the table, the column, the
+  dialect type and the way out (use `field.String`, or drop the constraint) —
+  where before `CREATE TABLE`/`CREATE INDEX` surfaced a bare
+  `error.MySQLExecFailed` and one errno in a warning. A key-length prefix is
+  deliberately **not** used: for `UNIQUE` it would constrain only the first N
+  characters.
+
 ## [0.57.0] - 2026-09-15
 
 ### Changed

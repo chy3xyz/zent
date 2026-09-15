@@ -30,6 +30,7 @@ sql (src/sql)         Dialect-aware SQL builder + driver interface
    ├── schema/        migrate (create tables/views, Flyway-style)
    ├── pool.zig       ConnPool (with active ping & idle reaping)
    ├── diagnostics.zig SqlDiagnostic context for rich error formatting
+   ├── statement.zig  checkStatement: prepare-and-discard raw-SQL validation
    └── logger/cache/explain
 
 cross-cutting:
