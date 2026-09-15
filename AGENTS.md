@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.63.1** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.64.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (398 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (412 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -50,7 +50,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 398, integration 208 passed + 3 skipped
+`baseline` counts move with this: unit 412, integration 214 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -209,6 +209,15 @@ Entities and queries are explicitly owned by the caller. See the contract:
   counted zero rows", not "nothing matched". SQLite reports unknown for a
   non-DML, PostgreSQL for a command with no count tag, and MySQL for a prepared
   `SELECT`.
+- **A `!bool` that means "the row exists" must not be `affected > 0` on MySQL.**
+  MySQL reports *changed* rows (`CLIENT_FOUND_ROWS` is off) while SQLite and
+  PostgreSQL report *matched* rows, so an idempotent write counts 0 on MySQL
+  alone. Re-check existence on the zero path — `crud_helpers.updateWithVersion`
+  and `crud.update` are the shapes to copy.
+- **`dryRun` and the real migration must share one planner.** They both call
+  `planMigrateStatements`; a second, hand-rolled "what would we do" branch is how
+  a preview starts disagreeing with the run it is previewing. Anything added to
+  the migration has to be added to the plan, once.
 - **`missing_junction_table` is read-breaking too, and only M2M needs it.** An M2M
   edge's junction table is not a `TypeInfo`, so it takes its own traversal in
   `checkSchema` (`junctionTableForEdge`, `relation == .m2m` **and no `Through`** —

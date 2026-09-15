@@ -4,6 +4,87 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Concurrency invariants for the prepared-statement cache and the outbox.**
+  The pool has had stress tests since v0.61, and they are the reason the two
+  fixes before them hold up; the two other components actually driven from
+  several threads had none. Same method — invariants, not a schedule, because a
+  flaky stress test is worse than none.
+
+  - the **cache**: concurrent take/put against eviction never recycles or loses a
+    handle (a canary is re-read while the handle is out), and the bookkeeping is
+    self-consistent after the storm;
+  - the **outbox**: a nested dispatcher on one connection and concurrent
+    dispatchers on separate ones, asserting the guarantee the implementation
+    actually makes — **a row is claimed exactly once, never by two dispatchers** —
+    rather than a stronger one it does not.
+
+  Verified by running the binary ten times: 10/10 stable.
+
+- `sql_sqlite.RecursiveMutex` is now public, with the reason in its doc comment:
+  the same lock has to guard anything fronting one SQLite connection — a `Driver`
+  wrapper fanning out to a shared handle, or the cache driven directly — and
+  re-implementing it at a second site is how two locks that must be the same
+  become two locks.
+
+### Fixed
+- **`crud.update` no longer answers `false` for an idempotent PUT on MySQL.**
+  MySQL reports *changed* rows (`CLIENT_FOUND_ROWS` is off), so writing a row
+  back unchanged counted `0` and the `!bool` read that as "missing" — a 404
+  upstream — while SQLite and PostgreSQL, which report matched rows, answered
+  `true`. The zero path now re-checks existence under the same `(tenant, id)`
+  predicates, the shape `crud_helpers.updateWithVersion` already used, so `false`
+  means "no such row" on all three dialects. The extra query runs only when the
+  `UPDATE` reports 0.
+
+  `crud_helpers.update` returns rows **matched** rather than rows **changed** for
+  the same reason, so an idempotent update answers `1` on MySQL as it already did
+  elsewhere.
+
+- **`crud_helpers.cursorPage` rejects a non-integer `cursor_col`** with
+  `error.InvalidCursorColumn`. It validated only that the name existed, so an
+  integer cursor bound against a text column **filtered nothing** (measured: 5
+  rows returned with `after=3`) and the page could come back with `has_more`
+  true beside a null `next_cursor` — a silent truncation with no error at all.
+  Checked before tightening: no caller in the tree, the examples or the
+  integration tests uses a non-integer cursor column, so this rejects only calls
+  that were already wrong.
+
+- **`migrateSchemaWithOptions` with `dry_run: true` previews the migration that
+  would actually run.** It printed the DDL for a *fresh* database — every
+  `CREATE TABLE`/`VIEW`/`INDEX`, no introspection — so the statements an
+  incremental migration really executes (`ALTER TABLE … ADD COLUMN`,
+  `DROP COLUMN`, `ALTER TYPE`, `SET`/`DROP NOT NULL`) never appeared. A consumer
+  could read the preview, see only `CREATE` statements, approve it, and have the
+  real run drop a column.
+
+  One planner now produces the statement list and **both paths use it** — the
+  real one executes it inside the transaction, the dry run prints it — so the two
+  sets cannot drift. Same introspection, same migration-history snapshot, same
+  opt-in gates, same MySQL BLOB/TEXT fail-closed diagnostics, and the dry run
+  still executes nothing. The core assertion is that a dry-run plan equals the
+  statements a real migration records, observed through a wrapper driver that
+  logs every `exec`.
+
+  One consequence worth naming: because the plan is built before any `exec`, a
+  generation failure (the MySQL TEXT guard) aborts *before* the first statement
+  instead of partway through — and on MySQL, where DDL autocommits, the old
+  interleaved flow left the already-executed statements behind.
+
+- **`ShardRouter.init` rejects `shard_count == 0`** with
+  `error.InvalidShardCount`; a zero-shard router previously reached `route`'s
+  `hash % shard_count` and panicked in Debug/ReleaseSafe (reproduced: `panic:
+  division by zero`) or hit undefined behaviour in ReleaseFast. Fixed at
+  construction rather than at the division, because `route` returns a plain
+  `usize` and the whole `clientForTenant`/`shardOf`/`moveTenant` chain is built on
+  "routing always succeeds" — making it fallible would have infected every
+  caller. `ShardSet.clientAt` asserts its index for the same reason.
+
+- **`ShardedEnv.open` closes and destroys the drivers of already-opened shards**
+  when a later shard fails to open. The per-iteration `errdefer` covered only the
+  failing iteration, so every earlier shard's driver leaked (falsified: the
+  testing allocator reports a leaked 33408-byte driver block).
+
 ## [0.63.1] - 2026-09-15
 
 ## [0.63.0] - 2026-09-15

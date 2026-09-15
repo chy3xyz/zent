@@ -763,12 +763,12 @@ A no-op `UPDATE` (all values already equal) therefore returns `0` on MySQL and
 `1` on the others. Never write `if (affected == 0) return error.NotFound` —
 use an explicit `SELECT`/`Count()` or check a genuinely changing column.
 
-This is one of the findings the audit above turned up, and it is the reason
-`crud.update`'s `!bool` currently reverses meaning on MySQL: it returns
-`affected > 0`, so an idempotent PUT that writes the values back unchanged
-answers `false` and the caller turns that into a 404. `crud_helpers.updateWithVersion`
-is the correct shape to copy — it re-checks existence on the `0` path instead of
-trusting the count.
+This is the trap `crud.update` used to fall into: it returned `affected > 0`, so
+an idempotent PUT that wrote the values back unchanged answered `false` on MySQL
+and the caller turned that into a 404. Since v0.64.0 `crud.update` and
+`crud_helpers.update` re-check existence on the `0` path instead of trusting the
+count — `false` now means "no such row" on all three dialects, and
+`crud_helpers.updateWithVersion` was always the shape to copy.
 
 ### "0 rows" and "no count" are different answers
 
