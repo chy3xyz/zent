@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.63.0] - 2026-09-15
+
 ### Added
 - **`driver.Result.rows_affected_known`** — a non-breaking additional field,
   defaulting to `true`, saying whether `rows_affected` is a count the driver
