@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.64.1] - 2026-09-15
+
 ### Fixed
 - **`crud_helpers.increment` reports rows *matched*, not rows *changed*.**
   `SET hits = hits + 0` changes nothing, so MySQL counted 0 while SQLite's
