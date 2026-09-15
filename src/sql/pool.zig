@@ -23,6 +23,11 @@ fn unixTimestamp() i64 {
 pub const Error = error{
     PoolClosed,
     PoolExhausted,
+    /// The caller's budget for waiting on a connection ran out (see
+    /// `borrowWithTimeout` / `borrowCtx`). Deliberately not `PoolExhausted`:
+    /// "the pool is too small" and "this request had only 200 ms to spare" are
+    /// different facts, and only the second one is fixed by a shorter query.
+    PoolWaitTimeout,
 };
 
 /// A mutex-backed connection pool for driver type `D`.
@@ -54,9 +59,13 @@ pub fn ConnPool(comptime D: type) type {
         /// after the driver call. Callbacks should still be fast and
         /// non-blocking to avoid delaying the caller.
         ///
-        /// Known limitation: the borrow-path health check runs inside the
-        /// mutex, so `health_check_on_borrow` serializes concurrent borrows
-        /// while the ping is in flight.
+        /// The borrow-path health check no longer runs under the mutex: the
+        /// entry is selected and marked under it, then pinged after it is
+        /// released, so `health_check_on_borrow` no longer serializes concurrent
+        /// borrows. Two things still touch the driver with the mutex held —
+        /// `openConnection` (only when the pool is below `max_connections`) and
+        /// `pingIdleConnections` — because both decide pool bookkeeping as they
+        /// go.
         pub const Metrics = struct {
             /// Called when a connection is successfully borrowed.
             /// `wait_ms` is the total time spent waiting for a connection.
@@ -97,18 +106,23 @@ pub fn ConnPool(comptime D: type) type {
             /// can provide an explicit `std.Io` here.
             io: ?std.Io = null,
             /// Total time budget in milliseconds that a single `borrow` may
-            /// spend waiting for a connection once the pool is exhausted.
+            /// spend waiting for a connection once the pool is exhausted. It is
+            /// an **upper bound**: when the budget is used up, `borrow` returns
+            /// `error.PoolWaitTimeout` without the extra
+            /// `max_retries` + `retry_backoff_ms` attempts, which used to make
+            /// the documented budget overshoot by their sum.
             ///
             /// When non-zero, borrowers block on the pool condition variable
             /// instead of polling and are woken as soon as a connection is
-            /// released (see `borrow` for the waiting/fairness contract). When
-            /// the budget is used up, `borrow` falls back to the
-            /// `max_retries` + `retry_backoff_ms` path and then reports
-            /// `error.PoolExhausted`.
+            /// released (see `borrow` for the waiting/fairness contract).
+            /// `borrowWithTimeout` / `borrowCtx` cap this per call: their own
+            /// budget can only shorten the wait, never extend it.
             ///
             /// Zero (the default) means non-blocking: no waiting happens and a
             /// failed attempt immediately returns `error.PoolExhausted` (after
-            /// the legacy retries). This preserves the historical behavior.
+            /// the legacy retries). This preserves the historical behavior —
+            /// including for `borrowWithTimeout`, which cannot turn a
+            /// non-blocking pool back into a blocking one.
             max_wait_ms: u32 = 0,
             /// Elapsed time in milliseconds at which a pooled query/exec is
             /// reported through `Metrics.onSlowQuery`. Zero disables reporting.
@@ -125,7 +139,10 @@ pub fn ConnPool(comptime D: type) type {
             metrics: Metrics = .{},
             /// Optional per-query timeout in milliseconds. When set and a builder
             /// does not provide its own deadline, the pool computes an absolute
-            /// deadline before invoking the underlying driver.
+            /// deadline before invoking the underlying driver. The deadline
+            /// covers waiting for a connection too: a statement that spends its
+            /// whole budget queued behind a saturated pool fails with
+            /// `error.PoolWaitTimeout` instead of running with no time left.
             query_timeout_ms: ?u32 = null,
         };
 
@@ -276,13 +293,14 @@ pub fn ConnPool(comptime D: type) type {
         /// `PoolExhausted` rather than widening this signature to `anyerror`,
         /// which would break `asDriver()`'s explicit error sets. The log line
         /// above carries the unmapped name, so nothing is hidden from operators.
-        fn borrowErrorFor(err: anyerror) error{ ConnectionFailed, PingFailed, OutOfMemory, DriverFailed, PoolClosed, PoolExhausted } {
+        fn borrowErrorFor(err: anyerror) error{ ConnectionFailed, PingFailed, OutOfMemory, DriverFailed, PoolClosed, PoolExhausted, PoolWaitTimeout } {
             return switch (err) {
                 error.ConnectionFailed => error.ConnectionFailed,
                 error.PingFailed => error.PingFailed,
                 error.OutOfMemory => error.OutOfMemory,
                 error.DriverFailed => error.DriverFailed,
                 error.PoolClosed => error.PoolClosed,
+                error.PoolWaitTimeout => error.PoolWaitTimeout,
                 else => error.PoolExhausted,
             };
         }
@@ -319,16 +337,29 @@ pub fn ConnPool(comptime D: type) type {
             self.allocator.destroy(entry);
         }
 
-        /// Non-blocking borrow attempt. Returns a pooled entry or null when
-        /// no connection could be produced. The caller must hold `self.mutex`.
-        fn tryBorrowNoLock(self: *Self) ?*PooledEntry {
+        /// A connection picked by `selectNoLock`, and whether the pool opened it
+        /// just now: the health check treats a fresh connection differently (see
+        /// `tryBorrowNoLock`).
+        const Selection = struct {
+            entry: *PooledEntry,
+            fresh: bool,
+        };
+
+        /// Non-blocking selection: hand out an idle connection (evicting stale
+        /// ones) or open a new one, marking it borrowed. No health check runs
+        /// here — `tryBorrowNoLock` runs that after dropping the mutex. The
+        /// caller must hold `self.mutex`.
+        fn selectNoLock(self: *Self) ?Selection {
             // Each attempt answers for itself; a later success means the earlier
             // reason no longer matters.
             self.last_attempt_error = null;
             while (true) {
                 const entry = self.available.pop() orelse {
                     if (self.all.items.len < self.options.max_connections) {
-                        // Open a new connection.
+                        // Open a new connection. This is the one driver call
+                        // that still runs under the mutex: it decides whether
+                        // the pool has room, and reserving the slot before the
+                        // connect is what keeps `max_connections` a ceiling.
                         var new_conn = self.openConnection() catch |err| {
                             self.last_attempt_error = err;
                             return null;
@@ -348,18 +379,7 @@ pub fn ConnPool(comptime D: type) type {
                             self.allocator.destroy(entry);
                             return null;
                         };
-                        // Newly created connections must also pass the health
-                        // check before being handed out. If they fail, close the
-                        // entry and let the caller's retry loop decide whether to
-                        // attempt again; otherwise we could spin forever creating
-                        // and discarding dead connections.
-                        if (self.options.health_check_on_borrow) {
-                            entry.conn.asDriver().ping() catch {
-                                self.closeConnection(entry);
-                                return null;
-                            };
-                        }
-                        return entry;
+                        return .{ .entry = entry, .fresh = true };
                     }
                     return null;
                 };
@@ -371,23 +391,59 @@ pub fn ConnPool(comptime D: type) type {
                         const idle_secs = unixTimestamp() - idle_since;
                         if (idle_secs > self.options.max_idle_secs) {
                             self.closeConnection(entry);
+                            // Closing frees room below `max_connections`, so a
+                            // parked borrower may be able to open a fresh one
+                            // instead of waiting out its budget.
+                            self.cond.signal(self.io);
                             continue;
                         }
                     }
                 }
 
-                // Health check before handing out.
-                if (self.options.health_check_on_borrow) {
-                    entry.conn.asDriver().ping() catch {
-                        // Connection is dead; drop it and try the next one.
-                        self.closeConnection(entry);
-                        continue;
-                    };
-                }
-
                 // Mark as borrowed (no longer idle).
                 entry.idle_since = null;
-                return entry;
+                return .{ .entry = entry, .fresh = false };
+            }
+        }
+
+        /// `selectNoLock` plus the borrow-path health check, which runs
+        /// **outside** the mutex: a ping is a network round trip, and holding
+        /// the pool mutex across it serialized every other borrower behind one
+        /// slow `PQping` (`ZENT_IMPROVEMENTS.md` item 4). This function
+        /// therefore releases and re-acquires `self.mutex` around the ping; the
+        /// caller must hold it on entry and holds it again on return.
+        ///
+        /// The selected entry is safe to ping unlocked: it has been popped from
+        /// `available` and only its borrower can reach it, while `reapIdle` /
+        /// `pingIdle` only look at entries still in `available` and `release`
+        /// only accepts a pointer its own borrower holds.
+        fn tryBorrowNoLock(self: *Self) ?*PooledEntry {
+            const io = self.io;
+            while (true) {
+                const selected = self.selectNoLock() orelse return null;
+                if (!self.options.health_check_on_borrow) return selected.entry;
+
+                self.mutex.unlock(io);
+                const checked = selected.entry.conn.asDriver().ping();
+                self.mutex.lockUncancelable(io);
+
+                if (checked) |_| {
+                    return selected.entry;
+                } else |_| {
+                    self.closeConnection(selected.entry);
+                    // Closing frees room below `max_connections`, so a parked
+                    // borrower may be able to open a fresh one instead of
+                    // waiting out its budget.
+                    self.cond.signal(io);
+                    // A *pooled* connection that fails its check is dropped and
+                    // the next idle one is tried, as before. A freshly opened
+                    // one that fails means the server is refusing everything:
+                    // report no selection so the caller's wait/retry logic
+                    // decides, instead of spinning here opening and discarding
+                    // connections.
+                    if (selected.fresh) return null;
+                    continue;
+                }
             }
         }
 
@@ -439,9 +495,11 @@ pub fn ConnPool(comptime D: type) type {
             }
         }
 
-        /// Borrow a connection from the pool.
+        /// Borrow a connection from the pool, waiting at most
+        /// `options.max_wait_ms`.
         ///
-        /// Performs idle eviction and health checks on each attempt.
+        /// Performs idle eviction and health checks on each attempt; the health
+        /// check runs outside the pool mutex (see `tryBorrowNoLock`).
         ///
         /// With the default `max_wait_ms == 0` the call is non-blocking: a
         /// failed attempt is retried up to `max_retries` times with linear
@@ -451,10 +509,12 @@ pub fn ConnPool(comptime D: type) type {
         /// opened (the pool is exhausted, or opening one failed), the caller
         /// blocks on the pool condition variable instead of polling, and is
         /// woken as soon as a connection is released. `max_wait_ms` is the
-        /// total budget for the whole call, measured from entry; once it runs
-        /// out the call falls back to the legacy retry/backoff path and then
-        /// reports `error.PoolExhausted`. A closed pool reports
-        /// `error.PoolClosed`.
+        /// total budget for the whole call, measured from entry, and it is a
+        /// **hard upper bound**: when it runs out the call reports
+        /// `error.PoolWaitTimeout` rather than adding the legacy
+        /// retry/backoff attempts on top of it. A failure that kept connections
+        /// away (a refused connect, a failed health check, OOM) is still
+        /// reported as itself; a closed pool reports `error.PoolClosed`.
         ///
         /// Waiting is **best-effort fair, not strict FIFO**: every blocked
         /// borrower holds a ticket and defers to a lower (older) ticket that is
@@ -463,18 +523,55 @@ pub fn ConnPool(comptime D: type) type {
         /// never blocks another borrower forever — after a bounded number of
         /// deferrals the connection goes to whichever waiter is awake.
         pub fn borrow(self: *Self) !*D {
-            const io = self.io;
-            const waiting_enabled = self.options.max_wait_ms > 0;
+            return self.borrowWithBudget(self.options.max_wait_ms);
+        }
 
-            // Absolute deadline for the total wait budget; `.none` selects the
-            // legacy non-blocking path, which needs no clock reads.
+        /// `borrow` with a request-level budget of `request_ms`: the wait is
+        /// capped at `min(request_ms, options.max_wait_ms)`, so a request can
+        /// shorten the pool's wait but never lengthen it. A pool configured
+        /// non-blocking (`max_wait_ms == 0`) stays non-blocking whatever the
+        /// request asks for.
+        ///
+        /// Expiry reports `error.PoolWaitTimeout`, which says "this call's
+        /// budget is gone" — not `PoolExhausted`, which says "the pool is too
+        /// small" and is the answer to a different question
+        /// (`ZENT_IMPROVEMENTS.md` item 3).
+        pub fn borrowWithTimeout(self: *Self, request_ms: u32) !*D {
+            return self.borrowWithBudget(@min(request_ms, self.options.max_wait_ms));
+        }
+
+        /// `borrow` bounded by the caller's own deadline: the budget is the
+        /// execution context's remaining time, or `options.max_wait_ms` when
+        /// the context carries no deadline, capped by `options.max_wait_ms`
+        /// exactly like `borrowWithTimeout`. An already-expired deadline gets a
+        /// single non-blocking attempt.
+        ///
+        /// Every pooled statement goes through here, so
+        /// `Query().withTimeout(200)` spends that budget waiting for a
+        /// connection instead of borrowing first (potentially for
+        /// `max_wait_ms`) and only then noticing the deadline.
+        pub fn borrowCtx(self: *Self, ctx: ?*const driver.ExecutionContext) !*D {
+            const budget = if (ctx) |cx|
+                (cx.remainingMs() orelse self.options.max_wait_ms)
+            else
+                self.options.max_wait_ms;
+            return self.borrowWithBudget(@min(budget, self.options.max_wait_ms));
+        }
+
+        /// Shared body of every borrow entry point. `budget_ms` is the total
+        /// wall-clock budget for this call; 0 selects the legacy non-blocking
+        /// path, which needs no clock reads.
+        fn borrowWithBudget(self: *Self, budget_ms: u32) !*D {
+            const io = self.io;
+            const waiting_enabled = budget_ms > 0;
+
             const wait_start: ?std.Io.Clock.Timestamp = if (waiting_enabled)
                 std.Io.Clock.Timestamp.now(io, .awake)
             else
                 null;
             const wait_deadline: std.Io.Timeout = if (wait_start) |start|
                 .{ .deadline = start.addDuration(.{
-                    .raw = std.Io.Duration.fromMilliseconds(@intCast(self.options.max_wait_ms)),
+                    .raw = std.Io.Duration.fromMilliseconds(@intCast(budget_ms)),
                     .clock = .awake,
                 }) }
             else
@@ -484,6 +581,10 @@ pub fn ConnPool(comptime D: type) type {
             var deferrals: u32 = 0;
             var wait_done = !waiting_enabled;
             var attempt: u32 = 0;
+            // Set when the blocked wait itself ran out: the caller had a budget
+            // and the budget is what ended the call, which is a different
+            // answer from "the pool is too small".
+            var timed_out = false;
 
             while (true) {
                 // The locked section only records the outcome; the metrics
@@ -518,11 +619,13 @@ pub fn ConnPool(comptime D: type) type {
                             // lose its signal. `waitTimeout` drops the mutex while
                             // blocked and re-acquires it before returning.
                             self.cond.waitTimeout(io, &self.mutex, wait_deadline) catch |err| switch (err) {
-                                error.Timeout => wait_done = true,
+                                error.Timeout => {
+                                    wait_done = true;
+                                    timed_out = true;
+                                },
                                 // `borrow` has no `Canceled` in its error set
                                 // (callers go through `driver.Error`), so treat
-                                // a canceled wait as budget exhaustion and let
-                                // the legacy retry path finish.
+                                // a canceled wait as the end of the wait.
                                 error.Canceled => wait_done = true,
                             };
                             if (wait_done) self.dropTicketNoLock(&ticket);
@@ -554,6 +657,12 @@ pub fn ConnPool(comptime D: type) type {
                     continue;
                 }
                 if (!wait_done) continue;
+                // With a budget in effect, that budget is the whole budget:
+                // once the wait ends, the legacy retry/backoff attempts would
+                // silently overshoot the documented ceiling by
+                // `max_retries × retry_backoff_ms`. The non-blocking path keeps
+                // them.
+                if (waiting_enabled) break;
 
                 if (attempt >= self.options.max_retries) break;
                 const backoff_ms: i64 = @as(i64, self.options.retry_backoff_ms) * (@as(i64, attempt) + 1);
@@ -562,17 +671,23 @@ pub fn ConnPool(comptime D: type) type {
             }
 
             // `PoolExhausted` only when the pool really is at its ceiling with
-            // everything lent out; otherwise the failure that actually happened
-            // travels to the caller, and a consumer can tell "capacity" from
+            // everything lent out and nothing in this call ran out of time;
+            // otherwise the failure that actually happened travels to the
+            // caller, and a consumer can tell "capacity" from
             // "misconfiguration" (see `ZENT_IMPROVEMENTS.md` item 3).
             self.exhausted_total += 1;
-            const reason: anyerror = self.last_attempt_error orelse error.PoolExhausted;
+            const reason: anyerror = self.last_attempt_error orelse
+                if (timed_out) error.PoolWaitTimeout else error.PoolExhausted;
             if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, reason);
             // Silent exhaustion was the other half of that report: the pool had
             // no log line at all.
+            const waited_ms: u64 = if (wait_start) |start|
+                @intCast(@max(start.untilNow(io).raw.toMilliseconds(), 0))
+            else
+                0;
             std.log.warn(
-                "zent pool: no connection could be handed out after {d} attempt(s): {s}",
-                .{ attempt + 1, @errorName(reason) },
+                "zent pool: no connection could be handed out after {d} attempt(s) and {d} ms of waiting: {s}",
+                .{ attempt + 1, waited_ms, @errorName(reason) },
             );
             return borrowErrorFor(reason);
         }
@@ -827,10 +942,15 @@ pub fn ConnPool(comptime D: type) type {
 
         fn driverExec(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const Value) driver.Error!driver.Result {
             const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrowForDriver();
-            defer pool.release(conn);
+            // The deadline is computed *before* borrowing so it covers the
+            // wait for a connection: previously the statement's budget only
+            // started once a connection had been found, so on a saturated pool
+            // twelve statements each waited out `max_wait_ms` and then ran with
+            // the time already spent (`ZENT_IMPROVEMENTS.md` item 3).
             var merged = pool.mergeExecutionContext(ctx);
             const ctx_ptr: ?*const driver.ExecutionContext = if (merged.deadline_ns != null) &merged else null;
+            const conn = try pool.borrowCtx(ctx_ptr);
+            defer pool.release(conn);
             if (pool.options.slow_query_threshold_ms > 0) {
                 const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
                 const result = conn.asDriver().execCtx(ctx_ptr, query_sql, args);
@@ -847,9 +967,9 @@ pub fn ConnPool(comptime D: type) type {
 
         fn driverQuery(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const Value) driver.Error!driver.Rows {
             const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrowForDriver();
             var merged = pool.mergeExecutionContext(ctx);
             const ctx_ptr: ?*const driver.ExecutionContext = if (merged.deadline_ns != null) &merged else null;
+            const conn = try pool.borrowCtx(ctx_ptr);
             const result = if (pool.options.slow_query_threshold_ms > 0) blk: {
                 const start = std.Io.Clock.Timestamp.now(pool.io, .awake);
                 const inner = conn.asDriver().queryCtx(ctx_ptr, query_sql, args);
@@ -879,7 +999,22 @@ pub fn ConnPool(comptime D: type) type {
 
         fn driverBeginTx(ptr: *anyopaque) driver.Error!driver.Tx {
             const pool: *Self = @ptrCast(@alignCast(ptr));
-            const conn = try pool.borrowForDriver();
+            return beginTxWithCtx(pool, null);
+        }
+
+        fn driverBeginTxCtx(ptr: *anyopaque, ctx: ?*const driver.ExecutionContext) driver.Error!driver.Tx {
+            const pool: *Self = @ptrCast(@alignCast(ptr));
+            return beginTxWithCtx(pool, ctx);
+        }
+
+        /// Acquiring a transaction is a borrow plus a `BEGIN`, and the borrow is
+        /// the part that can block. With a deadline in `ctx` it is bounded by
+        /// that deadline: a request with 200 ms left must fail there rather than
+        /// queue for `max_wait_ms` behind a saturated pool and then run its
+        /// statements with no time left. Without one the pool's `max_wait_ms`
+        /// applies, exactly as `borrow` would.
+        fn beginTxWithCtx(pool: *Self, ctx: ?*const driver.ExecutionContext) driver.Error!driver.Tx {
+            const conn = try pool.borrowCtx(ctx);
             errdefer pool.release(conn);
 
             const tx = try conn.asDriver().beginTx();
@@ -956,6 +1091,7 @@ pub fn ConnPool(comptime D: type) type {
             .exec = driverExec,
             .query = driverQuery,
             .beginTx = driverBeginTx,
+            .beginTxCtx = driverBeginTxCtx,
             .beginSavepoint = driverBeginSavepoint,
             .close = driverClose,
             .dialect = driverDialect,
@@ -1953,7 +2089,7 @@ test "ConnPool zero wait budget does not park a borrower" {
     try std.testing.expect(elapsed_ms < 1000);
 }
 
-test "ConnPool wait budget expiry returns PoolExhausted" {
+test "ConnPool wait budget expiry returns PoolWaitTimeout" {
     const allocator = std.testing.allocator;
     const P = ConnPool(StubDriver);
 
@@ -1968,19 +2104,148 @@ test "ConnPool wait budget expiry returns PoolExhausted" {
     defer pool.deinit();
 
     // Hold the only connection: the second borrow must park for its whole
-    // budget and then report exhaustion rather than returning at once or
-    // waiting forever.
+    // budget and then report *its own* budget expiring rather than returning at
+    // once, waiting forever, or answering `PoolExhausted` — which says "the
+    // pool is too small" and is the wrong thing to tell a caller that asked for
+    // a bounded wait (`ZENT_IMPROVEMENTS.md` item 3).
     const c1 = try pool.borrow();
     defer pool.release(c1);
 
     const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
-    try std.testing.expectError(error.PoolExhausted, pool.borrow());
+    try std.testing.expectError(error.PoolWaitTimeout, pool.borrow());
     const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
 
     try std.testing.expect(elapsed_ms >= 40);
     // The timed-out waiter must not leave a phantom ticket behind, or later
     // waiters would defer to a borrower that is no longer there.
     try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
+    try std.testing.expectEqual(@as(u64, 1), pool.stats().exhausted_total);
+}
+
+test "max_wait_ms is a hard upper bound, not a floor for the retry path" {
+    const allocator = std.testing.allocator;
+    const P = ConnPool(StubDriver);
+
+    var pool = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 50,
+        // With the legacy fallback these add 100+200+…+800 = 3600 ms of sleeps
+        // *after* the 50 ms budget, which is how a documented budget turned into
+        // "whatever the retry policy says".
+        .max_retries = 8,
+        .retry_backoff_ms = 100,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.borrow();
+    defer pool.release(c1);
+
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, pool.borrow());
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 500);
+}
+
+test "borrowWithTimeout caps the wait, and cannot un-cap a non-blocking pool" {
+    const allocator = std.testing.allocator;
+    const P = ConnPool(StubDriver);
+
+    // A 50 ms request budget under a 1000 ms pool budget: the request wins.
+    var pool = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 1000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.borrow();
+    defer pool.release(c1);
+
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, pool.borrowWithTimeout(50));
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 400);
+
+    // A pool that never blocks stays that way: the request budget can only
+    // shorten the pool's wait, never introduce one.
+    var nb = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 0,
+        .max_retries = 0,
+    });
+    defer nb.deinit();
+
+    const nb_held = try nb.borrow();
+    defer nb.release(nb_held);
+
+    const nb_started = std.Io.Clock.Timestamp.now(nb.io, .awake);
+    try std.testing.expectError(error.PoolExhausted, nb.borrowWithTimeout(500));
+    const nb_elapsed_ms = nb_started.untilNow(nb.io).raw.toMilliseconds();
+    try std.testing.expect(nb_elapsed_ms < 200);
+    try std.testing.expectEqual(@as(usize, 0), nb.wait_tickets.items.len);
+}
+
+test "borrowCtx spends the request deadline, not the pool budget" {
+    const allocator = std.testing.allocator;
+    const P = ConnPool(StubDriver);
+
+    var pool = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 1000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const c1 = try pool.borrow();
+    defer pool.release(c1);
+
+    // The deadline a builder puts on a statement (`Query().withTimeout(…)`)
+    // becomes the borrow budget, so a request that is nearly out of time does
+    // not queue for the pool's full second.
+    const ctx = driver.ExecutionContext{ .deadline_ns = driver.monotonicNs() + 50 * std.time.ns_per_ms };
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, pool.borrowCtx(&ctx));
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 400);
+
+    // The cap works in both directions: a request with 5 s to spare still gets
+    // the pool's 50 ms, so no caller can extend the wait the pool was
+    // configured with.
+    var tight = try P.init(allocator, .{
+        .connect = stubConnect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 50,
+        .max_retries = 0,
+    });
+    defer tight.deinit();
+
+    const held = try tight.borrow();
+    defer tight.release(held);
+
+    const generous = driver.ExecutionContext{ .deadline_ns = driver.monotonicNs() + 5000 * std.time.ns_per_ms };
+    const started2 = std.Io.Clock.Timestamp.now(tight.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, tight.borrowCtx(&generous));
+    const elapsed_ms2 = started2.untilNow(tight.io).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms2 >= 40);
+    try std.testing.expect(elapsed_ms2 < 400);
 }
 
 test "an unusable factory reports its own error instead of PoolExhausted" {
@@ -2047,4 +2312,206 @@ test "an unusable factory reports its own error instead of PoolExhausted" {
         try testing.expectEqual(@as(usize, 0), idle.in_use);
         try testing.expectEqual(@as(usize, 1), idle.available);
     }
+}
+
+test "a pooled statement's deadline bounds its wait for a connection" {
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, ":memory:");
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 1000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    // Hold the only connection: the statement below has nowhere to run. Its own
+    // 50 ms deadline must end the call — the deadline used to be merged only
+    // *after* a connection had been borrowed, so a request could spend the
+    // whole pool budget queued and then run its statements with no time left
+    // (`ZENT_IMPROVEMENTS.md` item 3: twelve statements per request, each
+    // waiting `max_wait_ms`).
+    const held = try pool.borrow();
+    defer pool.release(held);
+
+    const ctx = driver.ExecutionContext{ .deadline_ns = driver.monotonicNs() + 50 * std.time.ns_per_ms };
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, pool.asDriver().execCtx(&ctx, "SELECT 1", &.{}));
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 400);
+}
+
+test "a pooled transaction's deadline bounds its wait for a connection" {
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, ":memory:");
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 1000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+    const drv = pool.asDriver();
+
+    // The fallback path stays intact: no ctx, no deadline, the pool's own
+    // budget applies and an uncontended acquisition just works.
+    {
+        var tx = try drv.beginTxCtx(null);
+        try tx.commit();
+        tx.deinit();
+    }
+
+    const held = try pool.borrow();
+    defer pool.release(held);
+
+    const ctx = driver.ExecutionContext{ .deadline_ns = driver.monotonicNs() + 50 * std.time.ns_per_ms };
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, drv.beginTxCtx(&ctx));
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 400);
+}
+
+test "ConnPool runs the borrow-path health check outside the mutex" {
+    // A ping is a network round trip. Running it under the pool mutex made
+    // `health_check_on_borrow` serialize every borrower behind one slow
+    // `PQping`; the consumer measured that and turned the check off, which left
+    // them no way to notice a dead connection at all.
+    const BlockingPing = struct {
+        pub var ping_started = std.atomic.Value(bool).init(false);
+        pub var release_ping = std.atomic.Value(bool).init(false);
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+        }
+
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {
+            ping_started.store(true, .release);
+            while (!release_ping.load(.acquire)) std.Thread.yield() catch {};
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            // `release` asks this of every connection it takes back.
+            return false;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
+        };
+    };
+
+    // Threads share the pool, so the single-threaded testing allocator is out.
+    const allocator = std.heap.page_allocator;
+    const P = ConnPool(BlockingPing);
+
+    var pool = try P.init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !BlockingPing {
+                _ = a;
+                return BlockingPing{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = true,
+        .max_wait_ms = 0,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const Borrower = struct {
+        pool: *P,
+        got: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            const conn = self.pool.borrow() catch return;
+            self.pool.release(conn);
+            self.got.store(true, .release);
+        }
+    };
+    const Observer = struct {
+        pool: *P,
+        stats_done: std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            _ = self.pool.stats();
+            self.stats_done.store(true, .release);
+        }
+    };
+
+    var borrower = Borrower{ .pool = &pool };
+    const borrower_thread = try std.Thread.spawn(.{}, Borrower.run, .{&borrower});
+
+    // The borrower is now inside the driver's ping, which blocks until we let
+    // it go — so whatever the pool does next, it does while a ping is in flight.
+    var spins: usize = 0;
+    while (!BlockingPing.ping_started.load(.acquire) and spins < 5000) : (spins += 1) {
+        pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expect(BlockingPing.ping_started.load(.acquire));
+
+    var observer = Observer{ .pool = &pool, .stats_done = std.atomic.Value(bool).init(false) };
+    const observer_thread = try std.Thread.spawn(.{}, Observer.run, .{&observer});
+
+    spins = 0;
+    while (!observer.stats_done.load(.acquire) and spins < 300) : (spins += 1) {
+        pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    // Read *before* the ping is released: if the mutex were held across the
+    // ping, `stats()` could not have returned while the ping was in flight.
+    const stats_returned_during_ping = observer.stats_done.load(.acquire);
+
+    // Unblock unconditionally, so a regression fails the assertion below
+    // instead of hanging the run.
+    BlockingPing.release_ping.store(true, .release);
+    borrower_thread.join();
+    observer_thread.join();
+
+    try std.testing.expect(stats_returned_during_ping);
+    try std.testing.expect(borrower.got.load(.acquire));
 }
