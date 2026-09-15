@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.60.0] - 2026-09-15
+
 ### Added
 - **`checkSchema` / `assertSchema` now cover column-level `UNIQUE` and foreign
   keys** — the last two declarations that only ever reached a table inside
