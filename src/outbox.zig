@@ -463,6 +463,12 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
 
 const testing = std.testing;
 
+// File-scope imports for the stress scaffolding below; the older tests keep
+// their own local imports under the plain names.
+const stress_migrate = @import("sql/schema/migrate.zig");
+const stress_sqlite = @import("sql/sqlite.zig");
+const stress_client = @import("codegen/client.zig");
+
 const TestSchema = struct {
     const Product = Schema("Product", .{
         .fields = &.{
@@ -1059,4 +1065,287 @@ test "outbox claim stamps claimed_at and requeueStale reclaims stale rows" {
     try expectRowState(root, infos, id3, Status.processing, true);
     try testing.expectEqual(@as(usize, 1), try OutboxOps.requeueStale(allocator, root, 100_000_000));
     try expectRowState(root, infos, id3, Status.pending, true);
+}
+
+// Stress tests: concurrent dispatchers hammering claim/markPublished
+// ------------------------------------------------------------------
+//
+// `claim`'s mutual exclusion is a database-level guarantee, not an
+// application lock: SQLite flips pending -> processing in one
+// `UPDATE ... RETURNING` (the single-writer UPDATE is atomic on its own),
+// PostgreSQL/MySQL add `FOR UPDATE SKIP LOCKED`. The probe below therefore
+// runs real dispatchers against a real database and asserts invariants,
+// never schedules:
+//
+//   1. claiming is exclusive: every claimed row id shows up in the
+//      cross-thread ledger exactly once (a duplicate is two dispatchers
+//      processing the same row);
+//   2. the state machine never regresses: with a never-failing publisher
+//      the run must settle with every row `published`, `attempts` untouched
+//      (a spurious requeue would bump it), `claimed_at` cleared, and no
+//      row pending / processing / failed;
+//   3. the dispatched count is honest: the sum of every `dispatch` return
+//      equals the number of rows actually marked published, and the
+//      published set is exactly the enqueued set (checked by summing
+//      `aggregate_id` inside the publisher, before any mark runs).
+//
+// Two shapes are covered because both are production wiring: dispatchers on
+// separate connections (the multi-process dispatcher pool, here against one
+// SQLite file with the driver's 5 s busy timeout absorbing writer
+// contention) and dispatchers on one shared connection (one process, many
+// worker threads — the shape `SQLiteDriver.mutex` exists for).
+
+/// Spin lock for the claim ledger, same shape as the pool stress harness:
+/// the critical sections are a couple of hash-map operations wide.
+const OutboxStressLock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *@This()) void {
+        self.inner.unlock();
+    }
+};
+
+/// Fixed `now_ms` every dispatcher passes to `markPublished`, so the
+/// final-state assertion can tell "marked by a dispatch" from any other path.
+const stress_publish_stamp: i64 = 7777;
+
+/// Cross-thread ledger for the stress tests. The `claimed` map is the
+/// double-claim probe: a row id that is already registered when a second
+/// dispatcher's publisher sees it is `claim` having handed the row out
+/// twice.
+const OutboxStressRegistry = struct {
+    allocator: std.mem.Allocator,
+    lock: OutboxStressLock = .{},
+    /// Claimed row id -> claiming dispatcher index.
+    claimed: std.AutoHashMapUnmanaged(i64, u8) = .empty,
+    dup_claims: usize = 0,
+    register_failures: usize = 0,
+    /// Sum of `aggregate_id` over every published entry, across threads.
+    published_id_sum: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    /// Sum of every `dispatch` return value.
+    dispatched: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Driver/op failures a dispatcher hit (an open or busy error).
+    op_failures: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+fn OutboxStressDispatcher(comptime infos: []const TypeInfo, comptime Client: type) type {
+    return struct {
+        const Self = @This();
+        const Ops = Outbox(infos, info);
+
+        registry: *OutboxStressRegistry,
+        idx: u8,
+        allocator: std.mem.Allocator,
+        /// Multi-connection mode: the dispatcher opens its own connection
+        /// to this path — the production shape of N dispatcher processes.
+        path: ?[]const u8 = null,
+        /// Shared-connection mode: every dispatcher drives this one client;
+        /// the driver's recursive mutex serializes each call.
+        shared: ?Client = null,
+        total_rows: usize,
+        max_rounds: usize,
+
+        fn publish(ctx: ?*anyopaque, entry: Entry) anyerror!void {
+            const d: *Self = @ptrCast(@alignCast(ctx.?));
+            d.registry.lock.lock();
+            defer d.registry.lock.unlock();
+            const slot = d.registry.claimed.getOrPut(d.registry.allocator, entry.id) catch {
+                d.registry.register_failures += 1;
+                return;
+            };
+            if (slot.found_existing) {
+                d.registry.dup_claims += 1;
+            } else {
+                slot.value_ptr.* = d.idx;
+            }
+            _ = d.registry.published_id_sum.fetchAdd(entry.aggregate_id, .monotonic);
+        }
+
+        fn run(self: *Self) void {
+            if (self.path) |p| {
+                var drv = stress_sqlite.SQLiteDriver.open(self.allocator, p) catch {
+                    _ = self.registry.op_failures.fetchAdd(1, .monotonic);
+                    return;
+                };
+                defer drv.close();
+                const client = stress_client.makeClient(infos, self.allocator, drv.asDriver());
+                self.loop(client);
+            } else {
+                self.loop(self.shared.?);
+            }
+        }
+
+        fn loop(self: *Self, client: Client) void {
+            var rounds: usize = 0;
+            while (rounds < self.max_rounds) : (rounds += 1) {
+                const n = Ops.dispatch(self.allocator, client, stress_publish_stamp, .{
+                    .ctx = self,
+                    .call = publish,
+                }, 5, 3) catch {
+                    _ = self.registry.op_failures.fetchAdd(1, .monotonic);
+                    std.Thread.yield() catch {};
+                    continue;
+                };
+                _ = self.registry.dispatched.fetchAdd(n, .monotonic);
+                // Every row is dispatched: further claims can only come back
+                // empty, and the other dispatchers will see the same total
+                // and exit too. `max_rounds` bounds the empty polls.
+                if (n == 0 and self.registry.dispatched.load(.acquire) == self.total_rows) break;
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+}
+
+fn expectOutboxStressInvariants(
+    registry: *OutboxStressRegistry,
+    client: anytype,
+    comptime infos: []const TypeInfo,
+    row_count: usize,
+) !void {
+    // Invariant 1: claiming was exclusive and total — every row exactly
+    // once, no ledger or driver failure anywhere.
+    try testing.expectEqual(@as(usize, 0), registry.dup_claims);
+    try testing.expectEqual(@as(usize, 0), registry.register_failures);
+    try testing.expectEqual(@as(usize, 0), registry.op_failures.load(.monotonic));
+    try testing.expectEqual(row_count, registry.claimed.count());
+    // Invariant 3: the dispatched count equals the rows actually marked
+    // published, and the published set is exactly the enqueued set.
+    try testing.expectEqual(row_count, registry.dispatched.load(.monotonic));
+    try testing.expectEqual(
+        @as(i64, @intCast(row_count * (row_count + 1) / 2)),
+        registry.published_id_sum.load(.monotonic),
+    );
+
+    // Invariant 2, settled form: with a never-failing publisher every row
+    // must end `published` exactly once — no row left pending/processing/
+    // failed (a state machine regression would strand or duplicate rows),
+    // `attempts` untouched (a spurious requeue would bump it), the claim
+    // stamp cleared, and the publish stamp the one dispatch wrote.
+    const ec = @field(client, "outbox_message");
+    var q = ec.Query();
+    defer q.deinit();
+    var found = try q.All();
+    defer {
+        for (found.items) |*e| deinitEntity(infos, info, e, testing.allocator);
+        found.deinit();
+    }
+    try testing.expectEqual(row_count, found.items.len);
+    for (found.items) |e| {
+        try testing.expectEqualStrings(Status.published, e.status);
+        try testing.expectEqual(@as(i64, 0), e.attempts);
+        try testing.expectEqual(stress_publish_stamp, e.published_at);
+        try testing.expect(e.claimed_at == null);
+    }
+}
+
+test "outbox stress: concurrent dispatchers on separate connections never double-claim" {
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const infos = graph.types;
+    const OutboxOps = Outbox(infos, info);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/outbox_stress.db", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var drv = try stress_sqlite.SQLiteDriver.open(allocator, path);
+    defer drv.close();
+    try stress_migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const setup_client = stress_client.makeClient(infos, allocator, drv.asDriver());
+
+    const row_count = 100;
+    for (0..row_count) |i| {
+        _ = try OutboxOps.enqueue(setup_client, @intCast(i + 1), .{
+            .aggregate_type = "p",
+            .aggregate_id = @intCast(i + 1),
+            .event_type = "e",
+            .payload = "{}",
+        });
+    }
+
+    var registry = OutboxStressRegistry{ .allocator = allocator };
+    defer registry.claimed.deinit(allocator);
+    // `publish` runs under the ledger spin lock and must not allocate there.
+    try registry.claimed.ensureTotalCapacity(allocator, row_count);
+
+    const Dispatcher = OutboxStressDispatcher(infos, @TypeOf(setup_client));
+    const dispatchers = 4;
+    var states: [dispatchers]Dispatcher = undefined;
+    var threads: [dispatchers]std.Thread = undefined;
+    var spawned: usize = 0;
+    for (&states, &threads, 0..) |*d, *t, i| {
+        d.* = .{
+            .registry = &registry,
+            .idx = @intCast(i),
+            .allocator = allocator,
+            .path = path,
+            .total_rows = row_count,
+            .max_rounds = 1000,
+        };
+        t.* = std.Thread.spawn(.{}, Dispatcher.run, .{d}) catch |err| {
+            // Bounded way out: the spawned dispatchers finish their bounded
+            // loops — never unwind the defers under live threads.
+            for (threads[0..spawned]) |*jt| jt.join();
+            return err;
+        };
+        spawned += 1;
+    }
+    for (&threads) |*t| t.join();
+
+    try expectOutboxStressInvariants(&registry, setup_client, infos, row_count);
+}
+
+test "outbox stress: concurrent dispatchers on a shared connection never double-claim" {
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const infos = graph.types;
+    const OutboxOps = Outbox(infos, info);
+
+    var drv = try stress_sqlite.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try stress_migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const root = stress_client.makeClient(infos, allocator, drv.asDriver());
+
+    const row_count = 100;
+    for (0..row_count) |i| {
+        _ = try OutboxOps.enqueue(root, @intCast(i + 1), .{
+            .aggregate_type = "p",
+            .aggregate_id = @intCast(i + 1),
+            .event_type = "e",
+            .payload = "{}",
+        });
+    }
+
+    var registry = OutboxStressRegistry{ .allocator = allocator };
+    defer registry.claimed.deinit(allocator);
+    try registry.claimed.ensureTotalCapacity(allocator, row_count);
+
+    const Dispatcher = OutboxStressDispatcher(infos, @TypeOf(root));
+    const dispatchers = 4;
+    var states: [dispatchers]Dispatcher = undefined;
+    var threads: [dispatchers]std.Thread = undefined;
+    var spawned: usize = 0;
+    for (&states, &threads, 0..) |*d, *t, i| {
+        d.* = .{
+            .registry = &registry,
+            .idx = @intCast(i),
+            .allocator = allocator,
+            .shared = root,
+            .total_rows = row_count,
+            .max_rounds = 1000,
+        };
+        t.* = std.Thread.spawn(.{}, Dispatcher.run, .{d}) catch |err| {
+            for (threads[0..spawned]) |*jt| jt.join();
+            return err;
+        };
+        spawned += 1;
+    }
+    for (&threads) |*t| t.join();
+
+    try expectOutboxStressInvariants(&registry, root, infos, row_count);
 }
