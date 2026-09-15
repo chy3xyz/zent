@@ -33,6 +33,24 @@ fn toDriverError(err: anyerror) driver.Error {
     };
 }
 
+/// The affected-row count libpq puts in a command tag (`PQcmdTuples`).
+///
+/// The tag is `""` for every command that reports no such count and 0 is the
+/// honest answer there: DDL, `BEGIN`/`COMMIT`, `SET`, `VACUUM`, `DO`, `EXPLAIN`
+/// all come back as `PGRES_COMMAND_OK` with an empty tag, and a `SELECT` via
+/// `exec` carries its row count. Anything that is neither empty nor decimal
+/// would have to be a malformed tag — and answering 0 for *that* is
+/// indistinguishable from a statement that really matched no rows, which is
+/// what `UpdateBuilder.Save` (version lock) and `SaveOne` read as
+/// `OptimisticLockConflict` / `error.NotFound`.
+fn rowCountFromCommandTag(tag: []const u8) error{DriverFailed}!usize {
+    if (tag.len == 0) return 0;
+    return std.fmt.parseInt(usize, tag, 10) catch {
+        std.log.warn("postgres: PQcmdTuples reported a row count of '{s}', which is not a number", .{tag});
+        return error.DriverFailed;
+    };
+}
+
 pub const PostgresDriver = struct {
     conn: *c.PGconn,
     allocator: std.mem.Allocator,
@@ -413,10 +431,7 @@ pub const PostgresDriver = struct {
             }
 
             const affected = c.PQcmdTuples(res);
-            var rows_affected: usize = 0;
-            if (affected) |a| {
-                rows_affected = std.fmt.parseInt(usize, std.mem.span(a), 10) catch 0;
-            }
+            const rows_affected = try rowCountFromCommandTag(if (affected) |a| std.mem.span(a) else "");
 
             var last_insert_id: ?i64 = null;
             if (c.PQntuples(res) > 0) {
@@ -456,10 +471,7 @@ pub const PostgresDriver = struct {
         }
 
         const affected = c.PQcmdTuples(res);
-        var rows_affected: usize = 0;
-        if (affected) |a| {
-            rows_affected = std.fmt.parseInt(usize, std.mem.span(a), 10) catch 0;
-        }
+        const rows_affected = try rowCountFromCommandTag(if (affected) |a| std.mem.span(a) else "");
 
         // Get last insert id from RETURNING clause if present, or use oid
         var last_insert_id: ?i64 = null;
@@ -1066,4 +1078,25 @@ test "PostgresDriver cache different SQL different entries" {
     }.f);
     try std.testing.expectEqual(@as(usize, 2), prepare_count);
     try std.testing.expectEqual(@as(usize, 2), cch.len);
+}
+
+test "Postgres: only a missing command tag reads as 0 affected rows" {
+    // `PQcmdTuples` is "" for every command that reports no row count — DDL,
+    // BEGIN/COMMIT, SET, VACUUM, DO, EXPLAIN — and libpq always prints the
+    // count as decimal for the statements that do report one:
+    //   CREATE TABLE -> ""      UPDATE ... WHERE id = -1 -> "0"
+    //   COMMIT       -> ""      INSERT ... VALUES (...)  -> "1"
+    // The empty tag is the only one that may become 0.
+    try std.testing.expectEqual(@as(usize, 0), try rowCountFromCommandTag(""));
+    try std.testing.expectEqual(@as(usize, 0), try rowCountFromCommandTag("0"));
+    try std.testing.expectEqual(@as(usize, 1), try rowCountFromCommandTag("1"));
+    try std.testing.expectEqual(@as(usize, 42), try rowCountFromCommandTag("42"));
+
+    // A tag that is neither: 0 here would be a lie no caller could detect —
+    // `UpdateBuilder.Save` compares it against 0 for the version lock, and
+    // `SaveOne` turns it into `error.NotFound`, so a write that did happen
+    // would be reported as "no such row".
+    try std.testing.expectError(error.DriverFailed, rowCountFromCommandTag("INSERT 0 1"));
+    try std.testing.expectError(error.DriverFailed, rowCountFromCommandTag("-1"));
+    try std.testing.expectError(error.DriverFailed, rowCountFromCommandTag("n/a"));
 }
