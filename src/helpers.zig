@@ -219,17 +219,29 @@ pub fn ShardedEnv(comptime Driver: type, comptime Infos: anytype) type {
             errdefer allocator.free(drivers);
             const clients = try allocator.alloc(Client, paths.len);
             errdefer allocator.free(clients);
-            var router = shard_mod.ShardRouter.init(allocator, paths.len);
+            var router = try shard_mod.ShardRouter.init(allocator, paths.len);
             errdefer router.deinit();
+
+            var opened: usize = 0;
+            // The per-iteration errdefers below only cover the shard that is
+            // mid-open; when shard i fails, shards 0..i would stay open
+            // (driver + handle leaked) without this teardown.
+            errdefer {
+                for (drivers[0..opened]) |dp| {
+                    dp.close();
+                    allocator.destroy(dp);
+                }
+            }
 
             for (paths, 0..) |p, i| {
                 const dp = try allocator.create(Driver);
                 errdefer allocator.destroy(dp);
                 dp.* = try Driver.open(allocator, p);
+                drivers[i] = dp;
                 errdefer dp.close();
                 try sql_schema.migrateSchema(allocator, dp.asDriver(), Infos);
-                drivers[i] = dp;
                 clients[i] = codegen.makeClient(Infos, allocator, dp.asDriver());
+                opened += 1;
             }
 
             var shards = try shard_mod.ShardSet(Infos).init(allocator, router, clients);
@@ -408,4 +420,51 @@ test "ShardedEnv routes tenants and rebalances idempotently" {
         rows2.deinit();
     }
     try testing.expectEqual(@as(usize, 0), rows2.items.len);
+}
+
+// Test double for the ShardedEnv.open partial-failure path: `open` delegates
+// to the real SQLite driver, but fails once `sharded_env_open_calls` passes
+// `sharded_env_open_fail_after`, so the loop's errdefer cleanup runs without
+// needing an unopenable path (the real driver's open failure logs at error
+// level, which the test runner counts as a failure).
+var sharded_env_open_calls: usize = 0;
+var sharded_env_open_fail_after: usize = 0;
+
+const ShardedEnvFlakyDriver = struct {
+    inner: sql_sqlite.SQLiteDriver,
+
+    pub fn open(allocator: std.mem.Allocator, path: []const u8) !ShardedEnvFlakyDriver {
+        sharded_env_open_calls += 1;
+        if (sharded_env_open_calls > sharded_env_open_fail_after)
+            return error.ShardOpenFailed;
+        return .{ .inner = try sql_sqlite.SQLiteDriver.open(allocator, path) };
+    }
+
+    pub fn close(self: *ShardedEnvFlakyDriver) void {
+        self.inner.close();
+    }
+
+    pub fn asDriver(self: *ShardedEnvFlakyDriver) sql_driver.Driver {
+        return self.inner.asDriver();
+    }
+};
+
+test "ShardedEnv.open cleans up earlier shards when a later shard fails to open" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path_a = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/flaky_a.db", .{tmp.sub_path});
+    defer allocator.free(path_a);
+    const path_b = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/flaky_b.db", .{tmp.sub_path});
+    defer allocator.free(path_b);
+
+    // First shard opens for real; the second fails inside Driver.open.
+    sharded_env_open_calls = 0;
+    sharded_env_open_fail_after = 1;
+    try testing.expectError(error.ShardOpenFailed, ShardedEnv(ShardedEnvFlakyDriver, TestInfos).open(allocator, &.{ path_a, path_b }));
+    // The regression this pins: shard 0's driver (allocated with
+    // `allocator.create`, sqlite handle open) leaked under the old
+    // per-iteration errdefer, and std.testing.allocator fails the run at
+    // scope exit. The sqlite handle itself is not allocator-tracked, so
+    // close-correctness rests on the errdefer structure, not this test.
 }
