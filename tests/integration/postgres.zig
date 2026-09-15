@@ -3312,6 +3312,48 @@ test "Postgres: getExistingIndexes reads plain key columns and skips the rest" {
     }
 }
 
+test "Postgres: introspection binds the table name instead of interpolating it" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    // The name carries the quote that would close a string literal. Pasted
+    // into `WHERE table_name = '…'` the predicate becomes `'zent_we'ird'` and
+    // the statement does not parse — which is the injection shape, whether or
+    // not a schema can be talked into carrying it. Both queries bind it ($1).
+    const weird = "zent_we'ird_probe";
+    _ = try drv.exec("DROP TABLE IF EXISTS \"zent_we'ird_probe\" CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS \"zent_we'ird_probe\" CASCADE", &.{}) catch {};
+    _ = try drv.exec(
+        "CREATE TABLE \"zent_we'ird_probe\" (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+        &.{},
+    );
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_zent_weird_email ON \"zent_we'ird_probe\" (email)", &.{});
+
+    var cols = try migrate.getExistingColumns(allocator, drv.asDriver(), weird);
+    defer migrate.freeExistingColumns(allocator, &cols);
+    try testing.expectEqual(@as(usize, 2), cols.items.len);
+    var saw_id = false;
+    var saw_email = false;
+    for (cols.items) |c| {
+        if (std.mem.eql(u8, c.name, "id")) saw_id = true;
+        if (std.mem.eql(u8, c.name, "email")) saw_email = true;
+    }
+    try testing.expect(saw_id and saw_email);
+
+    var indexes = try migrate.getExistingIndexes(allocator, drv.asDriver(), weird);
+    defer migrate.freeExistingIndexes(allocator, &indexes);
+
+    var found: ?migrate.ExistingIndex = null;
+    for (indexes.items) |i| {
+        if (std.mem.eql(u8, i.name, "idx_zent_weird_email")) found = i;
+    }
+    try testing.expect(found != null);
+    try testing.expect(found.?.unique);
+    try testing.expect(found.?.columns_comparable);
+    try testing.expectEqualStrings("email", found.?.columns[0]);
+}
+
 // ------------------------------------------------------------------
 // checkStatement: prepare-and-discard validation of a raw statement
 // ------------------------------------------------------------------

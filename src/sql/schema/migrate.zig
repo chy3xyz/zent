@@ -157,10 +157,12 @@ pub const SchemaDrift = struct {
     /// use-after-free that shows up as garbage in the name.
     column_owned: bool = false,
 
-    /// For `.index_columns`: the index name, borrowed from `infos` (a comptime
-    /// literal), and a formatted "schema wants (a, b), database has (a)"
-    /// sentence, **owned** — the database's column list is released before the
-    /// drift list reaches the caller, so the difference has to be copied out.
+    /// For the `.index_columns` and `.index_uniqueness` kinds: the index name,
+    /// borrowed from `infos` (a comptime literal), and a formatted sentence
+    /// describing the difference, **owned** — the database's answer is released
+    /// before the drift list reaches the caller, so the difference has to be
+    /// copied out. Both index kinds allocate it, and `freeSchemaDrift` frees it
+    /// for both; every other kind leaves it empty.
     index_name: []const u8 = "",
     index_detail: []const u8 = "",
 
@@ -174,6 +176,22 @@ pub const SchemaDrift = struct {
         /// with a **different key list**. Only reported when the database's
         /// key list could be read reliably (`ExistingIndex.columns_comparable`).
         index_columns,
+        /// The schema declares an index the database has under the same name
+        /// with a **different uniqueness**. Reported whenever the two exist,
+        /// with no comparable/not-comparable escape hatch: `unique` is a plain
+        /// boolean in all three catalogs (MySQL `statistics.non_unique`,
+        /// PostgreSQL `pg_index.indisunique`, SQLite `PRAGMA index_list`), so
+        /// unlike a key list it cannot be an expression, a prefix, a `WHERE`
+        /// or an access method — there is nothing to guess at.
+        ///
+        /// This is the difference that lets rows the application believes are
+        /// constrained through. A schema saying `Unique()` over an index the
+        /// database built without it looks enforced from the inside and is not,
+        /// so duplicates land until something else notices. The reverse
+        /// direction (the database is stricter than the schema) makes writes
+        /// fail that the schema never promised would, which is loud — reported
+        /// for the same reason, since it is the same disagreement.
+        index_uniqueness,
     };
 
     /// Whether this drift makes a *read* fail — the kinds worth blocking a
@@ -185,17 +203,18 @@ pub const SchemaDrift = struct {
     /// non-optional fails on the first row that actually holds a NULL. An extra
     /// column and a type difference do not fail reads by themselves.
     ///
-    /// `.index_columns` does not either: a different key list changes how fast
-    /// a query runs, not whether it returns the right rows, so it must never
-    /// fail `DriftStrictness.read_breaking_only` — that mode exists to stop a
+    /// Neither index kind does either: a different key list changes how fast a
+    /// query runs, and a different uniqueness changes whether a *write* is
+    /// rejected — a read returns the rows it always returned. So neither may
+    /// fail `DriftStrictness.read_breaking_only`: that mode exists to stop a
     /// deploy that would break reads, and widening it into "every index must
-    /// match" would convert a performance note into an outage. It fails only
-    /// under `.any`.
+    /// match" would convert a performance note, or a write that now fails
+    /// loudly, into an outage. They fail only under `.any`.
     pub fn breaksReads(self: SchemaDrift) bool {
         return switch (self.kind) {
             .missing_table, .missing_column => true,
             .nullability => !self.schema_optional and self.db_nullable,
-            .extra_column, .type_mismatch, .index_columns => false,
+            .extra_column, .type_mismatch, .index_columns, .index_uniqueness => false,
         };
     }
 };
@@ -203,21 +222,28 @@ pub const SchemaDrift = struct {
 /// Every non-view entity, compared against the live database: a missing table, a
 /// missing or extra column, a type or nullability difference, and — for a
 /// declared index the database already has under the same name — a different
-/// key list.
+/// key list or a different uniqueness.
 ///
 /// Returns a caller-owned slice (`freeSchemaDrift`); names and types borrow from
-/// `infos` or from comptime literals, so freeing is one call (the
-/// `.index_columns` detail is the exception, see `SchemaDrift.index_detail`).
+/// `infos` or from comptime literals, so freeing is one call (the detail of the
+/// two index kinds is the exception, see `SchemaDrift.index_detail`).
 /// Foreign keys and primary keys are **not** compared — PG/MySQL introspection
 /// does not read them yet (see `ISSUES_FROM_ZAPI.md` Z28).
 ///
 /// Index comparison is deliberately narrow: only indexes the schema declares
-/// **and** the database already has by name are looked at, and only in the
-/// direction "the key list differs", and only when the database's key list was
-/// read reliably (`ExistingIndex.columns_comparable`). An index that exists
+/// **and** the database already has by name are looked at. An index that exists
 /// only in the database is `migrateSchema`'s business (it is not drift), and an
 /// index the schema has and the database lacks is a missing index — reported by
 /// nothing here, because a missing index is a performance note too.
+///
+/// What *is* compared for such an index is its key list (`.index_columns`) and
+/// its uniqueness (`.index_uniqueness`). The two have different reliability:
+/// the key list is reported only when the database's answer could be read
+/// reliably (`ExistingIndex.columns_comparable`), because it can be an
+/// expression, a prefix, a `WHERE`, or an access method; uniqueness is a
+/// boolean in every catalog and is reported whenever the two exist. They are
+/// separate kinds and separate conditions for exactly that reason — neither may
+/// suppress the other.
 ///
 /// The point is the class of failure this cannot survive silently: a column the
 /// schema believes in but the database does not have makes every query that
@@ -308,15 +334,18 @@ pub fn checkSchema(
             //    index it does not have yet is not a difference to describe),
             //  * the schema declares the index (`info.indexes`),
             //  * the database has an index of the same name, and
-            //  * the database's key list was readable at all
-            //    (`ExistingIndex.columns_comparable`, which is where expression
-            //    keys, partial indexes, non-btree access methods and INCLUDE
-            //    columns are dropped).
+            //  * for the *key list* only, the database's answer was readable at
+            //    all (`ExistingIndex.columns_comparable`, which is where
+            //    expression keys, partial indexes, non-btree access methods and
+            //    INCLUDE columns are dropped). Uniqueness is a boolean in every
+            //    catalog and needs no such gate.
             //
-            // Anything else is skipped without a word. This drift is a
-            // performance/consistency signal; `assertSchema` turns every
-            // reported drift into a decision, so a false one is a blocked
-            // deploy — strictly worse than a missing warning.
+            // Anything else is skipped without a word. A key-list difference is
+            // a performance signal; a uniqueness difference is a write
+            // constraint the application may believe in and not have. Either
+            // way `assertSchema` turns every reported drift into a decision, so
+            // a false one is a blocked deploy — strictly worse than a missing
+            // warning. That is the reason for the gates, not for silence.
             if (comptime info.indexes.len > 0) {
                 if (existing.items.len > 0) {
                     var existing_idxs = try getExistingIndexes(allocator, driver, table.name);
@@ -330,6 +359,25 @@ pub fn checkSchema(
                                     .kind = .index_columns,
                                     .index_name = idx.name,
                                     .index_detail = try indexColumnsDetailAlloc(allocator, idx.columns, db_idx.columns),
+                                });
+                            }
+                            // Uniqueness, on its own gate. It is deliberately
+                            // *not* nested in the `columns_comparable` branch
+                            // above: that flag answers "can the key list be
+                            // read", and uniqueness can always be read, so
+                            // coupling the two would drop this drift for
+                            // exactly the indexes a comparison found hardest
+                            // to see (expression keys, partial indexes,
+                            // non-btree access methods). The reverse coupling
+                            // matters too: a difference in uniqueness must
+                            // never make `index_columns` report a key list it
+                            // could not compare.
+                            if (db_idx.unique != idx.unique) {
+                                try drifts.append(.{
+                                    .table = table.name,
+                                    .kind = .index_uniqueness,
+                                    .index_name = idx.name,
+                                    .index_detail = try indexUniquenessDetailAlloc(allocator, idx.unique, db_idx.unique),
                                 });
                             }
                         }
@@ -370,13 +418,28 @@ fn indexColumnsDetailAlloc(allocator: std.mem.Allocator, schema_columns: []const
     return detail.toOwnedSlice();
 }
 
-/// Frees the slice, the `.extra_column` names it duplicated, and the
-/// `.index_columns` detail; every other entry borrows from `infos` or from
-/// comptime literals (see `SchemaDrift.column_owned` / `SchemaDrift.index_detail`).
+/// "schema declares UNIQUE, database index is not unique" — the difference in
+/// one sentence, and **owned** (see `indexColumnsDetailAlloc`).
+///
+/// Both directions are spelled out because they are not the same news: the
+/// first is a constraint the application believes in and does not have, the
+/// second is one it never asked for.
+fn indexUniquenessDetailAlloc(allocator: std.mem.Allocator, schema_unique: bool, db_unique: bool) ![]const u8 {
+    std.debug.assert(schema_unique != db_unique);
+    return allocator.dupe(u8, if (schema_unique)
+        "schema declares UNIQUE, database index is not unique"
+    else
+        "schema declares a non-unique index, database index is UNIQUE");
+}
+
+/// Frees the slice, the `.extra_column` names it duplicated, and the detail
+/// carried by the two index kinds (`.index_columns`, `.index_uniqueness`);
+/// every other entry borrows from `infos` or from comptime literals (see
+/// `SchemaDrift.column_owned` / `SchemaDrift.index_detail`).
 pub fn freeSchemaDrift(allocator: std.mem.Allocator, drifts: []SchemaDrift) void {
     for (drifts) |d| {
         if (d.column_owned) allocator.free(d.column);
-        if (d.kind == .index_columns) allocator.free(d.index_detail);
+        if (d.kind == .index_columns or d.kind == .index_uniqueness) allocator.free(d.index_detail);
     }
     allocator.free(drifts);
 }
@@ -389,7 +452,7 @@ pub fn assertSchema(
     driver: sql_driver.Driver,
     comptime infos: []const TypeInfo,
     strictness: DriftStrictness,
-) (sql_driver.Error || error{ SchemaDrift, UnsupportedDialect })!void {
+) (sql_driver.Error || error{ SchemaDrift, UnsupportedDialect, InvalidTableName })!void {
     const drifts = try checkSchema(allocator, driver, infos);
     defer freeSchemaDrift(allocator, drifts);
     for (drifts) |d| {
@@ -462,7 +525,7 @@ pub const DriftStrictness = enum {
     any,
 };
 
-pub const NullabilityError = sql_driver.Error || error{ NullabilityDrift, UnsupportedDialect };
+pub const NullabilityError = sql_driver.Error || error{ NullabilityDrift, UnsupportedDialect, InvalidTableName };
 
 /// The same check as `checkNullability`, as a **gate** rather than a side
 /// effect: fails with `error.NullabilityDrift` instead of writing a log line.
@@ -1417,6 +1480,7 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
         if (std.mem.eql(u8, dialect.name, "mysql")) {
             existing_mysql_indexes = getExistingIndexes(allocator, driver_drv, info.table_name) catch |err| switch (err) {
                 error.UnsupportedDialect => unreachable, // The dialect was checked immediately above.
+                error.InvalidTableName => unreachable, // SQLite-only, and the dialect was checked immediately above.
                 error.OutOfMemory => return error.OutOfMemory,
                 error.PoolExhausted => return error.PoolExhausted,
                 error.PoolWaitTimeout => return error.PoolWaitTimeout,
@@ -1668,36 +1732,85 @@ pub const ExistingIndex = struct {
     columns_comparable: bool = false,
 };
 
-const IntrospectionError = sql_driver.Error || error{UnsupportedDialect};
+/// The introspection helpers' error set.
+///
+/// `InvalidTableName` is SQLite's alone and exists for one reason: `PRAGMA`
+/// statements take their argument as **syntax** (`PRAGMA table_info(?)` is a
+/// parse error), so a table name has to be interpolated there. A name carrying
+/// the quote that closes the literal would end the argument early and turn the
+/// rest of the name into more statement — the injection shape a bound
+/// parameter exists to remove. The names come from a comptime schema and never
+/// from user input, so this is a fail-closed guard rather than a sanitiser:
+/// refuse the name, and say which one.
+const IntrospectionError = sql_driver.Error || error{ UnsupportedDialect, InvalidTableName };
+
+/// True when `name` can be interpolated into a SQLite `PRAGMA` argument.
+///
+/// SQLite accepts `'`, `"` and `` ` `` as identifier quotes, and the argument
+/// here is interpolated — not escaped — so any of the three would end it
+/// early; a NUL truncates the statement on the C side before SQLite ever sees
+/// the rest. Everything else, spaces and non-ASCII included, is a legal
+/// argument inside the quotes: this rejects the shapes that break the
+/// statement, not the shapes one would not have chosen.
+fn sqlitePragmaNameUsable(name: []const u8) bool {
+    for (name) |c| {
+        switch (c) {
+            '\'', '"', '`', 0 => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// The error carries no payload, so the name it refused is logged instead —
+/// `warn`, because this is a diagnostic the caller is about to see as a
+/// returned error, not a failed statement of its own.
+fn reportUnusableSqliteName(pragma: []const u8, table_name: []const u8) void {
+    std.log.warn(
+        "zent: refusing to build SQLite PRAGMA {s} for table {s} — the name contains a quote or NUL that would end the statement early; rename the table or reach it through a dialect that binds the name",
+        .{ pragma, table_name },
+    );
+}
 
 /// Query existing columns for a table using dialect-specific metadata.
+///
+/// The table name is **bound** on PostgreSQL (`$1`) and MySQL (`?`), never
+/// interpolated into a string literal, so a name carrying a quote cannot end
+/// the predicate early. SQLite is the exception and cannot be: `PRAGMA` takes
+/// no placeholders, so the name is checked first
+/// (`sqlitePragmaNameUsable`) and refused with `error.InvalidTableName`
+/// rather than emitted into a statement it would break.
 pub fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingColumn) {
     var result = std.array_list.Managed(ExistingColumn).init(allocator);
     errdefer freeExistingColumns(allocator, &result);
 
     const dialect = driver_drv.dialect();
-    const sql_text = if (std.mem.eql(u8, dialect.name, "sqlite3"))
+    const is_sqlite = std.mem.eql(u8, dialect.name, "sqlite3");
+    const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
+    const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
+
+    if (is_sqlite and !sqlitePragmaNameUsable(table_name)) {
+        reportUnusableSqliteName("table_info", table_name);
+        return error.InvalidTableName;
+    }
+
+    const sql_text = if (is_sqlite)
         try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table_name})
-    else if (std.mem.eql(u8, dialect.name, "postgres"))
-        try std.fmt.allocPrint(
-            allocator,
-            "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = '{s}' AND table_schema = current_schema()",
-            .{table_name},
-        )
-    else if (std.mem.eql(u8, dialect.name, "mysql"))
+    else if (is_postgres)
+        try allocator.dupe(u8, "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()")
+    else if (is_mysql)
         try allocator.dupe(u8, "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = ? AND table_schema = DATABASE()")
     else
         return error.UnsupportedDialect;
     defer allocator.free(sql_text);
 
-    var rows = if (std.mem.eql(u8, dialect.name, "mysql"))
-        try driver_drv.query(sql_text, &.{.{ .string = table_name }})
+    var rows = if (is_sqlite)
+        try driver_drv.query(sql_text, &.{})
     else
-        try driver_drv.query(sql_text, &.{});
+        try driver_drv.query(sql_text, &.{.{ .string = table_name }});
     defer rows.deinit();
 
     while (rows.next()) |row| {
-        const is_sqlite = std.mem.eql(u8, dialect.name, "sqlite3");
         const name = row.getText(if (is_sqlite) 1 else 0) orelse continue;
         const sql_type = row.getText(if (is_sqlite) 2 else 1) orelse "";
         const not_null = if (is_sqlite)
@@ -1840,7 +1953,10 @@ fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
     errdefer freeExistingIndexes(allocator, &result);
 
-    const sql_text = try std.fmt.allocPrint(allocator,
+    // The table name is bound (`$1`), not interpolated: a name carrying a
+    // quote would otherwise end the predicate early. `relkind = 'r'` and the
+    // schema predicate stay literal — they are this function's own constants.
+    const sql_text =
         \\SELECT i.relname,
         \\       (ix.indisunique)::int,
         \\       (ix.indisvalid)::int,
@@ -1854,13 +1970,12 @@ fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
         \\JOIN pg_class t ON t.oid = ix.indrelid
         \\JOIN pg_am am ON am.oid = i.relam
         \\LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (ix.indkey)
-        \\WHERE t.relname = '{s}' AND t.relkind = 'r'
+        \\WHERE t.relname = $1 AND t.relkind = 'r'
         \\  AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
         \\ORDER BY i.relname, array_position(string_to_array(ix.indkey::text, ' ')::smallint[], a.attnum)
-    , .{table_name});
-    defer allocator.free(sql_text);
+    ;
 
-    var rows = try driver_drv.query(sql_text, &.{});
+    var rows = try driver_drv.query(sql_text, &.{.{ .string = table_name }});
     defer rows.deinit();
 
     var keys = std.array_list.Managed([]const u8).init(allocator);
@@ -1911,11 +2026,22 @@ fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
 /// The split is not cosmetic — the SQLite driver holds its connection mutex
 /// for as long as a `Rows` value lives, so the first statement must be
 /// finished before the second can be prepared.
+///
+/// `PRAGMA` takes no placeholders, so the table name is interpolated here and
+/// checked first (`sqlitePragmaNameUsable`); `error.InvalidTableName` is the
+/// answer for a name that would break the statement. The index names in the
+/// second phase come from the catalog, not from a declaration, and go through
+/// `quoteIdentToBuffer`, which doubles the quote.
 fn getSQLiteIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
     errdefer freeExistingIndexes(allocator, &result);
 
     const dialect = driver_drv.dialect();
+
+    if (!sqlitePragmaNameUsable(table_name)) {
+        reportUnusableSqliteName("index_list", table_name);
+        return error.InvalidTableName;
+    }
 
     {
         const list_sql = try std.fmt.allocPrint(allocator, "PRAGMA index_list(\"{s}\")", .{table_name});
@@ -2026,6 +2152,13 @@ fn getExistingColumnByName(columns: []const ExistingColumn, name: []const u8) ?E
 /// `converge_not_null` is `MigrateOptions.allow_nullability_change`: with it a
 /// NOT NULL column is *added* NOT NULL (and a DEFAULT is then mandatory), rather
 /// than arriving nullable and becoming the drift `check_nullability` reports.
+///
+/// Fail-closed on MySQL, like `createTableSQLAlloc`: `ADD COLUMN body TEXT
+/// DEFAULT 'x'` is errno 1101 for exactly the reason `CREATE TABLE` would have
+/// been, and this path is reached *instead of* it whenever the table already
+/// exists — the case where the CREATE-side guard never runs. The two go through
+/// the same classification (`findMySqlTextRestriction`), so the diagnosis and
+/// the way out are the same sentence in both places.
 fn alterTableAddColumnSQL(
     allocator: std.mem.Allocator,
     table_name: []const u8,
@@ -2033,6 +2166,25 @@ fn alterTableAddColumnSQL(
     dialect: Dialect,
     converge_not_null: bool,
 ) ![]const u8 {
+    // The check is handed exactly what the statement below emits: a name, a
+    // type, and — where one exists — a DEFAULT. UNIQUE and PRIMARY KEY are
+    // deliberately not part of an `ADD COLUMN` here (see the note at the end of
+    // this function), so they are not part of the declaration the check sees
+    // either; flagging a constraint this statement never writes would refuse
+    // SQL that the server accepts, for a difference the ALTER is not what
+    // introduced. `not_null` rides along: it is emitted, and it only changes
+    // whether a DEFAULT is mandatory.
+    const emitted = ColumnDef{
+        .name = col.name,
+        .sql_type = col.sql_type,
+        .logical_type = col.logical_type,
+        .not_null = col.not_null,
+        .default_value = col.default_value,
+    };
+    if (findMySqlTextRestriction(.{ .name = table_name, .columns = &.{emitted}, .primary_keys = &.{} }, &.{}, dialect)) |restriction| {
+        return reportMySqlTextRestriction(restriction);
+    }
+
     var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
 
@@ -3525,6 +3677,107 @@ test "MySQL CREATE INDEX refuses a BLOB/TEXT/JSON key column" {
     }
 }
 
+test "MySQL ALTER ADD COLUMN refuses a BLOB/TEXT DEFAULT" {
+    const mysql = Dialect{ .name = "mysql" };
+
+    // The shape the CREATE-side guard never sees: the table already exists, so
+    // `createTableSQLAlloc` is skipped and this ALTER is the only statement
+    // that would reach the server — as errno 1101, with no way out named.
+    const text_default = ColumnDef{ .name = "body", .sql_type = "TEXT", .default_value = "'x'" };
+    try std.testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        alterTableAddColumnSQL(std.testing.allocator, "article", text_default, mysql, false),
+    );
+
+    // `allow_nullability_change` takes the NOT NULL branch, which emits the
+    // same DEFAULT for a different reason; the restriction is the type and the
+    // default, and it does not care which branch asked for it.
+    const not_null_default = ColumnDef{ .name = "body", .sql_type = "TEXT", .default_value = "'x'", .not_null = true };
+    try std.testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        alterTableAddColumnSQL(std.testing.allocator, "article", not_null_default, mysql, true),
+    );
+
+    // `field.Bytes` is BLOB on MySQL and carries errno 1101 like TEXT does.
+    // (`field.JSON` is TEXT there, not MySQL's JSON type — see `field.sqlType`.)
+    for ([_][]const u8{ "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "JSON" }) |sql_type| {
+        const blob_default = ColumnDef{ .name = "payload", .sql_type = sql_type, .default_value = "'{}'" };
+        try std.testing.expectError(
+            error.MySQLTextColumnCannotHaveDefault,
+            alterTableAddColumnSQL(std.testing.allocator, "article", blob_default, mysql, false),
+        );
+    }
+
+    // Everything the server accepts still renders: the guard is about the type
+    // carrying a DEFAULT, not about the ALTER.
+    const varchar_default = ColumnDef{ .name = "title", .sql_type = "VARCHAR(255)", .default_value = "'t'" };
+    const ok = try alterTableAddColumnSQL(std.testing.allocator, "article", varchar_default, mysql, false);
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqualStrings("ALTER TABLE `article` ADD COLUMN `title` VARCHAR(255) DEFAULT 't'", ok);
+
+    // A TEXT column without a default is legal, and is what the schema gets.
+    const text_plain = ColumnDef{ .name = "body", .sql_type = "TEXT" };
+    const plain = try alterTableAddColumnSQL(std.testing.allocator, "article", text_plain, mysql, false);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("ALTER TABLE `article` ADD COLUMN `body` TEXT", plain);
+
+    // PostgreSQL and SQLite have no such restriction and must still generate
+    // the statement — the check is dialect-gated, not a blanket refusal.
+    for ([_]Dialect{ Dialect.sqlite, Dialect.postgres }) |dialect| {
+        const sql = try alterTableAddColumnSQL(std.testing.allocator, "article", text_default, dialect, false);
+        defer std.testing.allocator.free(sql);
+        try std.testing.expectEqualStrings("ALTER TABLE \"article\" ADD COLUMN \"body\" TEXT DEFAULT 'x'", sql);
+    }
+
+    // UNIQUE is deliberately not part of this statement (see the note above the
+    // return), so the check is not handed it either: a unique TEXT column is
+    // added as a TEXT column. What the ALTER would silently not enforce is the
+    // constraint — not the DEFAULT this guard exists for — and the CREATE-side
+    // guard is where a schema declaring it is refused.
+    const unique_text = ColumnDef{ .name = "body", .sql_type = "TEXT", .unique = true };
+    const unique_sql = try alterTableAddColumnSQL(std.testing.allocator, "article", unique_text, mysql, false);
+    defer std.testing.allocator.free(unique_sql);
+    try std.testing.expectEqualStrings("ALTER TABLE `article` ADD COLUMN `body` TEXT", unique_sql);
+}
+
+test "SQLite introspection refuses a table name that would break the PRAGMA" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    // A table that really exists under a name no PRAGMA argument can carry:
+    // SQLite accepts this name, the argument of `PRAGMA table_info("…")` does
+    // not.
+    _ = try drv.exec("CREATE TABLE \"we'ird\" (id INTEGER PRIMARY KEY, email TEXT)", &.{});
+
+    // One name per quote character, plus the NUL that truncates the statement
+    // before SQLite parses it.
+    for ([_][]const u8{ "we'ird", "we\"ird", "we`ird", "we\x00ird", "'; DROP TABLE t; --" }) |name| {
+        try std.testing.expectError(error.InvalidTableName, getExistingColumns(std.testing.allocator, drv.asDriver(), name));
+        try std.testing.expectError(error.InvalidTableName, getExistingIndexes(std.testing.allocator, drv.asDriver(), name));
+    }
+
+    // The guard is about the statement, not about names one would not have
+    // chosen: spaces and non-ASCII are legal inside the quotes and go through.
+    _ = try drv.exec("CREATE TABLE \"space name\" (id INTEGER PRIMARY KEY, email TEXT)", &.{});
+    _ = try drv.exec("CREATE INDEX idx_space_name_email ON \"space name\" (email)", &.{});
+
+    var cols = try getExistingColumns(std.testing.allocator, drv.asDriver(), "space name");
+    defer freeExistingColumns(std.testing.allocator, &cols);
+    try std.testing.expectEqual(@as(usize, 2), cols.items.len);
+
+    var idxs = try getExistingIndexes(std.testing.allocator, drv.asDriver(), "space name");
+    defer freeExistingIndexes(std.testing.allocator, &idxs);
+    try std.testing.expectEqual(@as(usize, 1), idxs.items.len);
+    try std.testing.expectEqualStrings("idx_space_name_email", idxs.items[0].name);
+
+    // A name that is simply absent is still "no columns", not a refusal.
+    var absent = try getExistingColumns(std.testing.allocator, drv.asDriver(), "no such table here");
+    defer freeExistingColumns(std.testing.allocator, &absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.items.len);
+}
+
 test "getExistingIndexes reports key columns in order (SQLite)" {
     const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
 
@@ -3661,4 +3914,131 @@ test "checkSchema stays silent about indexes it cannot compare (SQLite)" {
     const unreadable = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
     defer freeSchemaDrift(std.testing.allocator, unreadable);
     try std.testing.expectEqual(@as(usize, 0), unreadable.len);
+}
+
+test "checkSchema reports an index whose uniqueness differs (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const index = @import("../../core/index.zig");
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    // Two indexes the schema and the database agree about by name and by key
+    // list, and disagree about in the only way that lets duplicate rows in.
+    _ = try drv.exec(
+        "CREATE TABLE unique_item (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, tenant TEXT NOT NULL)",
+        &.{},
+    );
+    _ = try drv.exec("CREATE INDEX idx_unique_item_email ON unique_item (email)", &.{});
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_unique_item_tenant ON unique_item (tenant)", &.{});
+
+    const UniqueItem = schema("UniqueItem", .{
+        .fields = &.{ field.String("email"), field.String("tenant") },
+        .indexes = &.{
+            index.Named("idx_unique_item_email", &.{"email"}).Unique(),
+            index.Named("idx_unique_item_tenant", &.{"tenant"}),
+        },
+    });
+    const info = comptime fromSchema(UniqueItem);
+    const infos = &[_]TypeInfo{info};
+
+    {
+        const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+        defer freeSchemaDrift(std.testing.allocator, drifts);
+
+        // Both directions, and nothing else: the key lists match, so the only
+        // difference left is the one that matters.
+        try std.testing.expectEqual(@as(usize, 2), drifts.len);
+
+        var missing_unique: ?SchemaDrift = null;
+        var unexpected_unique: ?SchemaDrift = null;
+        for (drifts) |d| {
+            try std.testing.expectEqual(SchemaDrift.Kind.index_uniqueness, d.kind);
+            try std.testing.expectEqualStrings("unique_item", d.table);
+            try std.testing.expectEqualStrings("", d.column);
+            // A read returns what it always returned; it is a *write* that the
+            // constraint would have rejected and now does not.
+            try std.testing.expect(!d.breaksReads());
+            if (std.mem.eql(u8, d.index_name, "idx_unique_item_email")) {
+                missing_unique = d;
+            } else if (std.mem.eql(u8, d.index_name, "idx_unique_item_tenant")) {
+                unexpected_unique = d;
+            }
+        }
+        try std.testing.expect(missing_unique != null);
+        try std.testing.expectEqualStrings(
+            "schema declares UNIQUE, database index is not unique",
+            missing_unique.?.index_detail,
+        );
+        try std.testing.expect(unexpected_unique != null);
+        try std.testing.expectEqualStrings(
+            "schema declares a non-unique index, database index is UNIQUE",
+            unexpected_unique.?.index_detail,
+        );
+
+        // The gate: a uniqueness difference is not a broken read, so the mode
+        // that exists to stop a deploy that would break reads must not fail …
+        try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
+        // … while "everything must agree" is exactly the mode that does.
+        try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
+    }
+
+    // Rebuild both indexes with the uniqueness the schema declares: same names,
+    // same key lists, now the same constraint — and silence.
+    _ = try drv.exec("DROP INDEX idx_unique_item_email", &.{});
+    _ = try drv.exec("DROP INDEX idx_unique_item_tenant", &.{});
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_unique_item_email ON unique_item (email)", &.{});
+    _ = try drv.exec("CREATE INDEX idx_unique_item_tenant ON unique_item (tenant)", &.{});
+
+    const agreeing = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, agreeing);
+    try std.testing.expectEqual(@as(usize, 0), agreeing.len);
+}
+
+test "checkSchema reports uniqueness drift on an index it cannot compare by key (SQLite)" {
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const index = @import("../../core/index.zig");
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec(
+        "CREATE TABLE expr_item (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL)",
+        &.{},
+    );
+    // An expression key: `columns_comparable` is false, so the key list is not
+    // compared — but `PRAGMA index_list` still answers `unique`, and that
+    // answer is what says the application's constraint is not there.
+    _ = try drv.exec("CREATE UNIQUE INDEX idx_expr_item_email ON expr_item (lower(email))", &.{});
+
+    const ExprItem = schema("ExprItem", .{
+        .fields = &.{field.String("email")},
+        .indexes = &.{index.Named("idx_expr_item_email", &.{"email"})},
+    });
+    const info = comptime fromSchema(ExprItem);
+    const infos = &[_]TypeInfo{info};
+
+    const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, drifts);
+
+    // Exactly one, and it is the uniqueness one: the two conditions are
+    // separate on purpose, so the unreadable key list must not suppress it —
+    // and the uniqueness difference must not produce an `index_columns` report
+    // either.
+    try std.testing.expectEqual(@as(usize, 1), drifts.len);
+    try std.testing.expectEqual(SchemaDrift.Kind.index_uniqueness, drifts[0].kind);
+    try std.testing.expectEqualStrings("idx_expr_item_email", drifts[0].index_name);
+    try std.testing.expectEqualStrings(
+        "schema declares a non-unique index, database index is UNIQUE",
+        drifts[0].index_detail,
+    );
+    try std.testing.expect(!drifts[0].breaksReads());
+    try assertSchema(std.testing.allocator, drv.asDriver(), infos, .read_breaking_only);
+    try std.testing.expectError(error.SchemaDrift, assertSchema(std.testing.allocator, drv.asDriver(), infos, .any));
 }

@@ -1269,6 +1269,67 @@ test "MySQL: allow_nullability_change adds a NOT NULL column with a backfill def
     try testing.expectEqual(@as(i64, 7), value_row.getInt(0).?);
 }
 
+test "MySQL: an ALTER ADD COLUMN that would be errno 1101 is refused before it is emitted" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const drop = "DROP TABLE IF EXISTS my_alter_guard";
+    _ = try drv.exec(drop, &.{});
+    defer _ = drv.exec(drop, &.{}) catch {};
+
+    // Two schemas over one table name, run in order. The first is the table as
+    // a previous deploy left it; migrating it records the `create_table`
+    // version, so the second run takes the ALTER path and never generates a
+    // CREATE TABLE — which is exactly the case the CREATE-side MySQL guard
+    // cannot cover, because for a table that already exists there is no
+    // CREATE to guard.
+    const BeforeBase = schema("MyAlterGuard", .{
+        .fields = &.{field.String("name")},
+    });
+    const before_graph = comptime buildGraph(&.{BeforeBase});
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    // `field.Text` is TEXT on MySQL (only `String`/`Enum` are VARCHAR(255)),
+    // and MySQL refuses a DEFAULT on it — so the ADD COLUMN this schema asks
+    // for is errno 1101. The refusal is zent's own error, raised client-side
+    // before the statement is sent, which is why it is the same on MySQL and
+    // on MariaDB (whose 10.2+ *does* allow a TEXT default — the guard is
+    // deliberately the stricter of the two servers' rules).
+    const AfterBase = schema("MyAlterGuard", .{
+        .fields = &.{
+            field.String("name"),
+            field.Text("body").Default("none"),
+        },
+    });
+    const after_graph = comptime buildGraph(&.{AfterBase});
+    try testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        migrate.migrateSchema(allocator, drv.asDriver(), after_graph.types),
+    );
+
+    // The statement never reached the server: the column is not there, and the
+    // history did not record the step as applied.
+    var rows = try drv.query(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+        &.{ .{ .string = "my_alter_guard" }, .{ .string = "body" } },
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+
+    // The dry run answers the same way, and it does so through the CREATE-side
+    // guard: it prints the CREATE TABLE this schema would need, and that
+    // statement carries the same DEFAULT. (It emits no ALTER at all — see the
+    // note on `MigrateOptions.dry_run` — so this is the only guard it can
+    // reach, and the point here is that it reaches one instead of printing SQL
+    // the server would reject.)
+    try testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), after_graph.types, migrate.MigrateOptions{ .dry_run = true }),
+    );
+}
+
 test "MySQL: an existing column's nullability fails closed, it does not get a MODIFY" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
