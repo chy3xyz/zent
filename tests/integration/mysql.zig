@@ -3982,3 +3982,47 @@ test "MySQL: a statement the prepared protocol rejects is not_checkable, not fai
         try testing.expect(std.mem.indexOf(u8, d.message.?, "not supported in the prepared statement protocol") != null);
     }
 }
+
+test "MySQL: exec maps the client's missing count to unknown, not to 18446744073709551615" {
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("DROP TABLE IF EXISTS my_rowcount", &.{});
+    _ = try d.exec("CREATE TABLE my_rowcount (id INT PRIMARY KEY, v VARCHAR(32))", &.{});
+    defer _ = d.exec("DROP TABLE IF EXISTS my_rowcount", &.{}) catch {};
+
+    // DML: the OK packet carries the count through both paths, zero included —
+    // this is what the optimistic-lock check and the NotFound paths read.
+    const inserted = try d.exec("INSERT INTO my_rowcount VALUES (1,'a'),(2,'b'),(3,'c')", &.{});
+    try testing.expectEqual(@as(usize, 3), inserted.rows_affected);
+    try testing.expect(inserted.rows_affected_known);
+
+    const inserted_param = try d.exec("INSERT INTO my_rowcount VALUES (?, ?)", &.{ .{ .int = 4 }, .{ .string = "d" } });
+    try testing.expectEqual(@as(usize, 1), inserted_param.rows_affected);
+    try testing.expect(inserted_param.rows_affected_known);
+
+    const updated = try d.exec("UPDATE my_rowcount SET v = 'z' WHERE id = ?", &.{.{ .int = 1 }});
+    try testing.expectEqual(@as(usize, 1), updated.rows_affected);
+    try testing.expect(updated.rows_affected_known);
+
+    const matched_none = try d.exec("UPDATE my_rowcount SET v = 'z' WHERE id = ?", &.{.{ .int = 999 }});
+    try testing.expectEqual(@as(usize, 0), matched_none.rows_affected);
+    try testing.expect(matched_none.rows_affected_known);
+
+    const deleted_none = try d.exec("DELETE FROM my_rowcount WHERE id = ?", &.{.{ .int = 999 }});
+    try testing.expectEqual(@as(usize, 0), deleted_none.rows_affected);
+    try testing.expect(deleted_none.rows_affected_known);
+
+    // A SELECT through the parameterized path is the reachable sentinel case,
+    // and it is a *client-library* value, not a server one: the connector
+    // reports `(my_ulonglong)-1` for as long as the statement has no affected
+    // count, which is until its result set is consumed — and this path never
+    // consumes it. (Measured against MySQL 9.3 through MariaDB Connector/C
+    // 3.4.5 with a zero error code, so the sentinel is not an error path.) The
+    // naive `@intCast` stored 18446744073709551615 as a row count.
+    const selected = try d.exec("SELECT * FROM my_rowcount WHERE id > ?", &.{.{ .int = 0 }});
+    try testing.expectEqual(@as(usize, 0), selected.rows_affected);
+    try testing.expect(!selected.rows_affected_known);
+}

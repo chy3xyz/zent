@@ -5,6 +5,12 @@ const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
 const cache = @import("cache.zig");
 
+/// The value `mysql_affected_rows` and `mysql_stmt_affected_rows` return when
+/// they have no count to give. The C API documents it as `(my_ulonglong)-1`, so
+/// it is the all-ones value rather than a negative number — comparing the
+/// unsigned result against this constant is what keeps it out of `usize`.
+const no_affected_rows: c.my_ulonglong = ~@as(c.my_ulonglong, 0);
+
 fn toDriverError(err: anyerror) driver.Error {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -482,8 +488,10 @@ pub const MySQLDriver = struct {
                 return error.MySQLExecFailed;
             }
 
+            const raw = c.mysql_affected_rows(self.conn);
             return driver.Result{
-                .rows_affected = @intCast(c.mysql_affected_rows(self.conn)),
+                .rows_affected = if (raw == no_affected_rows) 0 else @intCast(raw),
+                .rows_affected_known = raw != no_affected_rows,
                 .last_insert_id = @intCast(c.mysql_insert_id(self.conn)),
             };
         }
@@ -561,8 +569,15 @@ pub const MySQLDriver = struct {
             return error.MySQLStmtFailed;
         }
 
+        // `mysql_stmt_affected_rows` answers `(my_ulonglong)-1` — not 0 — while
+        // it has no count: on error, and for a statement whose result set has
+        // not been consumed, which is every SELECT issued through this
+        // parameterized path (measured with a zero error code, so it is live).
+        // `@intCast`ing that to `usize` used to store 18446744073709551615.
+        const raw = c.mysql_stmt_affected_rows(stmt);
         return driver.Result{
-            .rows_affected = @intCast(c.mysql_stmt_affected_rows(stmt)),
+            .rows_affected = if (raw == no_affected_rows) 0 else @intCast(raw),
+            .rows_affected_known = raw != no_affected_rows,
             .last_insert_id = @intCast(c.mysql_stmt_insert_id(stmt)),
         };
     }

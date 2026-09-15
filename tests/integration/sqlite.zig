@@ -5255,3 +5255,96 @@ test "SQLite: a checked INSERT, UPDATE or DELETE changes nothing" {
     try testing.expectEqual(@as(i64, 1), row.getInt(0).?);
     try testing.expectEqualStrings("real", row.getText(1).?);
 }
+
+test "SQLite: exec counts the statement it ran, not the last DML on the connection" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("CREATE TABLE rowcount_t (id INTEGER PRIMARY KEY, v TEXT)", &.{});
+    _ = try d.exec("INSERT INTO rowcount_t VALUES (1,'a'),(2,'b'),(3,'c')", &.{});
+
+    // The statements the optimistic-lock check and the NotFound paths act on:
+    // a count the driver obtained, the zero an UPDATE that matched nothing
+    // reports included.
+    const updated = try d.exec("UPDATE rowcount_t SET v = 'z' WHERE id = 2", &.{});
+    try testing.expectEqual(@as(usize, 1), updated.rows_affected);
+    try testing.expect(updated.rows_affected_known);
+
+    const matched_none = try d.exec("UPDATE rowcount_t SET v = 'z' WHERE id = 999", &.{});
+    try testing.expectEqual(@as(usize, 0), matched_none.rows_affected);
+    try testing.expect(matched_none.rows_affected_known);
+
+    const deleted = try d.exec("DELETE FROM rowcount_t WHERE id = 3", &.{});
+    try testing.expectEqual(@as(usize, 1), deleted.rows_affected);
+    try testing.expect(deleted.rows_affected_known);
+
+    // `sqlite3_changes` still holds the DELETE's 1 here and a SELECT does not
+    // reset it, so exec used to hand that number back as the SELECT's own.
+    const selected = try d.exec("SELECT * FROM rowcount_t", &.{});
+    try testing.expectEqual(@as(usize, 0), selected.rows_affected);
+    try testing.expect(!selected.rows_affected_known);
+
+    // DDL is the case a read-only check alone misses: not read-only, and still
+    // no count of its own.
+    const ddl = try d.exec("CREATE INDEX idx_rowcount_t ON rowcount_t(v)", &.{});
+    try testing.expectEqual(@as(usize, 0), ddl.rows_affected);
+    try testing.expect(!ddl.rows_affected_known);
+}
+
+test "SQLite: Restore answers from the count UPDATE reported" {
+    const allocator = testing.allocator;
+    const Post = schema("RestoreCountPost", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("title"),
+        },
+        .mixins = &.{zent.core.mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+
+    const graph = comptime buildGraph(&.{Post});
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var b = try client.restore_count_post.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("title", "hello");
+    var created = try b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+
+    // Restore's own UPDATE is `SET deleted_at = NULL WHERE id = ?`, so a live
+    // row — and an already-restored one — match it: SQLite counts the rows an
+    // UPDATE *matched*, not the ones whose value changed. What this test is
+    // about is the other half of the answer: the false that comes from a count
+    // of zero must keep coming from a count.
+    {
+        var db = client.restore_count_post.Delete();
+        defer db.deinit();
+        try testing.expect(!try db.Restore(created.id + 1000));
+    }
+
+    {
+        var db = client.restore_count_post.Delete();
+        defer db.deinit();
+        _ = try db.Where(.{client.restore_count_post.predicates.idEQ(.{ .int = created.id })});
+        try testing.expectEqual(@as(usize, 1), try db.Exec());
+    }
+
+    {
+        var db = client.restore_count_post.Delete();
+        defer db.deinit();
+        try testing.expect(try db.Restore(created.id));
+    }
+    {
+        var db = client.restore_count_post.Delete();
+        defer db.deinit();
+        try testing.expect(!try db.Restore(created.id + 1000));
+    }
+}

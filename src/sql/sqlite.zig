@@ -161,10 +161,78 @@ pub const SQLiteDriver = struct {
             if (step_rc == c.SQLITE_CONSTRAINT) return toDriverError(sqliteErrnoToDriver(self.db, error.ExecFailed));
             return error.SqliteExecFailed;
         }
+        // A statement that stopped on SQLITE_ROW has not finished emitting rows,
+        // and SQLite settles the counter only when the statement runs to
+        // completion — so at this point it is still the previous DML's count.
+        // (`exec` deliberately steps once, so this is not a rare shape: measured
+        // with `INSERT ... VALUES (…) RETURNING id` stepped once, the row is
+        // inserted and `sqlite3_changes` still says 0; the same statement
+        // stepped to SQLITE_DONE says 1.)
+        const counts_rows = step_rc == c.SQLITE_DONE and statementReportsRowCount(sql, stmt);
         return driver.Result{
-            .rows_affected = @intCast(c.sqlite3_changes(self.db)),
+            .rows_affected = if (counts_rows) @intCast(c.sqlite3_changes(self.db)) else 0,
             .last_insert_id = c.sqlite3_last_insert_rowid(self.db),
+            .rows_affected_known = counts_rows,
         };
+    }
+
+    /// Whether `sqlite3_changes` holds *this* statement's row count.
+    ///
+    /// It answers for the most recent INSERT / UPDATE / DELETE that ran on the
+    /// connection to completion, and nothing else resets it — so after anything
+    /// else it still holds the previous DML's count and reporting it would
+    /// answer a question about a different statement. (Measured: insert 3 rows,
+    /// step a `SELECT` → `sqlite3_changes` still says 3.)
+    ///
+    /// Three conditions have to hold, because SQLite's own signal covers only
+    /// part of the cases:
+    ///
+    ///   * the statement must have run to completion (`SQLITE_DONE`, checked by
+    ///     the caller). A statement still emitting rows has not settled the
+    ///     counter yet, which is why a `RETURNING` DML through `exec` — one step
+    ///     only — has no count to report.
+    ///   * `sqlite3_stmt_readonly` must be 0. A read-only statement cannot be
+    ///     the DML the counter is about. Measured 1 for `SELECT`, `EXPLAIN`,
+    ///     `VALUES`, `WITH ... SELECT`, a reading PRAGMA, `BEGIN`/`COMMIT`/
+    ///     `SAVEPOINT`/`RELEASE` and `PRAGMA foreign_keys = ON`; measured 0 for
+    ///     INSERT / UPDATE / DELETE (including the `... RETURNING` forms).
+    ///   * the statement must not be one of the writable statements that are
+    ///     not DML — see `writesWithoutReportingChanges`.
+    fn statementReportsRowCount(sql: []const u8, stmt: *c.sqlite3_stmt) bool {
+        return c.sqlite3_stmt_readonly(stmt) == 0 and !writesWithoutReportingChanges(sql);
+    }
+
+    /// The writable statements that are *not* INSERT / UPDATE / DELETE, and so
+    /// never set `sqlite3_changes`.
+    ///
+    /// `sqlite3_stmt_readonly` reports 0 (not read-only) for every one of these,
+    /// which is why the read-only check alone is not enough: a `CREATE INDEX`
+    /// that runs right after an INSERT leaves the counter at that INSERT's count,
+    /// and the driver used to hand that number back as the DDL's own.
+    ///
+    /// Every entry was measured on SQLite 3.x, after an INSERT that changed 3
+    /// rows, and left the counter at 3: `CREATE`, `ALTER`, `DROP`, `ANALYZE`,
+    /// `VACUUM`, `REINDEX` (the one entry in the list that reports *read-only* —
+    /// kept because the keyword, not the report, is what makes it safe to list)
+    /// and a writing PRAGMA. PRAGMA covers both forms deliberately: a reading
+    /// PRAGMA is already caught by the read-only check, but not every reading
+    /// form reports read-only (`PRAGMA journal_mode` does not), and no PRAGMA
+    /// sets the counter either way.
+    ///
+    /// The list is a blacklist on purpose: an unrecognised statement keeps the
+    /// count it had, so the change can only ever remove a number that was never
+    /// this statement's. A statement whose first token is not a keyword — a
+    /// leading comment, say — is therefore unrecognised and keeps the old
+    /// answer; the driver's own DDL never looks like that, and reading past
+    /// comments is not worth a SQL lexer here.
+    fn writesWithoutReportingChanges(sql: []const u8) bool {
+        const rest = std.mem.trimStart(u8, sql, " \t\n\r\x0b\x0c");
+        const first_word = rest[0 .. std.mem.indexOfAny(u8, rest, " \t\n\r\x0b\x0c(") orelse rest.len];
+        const not_dml = [_][]const u8{ "create", "alter", "drop", "analyze", "vacuum", "pragma", "reindex" };
+        for (not_dml) |kw| {
+            if (std.ascii.eqlIgnoreCase(first_word, kw)) return true;
+        }
+        return false;
     }
 
     pub fn query(self: *SQLiteDriver, query_sql: []const u8, args: []const Value) !driver.Rows {
@@ -994,4 +1062,112 @@ test "SQLite concurrent access from multiple threads is serialized" {
     defer rows.deinit();
     const row = rows.next() orelse return error.NoRow;
     try std.testing.expectEqual(@as(i64, 4 * 200), row.getInt(0).?);
+}
+
+test "SQLite: a non-DML statement does not report the previous DML's row count" {
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &.{});
+    const inserted = try d.exec("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')", &.{});
+    try std.testing.expectEqual(@as(usize, 3), inserted.rows_affected);
+    try std.testing.expect(inserted.rows_affected_known);
+
+    // `sqlite3_changes` still answers 3 for every statement below — the count of
+    // the INSERT above. None of them is that INSERT, so none may report its
+    // count. The three conditions of the criterion each have a witness here:
+    // a SELECT is read-only, a DDL is not read-only but is not DML either, and
+    // the statement below that returns no row runs to completion.
+    const selected = try d.exec("SELECT * FROM t", &.{});
+    try std.testing.expectEqual(@as(usize, 0), selected.rows_affected);
+    try std.testing.expect(!selected.rows_affected_known);
+
+    // An empty result set is the shape a SELECT shares with a DML: it steps
+    // straight to SQLITE_DONE, so "the statement finished" is not enough to say
+    // the count is its own, and only the read-only check separates it from an
+    // UPDATE that matched nothing.
+    const selected_none = try d.exec("SELECT * FROM t WHERE id = 999", &.{});
+    try std.testing.expectEqual(@as(usize, 0), selected_none.rows_affected);
+    try std.testing.expect(!selected_none.rows_affected_known);
+
+    // The trap `sqlite3_stmt_readonly` alone does not catch: DDL is not
+    // read-only and still reports no count of its own.
+    const ddl = try d.exec("CREATE INDEX idx_t_v ON t(v)", &.{});
+    try std.testing.expectEqual(@as(usize, 0), ddl.rows_affected);
+    try std.testing.expect(!ddl.rows_affected_known);
+
+    // Neither a PRAGMA — `journal_mode` is a *reading* form that SQLite
+    // nevertheless reports as not read-only.
+    try std.testing.expect(!(try d.exec("PRAGMA user_version = 7", &.{})).rows_affected_known);
+    try std.testing.expect(!(try d.exec("PRAGMA journal_mode", &.{})).rows_affected_known);
+
+    // Nor transaction control.
+    try std.testing.expect(!(try d.exec("BEGIN", &.{})).rows_affected_known);
+    try std.testing.expect(!(try d.exec("COMMIT", &.{})).rows_affected_known);
+
+    // DML keeps its count — including the zero an UPDATE that matched nothing
+    // reports, which is the value the optimistic-lock check compares against.
+    const updated = try d.exec("UPDATE t SET v = 'z' WHERE id = 1", &.{});
+    try std.testing.expectEqual(@as(usize, 1), updated.rows_affected);
+    try std.testing.expect(updated.rows_affected_known);
+
+    const matched_none = try d.exec("UPDATE t SET v = 'z' WHERE id = 999", &.{});
+    try std.testing.expectEqual(@as(usize, 0), matched_none.rows_affected);
+    try std.testing.expect(matched_none.rows_affected_known);
+
+    const deleted_none = try d.exec("DELETE FROM t WHERE id = 999", &.{});
+    try std.testing.expectEqual(@as(usize, 0), deleted_none.rows_affected);
+    try std.testing.expect(deleted_none.rows_affected_known);
+
+    // `RETURNING` is a DML whose count `exec` cannot have: it stops on the first
+    // returned row, and SQLite settles the counter only at completion. Measured:
+    // the row really is inserted and `sqlite3_changes` still holds the previous
+    // DML's value, so reporting it — as a count, with the flag set — would assert
+    // a number from a different statement. The `INSERT` itself still runs.
+    const returning = try d.exec("INSERT INTO t VALUES (9,'q') RETURNING id", &.{});
+    try std.testing.expectEqual(@as(usize, 0), returning.rows_affected);
+    try std.testing.expect(!returning.rows_affected_known);
+    var count_rows = try d.query("SELECT count(*) FROM t WHERE id = 9", &.{});
+    defer count_rows.deinit();
+    const only = count_rows.next() orelse return error.NoRow;
+    try std.testing.expectEqual(@as(i64, 1), only.getInt(0).?);
+}
+
+test "SQLite: the statements whose count sqlite3_changes does not report" {
+    // The keyword half of the criterion, pinned on its own because it is what
+    // covers the statements `sqlite3_stmt_readonly` calls writable but whose
+    // count the counter never holds.
+    for ([_][]const u8{
+        "CREATE TABLE t (id INTEGER)",
+        "create table t (id INTEGER)",
+        "  \n\tCREATE INDEX i ON t(id)",
+        "ALTER TABLE t ADD COLUMN v TEXT",
+        "DROP TABLE t",
+        "ANALYZE",
+        "VACUUM",
+        "REINDEX",
+        "PRAGMA user_version = 7",
+        "PRAGMA journal_mode",
+    }) |sql| {
+        try std.testing.expect(SQLiteDriver.writesWithoutReportingChanges(sql));
+    }
+
+    // The DML side must not be caught by the keyword check — a false positive
+    // here would drop a count the driver really does have, and an UPDATE that
+    // matched nothing is exactly the value the optimistic lock reads.
+    for ([_][]const u8{
+        "INSERT INTO t VALUES (1)",
+        "insert into t values (1)",
+        "INSERT OR REPLACE INTO t VALUES (1)",
+        "REPLACE INTO t VALUES (1)",
+        "UPDATE t SET v = 1",
+        "DELETE FROM t WHERE id = 1",
+        "INSERT INTO t VALUES (1) RETURNING id",
+        "WITH x AS (SELECT 1) SELECT * FROM x",
+        "SELECT 1",
+    }) |sql| {
+        try std.testing.expect(!SQLiteDriver.writesWithoutReportingChanges(sql));
+    }
 }

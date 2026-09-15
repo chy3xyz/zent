@@ -799,7 +799,14 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
 
             // Optimistic-lock conflict: no row was updated, so after-hooks must
             // not run. Mark them fired so the errdefer above is skipped.
-            if (version_locked and res.rows_affected == 0) {
+            //
+            // `rows_affected_known` first: "the driver counted zero rows" and
+            // "the versioned row is gone" are different questions, and a driver
+            // that never obtained a count answers the second one with 0 — which
+            // would report a write that did happen as a lost update. An UPDATE
+            // whose count the driver did obtain sets the flag on all three
+            // dialects, so the versioned path is unchanged.
+            if (version_locked and res.rows_affected_known and res.rows_affected == 0) {
                 after_hooks_fired = true;
                 return error.OptimisticLockConflict;
             }
@@ -1008,7 +1015,10 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const q = try builder.query();
             self.ensureDeadline();
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
-            return res.rows_affected > 0;
+            // "a row was restored" is a claim about a count the driver has to
+            // have; with no count in hand the honest answer is the same false
+            // the caller gets when nothing matched.
+            return res.rows_affected_known and res.rows_affected > 0;
         }
 
         fn execSoftDelete(self: *Self) ExecError!usize {
@@ -1091,7 +1101,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
-            if (version_locked and res.rows_affected == 0) {
+            if (version_locked and res.rows_affected_known and res.rows_affected == 0) {
                 after_hooks_fired = true;
                 return error.OptimisticLockConflict;
             }
@@ -1189,7 +1199,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
             const duration_us: u64 = nowUs() - start;
 
-            if (version_locked and res.rows_affected == 0) {
+            if (version_locked and res.rows_affected_known and res.rows_affected == 0) {
                 after_hooks_fired = true;
                 return error.OptimisticLockConflict;
             }
@@ -2470,3 +2480,206 @@ test "UpdateBuilder registers edge writes and reuses source predicates" {
     try std.testing.expectEqual(EdgeOp.add_ids, u.edge_actions.items[0].op);
     try std.testing.expectEqual(EdgeOp.set_ids, u.edge_actions.items[3].op);
 }
+
+// ------------------------------------------------------------------
+// The decision points that read `Result.rows_affected`
+// ------------------------------------------------------------------
+
+/// A driver whose `exec` answers `0` rows **without having counted any** — the
+/// shape SQLite produces for a non-DML, MySQL for an unconsumed result set and
+/// PostgreSQL for a command that publishes no tag. Nothing in-tree reaches a
+/// versioned UPDATE this way on a real server, so the guard that keeps such a
+/// result from being read as a lost update is only observable through a driver
+/// that says "no count" on purpose.
+const UncountedDriver = struct {
+    /// The first bytes of the statement `exec` was handed. Copied rather than
+    /// kept as a slice: `QueryResult.sql` borrows from the builder, which the
+    /// caller has already deinit'd by the time a test looks at it.
+    sql_prefix: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    exec_calls: usize = 0,
+    /// What the driver puts in `rows_affected` while saying it has no count.
+    /// `driver.Result` documents 0 for that, and a conforming driver only ever
+    /// answers 0 here; a non-zero placeholder is the single case in which
+    /// reading the count alone and reading the flag disagree.
+    rows_while_unknown: usize = 0,
+
+    fn execFn(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        const self: *UncountedDriver = @ptrCast(@alignCast(ptr));
+        self.exec_calls += 1;
+        @memcpy(self.sql_prefix[0..@min(query_sql.len, self.sql_prefix.len)], query_sql[0..@min(query_sql.len, self.sql_prefix.len)]);
+        return .{ .rows_affected = self.rows_while_unknown, .rows_affected_known = false, .last_insert_id = null };
+    }
+
+    fn queryFn(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        return error.QueryFailed;
+    }
+
+    fn beginTxFn(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn savepointFn(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn closeFn(_: *anyopaque) void {}
+
+    fn dialectFn(_: *anyopaque) Dialect {
+        return .sqlite;
+    }
+
+    fn pingFn(_: *anyopaque) sql_driver.Error!void {}
+
+    fn inTxFn(_: *anyopaque) bool {
+        return false;
+    }
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = execFn,
+        .query = queryFn,
+        .beginTx = beginTxFn,
+        .close = closeFn,
+        .dialect = dialectFn,
+        .ping = pingFn,
+        .inTransaction = inTxFn,
+        .beginSavepoint = savepointFn,
+    };
+
+    fn asDriver(self: *UncountedDriver) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "a versioned UPDATE the driver could not count is not reported as a lost update" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Doc = Schema("UncountedDoc", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("title"),
+            field.Version("version"),
+        },
+    });
+    const info = comptime fromSchema(Doc);
+    const Upd = UpdateBuilder(&.{info}, info);
+    const Del = DeleteBuilder(info);
+
+    var mock = UncountedDriver{};
+
+    // A version lock turns the zero into `error.OptimisticLockConflict`. The
+    // zero here is not "the versioned row is gone" — the driver never counted —
+    // so the write must stand, and `Save` reports the placeholder it was given.
+    {
+        var u = Upd.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer u.deinit();
+        _ = try u.setFieldValue("title", "edited");
+        _ = try u.setFieldValue("version", @as(i64, 3));
+        try std.testing.expectEqual(@as(usize, 0), try u.Save());
+        try std.testing.expectEqual(@as(usize, 1), mock.exec_calls);
+        try std.testing.expect(std.mem.eql(u8, mock.sql_prefix[0..6], "UPDATE"));
+    }
+    {
+        var d = Del.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer d.deinit();
+        _ = d.setVersion(3);
+        try std.testing.expectEqual(@as(usize, 0), try d.Exec());
+        try std.testing.expectEqual(@as(usize, 2), mock.exec_calls);
+        try std.testing.expect(std.mem.eql(u8, mock.sql_prefix[0..6], "DELETE"));
+    }
+
+    // The same statement with a count the driver *did* obtain keeps its meaning:
+    // this is the direction the versioned path must not lose.
+    {
+        var counted = CountingZeroDriver{};
+        var u = Upd.init(std.testing.allocator, counted.asDriver(), &.{}, null);
+        defer u.deinit();
+        _ = try u.setFieldValue("title", "edited");
+        _ = try u.setFieldValue("version", @as(i64, 3));
+        try std.testing.expectError(error.OptimisticLockConflict, u.Save());
+    }
+
+    // `Restore` answers "a row was restored" from the same count, and with no
+    // count in hand that claim cannot be made. A conforming driver puts 0 in
+    // `rows_affected` while it says it has no count, and 0 already answers
+    // false; the placeholder below is deliberately non-zero, which is the only
+    // shape in which reading the flag and reading the number disagree.
+    {
+        const Post = Schema("UncountedPost", .{
+            .fields = &.{
+                field.Int("id"),
+                field.String("title"),
+            },
+            .mixins = &.{@import("../core/mixin.zig").SoftDeleteMixin},
+            .soft_delete = true,
+        });
+        const post_info = comptime fromSchema(Post);
+        const PostDel = DeleteBuilder(post_info);
+
+        var d = PostDel.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer d.deinit();
+        try std.testing.expect(!try d.Restore(1));
+
+        var placeholder = UncountedDriver{ .rows_while_unknown = 7 };
+        var d2 = PostDel.init(std.testing.allocator, placeholder.asDriver(), &.{}, null);
+        defer d2.deinit();
+        try std.testing.expect(!try d2.Restore(1));
+
+        // The same placeholder does not turn a versioned UPDATE into a lost
+        // update either: the flag decides, not the number beside it.
+        var u = Upd.init(std.testing.allocator, placeholder.asDriver(), &.{}, null);
+        defer u.deinit();
+        _ = try u.setFieldValue("title", "edited");
+        _ = try u.setFieldValue("version", @as(i64, 3));
+        try std.testing.expectEqual(@as(usize, 7), try u.Save());
+    }
+}
+
+/// The same "zero rows" as `UncountedDriver`, but counted: this is the result a
+/// real UPDATE that matched nothing produces on all three dialects, and it must
+/// keep turning into `error.OptimisticLockConflict`.
+const CountingZeroDriver = struct {
+    fn execFn(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        return .{ .rows_affected = 0, .rows_affected_known = true, .last_insert_id = null };
+    }
+
+    fn queryFn(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        return error.QueryFailed;
+    }
+
+    fn beginTxFn(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn savepointFn(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn closeFn(_: *anyopaque) void {}
+
+    fn dialectFn(_: *anyopaque) Dialect {
+        return .sqlite;
+    }
+
+    fn pingFn(_: *anyopaque) sql_driver.Error!void {}
+
+    fn inTxFn(_: *anyopaque) bool {
+        return false;
+    }
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = execFn,
+        .query = queryFn,
+        .beginTx = beginTxFn,
+        .close = closeFn,
+        .dialect = dialectFn,
+        .ping = pingFn,
+        .inTransaction = inTxFn,
+        .beginSavepoint = savepointFn,
+    };
+
+    fn asDriver(self: *CountingZeroDriver) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};

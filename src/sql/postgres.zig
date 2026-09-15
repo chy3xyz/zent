@@ -33,22 +33,32 @@ fn toDriverError(err: anyerror) driver.Error {
     };
 }
 
-/// The affected-row count libpq puts in a command tag (`PQcmdTuples`).
+/// What libpq's command tag said about the rows a command affected: the count,
+/// and whether it reported one at all.
 ///
-/// The tag is `""` for every command that reports no such count and 0 is the
-/// honest answer there: DDL, `BEGIN`/`COMMIT`, `SET`, `VACUUM`, `DO`, `EXPLAIN`
-/// all come back as `PGRES_COMMAND_OK` with an empty tag, and a `SELECT` via
-/// `exec` carries its row count. Anything that is neither empty nor decimal
-/// would have to be a malformed tag — and answering 0 for *that* is
-/// indistinguishable from a statement that really matched no rows, which is
-/// what `UpdateBuilder.Save` (version lock) and `SaveOne` read as
-/// `OptimisticLockConflict` / `error.NotFound`.
-fn rowCountFromCommandTag(tag: []const u8) error{DriverFailed}!usize {
-    if (tag.len == 0) return 0;
-    return std.fmt.parseInt(usize, tag, 10) catch {
+/// An empty tag is **not** "zero rows". `PQcmdTuples` is `""` for every command
+/// that reports no such count — DDL, `BEGIN`/`COMMIT`, `SET`, `VACUUM`,
+/// `ANALYZE`, `DO`, `TRUNCATE` all come back as `PGRES_COMMAND_OK` with an empty
+/// tag, and `TRUNCATE` is the pointed example: it removes every row and still
+/// reports nothing. Reporting 0 for those is indistinguishable from a statement
+/// that really matched no rows, which is what `UpdateBuilder.Save` (version
+/// lock) and `SaveOne` read as `OptimisticLockConflict` / `error.NotFound`.
+///
+/// `known` is false only for the empty tag; a decimal tag — including `"0"`,
+/// which a `SELECT`, an `UPDATE` or a `DELETE` really does report — is a count
+/// the driver obtained.
+const ReportedRows = struct {
+    rows: usize,
+    known: bool,
+};
+
+fn reportedRowsFromCommandTag(tag: []const u8) error{DriverFailed}!ReportedRows {
+    if (tag.len == 0) return .{ .rows = 0, .known = false };
+    const rows = std.fmt.parseInt(usize, tag, 10) catch {
         std.log.warn("postgres: PQcmdTuples reported a row count of '{s}', which is not a number", .{tag});
         return error.DriverFailed;
     };
+    return .{ .rows = rows, .known = true };
 }
 
 pub const PostgresDriver = struct {
@@ -431,7 +441,7 @@ pub const PostgresDriver = struct {
             }
 
             const affected = c.PQcmdTuples(res);
-            const rows_affected = try rowCountFromCommandTag(if (affected) |a| std.mem.span(a) else "");
+            const reported = try reportedRowsFromCommandTag(if (affected) |a| std.mem.span(a) else "");
 
             var last_insert_id: ?i64 = null;
             if (c.PQntuples(res) > 0) {
@@ -442,7 +452,8 @@ pub const PostgresDriver = struct {
             }
 
             return driver.Result{
-                .rows_affected = rows_affected,
+                .rows_affected = reported.rows,
+                .rows_affected_known = reported.known,
                 .last_insert_id = last_insert_id,
             };
         }
@@ -471,7 +482,7 @@ pub const PostgresDriver = struct {
         }
 
         const affected = c.PQcmdTuples(res);
-        const rows_affected = try rowCountFromCommandTag(if (affected) |a| std.mem.span(a) else "");
+        const reported = try reportedRowsFromCommandTag(if (affected) |a| std.mem.span(a) else "");
 
         // Get last insert id from RETURNING clause if present, or use oid
         var last_insert_id: ?i64 = null;
@@ -483,7 +494,8 @@ pub const PostgresDriver = struct {
         }
 
         return driver.Result{
-            .rows_affected = rows_affected,
+            .rows_affected = reported.rows,
+            .rows_affected_known = reported.known,
             .last_insert_id = last_insert_id,
         };
     }
@@ -1080,23 +1092,40 @@ test "PostgresDriver cache different SQL different entries" {
     try std.testing.expectEqual(@as(usize, 2), cch.len);
 }
 
-test "Postgres: only a missing command tag reads as 0 affected rows" {
+test "Postgres: only a reported decimal command tag counts as a known row count" {
     // `PQcmdTuples` is "" for every command that reports no row count — DDL,
-    // BEGIN/COMMIT, SET, VACUUM, DO, EXPLAIN — and libpq always prints the
-    // count as decimal for the statements that do report one:
+    // BEGIN/COMMIT, SET, VACUUM, ANALYZE, DO, TRUNCATE — and libpq always prints
+    // the count as decimal for the statements that do report one:
     //   CREATE TABLE -> ""      UPDATE ... WHERE id = -1 -> "0"
     //   COMMIT       -> ""      INSERT ... VALUES (...)  -> "1"
-    // The empty tag is the only one that may become 0.
-    try std.testing.expectEqual(@as(usize, 0), try rowCountFromCommandTag(""));
-    try std.testing.expectEqual(@as(usize, 0), try rowCountFromCommandTag("0"));
-    try std.testing.expectEqual(@as(usize, 1), try rowCountFromCommandTag("1"));
-    try std.testing.expectEqual(@as(usize, 42), try rowCountFromCommandTag("42"));
+    //   TRUNCATE     -> ""
+    // The empty tag is the only one that may become 0, and it must say it is not
+    // a count: `TRUNCATE` removes every row and still reports nothing, so 0
+    // there would be a count for a statement that emptied the table.
+    const none = try reportedRowsFromCommandTag("");
+    try std.testing.expectEqual(@as(usize, 0), none.rows);
+    try std.testing.expect(!none.known);
+
+    // A reported zero really is a count and has to stay known — this is the tag
+    // an `UPDATE ... WHERE` that matched nothing produces, which is exactly what
+    // the optimistic-lock check reads.
+    const zero = try reportedRowsFromCommandTag("0");
+    try std.testing.expectEqual(@as(usize, 0), zero.rows);
+    try std.testing.expect(zero.known);
+
+    const one = try reportedRowsFromCommandTag("1");
+    try std.testing.expectEqual(@as(usize, 1), one.rows);
+    try std.testing.expect(one.known);
+
+    const many = try reportedRowsFromCommandTag("42");
+    try std.testing.expectEqual(@as(usize, 42), many.rows);
+    try std.testing.expect(many.known);
 
     // A tag that is neither: 0 here would be a lie no caller could detect —
     // `UpdateBuilder.Save` compares it against 0 for the version lock, and
     // `SaveOne` turns it into `error.NotFound`, so a write that did happen
     // would be reported as "no such row".
-    try std.testing.expectError(error.DriverFailed, rowCountFromCommandTag("INSERT 0 1"));
-    try std.testing.expectError(error.DriverFailed, rowCountFromCommandTag("-1"));
-    try std.testing.expectError(error.DriverFailed, rowCountFromCommandTag("n/a"));
+    try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("INSERT 0 1"));
+    try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("-1"));
+    try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("n/a"));
 }

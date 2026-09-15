@@ -6,6 +6,34 @@ const Dialect = @import("dialect.zig").Dialect;
 pub const Result = struct {
     rows_affected: usize,
     last_insert_id: ?i64,
+    /// False when `rows_affected` is not a count the driver actually obtained,
+    /// and `rows_affected` is then 0 as a placeholder rather than an answer.
+    ///
+    /// `rows_affected: usize` cannot express "the driver does not know", so a
+    /// statement whose row count was never learned would otherwise be
+    /// indistinguishable from one that matched nothing — and a consumer
+    /// comparing it with 0 reads "not known" as "matched no row". Three
+    /// dialects produce that case, each for its own reason:
+    ///
+    ///   * SQLite — `sqlite3_changes` answers for the most recent INSERT /
+    ///     UPDATE / DELETE on the connection and nothing else resets it, so
+    ///     after a SELECT, a PRAGMA or a DDL statement it still returns the
+    ///     *previous* DML's count.
+    ///   * MySQL — `mysql_stmt_affected_rows` yields `(my_ulonglong)-1` until
+    ///     the statement's result set is consumed, which the parameterized
+    ///     `exec` path never does; the naive cast stored 18446744073709551615.
+    ///   * PostgreSQL — `PQcmdTuples` is `""` for every command that reports no
+    ///     count (DDL, `BEGIN`, `SET`, `VACUUM`, `TRUNCATE`, ...).
+    ///
+    /// **A consumer must read this field before `rows_affected`.** `rows == 0`
+    /// asks "did the driver count zero rows?"; `rows_affected_known and rows ==
+    /// 0` asks "did the statement match nothing?", which is the question the
+    /// optimistic-lock checks in `codegen/update_delete.zig` and the `NotFound`
+    /// paths of `SaveOne`/`ExecOne` actually mean. An UPDATE or DELETE whose
+    /// count the driver did obtain sets this true on all three dialects, so
+    /// those paths keep their meaning; the default is `true` because every
+    /// in-tree construction site either counts rows itself or is a mock.
+    rows_affected_known: bool = true,
 };
 
 /// What a driver can report about a statement it prepared (and discarded)
