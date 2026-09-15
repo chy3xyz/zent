@@ -514,11 +514,34 @@ pub fn GetMetrics() Metrics {
 /// Copies logger, hooks, privacy_ctx, and interceptors from the parent
 /// entity clients so that transactional operations retain hook callbacks,
 /// privacy rules, query interceptors, and logging configuration.
+/// Same as `beginTxCtx(infos, self, null)`.
 pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver.Error!TxClient(infos) {
+    return beginTxCtx(infos, self, null);
+}
+
+/// `beginTx` bounded by `ctx`: the deadline the caller is already spending
+/// on this request also bounds *acquiring* the transaction. Behind a pool
+/// that acquisition waits for a connection, and a driver that carries the
+/// deadline there reports `error.PoolWaitTimeout` when it expires instead
+/// of first queueing for the pool's own `max_wait_ms` and then running the
+/// transaction with none of the request's budget left. A driver with no
+/// ctx hook ignores it (`Driver.beginTxCtx` falls back to `beginTx`).
+///
+/// `ctx = null` is `beginTx`, down to the vtable entry the driver sees:
+/// with nothing to carry, `Driver.beginTx` is called, not
+/// `Driver.beginTxCtx` with a null. Everything else — the TxClient's
+/// inherited logger, hooks, privacy_ctx, interceptors, and the savepoint
+/// degradation of a re-entrant call — is identical, because `beginTx`
+/// delegates here.
+/// A re-entrant call reuses the connection its caller already holds, so
+/// there is nothing to wait for and `ctx` is not consulted on that path.
+pub fn beginTxCtx(comptime infos: []const TypeInfo, self: Client(infos), ctx: ?*const sql_driver.ExecutionContext) sql_driver.Error!TxClient(infos) {
     // Re-entrant beginTx inside an active transaction degrades to a
     // savepoint, so service orchestration can nest transactions safely.
     const tx = if (self.driver.inTransaction())
         try self.driver.beginSavepoint("zent_sp")
+    else if (ctx) |deadline|
+        try self.driver.beginTxCtx(deadline)
     else
         try self.driver.beginTx();
     var c = makeClient(infos, self.allocator, tx.inner);
@@ -541,9 +564,23 @@ pub fn beginTx(comptime infos: []const TypeInfo, self: Client(infos)) sql_driver
 /// use this to open a typed `TxClient` for any graph without building a
 /// root `Client` first. Like `beginTx`, a re-entrant call inside an
 /// active transaction degrades to a savepoint.
+/// Same as `beginTxFromDriverCtx(infos, driver, allocator, null)`.
 pub fn beginTxFromDriver(comptime infos: []const TypeInfo, driver: sql_driver.Driver, allocator: std.mem.Allocator) sql_driver.Error!TxClient(infos) {
+    return beginTxFromDriverCtx(infos, driver, allocator, null);
+}
+
+/// `beginTxFromDriver` bounded by `ctx`. The deadline bounds acquiring the
+/// transaction — the wait for a pooled connection that `beginTxFromDriver`
+/// spends unbounded — and a re-entrant call degrades to a savepoint
+/// exactly as it does there. `ctx = null` is `beginTxFromDriver`, down to
+/// the vtable entry the driver sees.
+/// As in `beginTxCtx`, the savepoint path has nothing to wait for and does
+/// not consult `ctx`.
+pub fn beginTxFromDriverCtx(comptime infos: []const TypeInfo, driver: sql_driver.Driver, allocator: std.mem.Allocator, ctx: ?*const sql_driver.ExecutionContext) sql_driver.Error!TxClient(infos) {
     const tx = if (driver.inTransaction())
         try driver.beginSavepoint("zent_sp")
+    else if (ctx) |deadline|
+        try driver.beginTxCtx(deadline)
     else
         try driver.beginTx();
     return TxClient(infos){
@@ -807,6 +844,9 @@ test "Client driver operations expose explicit driver error unions" {
 
     comptime {
         if (@typeInfo(@TypeOf(beginTx(infos, @as(RootClient, undefined)))).error_union.error_set != sql_driver.Error) @compileError("beginTx error set is not explicit");
+        if (@typeInfo(@TypeOf(beginTxCtx(infos, @as(RootClient, undefined), null))).error_union.error_set != sql_driver.Error) @compileError("beginTxCtx error set is not explicit");
+        if (@typeInfo(@TypeOf(beginTxFromDriver(infos, @as(sql_driver.Driver, undefined), @as(std.mem.Allocator, undefined)))).error_union.error_set != sql_driver.Error) @compileError("beginTxFromDriver error set is not explicit");
+        if (@typeInfo(@TypeOf(beginTxFromDriverCtx(infos, @as(sql_driver.Driver, undefined), @as(std.mem.Allocator, undefined), null))).error_union.error_set != sql_driver.Error) @compileError("beginTxFromDriverCtx error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.commit)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.commit error set is not explicit");
         if (@typeInfo(@typeInfo(@TypeOf(TransactionClient.rollback)).@"fn".return_type.?).error_union.error_set != sql_driver.Error) @compileError("TxClient.rollback error set is not explicit");
     }
@@ -927,6 +967,390 @@ test "beginTxFromDriver opens a typed tx straight from a Driver" {
     }
     try std.testing.expectEqual(@as(usize, 1), rows.items.len);
     try std.testing.expectEqualStrings("driver-first", rows.items[0].name);
+}
+
+// ------------------------------------------------------------------
+// ctx-carrying transaction entry points: `beginTxCtx` and
+// `beginTxFromDriverCtx`
+// ------------------------------------------------------------------
+
+/// Driver wrapper for the ctx tests. Every vtable entry delegates to the
+/// wrapped driver; the transaction entries are counted, and the
+/// `beginTxCtx` hook records the context pointer it was handed — that
+/// forwarding is what these tests pin. `in_transaction_override` pins
+/// `inTransaction` to a fixed answer: a *pooled* driver's own
+/// `inTransaction` borrows a connection with the pool's `max_wait_ms`, so a
+/// test that wants the caller's deadline to decide the outcome must keep
+/// the generated code's preflight from blocking first (that preflight cost
+/// belongs to the pooled `inTransaction`, not to these entry points).
+const TxSpyDriver = struct {
+    const Dialect = @import("../sql/dialect.zig").Dialect;
+
+    inner: sql_driver.Driver,
+    in_transaction_override: ?bool = null,
+    begin_tx_calls: usize = 0,
+    begin_tx_ctx_calls: usize = 0,
+    begin_savepoint_calls: usize = 0,
+    last_ctx: ?*const sql_driver.ExecutionContext = null,
+
+    fn cast(ptr: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn asDriver(self: *@This()) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn execFn(ptr: *anyopaque, ctx: ?*const sql_driver.ExecutionContext, query: []const u8, args: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        return cast(ptr).inner.execCtx(ctx, query, args);
+    }
+
+    fn queryFn(ptr: *anyopaque, ctx: ?*const sql_driver.ExecutionContext, query: []const u8, args: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        return cast(ptr).inner.queryCtx(ctx, query, args);
+    }
+
+    fn beginTxFn(ptr: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        const self = cast(ptr);
+        self.begin_tx_calls += 1;
+        return self.inner.beginTx();
+    }
+
+    fn beginTxCtxFn(ptr: *anyopaque, ctx: ?*const sql_driver.ExecutionContext) sql_driver.Error!sql_driver.Tx {
+        const self = cast(ptr);
+        self.begin_tx_ctx_calls += 1;
+        self.last_ctx = ctx;
+        return self.inner.beginTxCtx(ctx);
+    }
+
+    fn beginSavepointFn(ptr: *anyopaque, name: []const u8) sql_driver.Error!sql_driver.Tx {
+        const self = cast(ptr);
+        self.begin_savepoint_calls += 1;
+        return self.inner.beginSavepoint(name);
+    }
+
+    fn closeFn(ptr: *anyopaque) void {
+        cast(ptr).inner.close();
+    }
+
+    fn dialectFn(ptr: *anyopaque) Dialect {
+        return cast(ptr).inner.dialect();
+    }
+
+    fn pingFn(ptr: *anyopaque) sql_driver.Error!void {
+        return cast(ptr).inner.ping();
+    }
+
+    fn inTransactionFn(ptr: *anyopaque) bool {
+        const self = cast(ptr);
+        return self.in_transaction_override orelse self.inner.inTransaction();
+    }
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = execFn,
+        .query = queryFn,
+        .beginTx = beginTxFn,
+        .beginTxCtx = beginTxCtxFn,
+        .beginSavepoint = beginSavepointFn,
+        .close = closeFn,
+        .dialect = dialectFn,
+        .ping = pingFn,
+        .inTransaction = inTransactionFn,
+    };
+};
+
+/// Statement sink for the equivalence test. Builder logging fires before the
+/// driver runs the statement, so this also captures statements issued
+/// *inside* a transaction — a driver wrapper could not, because the tx client
+/// talks to `tx.inner` directly. The logger callbacks carry no user pointer,
+/// so the sink is container-level state.
+const SqlSink = struct {
+    const LogContext = @import("../sql/logger.zig").LogContext;
+
+    var statements: std.ArrayListUnmanaged([]u8) = .empty;
+    var enabled = false;
+
+    fn logger() Logger {
+        return .{ .onExec = onExec, .onQuery = onQuery };
+    }
+
+    fn onExec(ctx: LogContext) void {
+        append(ctx.sql);
+    }
+
+    fn onQuery(ctx: LogContext) void {
+        append(ctx.sql);
+    }
+
+    fn append(sql_text: []const u8) void {
+        if (!enabled) return;
+        const copy = std.testing.allocator.dupe(u8, sql_text) catch return;
+        statements.append(std.testing.allocator, copy) catch std.testing.allocator.free(copy);
+    }
+
+    fn take() std.ArrayListUnmanaged([]u8) {
+        const taken = statements;
+        statements = .empty;
+        return taken;
+    }
+
+    fn free(list: std.ArrayListUnmanaged([]u8)) void {
+        for (list.items) |sql_text| std.testing.allocator.free(sql_text);
+        var owned = list;
+        owned.deinit(std.testing.allocator);
+    }
+};
+
+test "beginTxCtx with a null ctx follows beginTx statement for statement" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Item = Schema("CtxItem", .{ .fields = &.{field.String("name")} });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+    const info = comptime fromSchema(Item);
+
+    var recorded: [2]std.ArrayListUnmanaged([]u8) = undefined;
+    for (&recorded, 0..) |*captured, run| {
+        var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+        defer driver.close();
+        try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+        var root = makeClient(infos, allocator, driver.asDriver());
+        SetLogger(infos, &root, SqlSink.logger());
+
+        SqlSink.enabled = true;
+        {
+            var tx = if (run == 0) try beginTx(infos, root) else try beginTxCtx(infos, root, null);
+            defer tx.deinit();
+            {
+                var b = try tx.client.ctx_item.Create();
+                defer b.deinit();
+                _ = try b.setFieldValue("name", "outer");
+                var row = try b.Save();
+                defer deinitEntity(infos, info, &row, allocator);
+            }
+            // Re-entrant on the same connection: a savepoint, not a second
+            // BEGIN (which SQLite rejects on an open transaction).
+            try std.testing.expect(driver.inTransaction());
+            var nested = if (run == 0) try beginTx(infos, root) else try beginTxCtx(infos, root, null);
+            defer nested.deinit();
+            {
+                var b = try nested.client.ctx_item.Create();
+                defer b.deinit();
+                _ = try b.setFieldValue("name", "inner");
+                var row = try b.Save();
+                defer deinitEntity(infos, info, &row, allocator);
+            }
+            try nested.rollback();
+            try tx.commit();
+        }
+        SqlSink.enabled = false;
+        captured.* = SqlSink.take();
+
+        // The TxClient inherited the parent's logger. Without this the
+        // comparison below would pass vacuously on two empty captures.
+        try std.testing.expect(captured.items.len >= 2);
+
+        var q = root.ctx_item.Query();
+        defer q.deinit();
+        const rows = try q.All();
+        defer {
+            for (rows.items) |*e| deinitEntity(infos, info, e, allocator);
+            rows.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+        try std.testing.expectEqualStrings("outer", rows.items[0].name);
+    }
+    defer SqlSink.free(recorded[0]);
+    defer SqlSink.free(recorded[1]);
+
+    try std.testing.expectEqual(recorded[0].items.len, recorded[1].items.len);
+    for (recorded[0].items, recorded[1].items) |from_begin_tx, from_begin_tx_ctx| {
+        try std.testing.expectEqualStrings(from_begin_tx, from_begin_tx_ctx);
+    }
+}
+
+test "beginTxCtx hands the driver the caller's ctx, and only then" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Item = Schema("CtxSpyItem", .{ .fields = &.{field.String("name")} });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    var spy = TxSpyDriver{ .inner = driver.asDriver() };
+    const ctx = sql_driver.ExecutionContext{ .deadline_ns = sql_driver.monotonicNs() + std.time.ns_per_s };
+
+    // Client entry: a deadline goes through the ctx-carrying vtable hook.
+    {
+        const root = makeClient(infos, allocator, spy.asDriver());
+        var tx = try beginTxCtx(infos, root, &ctx);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 1), spy.begin_tx_ctx_calls);
+        try std.testing.expectEqual(@as(usize, 0), spy.begin_tx_calls);
+        try std.testing.expect(spy.last_ctx == &ctx);
+        try tx.rollback();
+    }
+    // ... a null ctx takes the plain entry beginTx always took, so a driver
+    // that carries a deadline is not consulted with nothing to carry.
+    {
+        const root = makeClient(infos, allocator, spy.asDriver());
+        var tx = try beginTxCtx(infos, root, null);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 1), spy.begin_tx_ctx_calls);
+        try std.testing.expectEqual(@as(usize, 1), spy.begin_tx_calls);
+        try tx.rollback();
+    }
+    // Driver entry, both ways.
+    {
+        var tx = try beginTxFromDriverCtx(infos, spy.asDriver(), allocator, &ctx);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 2), spy.begin_tx_ctx_calls);
+        try std.testing.expect(spy.last_ctx == &ctx);
+        try tx.rollback();
+    }
+    {
+        var tx = try beginTxFromDriverCtx(infos, spy.asDriver(), allocator, null);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 2), spy.begin_tx_ctx_calls);
+        try std.testing.expectEqual(@as(usize, 2), spy.begin_tx_calls);
+        try tx.rollback();
+    }
+    // The pre-existing entries delegate to the ctx versions with a null ctx,
+    // so they keep landing on `beginTx`.
+    {
+        const root = makeClient(infos, allocator, spy.asDriver());
+        var tx = try beginTx(infos, root);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 3), spy.begin_tx_calls);
+        try tx.rollback();
+    }
+    {
+        var tx = try beginTxFromDriver(infos, spy.asDriver(), allocator);
+        defer tx.deinit();
+        try std.testing.expectEqual(@as(usize, 4), spy.begin_tx_calls);
+        try tx.rollback();
+    }
+    // Nothing above was inside an open transaction, so no savepoint.
+    try std.testing.expectEqual(@as(usize, 0), spy.begin_savepoint_calls);
+}
+
+test "beginTxCtx bounds acquiring a pooled transaction with the caller's deadline" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const ConnPool = @import("../sql/pool.zig").ConnPool;
+
+    const Item = Schema("CtxPoolItem", .{ .fields = &.{field.String("name")} });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    var pool = try ConnPool(sqlite_driver.SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn connect(a: std.mem.Allocator) !sqlite_driver.SQLiteDriver {
+                return sqlite_driver.SQLiteDriver.open(a, ":memory:");
+            }
+        }.connect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 1000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    var spy = TxSpyDriver{ .inner = pool.asDriver() };
+    const root = makeClient(infos, allocator, spy.asDriver());
+
+    // Uncontended and without a ctx: the pool's own budget applies and the
+    // transaction opens, exactly as it did before this entry point existed.
+    {
+        var tx = try beginTxCtx(infos, root, null);
+        defer tx.deinit();
+        try tx.rollback();
+    }
+
+    // Hold the only connection, and keep the generated code's `inTransaction`
+    // preflight from borrowing: the pooled `inTransaction` waits out the
+    // pool's `max_wait_ms`, and the caller's 50 ms is what must decide here.
+    const held = try pool.borrow();
+    defer pool.release(held);
+    spy.in_transaction_override = false;
+    const calls_before = spy.begin_tx_calls;
+
+    const ctx = sql_driver.ExecutionContext{ .deadline_ns = sql_driver.monotonicNs() + 50 * std.time.ns_per_ms };
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, beginTxCtx(infos, root, &ctx));
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 400);
+    // The deadline reached the pool, and reached it *through* the ctx hook:
+    // the null-ctx call above was the *plain* entry, this one the ctx one.
+    try std.testing.expectEqual(@as(usize, 1), spy.begin_tx_ctx_calls);
+    try std.testing.expectEqual(calls_before, spy.begin_tx_calls);
+    try std.testing.expect(spy.last_ctx == &ctx);
+}
+
+test "beginTxFromDriverCtx bounds acquiring a pooled transaction with the caller's deadline" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const ConnPool = @import("../sql/pool.zig").ConnPool;
+
+    const Item = Schema("CtxPoolDriverItem", .{ .fields = &.{field.String("name")} });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    var pool = try ConnPool(sqlite_driver.SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn connect(a: std.mem.Allocator) !sqlite_driver.SQLiteDriver {
+                return sqlite_driver.SQLiteDriver.open(a, ":memory:");
+            }
+        }.connect,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 1000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    var spy = TxSpyDriver{ .inner = pool.asDriver() };
+
+    // Uncontended and without a ctx: unchanged behaviour.
+    {
+        var tx = try beginTxFromDriverCtx(infos, spy.asDriver(), allocator, null);
+        defer tx.deinit();
+        try tx.rollback();
+    }
+
+    const held = try pool.borrow();
+    defer pool.release(held);
+    spy.in_transaction_override = false;
+    const calls_before = spy.begin_tx_calls;
+
+    const ctx = sql_driver.ExecutionContext{ .deadline_ns = sql_driver.monotonicNs() + 50 * std.time.ns_per_ms };
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, beginTxFromDriverCtx(infos, spy.asDriver(), allocator, &ctx));
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 400);
+    try std.testing.expectEqual(@as(usize, 1), spy.begin_tx_ctx_calls);
+    try std.testing.expectEqual(calls_before, spy.begin_tx_calls);
+    try std.testing.expect(spy.last_ctx == &ctx);
 }
 
 test "beginTx nested savepoint: inner commit releases to outer tx" {
