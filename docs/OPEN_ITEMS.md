@@ -1,0 +1,57 @@
+# Open items
+
+What is **still open**, in one place, with the evidence. `CHANGELOG.md` records
+each item where it was found and each fix where it landed, which is the right
+shape for history — but reading "what is open right now" out of it means diffing
+the accumulated notes against every later release. This file is that diff, kept
+current instead.
+
+**Not a wish list.** Everything here was observed: a measurement, a reproduction,
+or source that says something the docs do not.
+
+- `docs/ISSUES_FROM_ZAPI.md` — consumer-reported items (Z1–Z35), with verdicts.
+- `docs/BEST_PRACTICES.md` §5h — what `checkSchema` does **not** compare.
+- `CHANGELOG.md` — history, including the negative audit results.
+
+---
+
+## Needs a decision before it can be fixed
+
+| Item | Evidence | Why it needs you |
+|---|---|---|
+| **A failed borrow-time health check on a newly created connection parks the borrower for the whole budget** | Found by the pool stress tests (v0.61.0). With `health_check_on_borrow` and a wait budget, the ping fails on a connection the pool just opened, the borrower parks — and if no other thread holds a connection, nothing can signal it, so the caller waits out `max_wait_ms` and gets `PoolWaitTimeout` instead of the connection error. Reachable behind a proxy or a half-open connection | The fix is a policy choice: retry with a fresh connection (more work on the borrow path) or fail fast (the caller sees the real error) |
+| **A junction table name colliding with a declared entity table is undetected** | `junctionTableForEdge` derives `<a>_<b>`, and `createTableSQLAlloc` emits `CREATE TABLE IF NOT EXISTS`, so the first one created wins silently. An entity whose table is literally that pair's name is enough | Detecting it means either validating names at graph build (a new compile-time error) or reporting it in `checkSchema` (a new drift kind) |
+| **SQLite declares foreign keys but does not enforce them** | `zent` never issues `PRAGMA foreign_keys`, and SQLite defaults it OFF, so an FK in the DDL accepts dangling references. `checkSchema` compares the DDL shape and cannot see the switch — `missing_foreign_key` means "not declared", a clean result means "declared", not "enforced" | Turning it on changes write behaviour for existing consumers (some inserts would start failing) |
+| **`zig build migrate-rollback` does not inherit the caller's DSN** | `build.zig`'s `migrate-rollback` step calls `setEnvironmentVariable`, which materialises the env map into the long-lived build-server process; `migrate` (`build.zig:205`) does not and works. So the rollback step cannot be pointed at a database from the shell | Fixing it means changing how the step passes env — worth doing, but it touches the build's structure |
+
+## Open, with a known shape
+
+| Item | Evidence |
+|---|---|
+| **`create.zig`'s two insert log sites still report a hardcoded `rows_affected = 1`** | The RETURNING path logs 1 for a `SaveIgnore` the server ignored (0 rows written); the MySQL path logs 1 where the server reports 2 (an upsert that updated) or 0. `LogContext` already carries `rows_affected_known` since v0.65.0, so the value is available |
+| **`SaveOne` / `ExecOne` lose `rows_affected_known` at the `usize` boundary** | They return `usize`, so a driver that could not count reads as "0 rows" and answers `NotFound`. `UPDATE`/`DELETE` counts are known on all three dialects, so it is unreachable today — it is the one place the v0.63.0 distinction does not reach |
+| **The RETURNING path answers `error.TypeMismatch` for a uuid primary key the caller never set** | `create.zig`'s `row.getText(0) orelse return error.TypeMismatch`: SQLite inserts NULL and hands back NULL, so the caller gets a *type* error for what is a *missing key*. MySQL now answers `error.MissingPrimaryKey` (v0.69.0) — the two dialects name the same mistake differently. **Read from the source, not reproduced** |
+| **`sql.MultiInsert`'s length assertion does not validate what the rows set** | It asserts `values.len == columns.len * row_count`, which holds because the buffer is sized from the column list. The insert layer now checks the rows against each other (v0.69.0), so the assert is no longer the only guard — but it is still about the buffer, not the input |
+| **MySQL's prepared `exec` path never drains its result set** | So a parameterised `SELECT` through `exec` reports `rows_affected_known = false` where the unprepared path reports the row count (v0.63.0 documented the difference). Draining would make the two agree at the cost of materialising a result set `exec` is about to discard |
+| **`outbox.nowMs` falls back to `0`** | A `gettimeofday` failure would stamp `claimed_at = 0` (immediately stale) and compute a negative cutoff for `requeueStale`. The syscall cannot fail for a valid pointer, so it is unreachable — recorded because it is the same "unknown as a value" shape |
+| **`field.String` is `VARCHAR(255)` on MySQL with no length validation** | Since v0.57.0 the API does not express the cap; a longer value that PostgreSQL and SQLite accept errors on MySQL under a strict `sql_mode` and truncates under a permissive one. `BEST_PRACTICES` documents it; nothing enforces it |
+| **The MySQL BLOB/TEXT `DEFAULT` guard is stricter than MariaDB requires** | MariaDB ≥ 10.2.1 accepts a `DEFAULT` on `TEXT`; the DDL layer cannot tell the two servers apart without a connection, so it applies MySQL's rule to both (v0.58.0, restated in v0.60.0). A MariaDB user who needs it must hand-write the migration |
+| **`examples/migrate`'s DSN dispatch stops at `postgres://`** | A libpq keyword/value conninfo (the shape `PG_DSN` has in CI) is not recognised, so the example cannot be pointed at that deployment. `examples/check_sql` handles it |
+
+## Open in the ledger
+
+| ID | What remains |
+|---|---|
+| Z14 | The `Contains` rename itself (the `Like` alias and the docs shipped). The rename gets more expensive with every adopter |
+| Z16 | Multi-graph stages 2/3: a cross-graph edge fails at *runtime* with a named error (stage 1), not at compile time |
+| Z31 | `view_sql` replacement; `UNIQUE` / foreign keys added by `ALTER` on an existing table |
+| Z32 | A bare `sql.InSelect` does not scope its inner table; `Has*` targets do. Documented as out of reach for the `sql` layer (it has no graph) |
+
+## Structural gaps
+
+| Gap | Why it matters |
+|---|---|
+| **MariaDB differences are still found after the tag is pushed** | The new `tests/integration/dialect_matrix.zig` now compares the dialects directly, which covers the semantic half. What it cannot cover is a difference neither harness knows to ask about, and this session's three escapes (`column_default` quoting, functional indexes, `BEGIN` through prepare) were all of that kind. The only root fix is a local MariaDB or a working container runtime |
+| **Modules the audit method has not reached** | `codegen/query.zig`'s full branches (2422 lines; entry/scope/cursor read so far), `graph.zig` / `meta.zig`, `update_delete.zig`'s edge-write branches, the drivers' dialect-specific edges, `bench/`, and `examples/` other than `check_sql` and `migrate`. The method's hit rate has stayed high — `catch {}` 20 sites → 1 defect, `catch null`/`catch 0` 10 → 2, the high-level modules → 4 including a privilege escalation, the unaudited modules → an EntQL fail-open — so this is where a defect is most likely to be found rather than reported |
+| **Log text is not assertable** | This repository has no `logFn`, so warnings cannot be captured in tests. Several fixes in this series are therefore pinned only at the level below the message (the renderer, or the value a callback receives), and each one says so rather than claiming an end-to-end assertion |
+| **`migrations/001_create_users.up.sql` is SQLite-only DDL** | It uses `INTEGER PRIMARY KEY AUTOINCREMENT`, so the `migrate` example's own migrations fail on MySQL and PostgreSQL (`errno=1064` / equivalent). The example is otherwise dialect-aware |

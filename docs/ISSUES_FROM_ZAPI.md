@@ -297,6 +297,24 @@ the line their eight experiments were trying to reach. Both dialects are pinned
 by an integration test with a hand-built table whose physical order differs from
 the schema, and each test fails when the explicit list is removed.
 
+### Z36 — `Restore` on a live row, found by the cross-dialect matrix (v0.69.0)
+
+Self-found, and the first thing the new `tests/integration/dialect_matrix.zig`
+reported on its first run. `DeleteBuilder.Restore(id)` cleared `deleted_at`
+where the id matched, without asking whether the row was in the trash: the
+statement matched a **live** row and changed nothing, so SQLite and PostgreSQL
+counted it (*matched*) and answered `true` while MySQL counted 0 (*changed*) and
+answered `false`. One call, two meanings — and **neither** one the documented
+behaviour, which is "returns true when a row was restored".
+
+**Fixed** (v0.69.0): the statement is scoped to `deleted_at IS NOT NULL`, the
+mirror of `execSoftDelete`'s `IS NULL`, so a live row is not restored and
+answers `false` on all three dialects. The already-trashed row and a missing id
+answer what they always did. This is the fourth call site in the
+changed-vs-matched family (after `crud.update`, `crud_helpers.update` and
+`increment`), and the first one found by comparison rather than by report — which
+is the argument for the matrix existing.
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -335,6 +353,7 @@ the schema, and each test fails when the explicit list is removed.
 | Z33 | Empty `dept_ids` widens a data scope instead of denying | P1 | **Fixed** v0.66.0 — an empty list is a "cannot be built": `1 = 0` + warn; `.all` is the way to say "unrestricted" |
 | Z34 | No-predicate `BulkDelete` is a silent `0` or a full-table delete | P1 | **Fixed** v0.66.0 — `error.NoPredicate`, the shape v0.45.0 chose for a `SET`-less UPDATE; the duplicated bodies were merged. Its verification also found the bulk soft-delete path dropping the policy's row filters (fixed v0.66.0) and both soft-delete paths re-trashing an already-trashed row (fixed v0.67.0) |
 | Z35 | An eager-loaded target is scanned in table order, so a migrated database reads every target's values into the wrong fields | P1 | **Fixed** v0.68.0 — the SELECT list is the target's columns in field order (`Step.to_columns`); `explainScanFailure` now names the column for a misaligned projection, and the eager-load target scan calls it at all |
+| Z36 | `Restore` on a live row answers `true` on SQLite/PG and `false` on MySQL | P1 | **Fixed** v0.69.0 — scoped to `deleted_at IS NOT NULL`; found by the new `dialect_matrix` on its first run |
 | Z32 | Sub-query predicates do not scope the inner table | P2 | **Partly fixed** v0.52.0 — `Has*` targets scoped; bare `sql.InSelect` documented as out of reach |
 
 **On IDs.** `Z<n>` numbers are allocated once and never reused; before v0.56.0 the

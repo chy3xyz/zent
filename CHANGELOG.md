@@ -4,6 +4,94 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **A cross-dialect matrix, and the first divergence it found**
+  (`tests/integration/dialect_matrix.zig`). Every other integration file is
+  self-consistent — each assertion is checked against the server that file talks
+  to — which is how the same class of defect shipped over and over: a call whose
+  answer depended on which server was behind it, noticed only when a consumer
+  reported it. The changed-vs-matched divergence reached four call sites; SQLite
+  coercing where MySQL answers null turned one column-order bug into silent wrong
+  values on one dialect and `TypeMismatch` on the other; three MariaDB-vs-MySQL
+  differences each turned a tag red.
+
+  The matrix runs one logical operation on every available dialect and asserts
+  the observables agree — **semantic** answers only (the returned `bool`, the
+  count an API reports, the rows and values that come back), never the metadata
+  where dialects differ by design. Eleven cases, each drawn from a defect this
+  repo actually shipped, plus a **documented exclusion list** so a reader can
+  tell "we do not compare this" from "we forgot". A case with fewer than two
+  dialects available skips rather than passing quietly, and a divergence names
+  the answers that disagree.
+
+- **`docs/OPEN_ITEMS.md`** — what is still open, in one place, with its evidence.
+  `CHANGELOG.md` is history and says so; reading "what is open right now" out of
+  it meant diffing accumulated notes against every later release. This is that
+  diff, kept current. It also separates the three kinds: what needs a decision,
+  what has a known shape, and the structural gaps.
+
+### Fixed
+- **`DeleteBuilder.Restore(id)` on a live row answered differently per dialect** —
+  found by the new matrix on its first run. The statement matched the live row and
+  changed nothing, so SQLite and PostgreSQL counted it and answered `true` while
+  MySQL's changed-rows count answered `false`: one call, two meanings, and
+  **neither** the documented one ("returns true when a row was restored"). It is
+  now scoped to `deleted_at IS NOT NULL`, as `execSoftDelete` is scoped to
+  `IS NULL`, so a live row is not restored and answers `false` on all three. The
+  already-trashed row and a missing id answer what they always did.
+
+- **A bulk insert whose rows declare different fields wrote to the wrong
+  columns.** The statement carries one column list — the first row's — while every
+  row's values were flattened in that row's own order, so a row with fewer fields
+  left the tail of its values bound as real values (the allocator's `0xaa` fill
+  under `std.testing.allocator`) and a row with more ran past the buffer.
+  `MultiInsert`'s length assertion held in both cases, because the buffer is sized
+  from the column list rather than from what the rows set. Every row is now
+  compared with the first **by position** before any statement runs:
+  `error.InconsistentRowFields`, with the row index in a warning, and nothing
+  written. Rows holding the same fields in another order are rejected too — a set
+  comparison would call those consistent and bind them just as wrongly. The same
+  check subsumes a divide-by-zero: a leading empty row left only *trailing*
+  empties trimmed, so the column list came from an empty row.
+
+- **A MySQL uuid primary key the caller never set is `error.MissingPrimaryKey`**
+  instead of an entity keyed by `""`. MySQL has no `RETURNING`, so the caller's
+  value is the only source of a `CHAR(36)` key — the library generates no uuid and
+  the server fills none in — and the entity's key stayed at a value that names no
+  row while looking like one. Decided **before** the statement, so no key-less row
+  is written (unlike `error.MissingLastInsertId`, which can only be known
+  afterwards). The upsert path resolves its conflict target through the same check.
+
+- **`CrudService.get` leaked the strings it had already duplicated** when a later
+  `dupe` failed: `ownedCopy` now tears down by count, the shape
+  `ShardedEnv.open` uses.
+
+- **`requeueStale`'s staleness cutoff is explicit** (`staleCutoffMs`). The report
+  that prompted this said the old code saturated to `0` and thereby reversed the
+  meaning; measuring it showed otherwise, and the code follows the measurement:
+  Zig's signed `-|` saturates to `minInt`, not `0`, and `now_ms -| maxInt` does not
+  saturate at all, so the old value was already "far past". What was worth fixing
+  is that it *relied* on saturating arithmetic to land there — the cutoff is now
+  `minInt` for an unrepresentable threshold, stays monotonic across the overflow
+  point, and never lands on `0`, which reads as "claimed before 1970" and would
+  reclaim negative-stamped rows under a threshold nothing can be older than.
+  `older_than_secs <= 0` remains the way to ask for "reclaim every processing row".
+
+- **The `migrate` example leaked eight allocations on every MySQL run** — the four
+  parsed DSN strings and the four sentinels handed to `MySQLDriver.connect`. Both
+  now live in an arena that ends with the connect call, the shape
+  `examples/check_sql` already used; the example's output is unchanged.
+
+### Notes
+- **Two `SaveError` members were added** (`InconsistentRowFields`,
+  `MissingPrimaryKey`), which is incompatible with exhaustive switches over the
+  create error sets. The in-tree compile-time error-set pins were updated; no
+  switch on the create path was exhaustive.
+- **`docs/OPEN_ITEMS.md` is the entry point for "what is left"** — it carries the
+  pool health-check decision, the junction-name collision, SQLite's unenforced
+  foreign keys, the unassertable log text, and the modules the audit method has
+  not reached.
+
 ## [0.68.0] - 2026-09-20
 
 ### Fixed
@@ -473,7 +561,8 @@ All notable changes to this project will be documented in this file.
   returned with `after=3`, and `has_more=true` beside `next_cursor=null`);
   `ShardRouter.route` divides by zero at `shard_count == 0`; `ShardedEnv.open`
   leaks the drivers opened before a failure; `requeueStale`'s age overflow
-  saturates in the wrong direction; `outbox.nowMs` falls back to `0` (unreachable);
+  was claimed to saturate in the wrong direction — measured in v0.69.0 and it did
+  not, see that release; `outbox.nowMs` falls back to `0` (unreachable);
   `crud.ownedCopy` has no `errdefer`; `ShardSet.clientAt` is unchecked;
   `saveOrUpdate`'s exists-then-create is a TOCTOU window.
 

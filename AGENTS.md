@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.68.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.69.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (437 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (445 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -51,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 437, integration 230 passed + 3 skipped
+`baseline` counts move with this: unit 445, integration 231 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -74,6 +74,11 @@ be set up at all on one server, create it only there and say why in a comment.
 
 ## Docs map
 
+- `docs/OPEN_ITEMS.md` — **what is still open**, with evidence: needs-a-decision,
+  known-shape, and structural gaps. Start here when asking "what is left", not in
+  `CHANGELOG.md` (which is history)
+- `docs/ISSUES_FROM_ZAPI.md` — the consumer-reported items Z1–Z35, with verdicts
+  and file:line evidence
 - `docs/RELEASING.md` — release flow + consumer hash-sync
 - `docs/ARCHITECTURE.md` — layer map + memory ownership contract
 - `docs/superpowers/specs/` — design specs (benchmark, …)
