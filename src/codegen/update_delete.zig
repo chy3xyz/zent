@@ -1005,6 +1005,15 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         /// Restore a soft-deleted row (clears `deleted_at`). Compile error
         /// unless the entity has soft_delete enabled. Returns true when a
         /// row was restored.
+        ///
+        /// A row that is **live** is not restored, so it answers false — the
+        /// statement is scoped to `deleted_at IS NOT NULL` for the same reason
+        /// `execSoftDelete` is scoped to `IS NULL`. Without it the UPDATE
+        /// *matched* the live row, so SQLite and PostgreSQL counted it and
+        /// answered true while MySQL's *changed*-rows count answered false: one
+        /// call, two meanings, and neither of them the documented one. The
+        /// already-trashed row and the missing id answer the same as before on
+        /// every dialect.
         pub fn Restore(self: *Self, id: i64) !bool {
             if (!info.soft_delete) @compileError("Restore requires soft_delete on the entity");
             if (info.policy) |p| {
@@ -1017,6 +1026,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             defer builder.deinit();
             _ = try builder.set("deleted_at", .null);
             _ = try builder.where(sql.EQ(pkColumn(info), .{ .int = id }));
+            _ = try builder.where(sql.IsNotNull("deleted_at"));
             const q = try builder.query();
             self.ensureDeadline();
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);

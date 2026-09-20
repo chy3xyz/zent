@@ -14,6 +14,7 @@ pub fn main() !void {
     _ = @import("pool.zig");
     _ = @import("pressure.zig");
     _ = @import("check_sql_cli.zig");
+    _ = @import("dialect_matrix.zig");
     if (comptime build_options.have_pg) _ = @import("postgres.zig");
     if (comptime build_options.have_mysql) _ = @import("mysql.zig");
 }
@@ -23,6 +24,7 @@ test {
     _ = @import("pool.zig");
     _ = @import("pressure.zig");
     _ = @import("check_sql_cli.zig");
+    _ = @import("dialect_matrix.zig");
     if (comptime build_options.have_pg) _ = @import("postgres.zig");
     if (comptime build_options.have_mysql) _ = @import("mysql.zig");
 }
