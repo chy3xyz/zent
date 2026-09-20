@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.69.0] - 2026-09-21
+
 ### Added
 - **A cross-dialect matrix, and the first divergence it found**
   (`tests/integration/dialect_matrix.zig`). Every other integration file is
