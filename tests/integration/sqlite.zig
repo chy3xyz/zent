@@ -5504,3 +5504,79 @@ test "SQLite: Restore answers from the count UPDATE reported" {
         try testing.expect(!try db.Restore(created.id + 1000));
     }
 }
+
+test "SQLite: an eager-loaded target is scanned by field order, not the table's column order" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const OwningBase = schema("ReproOwning", .{
+        .fields = &.{ field.String("code"), field.Int("stock") },
+    });
+    const TargetBase = schema("ReproTarget", .{
+        .fields = &.{ field.Int("app_id"), field.String("label"), field.Int("qty") },
+    });
+    const Owning = struct {
+        pub const schema_name = OwningBase.schema_name;
+        pub const fields = OwningBase.fields;
+        pub const edges = &.{edge.From("thing", TargetBase).Field("thing_id")};
+        pub const indexes = OwningBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ TargetBase, Owning });
+    const infos = graph.types;
+    const owning_info = infos[1];
+
+    // Both tables are hand-built so the PHYSICAL column order differs from the
+    // schema's field order — exactly what `ALTER TABLE ... ADD COLUMN` leaves
+    // behind on a long-migrated database (the new column lands last, while the
+    // schema keeps it where the author declared it).
+    _ = try drv.exec(
+        "CREATE TABLE repro_target (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, app_id INTEGER NOT NULL, qty INTEGER NOT NULL)",
+        &.{},
+    );
+    _ = try drv.exec(
+        "CREATE TABLE repro_owning (id INTEGER PRIMARY KEY AUTOINCREMENT, thing_id INTEGER NOT NULL, stock INTEGER NOT NULL, code TEXT NOT NULL)",
+        &.{},
+    );
+
+    _ = try drv.exec("INSERT INTO repro_target (label, app_id, qty) VALUES ('widget', 1, 5)", &.{});
+    _ = try drv.exec("INSERT INTO repro_owning (thing_id, stock, code) VALUES (1, 9, 'own-1')", &.{});
+
+    const client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Control: the SOURCE read is fine — it lists columns explicitly.
+    {
+        var q = client.repro_owning.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, owning_info, e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("own-1", rows.items[0].code);
+        try testing.expectEqual(@as(i64, 9), rows.items[0].stock);
+    }
+
+    // The eager-loaded TARGET is scanned positionally. With `target.*` the
+    // projection follows the table order above, so each field takes the wrong
+    // column. The SYMPTOM differs by dialect: SQLite coerces (an integer field
+    // reading '"widget"' gets 0), so this test sees wrong values, while MySQL's
+    // binary protocol makes the getter answer null and the scan fails with
+    // error.TypeMismatch — the shape reported against a live cart. Same defect,
+    // and the SELECT list is now the target's columns in field order.
+    {
+        var q = client.repro_owning.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("thing");
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, owning_info, e, allocator);
+            rows.deinit();
+        }
+        const t = rows.items[0].edges.thing.?[0];
+        try testing.expectEqualStrings("widget", t.label);
+        try testing.expectEqual(@as(i64, 5), t.qty);
+        try testing.expectEqual(@as(i64, 1), t.app_id);
+    }
+}

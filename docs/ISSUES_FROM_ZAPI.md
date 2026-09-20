@@ -263,6 +263,40 @@ Both items were judged worth acting on despite a **zero** exposure for the
 reporting consumer, because the shape they share is the one this ledger keeps
 recording: a value that carries two meanings, resolved silently in one direction.
 
+### Z35 — an eager-loaded target was scanned in table order (1 item, v0.67.0 baseline)
+
+Reported from a live deployment: on MySQL, any `cart` read with
+`WithEdge("product")` returned 500 with `error.TypeMismatch` on the first row
+that was actually scanned, while the same entity and code on a freshly-created
+SQLite database were fine. The report narrowed it to the eager-load path with
+eight experiments and could not name the column, because `explainScanFailure`
+covered only "too few columns" and "NULL in a non-optional field" — and, as it
+turned out, the eager-load target scan never called it at all.
+
+**Confirmed, and the cause is neither the driver nor MySQL.** The neighbour
+query selected `<target>.*`, whose order is the **table's** physical column
+order, while the result set is scanned **positionally**. Those agree only on a
+database created from the current schema — and `ALTER TABLE … ADD COLUMN`, which
+is how `migrateSchema` adds a field to an existing table, **appends** the column.
+On a long-migrated database (theirs) every eager-loaded target read its values
+into the wrong fields. The two dialects show it differently, which is why their
+SQLite layer looked like proof that it worked: MySQL's binary protocol makes the
+getter answer `null` and the scan fails with `TypeMismatch`, while SQLite coerces
+an integer field reading `'widget'` to `0` and returns **wrong values silently**.
+Source reads were never affected — `QueryBuilder` lists its columns explicitly —
+which is why only the eager path failed.
+
+**Fixed** (v0.68.0): the SELECT list is now the target's columns in field order
+(`Step.to_columns`, filled by `buildEdgeStep` from the same `TypeInfo` the
+scanner walks, mirroring the source query's own `all_cols`). Their report's other
+half is fixed too: `explainScanFailure` now **names the column** for a misaligned
+projection, and the eager-load target scan calls it — reproducing their case now
+prints `column 2 is 'label' with value 'widget', which field 'app_id' (i64) cannot
+hold — the projection does not line up with the schema's field order`, which is
+the line their eight experiments were trying to reach. Both dialects are pinned
+by an integration test with a hand-built table whose physical order differs from
+the schema, and each test fails when the explicit list is removed.
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -300,6 +334,7 @@ recording: a value that carries two meanings, resolved silently in one direction
 | Z31 | `migrateSchema` creates the drift it later warns about | P2 | **Reporting complete; repair still opt-in or absent** — v0.56.0 nullability behind `allow_nullability_change`; v0.58.0 `ExistingIndex.columns` + `index_columns` drift and MySQL BLOB/TEXT DDL diagnosis; v0.59.0 `index_uniqueness` drift, the ALTER ADD COLUMN half of the diagnosis, bound/validated introspection names; v0.60.0 `unique_constraint` (field-level `UNIQUE`) and `missing_foreign_key` (by shape); v0.61.0 `missing_view` (`breaksReads` **true**) plus `getExistingViews`, and **PostgreSQL can create a view at all now** (`CREATE VIEW IF NOT EXISTS` is not PostgreSQL syntax — 42601 — so a schema with a view entity could not be migrated on PG since views were added). v0.62.0 adds `missing_junction_table` (**M2M junction tables were the last declared surface nothing checked** — found this round by enumerating what the schema declares against what `checkSchema` compares) and fixes two driver failures that were being read as a default (SQLite step failures read as end-of-rows, PostgreSQL's `rows_affected` count). v0.65.0 adds the junction **shape** comparison (`missing_column` / `junction_pair_uniqueness` / `missing_foreign_key` for a present junction) and the EntQL end-of-input requirement. Still open: `migrateSchema` does not add `UNIQUE`/FK with `ALTER`; view *definitions* are deliberately not compared; a junction name colliding with an entity table is unchecked |
 | Z33 | Empty `dept_ids` widens a data scope instead of denying | P1 | **Fixed** v0.66.0 — an empty list is a "cannot be built": `1 = 0` + warn; `.all` is the way to say "unrestricted" |
 | Z34 | No-predicate `BulkDelete` is a silent `0` or a full-table delete | P1 | **Fixed** v0.66.0 — `error.NoPredicate`, the shape v0.45.0 chose for a `SET`-less UPDATE; the duplicated bodies were merged. Its verification also found the bulk soft-delete path dropping the policy's row filters (fixed v0.66.0) and both soft-delete paths re-trashing an already-trashed row (fixed v0.67.0) |
+| Z35 | An eager-loaded target is scanned in table order, so a migrated database reads every target's values into the wrong fields | P1 | **Fixed** v0.68.0 — the SELECT list is the target's columns in field order (`Step.to_columns`); `explainScanFailure` now names the column for a misaligned projection, and the eager-load target scan calls it at all |
 | Z32 | Sub-query predicates do not scope the inner table | P2 | **Partly fixed** v0.52.0 — `Has*` targets scoped; bare `sql.InSelect` documented as out of reach |
 
 **On IDs.** `Z<n>` numbers are allocated once and never reused; before v0.56.0 the

@@ -38,6 +38,25 @@ pub const Step = struct {
     to_table: []const u8,
     to_column: []const u8,
 
+    /// The target's data columns, **in the target entity's field order**.
+    ///
+    /// The eager-load result set is scanned **positionally**, so the SELECT
+    /// list has to be exactly what the scanner consumes. It used to be
+    /// `<to_table>.*`, whose order is the *table's* physical column order — and
+    /// `ALTER TABLE … ADD COLUMN`, which is how `migrateSchema` adds a field to
+    /// an existing table, appends the column last. On a database that has been
+    /// migrated (any long-lived one) every eager-loaded target then read its
+    /// values into the wrong fields: a `String` field took an `Int` column's
+    /// value and a numeric field got nothing to parse, which surfaces as
+    /// `error.TypeMismatch` on the first row that is actually scanned.
+    ///
+    /// `buildEdgeStep` fills this from the target's `TypeInfo`, so **every Step
+    /// that came from a graph is explicit**. The default is for a Step a caller
+    /// (or a shape test) constructs by hand: that one falls back to
+    /// `<to_table>.*`, which is the old behaviour, and is why the field
+    /// documents the hazard instead of only relying on the type.
+    to_columns: []const []const u8 = &.{},
+
     /// Edge relation type.
     edge_rel: Rel,
 

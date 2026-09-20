@@ -4466,3 +4466,78 @@ test "MySQL: bulk upsert ids name the rows that were written, collisions include
     defer total.deinit();
     try testing.expectEqual(@as(i64, 3), (total.next() orelse return error.NoRow).getInt(0).?);
 }
+
+test "MySQL: an eager-loaded target is projected in field order, not table order" {
+    // The symptom that reached us from a live cart: MySQL's binary protocol
+    // makes the getter answer null when a text column lands on a numeric field,
+    // so a misaligned eager-load projection surfaces as error.TypeMismatch on
+    // the first row actually scanned (SQLite coerces and returns wrong values
+    // instead). The tables here are hand-built so the PHYSICAL column order
+    // differs from the schema's field order — what `ALTER TABLE … ADD COLUMN`
+    // leaves behind on any long-migrated database.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MtOwningBase = schema("MtOwning", .{
+        .fields = &.{ field.String("code"), field.Int("stock") },
+    });
+    const MtTargetBase = schema("MtTarget", .{
+        .fields = &.{ field.Int("app_id"), field.String("label"), field.Int("qty") },
+    });
+    const MtOwning = struct {
+        pub const schema_name = MtOwningBase.schema_name;
+        pub const fields = MtOwningBase.fields;
+        pub const edges = &.{edge.From("thing", MtTargetBase).Field("thing_id")};
+        pub const indexes = MtOwningBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ MtTargetBase, MtOwning });
+    const infos = graph.types;
+    const owning_info = infos[1];
+
+    _ = try drv.exec("DROP TABLE IF EXISTS mt_owning", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS mt_target", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS mt_owning", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS mt_target", &.{}) catch {};
+
+    _ = try drv.exec(
+        "CREATE TABLE mt_target (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(255) NOT NULL, app_id BIGINT NOT NULL, qty BIGINT NOT NULL)",
+        &.{},
+    );
+    _ = try drv.exec(
+        "CREATE TABLE mt_owning (id BIGINT PRIMARY KEY AUTO_INCREMENT, thing_id BIGINT NOT NULL, stock BIGINT NOT NULL, code VARCHAR(255) NOT NULL)",
+        &.{},
+    );
+    _ = try drv.exec("INSERT INTO mt_target (label, app_id, qty) VALUES ('widget', 1, 5)", &.{});
+    _ = try drv.exec("INSERT INTO mt_owning (thing_id, stock, code) VALUES (1, 9, 'own-1')", &.{});
+
+    const client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // The source read lists its columns explicitly, so it is the control.
+    {
+        var q = client.mt_owning.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, owning_info, e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("own-1", rows.items[0].code);
+    }
+
+    {
+        var q = client.mt_owning.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("thing");
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, owning_info, e, allocator);
+            rows.deinit();
+        }
+        const t = rows.items[0].edges.thing.?[0];
+        try testing.expectEqualStrings("widget", t.label);
+        try testing.expectEqual(@as(i64, 5), t.qty);
+        try testing.expectEqual(@as(i64, 1), t.app_id);
+    }
+}

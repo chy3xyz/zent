@@ -609,6 +609,18 @@ fn getJunctionTable(comptime edge: EdgeInfo, comptime source_table: []const u8, 
 }
 
 /// Build a graph Step from edge/source/target metadata at comptime.
+/// The target's data columns in field order — what the positional scan of an
+/// eager-load result set expects, and what `Step.to_columns` carries. Mirrors
+/// `QueryBuilder`'s own `all_cols` (query.zig), so the two column lists cannot
+/// drift.
+fn fieldColumns(comptime info: TypeInfo) []const []const u8 {
+    comptime {
+        var cols: []const []const u8 = &.{};
+        for (info.fields) |f| cols = cols ++ &[_][]const u8{f.column_name};
+        return cols;
+    }
+}
+
 pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) graph_step.Step {
     const source_table = source_info.table_name;
     const target_table = target_info.table_name;
@@ -622,6 +634,7 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
             .from_column = pkColumn(source_info),
             .to_table = target_table,
             .to_column = pkColumn(target_info),
+            .to_columns = fieldColumns(target_info),
             .edge_rel = .m2m,
             .edge_table = junction,
             .edge_columns = &[_][]const u8{ target_col, source_col },
@@ -639,6 +652,7 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
             .from_column = pkColumn(source_info),
             .to_table = target_table,
             .to_column = pkColumn(target_info),
+            .to_columns = fieldColumns(target_info),
             .edge_rel = if (is_to) .o2m else .m2o,
             .edge_table = if (is_to) target_table else source_table,
             .edge_columns = &[_][]const u8{fk_col},

@@ -51,11 +51,28 @@ fn writeInClauseChunked(
 }
 
 fn writeEagerLoadColumns(b: *sql.Builder, step: Step, include_select: bool) !void {
-    // The result set includes target.* plus a computed __fk column that
-    // identifies which parent row each result belongs to.
+    // The result set is the target's **data columns in field order**, plus a
+    // computed `__fk` column identifying which parent row each result belongs
+    // to. It used to be `<target>.*`, which follows the *table's* physical
+    // column order — and `ALTER TABLE … ADD COLUMN` appends, so on a migrated
+    // database the positional scan read every target's values into the wrong
+    // fields. See `Step.to_columns`.
     if (include_select) try b.writeString("SELECT ");
-    try b.ident(step.to_table);
-    try b.writeString(".*, ");
+    for (step.to_columns, 0..) |col, i| {
+        if (i > 0) try b.writeString(", ");
+        try b.ident(step.to_table);
+        try b.writeByte('.');
+        try b.ident(col);
+    }
+    if (step.to_columns.len == 0) {
+        // A hand-built Step with no columns: keep the previous shape rather
+        // than emitting a SELECT with no projection. `buildEdgeStep` always
+        // fills `to_columns`, so this is only reachable from a Step a caller
+        // constructed itself.
+        try b.ident(step.to_table);
+        try b.writeString(".*");
+    }
+    try b.writeString(", ");
 
     switch (step.edge_rel) {
         .o2m, .o2o => {

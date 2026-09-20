@@ -63,6 +63,30 @@ fn explainScanFailure(comptime info: TypeInfo, comptime T: type, row: sql_driver
             return;
         }
     }
+    // No NULL explains it (and the field types are optional-tolerant), so a
+    // value does not fit its field. Find which one: replay the scan field by
+    // field in the same order and report the first that throws. Without this
+    // the message named no column at all, which left a misaligned projection —
+    // e.g. an eager-loaded target read in table order instead of field order —
+    // to be found by bisecting the query shape by hand.
+    const Scratch = struct {
+        var arena: ?*std.heap.ArenaAllocator = null;
+    };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    _ = &Scratch;
+    var idx2: usize = 0;
+    inline for (field_names, field_types) |fname, ftype| {
+        if (comptime std.mem.eql(u8, fname, "edges") or std.mem.eql(u8, fname, "json_arena")) continue;
+        const col2 = idx2;
+        idx2 += 1;
+        _ = sql_scan.scanColumn(ftype, arena.allocator(), row, col2, null) catch {
+            const col_name = if (col2 < row.columnCount()) row.columnName(col2) else "<past the end>";
+            const value = if (col2 < row.columnCount()) (row.getText(col2) orelse "<null>") else "<none>";
+            std.log.warn("zent: scanning table '{s}' failed: column {d} is '{s}' with value '{s}', which field '{s}' ({s}) cannot hold — the projection does not line up with the schema's field order (an eager-loaded target is scanned positionally, so its SELECT list must be the target's columns in field order)", .{ info.table_name, col2 + 1, col_name, value, fname, @typeName(ftype) });
+            return;
+        };
+    }
     std.log.warn("zent: scanning table '{s}' failed: no NULL found among the {d} projected column(s), so a value does not fit its field's type (check the SELECT projection order against the schema)", .{ info.table_name, row.columnCount() });
 }
 
@@ -311,8 +335,14 @@ fn loadEdgePath(
                         arena.deinit();
                         allocator.destroy(arena);
                     }
-                    break :blk try sql_scan.scanRowWithArena(TargetEntity, allocator, row, arena);
-                } else try sql_scan.scanRow(TargetEntity, allocator, row);
+                    break :blk sql_scan.scanRowWithArena(TargetEntity, allocator, row, arena) catch |err| {
+                        if (err == error.TypeMismatch) explainScanFailure(target_info, TargetEntity, row);
+                        return err;
+                    };
+                } else sql_scan.scanRow(TargetEntity, allocator, row) catch |err| {
+                    if (err == error.TypeMismatch) explainScanFailure(target_info, TargetEntity, row);
+                    return err;
+                };
                 const fk_idx = sql_scan.findColumnIndex(row, "__fk") orelse return error.MissingColumn;
                 const parent_id: IdType = if (comptime IdType == i64)
                     row.getInt(fk_idx) orelse return error.TypeMismatch

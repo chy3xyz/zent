@@ -511,7 +511,7 @@ pub fn findColumnIndex(row: Row, name: []const u8) ?usize {
     return null;
 }
 
-fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: usize, json_arena: ?*std.heap.ArenaAllocator) !T {
+pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, index: usize, json_arena: ?*std.heap.ArenaAllocator) !T {
     const info = @typeInfo(T);
     switch (info) {
         .int => |int| {

@@ -6,7 +6,7 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.67.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.68.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
@@ -51,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 437, integration 228 passed + 3 skipped
+`baseline` counts move with this: unit 437, integration 230 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -219,6 +219,13 @@ Entities and queries are explicitly owned by the caller. See the contract:
   `planMigrateStatements`; a second, hand-rolled "what would we do" branch is how
   a preview starts disagreeing with the run it is previewing. Anything added to
   the migration has to be added to the plan, once.
+- **An eager-loaded target's SELECT list is the target's columns in field order,
+  never `*`.** The result set is scanned positionally, and `<table>.*` follows the
+  *table's* physical order — which `ALTER TABLE … ADD COLUMN` breaks on any
+  migrated database, reading every target's values into the wrong fields.
+  `Step.to_columns` carries the list (`buildEdgeStep` fills it from the same
+  `TypeInfo` the scanner walks); keep the two in step, and remember the symptom
+  differs by dialect (MySQL: `TypeMismatch`; SQLite: wrong values, silently).
 - **An unknown key is an error, never a value.** `CreateBuilder.Save` answers
   `error.MissingLastInsertId` when the driver reports no `last_insert_id`, and the
   MySQL bulk path sends one statement per row so each id is the one reported for

@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **An eager-loaded target is projected in field order, not in the table's column
+  order.** The neighbour query selected `<target>.*`, whose order is the *table's*
+  physical column order, while the result set is scanned **positionally**. Those
+  two agree only on a database whose tables were created from the current schema —
+  and `ALTER TABLE … ADD COLUMN`, which is how `migrateSchema` adds a field to an
+  existing table, **appends the column**. So on any long-migrated database every
+  eager-loaded target read its values into the wrong fields.
+
+  Reported against a live MySQL cart with `WithEdge("product")`: every cart read
+  returned 500 with `error.TypeMismatch`, while the same entity and code on a
+  freshly-created SQLite database were fine. The SELECT list is now the target's
+  columns in **field order**, taken from the same `TypeInfo` the scanner walks
+  (`Step.to_columns`, filled by `buildEdgeStep`), so the projection and the scan
+  cannot disagree. `Step.to_columns` has no default only in the sense that
+  `buildEdgeStep` always fills it; a Step built by hand falls back to `*` and the
+  field documents why.
+
+  The two dialects show the same defect differently, and both are pinned by a
+  test: MySQL's binary protocol makes the getter answer `null`, so the scan fails
+  with `error.TypeMismatch`; SQLite coerces (an integer field reading `'widget'`
+  gets `0`), so it returns **wrong values silently**.
+
+### Added
+- **`explainScanFailure` names the column for a misaligned projection**, and the
+  eager-load target scan now calls it at all — it previously had no diagnostic,
+  which is why the report above arrived as "no output" and had to be narrowed by
+  hand through eight experiments. The new message reads, for the cart case:
+
+  `zent: scanning table 'mt_target' failed: column 2 is 'label' with value
+  'widget', which field 'app_id' (i64) cannot hold — the projection does not line
+  up with the schema's field order (an eager-loaded target is scanned positionally,
+  so its SELECT list must be the target's columns in field order)`
+
+- `sql_scan.scanColumn` is public, so a caller can replay a scan field by field the
+  way that diagnostic does.
+
 ## [0.67.0] - 2026-09-15
 
 ### Changed
