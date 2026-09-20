@@ -560,8 +560,7 @@ const MysqlDsn = struct {
 
 /// The MariaDB client copies the strings it is handed while connecting, so the
 /// parsing scratch and the sentinels live in an arena that ends with this call.
-/// (The migrate example allocates them with the caller's allocator and leaks
-/// them; that is its business, not a thing to copy.)
+/// (examples/migrate/main.zig connects the same way.)
 fn connectMysql(allocator: std.mem.Allocator, rest: []const u8) !MySQLDriver {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
