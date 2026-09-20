@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.68.0] - 2026-09-20
+
 ### Fixed
 - **An eager-loaded target is projected in field order, not in the table's column
   order.** The neighbour query selected `<target>.*`, whose order is the *table's*
