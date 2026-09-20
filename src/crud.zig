@@ -214,22 +214,64 @@ pub fn CrudService(
 const zent_deinit = @import("codegen/entity.zig").deinitEntity;
 
 /// Owned copy of a scanned entity: struct fields are copied and string
-/// fields are duplicated into `allocator`.
+/// fields are duplicated into `allocator`. On error nothing is leaked and
+/// nothing is transferred: the copies made before the failing one are freed
+/// before the error is returned, so the caller owns nothing but the error.
 fn ownedCopy(allocator: std.mem.Allocator, src: anytype) !@TypeOf(src) {
     const T = @TypeOf(src);
     var out: T = src;
     const fields = @typeInfo(T).@"struct".field_names;
     const types = @typeInfo(T).@"struct".field_types;
+    // One `dupe` per string field, so a failure part-way through leaves the
+    // earlier copies owned by nobody: the struct that would own them is never
+    // returned. Track them as they are made and release exactly that count
+    // (the same shape as `ShardedEnv.open`'s partial-open teardown).
+    var duped: [fields.len][]const u8 = undefined;
+    var n: usize = 0;
+    errdefer {
+        for (duped[0..n]) |s| allocator.free(s);
+    }
     inline for (fields, types) |fname, ftype| {
         if (ftype == []const u8) {
-            @field(out, fname) = try allocator.dupe(u8, @field(src, fname));
+            const copy = try allocator.dupe(u8, @field(src, fname));
+            duped[n] = copy;
+            n += 1;
+            @field(out, fname) = copy;
         } else if (ftype == ?[]const u8) {
             if (@field(src, fname)) |s| {
-                @field(out, fname) = try allocator.dupe(u8, s);
+                const copy = try allocator.dupe(u8, s);
+                duped[n] = copy;
+                n += 1;
+                @field(out, fname) = copy;
             }
         }
     }
     return out;
+}
+
+test "ownedCopy releases the strings it already duplicated when a later dupe fails" {
+    const Row = struct {
+        id: i64,
+        a: []const u8,
+        b: []const u8,
+        opt: ?[]const u8,
+        c: []const u8,
+    };
+    // Every string field non-empty, and the optional present, so the copy is
+    // exactly four allocations and `fail_index = i` means "the first i dupes
+    // landed, the (i+1)-th failed".
+    const src = Row{ .id = 7, .a = "alpha", .b = "bravo", .opt = "delta", .c = "charlie" };
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
+        try std.testing.expectError(error.OutOfMemory, ownedCopy(failing.allocator(), src));
+        // i dupes succeeded and all i must have been released again: without
+        // the errdefer this is `deallocations == 0`, and the leaked slices are
+        // also reported by `std.testing.allocator` at test exit.
+        try std.testing.expectEqual(i, failing.allocations);
+        try std.testing.expectEqual(i, failing.deallocations);
+    }
 }
 
 test "CrudService list/get/create/update/delete with events and tenant isolation" {

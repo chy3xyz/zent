@@ -98,6 +98,29 @@ fn nowMs() i64 {
         @divTrunc(@as(i64, @intCast(tv.usec)), std.time.us_per_ms);
 }
 
+/// The `claimed_at` cutoff (epoch ms) for a positive `older_than_secs`: a row
+/// is stale when its stamp is *below* `staleCutoffMs(now, older_than_secs)`,
+/// i.e. older than `now - older_than_secs * 1000`. `older_than_secs <= 0`
+/// means "no age test at all" and is decided by the caller, not here.
+///
+/// **Overflow saturates towards "nothing is that old", never towards
+/// "everything is".** A threshold in milliseconds too large for an i64
+/// describes an age no row can have, so the cutoff belongs at the far past
+/// end of the range (`minInt`) and matches no realistic stamp — the same
+/// verdict the arithmetic gives just below the overflow point, so the
+/// function stays monotonic in `older_than_secs` across it. Landing on 0
+/// instead ("claimed before 1970") would make negative stamps — pre-epoch
+/// clocks, skewed hosts — stale, i.e. it would widen the sweep the caller
+/// asked to narrow, and a sweeper whose threshold is too large would start
+/// reclaiming rows a live dispatcher is still publishing. Widening is the
+/// dangerous direction here; `requeueStale(…, 0)` is the supported way to say
+/// "reclaim every processing row".
+fn staleCutoffMs(now_ms: i64, older_than_secs: i64) i64 {
+    const age_ms = std.math.mul(i64, older_than_secs, std.time.ms_per_s) catch
+        return std.math.minInt(i64);
+    return std.math.sub(i64, now_ms, age_ms) catch std.math.minInt(i64);
+}
+
 /// Outbox operations bound to a generated client whose `infos` include
 /// `OutboxMessage`. `client` is the root Client - pass `tx.client` inside a
 /// transaction so enqueue shares the transaction with business writes.
@@ -217,6 +240,10 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
         /// skips the age test entirely and reclaims every `processing` row
         /// ("start over").
         ///
+        /// A threshold so large that its millisecond form overflows an i64 is
+        /// beyond any age, so nothing is stale under it — that is *not* the same
+        /// as `0`, which reclaims everything (see `staleCutoffMs`).
+        ///
         /// This is the crash-recovery companion to `claim`: a dispatcher that
         /// died after claiming leaves rows in `processing`, and this call moves
         /// them back for a later `dispatch`/`claim`. Run it from a periodic
@@ -234,9 +261,7 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             _ = try b.set("claimed_at", .null);
             _ = try b.where(sql.EQ("status", .{ .string = Status.processing }));
             if (older_than_secs > 0) {
-                const now_ms = nowMs();
-                const age_ms = std.math.mul(i64, older_than_secs, std.time.ms_per_s) catch std.math.maxInt(i64);
-                const cutoff = now_ms -| age_ms;
+                const cutoff = staleCutoffMs(nowMs(), older_than_secs);
                 const never_claimed = sql.IsNull("claimed_at");
                 const claimed_too_long_ago = sql.LT("claimed_at", .{ .int = cutoff });
                 _ = try b.where(sql.Or(&never_claimed, &claimed_too_long_ago));
@@ -1065,6 +1090,77 @@ test "outbox claim stamps claimed_at and requeueStale reclaims stale rows" {
     try expectRowState(root, infos, id3, Status.processing, true);
     try testing.expectEqual(@as(usize, 1), try OutboxOps.requeueStale(allocator, root, 100_000_000));
     try expectRowState(root, infos, id3, Status.pending, true);
+}
+
+test "staleCutoffMs saturates an unrepresentable threshold at the far past, not at 0" {
+    const now_ms: i64 = 1_758_000_000_000;
+
+    // Ordinary case: plain subtraction, and a larger threshold is a lower
+    // cutoff (a smaller stale set).
+    try testing.expectEqual(now_ms - 5 * std.time.ms_per_s, staleCutoffMs(now_ms, 5));
+    try testing.expect(staleCutoffMs(now_ms, 3600) < staleCutoffMs(now_ms, 60));
+
+    // The largest threshold in seconds whose millisecond form still fits: the
+    // cutoff is already far in the past, and no realistic stamp is below it.
+    const largest_fitting = std.math.maxInt(i64) / std.time.ms_per_s;
+    const below_overflow = staleCutoffMs(now_ms, largest_fitting);
+    try testing.expect(below_overflow < now_ms - 9_000_000_000_000_000_000);
+
+    // Every threshold past that point lands at the same end of the range:
+    // `minInt` = "no stamp can be that old". It must not jump *up* to 0 —
+    // "claimed before 1970" — which would make a negative stamp stale under a
+    // threshold nothing is older than, i.e. grow the stale set as the caller
+    // raises the threshold.
+    try testing.expectEqual(std.math.minInt(i64), staleCutoffMs(now_ms, std.math.maxInt(i64)));
+    try testing.expect(staleCutoffMs(now_ms, std.math.maxInt(i64)) <= below_overflow);
+}
+
+test "requeueStale with a threshold too large to be representable reclaims nothing, not everything" {
+    const allocator = testing.allocator;
+    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const infos = graph.types;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const client_mod = @import("codegen/client.zig");
+    const OutboxOps = Outbox(infos, info);
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, drv.asDriver());
+
+    const id1 = try OutboxOps.enqueue(root, 1000, .{
+        .aggregate_type = "p",
+        .aggregate_id = 1,
+        .event_type = "a",
+        .payload = "{}",
+    });
+    // A `processing` row with a *negative* stamp. It is the only stamp that
+    // tells the two saturation targets apart: `cutoff = minInt` leaves it
+    // alone (nothing was claimed 292 million years ago), while the widening
+    // `cutoff = 0` reads it as "claimed before 1970" and reclaims it.
+    {
+        const ec = @field(root, "outbox_message");
+        var b = ec.Update();
+        defer b.deinit();
+        _ = try b.setFieldValue("status", Status.processing);
+        _ = try b.setFieldValue("claimed_at", @as(?i64, -1));
+        _ = try b.Where(.{ec.predicates.idEQ(.{ .int = id1 })});
+        _ = try b.Save();
+    }
+    try expectRowState(root, infos, id1, Status.processing, false);
+
+    try testing.expectEqual(
+        @as(usize, 0),
+        try OutboxOps.requeueStale(allocator, root, std.math.maxInt(i64)),
+    );
+    try expectRowState(root, infos, id1, Status.processing, false);
+
+    // Control: the same row *is* reclaimed when the caller asks for
+    // "everything" (threshold 0 skips the age test), so the 0 above is the
+    // threshold's verdict on a row the sweep can otherwise see.
+    try testing.expectEqual(@as(usize, 1), try OutboxOps.requeueStale(allocator, root, 0));
+    try expectRowState(root, infos, id1, Status.pending, true);
 }
 
 // Stress tests: concurrent dispatchers hammering claim/markPublished

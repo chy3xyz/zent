@@ -83,14 +83,24 @@ fn connectFromDsn(allocator: std.mem.Allocator, dsn: []const u8) !AnyDriver {
 
     if (std.mem.startsWith(u8, dsn, "mysql://")) {
         if (comptime build_options.have_mysql) {
-            const parsed = try parseMysqlDsn(allocator, dsn[8..]);
+            // `mysql_real_connect` copies these strings while connecting (the
+            // driver keeps no pointer to them), so the parse scratch and the
+            // sentinels are needed only until `connect` returns: an arena ends
+            // both lifetimes here instead of handing four parsed strings and
+            // four sentinels to the caller's allocator, which nothing owns and
+            // nothing frees. Same shape as examples/check_sql/cli.zig.
+            var scratch = std.heap.ArenaAllocator.init(allocator);
+            defer scratch.deinit();
+            const arena = scratch.allocator();
+
+            const parsed = try parseMysqlDsn(arena, dsn[8..]);
             return .{ .mysql = try MySQLDriver.connect(
                 allocator,
-                try allocator.dupeSentinel(u8, parsed.host, 0),
+                try arena.dupeSentinel(u8, parsed.host, 0),
                 parsed.port,
-                try allocator.dupeSentinel(u8, parsed.user, 0),
-                try allocator.dupeSentinel(u8, parsed.pass, 0),
-                try allocator.dupeSentinel(u8, parsed.db, 0),
+                try arena.dupeSentinel(u8, parsed.user, 0),
+                try arena.dupeSentinel(u8, parsed.pass, 0),
+                try arena.dupeSentinel(u8, parsed.db, 0),
             ) };
         }
         return error.UnsupportedDriver;
@@ -107,6 +117,9 @@ const MysqlDsn = struct {
     db: []const u8,
 };
 
+/// Split `user:pass@host:port/db`. The four returned strings are allocations the
+/// **caller owns**; the call site above passes an arena-scoped allocator, so
+/// they are released when the connect call returns.
 fn parseMysqlDsn(allocator: std.mem.Allocator, s: []const u8) !MysqlDsn {
     // Expected: user:pass@host:port/db
     const at = std.mem.indexOfScalar(u8, s, '@') orelse return error.InvalidDsn;
