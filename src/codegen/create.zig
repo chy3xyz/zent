@@ -40,6 +40,18 @@ fn findEdgeInfo(comptime info: TypeInfo, comptime name: []const u8) EdgeInfo {
     @compileError("Edge not found: " ++ name ++ " on " ++ info.name);
 }
 
+/// The caller's own value for a textual (uuid) primary key, or `null` when the
+/// values hold none. `setFieldValue` binds a `string` / `uuid` / `text` field as
+/// `.string`, so any other shape for the key — an explicit `.null`, or a name
+/// that was never set — leaves the key just as unknown as an omitted one, and
+/// the caller gets `error.MissingPrimaryKey` rather than `""`.
+fn textPrimaryKeyFrom(values: []const FieldValue, pk_field: []const u8) ?[]const u8 {
+    for (values) |fv| {
+        if (std.mem.eql(u8, fv.name, pk_field) and fv.value == .string) return fv.value.string;
+    }
+    return null;
+}
+
 /// Generate a Create builder for an entity.
 pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, comptime Entity: type) type {
     return struct {
@@ -156,7 +168,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self;
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId, MissingPrimaryKey };
 
         /// Run the interceptor chain (`.create`). `whereEq` fills omitted
         /// columns; already-set fields are left alone. Errors collapse to
@@ -196,6 +208,15 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         /// reported no id for it, so the row's key is unknown. The row is not
         /// re-read to find it (`Save` has no unique key to look it up by), and
         /// `0` would name a row that does not exist.
+        ///
+        /// `error.MissingPrimaryKey` is the same "the key is unknown" on the
+        /// path that has no id to report in the first place: a textual (uuid)
+        /// key on MySQL, which has no `RETURNING`, so the caller's own value is
+        /// the only source — the library generates no key (`core/id.zig` is a
+        /// helper set the caller drives) and MySQL fills no `CHAR(36)` key in.
+        /// It is decided **before** the statement runs, so no row is written: an
+        /// empty string names a row that does not exist, and every later call
+        /// would pass it around as an id.
         pub fn Save(self: *Self) SaveError!Entity {
             return self.saveInternal(false, false, null, self.allocator);
         }
@@ -414,6 +435,19 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             } else {
                 // MySQL path: normal INSERT plus ON DUPLICATE KEY UPDATE suffix,
                 // or INSERT IGNORE for conflict-ignore mode.
+                //
+                // A textual (uuid) primary key has no `RETURNING` here, so the
+                // caller's own value is the only source — and a caller that
+                // never wrote one leaves the key unknown. Resolved *before* the
+                // statement runs, because MySQL would otherwise write whatever
+                // the schema defaults to (an empty string on a lenient
+                // `sql_mode`, a server error on a strict one) and the entity
+                // would come back carrying `""`, which names no row while
+                // looking like a key that names one — the same shape as the
+                // `last_insert_id orelse 0` this path's integer branch refuses.
+                if (comptime @TypeOf(@field(entity, info.pk_field)) != i64) {
+                    if (textPrimaryKeyFrom(self.values.items, info.pk_field) == null) return error.MissingPrimaryKey;
+                }
                 var builder = if (ignore_conflicts)
                     sql.InsertOrIgnore(self.allocator, dialect, info.table_name)
                 else
@@ -444,12 +478,10 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     @field(entity, info.pk_field) = @intCast(res.last_insert_id orelse return error.MissingLastInsertId);
                 } else {
                     // Textual primary key (uuid) on MySQL: no RETURNING — keep
-                    // the caller-provided id from the values.
-                    for (self.values.items) |fv| {
-                        if (std.mem.eql(u8, fv.name, info.pk_field) and fv.value == .string) {
-                            @field(entity, info.pk_field) = try entity_alloc.dupe(u8, fv.value.string);
-                        }
-                    }
+                    // the caller-provided id from the values. Presence was
+                    // established above; the `orelse` keeps the two from
+                    // drifting into a panic instead of the named error.
+                    @field(entity, info.pk_field) = try entity_alloc.dupe(u8, textPrimaryKeyFrom(self.values.items, info.pk_field) orelse return error.MissingPrimaryKey);
                 }
 
                 if (self.logger.onExec) |log| {
@@ -1051,7 +1083,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             return try self.setValue(field_name, field_value.toSqlValue(value));
         }
 
-        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
+        const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId, InconsistentRowFields };
 
         fn runInterceptors(self: *Self) error{InterceptFailed}!void {
             const chain = self.interceptors orelse return;
@@ -1087,6 +1119,18 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             }
         }
 
+        /// Insert every row of the batch and return one id per row, in the order
+        /// the rows were added.
+        ///
+        /// A batch is **one** multi-row statement (per chunk), so it carries one
+        /// column list — the first row's — and every row must name the same
+        /// fields in the same order. A row that does not is rejected with
+        /// `error.InconsistentRowFields` *before* any statement runs: the values
+        /// of such a row are flattened in its own order, so a row missing a
+        /// field would leave allocator-fill bytes bound as its value, an extra
+        /// field would run past the flattened buffer, and the length check in
+        /// `sql.MultiInsert` would hold throughout. The batch is not written and
+        /// the row index is reported in a `warn`.
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
             return self.saveInternal(false, null);
         }
@@ -1100,7 +1144,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         /// row it just wrote (the emitted `id=LAST_INSERT_ID(id)` is what makes
         /// an updated row answer its existing id). A driver that reports none
         /// makes the call `error.MissingLastInsertId` rather than a fabricated
-        /// run of ids.
+        /// run of ids. Rows that disagree on their fields are rejected with
+        /// `error.InconsistentRowFields`, as in `Save`.
         pub fn SaveOrUpdate(self: *Self) SaveError!std.array_list.Managed(i64) {
             return self.saveInternal(true, null);
         }
@@ -1156,6 +1201,41 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 return std.array_list.Managed(i64).init(self.allocator);
             }
 
+            // Every row must name the same fields in the same positions as the
+            // first one, checked before any statement runs.
+            //
+            // The batch is emitted as one statement with one column list — the
+            // first row's — while each row's values are flattened in *that row's*
+            // own order, so a row that disagrees does not fail anywhere: its
+            // values are bound to the wrong columns, a row missing a field
+            // leaves the tail of its flattened values at allocator-fill bytes
+            // (`0xaa` under `std.testing.allocator`), an extra field runs past
+            // the flattened buffer, and `MultiInsert`'s
+            // `values.len == columns.len * row_count` holds in every one of
+            // those cases. A batch that would be written wrong is not written
+            // at all.
+            //
+            // Compared **by position, not as a set**: rows holding the same
+            // fields in a different order bind just as wrongly, so a set
+            // comparison would let the very bug this rejects through. The
+            // container does not reorder a caller's row to guess which reading
+            // was meant — `error.NoFieldsToUpdate` (a `SET`-less UPDATE) and
+            // `error.NoPredicate` are the other two errors that name the
+            // caller's mistake instead of resolving it silently.
+            const first_row = self.rows.items[0];
+            for (self.rows.items[1..], 1..) |row, row_index| {
+                if (row.items.len != first_row.items.len) {
+                    std.log.warn("bulk insert into '{s}': row {d} sets {d} field(s) where row 0 sets {d} — the batch was not executed", .{ info.table_name, row_index, row.items.len, first_row.items.len });
+                    return error.InconsistentRowFields;
+                }
+                for (row.items, first_row.items, 0..) |fv, first_fv, field_index| {
+                    if (!std.mem.eql(u8, fv.name, first_fv.name)) {
+                        std.log.warn("bulk insert into '{s}': row {d} sets '{s}' at position {d} where row 0 sets '{s}' — the batch was not executed", .{ info.table_name, row_index, fv.name, field_index, first_fv.name });
+                        return error.InconsistentRowFields;
+                    }
+                }
+            }
+
             // Validate all rows
             for (self.rows.items) |row| {
                 for (row.items) |fv| {
@@ -1167,7 +1247,6 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 }
             }
 
-            const first_row = self.rows.items[0];
             var columns = std.array_list.Managed([]const u8).init(self.allocator);
             defer columns.deinit();
             for (first_row.items) |fv| {
@@ -1464,8 +1543,8 @@ test "Create builders expose explicit driver error unions" {
     const UserEntity = comptime EntityGen(infos, info);
     const Builder = CreateBuilder(infos, info, UserEntity);
     const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
-    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
-    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId };
+    const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId, MissingPrimaryKey };
+    const BulkSaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId, InconsistentRowFields };
 
     comptime {
         const save_return = @typeInfo(@TypeOf(Builder.Save)).@"fn".return_type.?;
@@ -1766,4 +1845,196 @@ test "bulk insert: a driver that reports no last_insert_id is an error, not a ru
     // It stops at the first unanswerable row rather than writing the batch and
     // reporting ids for it afterwards.
     try std.testing.expectEqual(@as(usize, 1), drv.exec_calls);
+}
+
+test "bulk insert: a row that names different fields is rejected, and nothing is written" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
+
+    // Row 0 sets (name, age); row 1 sets `age` only. The batch is one INSERT
+    // with row 0's column list, so `25` would be bound to the `name` column and
+    // the allocator-fill bytes behind the flattened values to `age` — the
+    // statement's own length check (`columns.len * row_count == values.len`)
+    // would still hold, because the buffer it reads is allocated for the column
+    // list, not sized by what the rows actually set.
+    var short_row = IdScriptDriver{ .script = &.{ 1, 2 } };
+    defer short_row.freeCapture();
+    var b = try BulkBuilder.init(std.testing.allocator, short_row.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+    _ = try b.Next();
+    _ = try b.setFieldValue("age", @as(i64, 25));
+
+    try std.testing.expectError(error.InconsistentRowFields, b.Save());
+    // Rejected before the statement: the driver was never asked to run it, so
+    // no row of the batch exists.
+    try std.testing.expectEqual(@as(usize, 0), short_row.exec_calls);
+    try std.testing.expectEqual(@as(?[]u8, null), short_row.last_sql_owned);
+
+    // Row 1 sets one field more than row 0 (a name the schema does not have,
+    // through the unchecked `setValue`). Flattened, its third value ran past
+    // the buffer sized from row 0 — an index-out-of-bounds panic in a safe
+    // build rather than a wrong write.
+    var long_row = IdScriptDriver{ .script = &.{ 3, 4 } };
+    defer long_row.freeCapture();
+    var b2 = try BulkBuilder.init(std.testing.allocator, long_row.asDriver(), &.{}, null);
+    defer b2.deinit();
+    _ = try b2.setFieldValue("name", "carol");
+    _ = try b2.setFieldValue("age", @as(i64, 40));
+    _ = try b2.Next();
+    _ = try b2.setFieldValue("name", "dave");
+    _ = try b2.setFieldValue("age", @as(i64, 50));
+    _ = try b2.setValue("nickname", .{ .string = "d" });
+
+    try std.testing.expectError(error.InconsistentRowFields, b2.Save());
+    try std.testing.expectEqual(@as(usize, 0), long_row.exec_calls);
+}
+
+test "bulk insert: rows holding the same fields in another order are rejected too" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
+
+    // Same *set* of names, different order. A set comparison would call this
+    // batch consistent and then bind row 1's `25` to `name` and `"bob"` to
+    // `age`, silently — which is why the check compares by position.
+    var drv = IdScriptDriver{ .script = &.{ 1, 2 } };
+    defer drv.freeCapture();
+    var b = try BulkBuilder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+    _ = try b.Next();
+    _ = try b.setFieldValue("age", @as(i64, 25));
+    _ = try b.setFieldValue("name", "bob");
+
+    try std.testing.expectError(error.InconsistentRowFields, b.Save());
+    try std.testing.expectEqual(@as(usize, 0), drv.exec_calls);
+}
+
+test "bulk insert: a leading empty row is a named error, not a divide by zero" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const BulkBuilder = BulkInsertBuilder(infos, info, UserEntity);
+
+    // `Next()` before the first `setFieldValue` — a plausible reading of the
+    // API ("start the first row") — leaves row 0 empty while row 1 carries the
+    // fields. Only *trailing* empty rows are trimmed, so the column list came
+    // from an empty row: `maxBindParams / 0` divided by zero before anything
+    // compared the rows.
+    var drv = IdScriptDriver{ .script = &.{1} };
+    defer drv.freeCapture();
+    var b = try BulkBuilder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.Next();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+
+    try std.testing.expectError(error.InconsistentRowFields, b.Save());
+    try std.testing.expectEqual(@as(usize, 0), drv.exec_calls);
+}
+
+test "create: a MySQL uuid key is the caller's value, and the driver needs no id" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Doc = schema("MyUuidDoc", .{
+        .fields = &.{ field.UUID("id"), field.String("title") },
+    });
+
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]TypeInfo{info};
+    const DocEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, DocEntity);
+
+    // A driver with no id to report at all: a textual key does not come from
+    // `last_insert_id`, so the insert still answers the row the caller named.
+    var drv = IdScriptDriver{ .script = &.{} };
+    defer drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("id", "01920000-0000-7000-8000-0000000000f2");
+    _ = try b.setFieldValue("title", "t");
+
+    var entity = try b.Save();
+    defer deinitEntity(infos, info, &entity, std.testing.allocator);
+    try std.testing.expectEqualStrings("01920000-0000-7000-8000-0000000000f2", entity.id);
+    try std.testing.expectEqualStrings("t", entity.title);
+    try std.testing.expectEqual(@as(usize, 1), drv.exec_calls);
+}
+
+test "create: a MySQL uuid key the caller never set is an error before the statement" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const Doc = schema("MyUuidDoc", .{
+        .fields = &.{ field.UUID("id"), field.String("title") },
+    });
+
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]TypeInfo{info};
+    const DocEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, DocEntity);
+
+    // MySQL has no RETURNING and the library generates no key, so the entity's
+    // id used to stay at the zero value — an empty string, which names no row
+    // while looking like a key that names one, and which every later call would
+    // pass around as an id.
+    var insert_drv = IdScriptDriver{ .script = &.{ 7, 8 } };
+    defer insert_drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, insert_drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("title", "t");
+
+    try std.testing.expectError(error.MissingPrimaryKey, b.Save());
+    // Decided before the statement: no key-less row is written for the caller
+    // to find later.
+    try std.testing.expectEqual(@as(usize, 0), insert_drv.exec_calls);
+
+    // The upsert path resolves its conflict target the same way.
+    var upsert_drv = IdScriptDriver{ .script = &.{9} };
+    defer upsert_drv.freeCapture();
+    var b2 = Builder.init(std.testing.allocator, upsert_drv.asDriver(), &.{}, null);
+    defer b2.deinit();
+    _ = try b2.setFieldValue("title", "t");
+
+    try std.testing.expectError(error.MissingPrimaryKey, b2.SaveOrUpdate());
+    try std.testing.expectEqual(@as(usize, 0), upsert_drv.exec_calls);
 }
