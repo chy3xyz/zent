@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-09-21
+
 ### Fixed
 - **A restore is scoped by the policy's filters and the interceptor chain.**
   `Delete().Restore(id)` checked the policy's decision and then dropped
