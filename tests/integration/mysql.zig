@@ -3929,13 +3929,15 @@ test "MySQL: checkSchema reports a missing M2M junction table" {
     defer drv.close();
 
     // Leftovers from an interrupted run. The junction table goes first: it
-    // holds foreign keys to both entity tables.
+    // holds foreign keys to both entity tables. The cleanup `defer`s are
+    // registered in the opposite order for the same reason — they run in
+    // reverse, so the junction table (registered last) is dropped first.
     _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_my_member_zent_jc_my_tag", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_my_member", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_my_tag", &.{});
-    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_member_zent_jc_my_tag", &.{}) catch {};
-    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_member", &.{}) catch {};
     defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_tag", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_member", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_my_member_zent_jc_my_tag", &.{}) catch {};
 
     const ZentJcMyMemberBase = schema("ZentJcMyMember", .{ .fields = &.{field.String("name")} });
     const ZentJcMyTagBase = schema("ZentJcMyTag", .{ .fields = &.{field.String("label")} });

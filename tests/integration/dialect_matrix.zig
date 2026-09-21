@@ -888,6 +888,91 @@ fn sameOrder(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
+/// A foreign key is worth what the connection enforcing it is worth. The library
+/// declares the constraint on all three dialects — `createTableSQLAlloc` writes
+/// `FOREIGN KEY (…) REFERENCES … ON DELETE CASCADE ON UPDATE CASCADE` — but
+/// SQLite ships `PRAGMA foreign_keys` **OFF** and the pragma is per connection,
+/// so on that dialect "the schema declares an FK" and "a dangling reference is
+/// refused" used to be two different statements. They are one now, and this is
+/// where the three dialects have to agree: the *same named* error
+/// (`driver.Error.ForeignKeyViolation`, from SQLite's `SQLITE_CONSTRAINT_FOREIGNKEY`
+/// 787, PostgreSQL's SQLSTATE 23503 and MySQL's errno 1452), no row stored, and
+/// the DDL's cascading delete taking the children with the parent.
+///
+/// Both follow-ups are half of the same contract. A refusal that still left the
+/// row behind would be worse than no refusal, and "the children went with the
+/// parent" is the answer an application gets for the DDL this library generates
+/// — on a dialect where the constraint was never enforced it got a different
+/// one (the delete silently succeeded and the children stayed).
+fn caseForeignKeyEnforcement(a: std.mem.Allocator, drv: Driver) ![]const u8 {
+    const allocator = testing.allocator;
+
+    const DmFkParent = schema("DmFkParent", .{ .fields = &.{field.String("name")} });
+    const DmFkChildBase = schema("DmFkChild", .{ .fields = &.{field.String("label")} });
+    const DmFkChild = struct {
+        pub const schema_name = DmFkChildBase.schema_name;
+        pub const fields = DmFkChildBase.fields;
+        pub const edges = &.{edge.From("parent", DmFkParent).Required()};
+        pub const indexes = DmFkChildBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ DmFkParent, DmFkChild });
+    const infos = graph.types;
+
+    // The child holds the foreign key, so it goes first: on MySQL a parent drop
+    // with the constraint still in place is errno 3730, and the `dropTable`
+    // helper would swallow it and leave the parent behind for the next run.
+    try freshTable(allocator, drv, infos, &.{ "dm_fk_child", "dm_fk_parent" });
+    defer {
+        dropTable(drv, "dm_fk_child");
+        dropTable(drv, "dm_fk_parent");
+    }
+
+    const client = Client.makeClient(infos, allocator, drv);
+
+    // A child naming a parent row that is not there.
+    const dangling = resultName(drv.exec(
+        "INSERT INTO dm_fk_child (label, parent_id) VALUES ('orphan', 424242)",
+        &.{},
+    ));
+
+    var orphans = client.dm_fk_child.Query();
+    defer orphans.deinit();
+    const orphans_stored = try orphans.Count();
+
+    // The same statement against a parent that exists, through the builder — so
+    // the refusal above was about the reference and not about the row.
+    var parent_b = try client.dm_fk_parent.Create();
+    defer parent_b.deinit();
+    _ = try parent_b.setFieldValue("name", "p");
+    var parent = try parent_b.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &parent, allocator);
+
+    const linked: []const u8 = blk: {
+        var b = try client.dm_fk_child.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("label", "linked");
+        _ = try b.setFieldValue("parent_id", parent.id);
+        var created = b.Save() catch |err| break :blk @errorName(err);
+        zent.codegen.deinitEntity(infos, infos[1], &created, allocator);
+        break :blk "ok";
+    };
+
+    // `ON DELETE CASCADE` is what the generated DDL says (`ForeignKeyDef`'s
+    // default), so the children go with the parent.
+    var buf: [128]u8 = undefined;
+    const delete_parent = try std.fmt.bufPrint(&buf, "DELETE FROM dm_fk_parent WHERE id = {d}", .{parent.id});
+    _ = try drv.exec(delete_parent, &.{});
+
+    var remaining = client.dm_fk_child.Query();
+    defer remaining.deinit();
+    const after_parent_delete = try remaining.Count();
+
+    return std.fmt.allocPrint(a, "dangling={s}|orphans={d}|linked={s}|after_parent_delete={d}", .{
+        dangling, orphans_stored, linked, after_parent_delete,
+    });
+}
+
 /// Every id a bulk write returns must name the row its own input row wrote.
 /// MySQL has no `INSERT … RETURNING`, so a multi-row statement there reports one
 /// `last_insert_id` — the statement's *first generated* value — while an
@@ -1213,6 +1298,11 @@ const cases = [_]Case{
         .name = "Restore: a live row was not restored",
         .expect = "live=false|trashed=true|missing=false",
         .run = caseRestoreLiveRow,
+    },
+    .{
+        .name = "foreign keys: a dangling reference is refused, and the parent's delete cascades",
+        .expect = "dangling=ForeignKeyViolation|orphans=0|linked=ok|after_parent_delete=0",
+        .run = caseForeignKeyEnforcement,
     },
 };
 

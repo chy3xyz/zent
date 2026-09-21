@@ -305,7 +305,13 @@ pub const PostgresDriver = struct {
     /// Map a SQLSTATE error code to driver.Error for precise diagnostics.
     fn sqlstateToError(result: *c.PGresult) driver.Error {
         const field = c.PQresultErrorField(result, c.PG_DIAG_SQLSTATE) orelse return error.DriverFailed;
-        const sqlstate: []const u8 = std.mem.span(field);
+        return sqlstateCodeToError(std.mem.span(field));
+    }
+
+    /// The classification above, on the code alone, so it can be pinned by a
+    /// test: a `PGresult` is what the call sites have, and one is not
+    /// constructible without a server.
+    fn sqlstateCodeToError(sqlstate: []const u8) driver.Error {
         if (sqlstate.len < 2) return error.DriverFailed;
         if (sqlstate.len >= 5) {
             if (std.mem.eql(u8, sqlstate[0..5], "57014")) return error.QueryTimeout;
@@ -320,12 +326,25 @@ pub const PostgresDriver = struct {
             '0' => if (sqlstate[1] == '8') error.ConnectionFailed else error.DriverFailed,
             '2' => switch (sqlstate[1]) {
                 // Integrity constraint violation: classify the common codes.
-                '3' => switch (sqlstate[2]) {
-                    '5' => error.UniqueViolation, // 23505 unique_violation
-                    '0' => error.NotNullViolation, // 23502 not_null_violation
-                    '3' => error.ForeignKeyViolation, // 23503 foreign_key_violation
+                //
+                // The class is the first **two** characters (`23`), so the
+                // specific condition sits at offset 3 — offset 2 is `5` for the
+                // whole `235xx` family. Reading it there made `23502`
+                // (not_null) and `23503` (foreign_key) answer
+                // `UniqueViolation`, the third code to arrive in that family.
+                // Measured through `dialect_matrix`'s foreign-key case: a
+                // dangling reference came back as `UniqueViolation` on
+                // PostgreSQL while SQLite and MySQL answered
+                // `ForeignKeyViolation`.
+                '3' => if (sqlstate.len >= 5) switch (sqlstate[3]) {
+                    '0' => switch (sqlstate[4]) {
+                        '5' => error.UniqueViolation, // 23505 unique_violation
+                        '2' => error.NotNullViolation, // 23502 not_null_violation
+                        '3' => error.ForeignKeyViolation, // 23503 foreign_key_violation
+                        else => error.ExecFailed,
+                    },
                     else => error.ExecFailed,
-                },
+                } else error.ExecFailed,
                 '2', '8' => error.ExecFailed,
                 '5', 'D' => error.TxFailed,
                 else => error.DriverFailed,
@@ -1128,4 +1147,36 @@ test "Postgres: only a reported decimal command tag counts as a known row count"
     try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("INSERT 0 1"));
     try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("-1"));
     try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("n/a"));
+}
+
+test "Postgres: the SQLSTATE of each constraint failure maps to its own error" {
+    // The class is the first two characters, so the condition sits at offset 3:
+    // every `235xx` code has `5` at offset 2, which is where the not-null and
+    // foreign-key codes used to be read from — both answered `UniqueViolation`,
+    // the code that happened to be first in that family.
+    //
+    // Measured (dialect_matrix's foreign-key case, PostgreSQL 17.10): a dangling
+    // reference reported `dangling=UniqueViolation` on PostgreSQL while SQLite
+    // and MySQL reported `ForeignKeyViolation` for the same statement. The
+    // offset is the whole difference, so it is pinned here, code by code.
+    try std.testing.expectEqual(driver.Error.UniqueViolation, PostgresDriver.sqlstateCodeToError("23505"));
+    try std.testing.expectEqual(driver.Error.NotNullViolation, PostgresDriver.sqlstateCodeToError("23502"));
+    try std.testing.expectEqual(driver.Error.ForeignKeyViolation, PostgresDriver.sqlstateCodeToError("23503"));
+
+    // A `235xx` code this driver does not classify stays "a failed statement",
+    // not a constraint name a caller would branch on.
+    try std.testing.expectEqual(driver.Error.ExecFailed, PostgresDriver.sqlstateCodeToError("23514"));
+
+    // The codes that were already right, so the fix above did not move them.
+    try std.testing.expectEqual(driver.Error.QueryTimeout, PostgresDriver.sqlstateCodeToError("57014"));
+    try std.testing.expectEqual(driver.Error.DeadlockDetected, PostgresDriver.sqlstateCodeToError("40P01"));
+    try std.testing.expectEqual(driver.Error.SerializationFailure, PostgresDriver.sqlstateCodeToError("40001"));
+    try std.testing.expectEqual(driver.Error.LockTimeout, PostgresDriver.sqlstateCodeToError("55P03"));
+    try std.testing.expectEqual(driver.Error.ConnectionFailed, PostgresDriver.sqlstateCodeToError("08006"));
+    try std.testing.expectEqual(driver.Error.TxFailed, PostgresDriver.sqlstateCodeToError("25P02"));
+
+    // Shorter than a class: never read past the end for a code that has no
+    // condition to read.
+    try std.testing.expectEqual(driver.Error.DriverFailed, PostgresDriver.sqlstateCodeToError("2"));
+    try std.testing.expectEqual(driver.Error.ExecFailed, PostgresDriver.sqlstateCodeToError("235"));
 }
