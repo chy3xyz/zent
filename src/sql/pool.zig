@@ -383,6 +383,7 @@ pub fn ConnPool(comptime D: type) type {
                         self.all.append(self.allocator, entry) catch {
                             entry.conn.close();
                             self.allocator.destroy(entry);
+                            self.last_attempt_error = error.OutOfMemory;
                             return null;
                         };
                         return .{ .entry = entry, .fresh = true };
@@ -1190,6 +1191,12 @@ pub fn ConnPool(comptime D: type) type {
             return conn.asDriver().ping();
         }
 
+        // A failed borrow answers false BY DESIGN: the generated beginTxCtx
+        // preflight branches on this, and false routes to beginTx/beginTxCtx,
+        // whose own borrow surfaces the recorded error loudly (client.zig's
+        // beginTxCtx deadline test asserts that PoolWaitTimeout). Answering
+        // true would misroute into beginSavepoint, and the boolean vtable
+        // cannot carry the error.
         fn driverInTransaction(ptr: *anyopaque) bool {
             const pool: *Self = @ptrCast(@alignCast(ptr));
             const conn = pool.borrow() catch return false;
@@ -1580,6 +1587,104 @@ test "ConnPool closes connection once when available.append fails" {
     try std.testing.expectEqual(@as(usize, 2), MockDriver.opens);
 
     pool.allocator = allocator;
+}
+
+test "ConnPool borrow reports OutOfMemory when all.append fails" {
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {
+            unreachable;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            return false;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
+        };
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+
+    const allocator = std.testing.allocator;
+    var pool = try ConnPool(MockDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 2,
+        .health_check_on_borrow = false,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    // Take the warmed connection so the next borrow runs the create path
+    // (`available` empty, room below `max_connections`), then free `all`'s
+    // spare capacity — init pre-reserves `max_connections`, so without this
+    // the create path's all.append would not allocate at all.
+    const held = try pool.borrow();
+    pool.all.shrinkAndFree(allocator, pool.all.items.len);
+
+    // Entry create (#0) succeeds; all.append's in-place remap is denied
+    // (resize_fail_index 0) and its fresh allocation (#1) fails, so the pool
+    // must report the OOM itself, not fold it into PoolExhausted.
+    var failing = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+    pool.allocator = failing.allocator();
+
+    try std.testing.expectError(error.OutOfMemory, pool.borrow());
+    try std.testing.expectEqual(@as(?anyerror, error.OutOfMemory), pool.last_attempt_error);
+    try std.testing.expectEqual(@as(usize, 1), pool.all.items.len);
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.closes);
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.opens);
+
+    pool.allocator = allocator;
+    pool.release(held);
 }
 
 test "pool retries on exhaustion with backoff" {
