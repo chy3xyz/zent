@@ -1016,17 +1016,36 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         /// every dialect.
         pub fn Restore(self: *Self, id: i64) !bool {
             if (!info.soft_delete) @compileError("Restore requires soft_delete on the entity");
+            // The policy's row filters scope the restore exactly as they scope
+            // the delete it undoes: a filter that pins a tenant means a row
+            // outside that tenant matches nothing and answers false, rather
+            // than being resurrected by a caller that merely named its id. The
+            // decision still fails closed first.
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .update;
                 const result = p.eval(ctx);
                 if (result.decision == .deny) return error.PrivacyDenied;
+                const filters = result.getFilters();
+                for (filters) |opaque_ptr| {
+                    const pred: *const sql.Predicate = @ptrCast(@alignCast(opaque_ptr));
+                    try self.predicates.append(pred.*);
+                }
             }
+            // Interceptor predicates (tenant rewriting, audit columns) reach a
+            // restore the same way they reach every other write — this was the
+            // one write path that never ran the chain.
+            try self.runInterceptors(.update);
             var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .null);
             _ = try builder.where(sql.EQ(pkColumn(info), .{ .int = id }));
             _ = try builder.where(sql.IsNotNull("deleted_at"));
+            // The builder's own predicates, plus whatever the two passes above
+            // appended — the same set `execHardDelete` renders.
+            for (self.predicates.items) |pred| {
+                _ = try builder.where(pred);
+            }
             const q = try builder.query();
             self.ensureDeadline();
             const res = try self.driver.execCtx(&self.execution_context, q.sql, q.args);
@@ -3057,6 +3076,129 @@ test "BulkDelete on a soft-deleting entity applies the policy's row filters" {
         }
         try std.testing.expectEqual(@as(usize, 0), all.items.len);
     }
+}
+
+var restore_scope_pred: sql.Predicate = undefined;
+
+fn restoreOwnerFilter(ctx: privacy.PrivacyContext) ?*const anyopaque {
+    const owner = ctx.user_id orelse return null;
+    restore_scope_pred = sql.EQ("owner_id", .{ .int = @intCast(owner) });
+    return @ptrCast(&restore_scope_pred);
+}
+
+test "Restore applies the policy's row filters and the interceptor chain" {
+    // `Restore` checked `decision == .deny` and then dropped
+    // `result.getFilters()`, and never ran the interceptor chain at all. Every
+    // sibling write path appends them (`execSoftDelete`, `execHardDelete`, both
+    // bulk paths, `Save`) — the bulk soft-delete test above exists because the
+    // same omission had already been fixed there once. Without the filters a
+    // scoped caller resurrects any row it names, including one outside its
+    // scope; without the interceptors a multi-tenant rewrite does not reach the
+    // statement either.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const SoftDeleteMixin = @import("../core/mixin.zig").SoftDeleteMixin;
+    const ScopedRow = schema("RestoreScopedRow", .{
+        .table_name = "restore_scoped_row",
+        .fields = &.{ field.Int("owner_id"), field.String("title") },
+        .mixins = &.{SoftDeleteMixin},
+        .soft_delete = true,
+        .policy = privacy.Policy{ .rules = &.{ privacy.Allow, privacy.Filter(restoreOwnerFilter) } },
+    });
+    const info = comptime fromSchema(ScopedRow);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = client_mod.EntityClient(infos, info);
+    const base = Client.init(allocator, driver.asDriver());
+    // No user_id: the filter rule answers null, i.e. "not applicable", so the
+    // seeding and the trashing below carry no scope of their own.
+    const unscoped = base.withContext(privacy.PrivacyContext{ .user_id = null });
+
+    // One row per owner, both trashed before any scoped call.
+    var ids: [2]i64 = undefined;
+    for ([_]i64{ 1, 2 }, 0..) |owner, i| {
+        var b = try unscoped.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("owner_id", owner);
+        _ = try b.setFieldValue("title", "row");
+        var row = try b.Save();
+        ids[i] = row.id;
+        deinitEntity(infos, info, &row, allocator);
+    }
+    for (ids) |id| {
+        var d = unscoped.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{sql.EQ("id", .{ .int = id })});
+        try std.testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    // The policy says owner 1. Restoring owner 2's trashed row is a row outside
+    // the caller's scope: it must answer false and leave the row trashed.
+    const scoped = base.withContext(privacy.PrivacyContext{ .user_id = 1 });
+    {
+        var d = scoped.Delete();
+        defer d.deinit();
+        try std.testing.expect(!try d.Restore(ids[1]));
+    }
+    try std.testing.expectEqual(@as(i64, 0), try countLive(&driver, ids[1]));
+
+    // The caller's own row still restores.
+    {
+        var d = scoped.Delete();
+        defer d.deinit();
+        try std.testing.expect(try d.Restore(ids[0]));
+    }
+    try std.testing.expectEqual(@as(i64, 1), try countLive(&driver, ids[0]));
+
+    // Now the interceptor half: the same trashed row, reached through a client
+    // whose chain pins `owner_id = 1`. Re-trash owner 1's row first so the
+    // chain has one row it may restore and one it may not.
+    {
+        var d = unscoped.Delete();
+        defer d.deinit();
+        _ = try d.Where(.{sql.EQ("id", .{ .int = ids[0] })});
+        try std.testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+    var chain = @import("../runtime/intercept.zig").InterceptorChain.init(allocator);
+    defer chain.deinit();
+    try chain.use(.{ .intercept = struct {
+        fn f(_: ?*anyopaque, view: *@import("../runtime/intercept.zig").QueryView) anyerror!void {
+            try view.whereEq("owner_id", .{ .int = 1 });
+        }
+    }.f });
+    const tenant = unscoped.withInterceptors(&chain);
+    {
+        var d = tenant.Delete();
+        defer d.deinit();
+        try std.testing.expect(!try d.Restore(ids[1]));
+    }
+    try std.testing.expectEqual(@as(i64, 0), try countLive(&driver, ids[1]));
+    {
+        var d = tenant.Delete();
+        defer d.deinit();
+        try std.testing.expect(try d.Restore(ids[0]));
+    }
+    try std.testing.expectEqual(@as(i64, 1), try countLive(&driver, ids[0]));
+}
+
+/// 1 when the row is live (not trashed), 0 when it is still trashed. Raw SQL,
+/// so the read is not itself filtered by the scopes under test.
+fn countLive(driver: *@import("../sql/sqlite.zig").SQLiteDriver, id: i64) !i64 {
+    var rows = try driver.query("SELECT COUNT(*) FROM restore_scoped_row WHERE id = ? AND deleted_at IS NULL", &.{.{ .int = id }});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    return row.getInt(0) orelse error.NoInt;
 }
 
 test "a second soft delete neither rewrites deleted_at nor counts the row" {
