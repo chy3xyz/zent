@@ -781,6 +781,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
         const ExplainError = error{ OutOfMemory, BuildFailed, InvalidCursor, UnsupportedDialect };
+        /// `Sum` / `Avg` only. A separate set rather than a member of
+        /// `QueryError`, which every reader shares: adding to that one would
+        /// widen `All()`, `First()` and the rest with an error none of them can
+        /// return, and break callers that switch over the set exhaustively.
+        const AggregateError = QueryError || error{EmptyAggregate};
 
         /// Return the dialect-prefixed EXPLAIN SQL for the current query.
         /// The caller owns the returned `ExplainResult` and must call `deinit`.
@@ -1281,7 +1286,15 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return true;
         }
 
-        pub fn Sum(self: *Self, comptime field_name: []const u8) QueryError!f64 {
+        /// `SUM(col)` over the matching rows, as `f64`.
+        ///
+        /// `error.EmptyAggregate` when no row matched (or every value is NULL):
+        /// SQL's `SUM` is NULL there, and "there is no data" is a different
+        /// statement from `error.TypeMismatch`, which means a value came back
+        /// that is not a number. `SumOrZero` is the variant that answers `0`
+        /// instead of the error, and `Max` / `Min` answer `sql.Value` so their
+        /// NULL stays visible in the value.
+        pub fn Sum(self: *Self, comptime field_name: []const u8) AggregateError!f64 {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -1295,11 +1308,16 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (rows.nextError()) |e| return e;
                 return error.NotFound;
             };
-            // numeric SUM (int8/int4/numeric) parses via the text representation.
-            return row.getFloat(0) orelse return error.TypeMismatch;
+            // empty set (or an all-NULL column) makes SQL's SUM NULL; the
+            // numeric result parses via the text representation.
+            return row.getFloat(0) orelse if (row.isNull(0)) error.EmptyAggregate else error.TypeMismatch;
         }
 
-        pub fn Avg(self: *Self, comptime field_name: []const u8) QueryError!f64 {
+        /// `AVG(col)` over the matching rows — `error.EmptyAggregate` on an
+        /// empty set, exactly as `Sum` (see its doc; `getFloat` answers null
+        /// both for a SQL NULL and for a value it cannot read as a number, so
+        /// the column's own null check is what tells the two apart).
+        pub fn Avg(self: *Self, comptime field_name: []const u8) AggregateError!f64 {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -1313,7 +1331,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 if (rows.nextError()) |e| return e;
                 return error.NotFound;
             };
-            return row.getFloat(0) orelse return error.TypeMismatch;
+            // As in `Sum`: an empty set is NULL, not a type problem.
+            return row.getFloat(0) orelse if (row.isNull(0)) error.EmptyAggregate else error.TypeMismatch;
         }
 
         pub fn Max(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
@@ -1957,11 +1976,26 @@ test "Query builder execution methods expose explicit driver error union" {
     const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
 
     comptime {
-        const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist", "Sum", "Avg", "Max", "Min" };
+        const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist", "Max", "Min" };
         for (method_names) |method_name| {
             const return_type = @typeInfo(@TypeOf(@field(UserQuery, method_name))).@"fn".return_type.?;
             if (@typeInfo(return_type).error_union.error_set != QueryError) {
                 @compileError("QueryBuilder." ++ method_name ++ " error set is not explicit");
+            }
+        }
+    }
+
+    comptime {
+        // `Sum` / `Avg` add `error.EmptyAggregate` — an empty set makes SQL's
+        // aggregate NULL, which is not the type problem `TypeMismatch` names —
+        // and only they do: the five readers above keep the set they had, so a
+        // caller switching over `QueryError` is not disturbed by it.
+        const AggregateError = QueryError || error{EmptyAggregate};
+        const aggregate_names = .{ "Sum", "Avg" };
+        for (aggregate_names) |method_name| {
+            const return_type = @typeInfo(@TypeOf(@field(UserQuery, method_name))).@"fn".return_type.?;
+            if (@typeInfo(return_type).error_union.error_set != AggregateError) {
+                @compileError("QueryBuilder." ++ method_name ++ " error set is not AggregateError");
             }
         }
     }

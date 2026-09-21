@@ -558,3 +558,52 @@ test "ForUpdateWith flows lock options into the generated SELECT" {
     try std.testing.expect(std.mem.indexOf(u8, plain_sql, "SKIP LOCKED") == null);
     try std.testing.expect(std.mem.indexOf(u8, plain_sql, "NOWAIT") == null);
 }
+
+test "Sum and Avg name an empty set instead of answering a type error" {
+    // SQL's SUM/AVG over zero rows — or over a column that is all NULL — is
+    // NULL. `getFloat` answers null both for that and for a value it cannot
+    // read as a number, so the two arrived as the same `error.TypeMismatch`:
+    // "there is no data" was reported as a type problem, and a caller could
+    // not tell the two apart at all.
+    const allocator = std.testing.allocator;
+
+    const Order = schema("Order", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.Float("amount"),
+        },
+    });
+    const info = comptime fromSchema(Order);
+    const infos = &[_]TypeInfo{info};
+    const OrderEntity = comptime EntityGen(infos, info);
+    const OrderQuery = QueryBuilder(infos, info, OrderEntity);
+
+    // The empty set: a NULL aggregate, named for what it is.
+    for ([_][]const u8{ "Sum", "Avg" }) |method| {
+        var mock = MockDriver{ .value = .null };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        if (std.mem.eql(u8, method, "Sum")) {
+            try std.testing.expectError(error.EmptyAggregate, q.Sum("amount"));
+        } else {
+            try std.testing.expectError(error.EmptyAggregate, q.Avg("amount"));
+        }
+    }
+
+    // A value that is not a number is still a type error — the two must not be
+    // collapsed in the other direction either.
+    {
+        var mock = MockDriver{ .value = .{ .string = "not a number" } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try std.testing.expectError(error.TypeMismatch, q.Sum("amount"));
+    }
+
+    // And the ordinary answer is untouched.
+    {
+        var mock = MockDriver{ .value = .{ .float = 12.5 } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try std.testing.expectEqual(@as(f64, 12.5), try q.Sum("amount"));
+    }
+}
