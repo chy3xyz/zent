@@ -168,6 +168,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             return self;
         }
 
+        /// Explicit, and it **grows**: v0.67.0 added `MissingLastInsertId`,
+        /// v0.69.0 `InconsistentRowFields`, v0.69.0 `MissingPrimaryKey`. A
+        /// member is only ever added for a failure a caller could act on,
+        /// never renamed — but a caller that switches over this set must end
+        /// with `else =>`, or a minor release will not compile. See
+        /// `docs/BEST_PRACTICES.md` ("Error sets that grow").
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, NotFound, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId, MissingPrimaryKey };
 
         /// Run the interceptor chain (`.create`). `whereEq` fills omitted

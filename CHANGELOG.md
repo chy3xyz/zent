@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+- **`CrudService.get` is `getOwned`.** The method returns a row copied into the
+  caller's allocator, while `client.<entity>.deinitRow(&e)` frees with the
+  *client's* allocator — the same `Entity` type, so nothing but the call site
+  said which allocator was right, and pairing them wrongly is a mismatched free
+  (a request arena corrupted, or "free of invalid memory" taking the process
+  down). Every call site now states the ownership. `EntityClient.deinitRowWith
+  (allocator, &e)` is the release for such a row: it names the allocator that
+  allocated.
+- **`Sum` / `Avg` answer `error.EmptyAggregate` on an empty set.** They used to
+  answer `error.TypeMismatch` — the same error a value that is not a number
+  produces through `getFloat`, so "there is no data" was reported as a type
+  problem and the two could not be told apart. The member lives in a
+  `Sum`/`Avg`-only error set (`QueryError || error{EmptyAggregate}`) so the
+  shared readers (`All`, `First`, `Count`, …) are not widened with an error
+  none of them can return. `SumOrZero` and `Max`/`Min` are unchanged.
+
+### Fixed
+- **A column-level `UNIQUE` is now enforced on a table that already exists.**
+  The declaration is inline in `CREATE TABLE` and `ALTER TABLE ADD COLUMN`
+  cannot carry it, so a table created before the field was marked unique never
+  got the constraint — and with no unique index the statement
+  `SaveOrUpdateOn` builds is rejected outright ("ON CONFLICT clause does not
+  match any PRIMARY KEY or UNIQUE constraint" on SQLite and PostgreSQL), so
+  every upsert against that table failed at runtime while the schema said it
+  worked. The migration now adds a unique index over the one column — the
+  dialect-neutral form, no table rebuild — skipping it only when an unreadable
+  unique index already covers the column, or the server cannot index the type
+  (MySQL BLOB/TEXT/JSON, where the create-table path warns too). A deploy whose
+  data already violates the declaration fails loudly on the `CREATE UNIQUE
+  INDEX` and rolls back, rather than leaving the promise unkept.
+
 ## [0.72.0] - 2026-09-21
 
 ### Fixed

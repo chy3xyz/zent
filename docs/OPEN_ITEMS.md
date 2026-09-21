@@ -25,7 +25,12 @@ kept — now pinned in comments so they are not "fixed" into something worse:
 bounded set `asDriver` needs; the unmapped name stays in the warn log) and
 `driverInTransaction` answering `false` on a failed borrow (the `beginTxCtx`
 preflight routes `false` to `beginTx`, whose own borrow surfaces the real
-error). Resolved in v0.72.0: `Restore` is scoped by the policy's filters and the
+error). Resolved in v0.73.0: `CrudService.getOwned` names the row's allocator and
+`deinitRowWith` is the release that matches it, a column-level `UNIQUE` is
+enforced on an existing table (the migration adds the unique index), and
+`Sum`/`Avg` answer `error.EmptyAggregate` for an empty set instead of the
+`error.TypeMismatch` a non-numeric value produces. Resolved in v0.72.0:
+`Restore` is scoped by the policy's filters and the
 interceptor chain, `queryTargets*`/`QueryEdge` report a mid-read failure instead
 of a short page, `IDs()` projects the primary key, the EntQL `has()`/`not_has()`
 lowerings and the `WithEdgeOptions` inner join carry the target's soft-delete
@@ -49,7 +54,6 @@ with no runtime failure shapes to audit.
 |---|---|---|
 | **A junction table name colliding with a declared entity table is undetected** | `junctionTableForEdge` derives `<a>_<b>`, and `createTableSQLAlloc` emits `CREATE TABLE IF NOT EXISTS`, so the first one created wins silently. An entity whose table is literally that pair's name is enough | Detecting it means either validating names at graph build (a new compile-time error) or reporting it in `checkSchema` (a new drift kind) |
 | **`zig build migrate-rollback` does not inherit the caller's DSN** | `build.zig`'s `migrate-rollback` step calls `setEnvironmentVariable`, which materialises the env map into the long-lived build-server process; `migrate` (`build.zig:205`) does not and works. So the rollback step cannot be pointed at a database from the shell | Fixing it means changing how the step passes env — worth doing, but it touches the build's structure |
-| **`Sum` / `Avg` report an empty aggregate as a type error** | An aggregate over zero rows (or an all-NULL column) is SQL NULL, and `query.zig`'s `row.getFloat(0) orelse return error.TypeMismatch` names that a *type* problem. A caller cannot tell "no rows" from a driver type failure; `SumOrZero` covers only SUM, and by answering 0 it hides the case rather than distinguishing it (`query.zig:1283-1305`). Options: return `?f64`, or a named `error.EmptyAggregate` | Both are API-breaking; the current behavior is documented, so it is a deliberate choice rather than an oversight |
 | **`Count` / `Sum` / `Avg` / `Max` / `Min` read one row of a grouped query** | With `GroupBy` set, these read the first row only — the first group's aggregate is presented as *the* answer — and zero groups makes `Count()` answer `NotFound` where 0 is the expected count (`query.zig:1130-1145` via `buildCountQuery:1600-1620`, and `buildAggregateQuery:1622-1653`). Either reject group/order/limit on these methods (a compile-time or runtime error) or wrap the grouped select in a subquery | Rejecting breaks callers that pass a GroupBy today; the subquery wrap changes the emitted SQL on all three dialects |
 | **EntQL speaks physical column names, not field names** | `parseComparison` (`entql/parser.zig:433-440`) never maps an ident through `columnName`, so on a schema using `.StorageKey` a `WhereEntQL("name = …")` filters the literal column `name` rather than the mapped one. Fail-closed today (prepare error), unless the table happens to have both columns. Decide: map idents at lowering (needs the schema, which only the codegen layer has) or document that EntQL addresses physical columns | Mapping needs the whole parse tree to be lowered with the schema in hand; documenting it is a docs-only change but leaves `.StorageKey` schemas an easy trap |
 
@@ -72,7 +76,7 @@ with no runtime failure shapes to audit.
 |---|---|
 | Z14 | The `Contains` rename itself (the `Like` alias and the docs shipped). The rename gets more expensive with every adopter |
 | Z16 | Multi-graph stages 2/3: a cross-graph edge fails at *runtime* with a named error (stage 1), not at compile time |
-| Z31 | `view_sql` replacement; `UNIQUE` / foreign keys added by `ALTER` on an existing table |
+| Z31 | `view_sql` replacement; foreign keys added by `ALTER` on an existing table (the **column-level `UNIQUE`** half landed in v0.73.0 — the migration adds a unique index) |
 | Z32 | A bare `sql.InSelect` does not scope its inner table; `Has*` targets do. Documented as out of reach for the `sql` layer (it has no graph) |
 
 ## Structural gaps

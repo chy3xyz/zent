@@ -323,14 +323,43 @@ defer q.deinit();
 _ = try q.Where(.{client.user.predicates.app_idEQ(.{ .int = app_id })});
 const total = try q.Count();
 
-// SUM — returns f64; PG SUM over zero rows surfaces as error.TypeMismatch
+// SUM — returns f64. An empty set (or an all-NULL column) is SQL NULL, which
+// is `error.EmptyAggregate`, not `error.TypeMismatch` (a value that is not a
+// number). They used to share one error.
 const amount = q.Sum("pay_price") catch |err| switch (err) {
-    error.NotFound, error.TypeMismatch => 0,
+    error.EmptyAggregate => 0,
     else => return err,
 };
 ```
 
+`Avg` answers the same three ways: a value, `error.EmptyAggregate` for an
+empty set, `error.TypeMismatch` for a value it cannot read as a number.
+`SumOrZero` is the variant that answers `0` instead, and `Max` / `Min` return
+`sql.Value` so their NULL stays visible in the value.
+
 `COUNT(DISTINCT ...)` has no builder form — use the raw driver (§5).
+
+### Error sets that grow
+
+The write and query error sets (`SaveError`, `DeleteBuilder.ExecError`,
+`QueryError`, …) are explicit, and a **minor release may add a member** to one:
+v0.67.0 added `error.MissingLastInsertId`, v0.69.0
+`error.InconsistentRowFields` and `error.MissingPrimaryKey`, v0.73.0
+`error.EmptyAggregate` for `Sum`/`Avg` only. Members are added for failures a
+caller can act on and are never renamed — but a `switch` over one of these sets
+has to end with `else =>`, or an upgrade stops compiling:
+
+```zig
+const row = b.Save() catch |err| switch (err) {
+    error.MissingPrimaryKey, error.MissingLastInsertId => return error.NoKey,
+    error.UniqueViolation => return error.Duplicate,
+    else => return err,   // keep this: the set is expected to grow
+};
+```
+
+Where a member only one method can produce, it lives in that method's own set
+(`Sum`/`Avg` return `QueryError || error{EmptyAggregate}`) so the shared
+readers are not widened with an error they cannot return.
 
 ## 5. Raw driver (JOIN / GROUP BY / exotic SQL)
 
