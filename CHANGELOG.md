@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A uuid primary key the caller never set is `error.MissingPrimaryKey` on
+  every dialect, decided before the statement runs.** The RETURNING path
+  (PostgreSQL, SQLite) answered `error.TypeMismatch` after the fact:
+  PostgreSQL rejects the INSERT (NOT NULL), while SQLite's rowid-table quirk
+  *accepts* the NULL into a `TEXT PRIMARY KEY` and RETURNING hands back NULL
+  *after* the write — a type error naming the wrong mistake, with the keyless
+  row already on disk. MySQL has decided this before the statement since
+  v0.69.0; the RETURNING branch now makes the same decision at the same place,
+  so the two dialects cannot drift.
+- **Insert log lines report the rows the server actually wrote.** Both insert
+  log sites hardcoded `rows_affected = 1`: the RETURNING site logged 1 for a
+  `SaveIgnore` the server ignored (nothing written) — it now logs 0 when no
+  RETURNING row comes back — and the MySQL site forwards the driver's own
+  count and `rows_affected_known`, so an upsert that updated logs 2 and an
+  ignored insert logs 0 instead of an unconditional 1.
+- **The pool records an `all.append` OOM as itself.** `selectNoLock`'s
+  create-connection path recorded the failure reason for `openConnection` and
+  for the `PooledEntry` allocation but not for the `all.append` that follows,
+  so an out-of-memory there surfaced as `PoolExhausted` through the generic
+  mapping; it now reports `error.OutOfMemory`, matching its sibling paths.
+
 ## [0.70.0] - 2026-09-21
 
 ### Breaking

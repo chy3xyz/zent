@@ -16,8 +16,16 @@ or source that says something the docs do not.
 ---
 
 _Resolved in v0.70.0: the pool no longer parks when it has room to serve, and
-SQLite now enforces foreign keys. This file is pruned as items land; history
-lives in `CHANGELOG.md`._
+SQLite now enforces foreign keys. Resolved in v0.71.0: the missing-uuid-key
+error is `MissingPrimaryKey` on every dialect (decided before the statement
+runs), the insert log sites report the rows the server wrote, and the pool
+records an `all.append` OOM as itself. Two items were examined and deliberately
+kept — now pinned in comments so they are not "fixed" into something worse:
+`borrowErrorFor` folding unknown driver errors into `PoolExhausted` (the
+bounded set `asDriver` needs; the unmapped name stays in the warn log) and
+`driverInTransaction` answering `false` on a failed borrow (the `beginTxCtx`
+preflight routes `false` to `beginTx`, whose own borrow surfaces the real
+error). This file is pruned as items land; history lives in `CHANGELOG.md`._
 
 ## Needs a decision before it can be fixed
 
@@ -30,12 +38,7 @@ lives in `CHANGELOG.md`._
 
 | Item | Evidence |
 |---|---|
-| **`selectNoLock`'s append failure does not record `last_attempt_error`** | The `all.append` OOM path (`src/sql/pool.zig:377`) returns null without setting the recorded reason, so an out-of-memory surfaces as `PoolExhausted` — inconsistent with the sibling `create` path (`:375`), which sets `error.OutOfMemory`. Found while fixing the borrow semantics (v0.70.0) |
-| **`borrowErrorFor` folds unknown driver errors into `PoolExhausted`** | Its bounded set (`src/sql/pool.zig:296`) reports any driver error whose name is not in it as "the pool is too small" even when the pool had room — the residual half of the misattribution the v0.70.0 fix removed for the common cases. Deliberate per its doc (`asDriver` needs a bounded set), so widening it is a design choice |
-| **`driverInTransaction` maps a failed borrow to `false`** | A `Driver.inTransaction` that could not borrow reports "not in a transaction", so a caller can begin work believing it is inside one when the pool was merely unavailable. Related to the preflight the codegen `beginTx*` entries do |
-| **`create.zig`'s two insert log sites still report a hardcoded `rows_affected = 1`** | The RETURNING path logs 1 for a `SaveIgnore` the server ignored (0 rows written); the MySQL path logs 1 where the server reports 2 (an upsert that updated) or 0. `LogContext` already carries `rows_affected_known` since v0.65.0, so the value is available |
 | **`SaveOne` / `ExecOne` lose `rows_affected_known` at the `usize` boundary** | They return `usize`, so a driver that could not count reads as "0 rows" and answers `NotFound`. `UPDATE`/`DELETE` counts are known on all three dialects, so it is unreachable today — it is the one place the v0.63.0 distinction does not reach |
-| **The RETURNING path answers `error.TypeMismatch` for a uuid primary key the caller never set** | `create.zig`'s `row.getText(0) orelse return error.TypeMismatch`: SQLite inserts NULL and hands back NULL, so the caller gets a *type* error for what is a *missing key*. MySQL now answers `error.MissingPrimaryKey` (v0.69.0) — the two dialects name the same mistake differently. **Read from the source, not reproduced** |
 | **`sql.MultiInsert`'s length assertion does not validate what the rows set** | It asserts `values.len == columns.len * row_count`, which holds because the buffer is sized from the column list. The insert layer now checks the rows against each other (v0.69.0), so the assert is no longer the only guard — but it is still about the buffer, not the input |
 | **MySQL's prepared `exec` path never drains its result set** | So a parameterised `SELECT` through `exec` reports `rows_affected_known = false` where the unprepared path reports the row count (v0.63.0 documented the difference). Draining would make the two agree at the cost of materialising a result set `exec` is about to discard |
 | **`outbox.nowMs` falls back to `0`** | A `gettimeofday` failure would stamp `claimed_at = 0` (immediately stale) and compute a negative cutoff for `requeueStale`. The syscall cannot fail for a valid pointer, so it is unreachable — recorded because it is the same "unknown as a value" shape |
