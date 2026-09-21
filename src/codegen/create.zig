@@ -359,6 +359,20 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // handles that (Value fields default to .null).
             var entity: Entity = @import("../sql/scan.zig").zeroInit(Entity);
             if (supports_returning) {
+                // A textual (uuid) primary key has no source but the caller's
+                // own value here too — RETURNING only hands back what the
+                // statement wrote. Resolved *before* the statement runs — the
+                // same decision as the MySQL branch below, so the two
+                // dialects cannot drift — because the two servers disagree on
+                // a key that was never set: PostgreSQL rejects the INSERT
+                // (NOT NULL), while SQLite's rowid-table quirk ACCEPTS the
+                // NULL into a TEXT PRIMARY KEY and RETURNING then hands back
+                // NULL *after* the write. Answering `TypeMismatch` there would
+                // name a type error for what is actually a missing key, with
+                // the keyless row already on disk.
+                if (comptime @TypeOf(@field(entity, info.pk_field)) != i64) {
+                    if (textPrimaryKeyFrom(self.values.items, info.pk_field) == null) return error.MissingPrimaryKey;
+                }
                 var builder = if (or_replace and is_sqlite and self.upsert_set_exprs == null)
                     sql.InsertOrReplace(self.allocator, dialect, info.table_name)
                 else if (ignore_conflicts and is_sqlite)
@@ -392,11 +406,16 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const start = nowUs();
                 var rows = try self.driver.queryCtx(&self.execution_context, full_sql, q.args);
                 defer rows.deinit();
+                var returned_row = false;
                 if (rows.next()) |row| {
+                    returned_row = true;
                     if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
                         @field(entity, info.pk_field) = @intCast(row.getInt(0) orelse return error.TypeMismatch);
                     } else {
-                        // Textual primary key (uuid): RETURNING gives the value back.
+                        // Textual primary key (uuid): RETURNING gives the value
+                        // back. A NULL here means a supplied value came back
+                        // NULL — a genuine anomaly; the pre-check above owns
+                        // the "caller never set it" case.
                         @field(entity, info.pk_field) = try entity_alloc.dupe(u8, row.getText(0) orelse return error.TypeMismatch);
                     }
                 } else {
@@ -428,7 +447,12 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                         .sql = full_sql,
                         .args = log_args,
                         .duration_us = duration_us,
-                        .rows_affected = 1,
+                        // RETURNING answers at most one row per inserted row,
+                        // so the count is decided here: outside ignore mode a
+                        // missing row already returned earlier, and inside it
+                        // a missing row means nothing was written.
+                        .rows_affected = if (returned_row) 1 else 0,
+                        .rows_affected_known = true,
                         .table_name = info.table_name,
                     });
                 }
@@ -499,7 +523,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                         .sql = full_sql,
                         .args = log_args,
                         .duration_us = duration_us,
-                        .rows_affected = 1,
+                        // Forward the driver's own count: a MySQL upsert that
+                        // updated reports 2, an INSERT IGNORE that ignored
+                        // reports 0 — a hardcoded 1 claimed a row either way.
+                        .rows_affected = res.rows_affected,
+                        .rows_affected_known = res.rows_affected_known,
                         .table_name = info.table_name,
                     });
                 }
@@ -1640,6 +1668,9 @@ const IdScriptDriver = struct {
     /// Answered by calls past the end of `script`.
     repeat: ?i64 = null,
     exec_calls: usize = 0,
+    /// Rows the next `exec` reports as affected; defaults to the in-tree
+    /// drivers' one-row INSERT answer so existing callers see no change.
+    exec_rows_affected: usize = 1,
     /// Copy of the statement the last `exec` saw — copied because the builder
     /// that produced it is deinit'd before the test can look at it.
     last_sql_owned: ?[]u8 = null,
@@ -1670,7 +1701,7 @@ const IdScriptDriver = struct {
         self.exec_calls += 1;
         self.freeCapture();
         self.last_sql_owned = std.testing.allocator.dupe(u8, query_sql) catch null;
-        return .{ .rows_affected = 1, .last_insert_id = id };
+        return .{ .rows_affected = self.exec_rows_affected, .last_insert_id = id };
     }
 
     fn query(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
@@ -1695,6 +1726,153 @@ const IdScriptDriver = struct {
 
     fn inTransaction(_: *anyopaque) bool {
         return false;
+    }
+};
+
+/// The RETURNING-path sibling of `IdScriptDriver`: `dialect` says `sqlite3`,
+/// which the builders treat as a RETURNING dialect, so `Save` drives `query`
+/// rather than `exec`. `query` hands back the scripted pk text one call at a
+/// time — or no row at all for a `null` entry, the INSERT-or-IGNORE shape —
+/// and `error.QueryFailed` past the end of the script, the way the MySQL
+/// sibling's `query` always fails. `exec` never runs on this path, so it
+/// fails loudly instead of answering.
+const ReturningScriptDriver = struct {
+    /// One entry per `query` call: the pk text RETURNING hands back, or
+    /// `null` for a statement that wrote nothing and returned no row.
+    script: []const ?[]const u8,
+    /// Answered by calls past the end of `script`.
+    repeat: ?[]const u8 = null,
+    query_calls: usize = 0,
+    /// Copy of the statement the last `query` saw — copied because the
+    /// builder that produced it is deinit'd before the test can look at it.
+    last_sql_owned: ?[]u8 = null,
+
+    const RowState = struct {
+        has_row: bool,
+        text: ?[]const u8,
+        used: bool = false,
+    };
+
+    const rows_vtable = sql_driver.Rows.VTable{
+        .next = rowsNext,
+        .deinit = rowsDeinit,
+        .nextError = null,
+    };
+
+    const row_vtable = sql_driver.Row.VTable{
+        .columnCount = rowColumnCount,
+        .columnName = rowColumnName,
+        .getBool = rowGetBool,
+        .getInt = rowGetInt,
+        .getFloat = rowGetFloat,
+        .getText = rowGetText,
+        .getBlob = rowGetBlob,
+        .isNull = rowIsNull,
+    };
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = exec,
+        .query = query,
+        .beginTx = beginTx,
+        .beginSavepoint = beginSavepoint,
+        .close = close,
+        .dialect = dialect,
+        .ping = ping,
+        .inTransaction = inTransaction,
+    };
+
+    fn asDriver(self: *ReturningScriptDriver) sql_driver.Driver {
+        return sql_driver.Driver{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn freeCapture(self: *ReturningScriptDriver) void {
+        if (self.last_sql_owned) |s| std.testing.allocator.free(s);
+        self.last_sql_owned = null;
+    }
+
+    fn exec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        return error.ExecFailed;
+    }
+
+    fn query(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        const self: *ReturningScriptDriver = @ptrCast(@alignCast(ptr));
+        defer self.freeCapture();
+        self.last_sql_owned = std.testing.allocator.dupe(u8, query_sql) catch null;
+        if (self.query_calls >= self.script.len and self.repeat == null) {
+            self.query_calls += 1;
+            return error.QueryFailed;
+        }
+        const entry: ?[]const u8 = if (self.query_calls < self.script.len) self.script[self.query_calls] else self.repeat;
+        self.query_calls += 1;
+        const state = try std.testing.allocator.create(RowState);
+        state.* = .{ .has_row = entry != null, .text = entry };
+        return sql_driver.Rows{ .ptr = state, .vtable = &rows_vtable };
+    }
+
+    fn beginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn beginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn dialect(_: *anyopaque) Dialect {
+        return .sqlite;
+    }
+
+    fn ping(_: *anyopaque) sql_driver.Error!void {}
+
+    fn inTransaction(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn rowsNext(ptr: *anyopaque) ?sql_driver.Row {
+        const self: *RowState = @ptrCast(@alignCast(ptr));
+        if (self.used) return null;
+        self.used = true;
+        if (!self.has_row) return null;
+        return sql_driver.Row{ .ptr = @ptrCast(self), .vtable = &row_vtable };
+    }
+
+    fn rowsDeinit(ptr: *anyopaque) void {
+        std.testing.allocator.destroy(@as(*RowState, @ptrCast(@alignCast(ptr))));
+    }
+
+    fn rowColumnCount(_: *anyopaque) usize {
+        return 1;
+    }
+
+    fn rowColumnName(_: *anyopaque, _: usize) []const u8 {
+        return "id";
+    }
+
+    fn rowGetBool(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+
+    fn rowGetInt(_: *anyopaque, _: usize) ?i64 {
+        return null;
+    }
+
+    fn rowGetFloat(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+
+    fn rowGetText(ptr: *anyopaque, _: usize) ?[]const u8 {
+        const self: *RowState = @ptrCast(@alignCast(ptr));
+        return self.text;
+    }
+
+    fn rowGetBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+
+    fn rowIsNull(ptr: *anyopaque, _: usize) bool {
+        const self: *RowState = @ptrCast(@alignCast(ptr));
+        return self.text == null;
     }
 };
 
@@ -2037,4 +2215,138 @@ test "create: a MySQL uuid key the caller never set is an error before the state
 
     try std.testing.expectError(error.MissingPrimaryKey, b2.SaveOrUpdate());
     try std.testing.expectEqual(@as(usize, 0), upsert_drv.exec_calls);
+}
+
+test "create: a RETURNING-dialect uuid key the caller never set is an error before the statement" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const Doc = schema("RetUuidDoc", .{
+        .fields = &.{ field.UUID("id"), field.String("title") },
+    });
+
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]TypeInfo{info};
+    const DocEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, DocEntity);
+
+    // Same mistake as the MySQL case above, one name: without the pre-check
+    // the statement runs — PostgreSQL answers NOT NULL, while SQLite accepts
+    // the NULL into a TEXT PRIMARY KEY and RETURNING then hands back NULL,
+    // reported as `TypeMismatch` *after* the keyless row was written.
+    var insert_drv = ReturningScriptDriver{ .script = &.{} };
+    defer insert_drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, insert_drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("title", "t");
+
+    try std.testing.expectError(error.MissingPrimaryKey, b.Save());
+    // Decided before the statement: nothing was sent to the driver at all.
+    try std.testing.expectEqual(@as(usize, 0), insert_drv.query_calls);
+
+    // The upsert path takes the same RETURNING branch and resolves the same way.
+    var upsert_drv = ReturningScriptDriver{ .script = &.{} };
+    defer upsert_drv.freeCapture();
+    var b2 = Builder.init(std.testing.allocator, upsert_drv.asDriver(), &.{}, null);
+    defer b2.deinit();
+    _ = try b2.setFieldValue("title", "t");
+
+    try std.testing.expectError(error.MissingPrimaryKey, b2.SaveOrUpdate());
+    try std.testing.expectEqual(@as(usize, 0), upsert_drv.query_calls);
+}
+
+test "create: SaveIgnore on the RETURNING path logs the rows it actually wrote" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    // What the logger saw lives at container level: the callbacks carry no
+    // user pointer (same shape as `update_delete.zig`'s Seen).
+    const Seen = struct {
+        var calls: usize = 0;
+        var rows: usize = 999;
+        var known: bool = false;
+
+        fn onExec(ctx: LogContext) void {
+            calls += 1;
+            rows = ctx.rows_affected;
+            known = ctx.rows_affected_known;
+        }
+    };
+
+    const Doc = schema("IgnoreLogDoc", .{
+        .fields = &.{ field.Int("id"), field.String("title") },
+    });
+
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]TypeInfo{info};
+    const DocEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, DocEntity);
+
+    // A `null` script entry is the ignored-insert shape: the statement ran,
+    // the server wrote nothing, and RETURNING came back with no row.
+    var drv = ReturningScriptDriver{ .script = &.{null} };
+    defer drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    b.logger = .{ .onExec = Seen.onExec };
+    _ = try b.setFieldValue("title", "t");
+
+    var entity = try b.SaveIgnore();
+    defer deinitEntity(infos, info, &entity, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), Seen.calls);
+    try std.testing.expectEqual(@as(usize, 0), Seen.rows);
+    try std.testing.expect(Seen.known);
+}
+
+test "create: the MySQL exec path logs the driver's row count" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const Seen = struct {
+        var calls: usize = 0;
+        var rows: usize = 999;
+        var known: bool = false;
+
+        fn onExec(ctx: LogContext) void {
+            calls += 1;
+            rows = ctx.rows_affected;
+            known = ctx.rows_affected_known;
+        }
+    };
+
+    const User = schema("ExecLogUser", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, UserEntity);
+
+    // The upsert-updated shape: MySQL counts the UPDATE, so `affected_rows`
+    // is 2 while `last_insert_id` still names the row's own key. A hardcoded
+    // `1` in the log claimed a single row either way.
+    var drv = IdScriptDriver{ .script = &.{7}, .exec_rows_affected = 2 };
+    defer drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    b.logger = .{ .onExec = Seen.onExec };
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+
+    var entity = try b.SaveOrUpdate();
+    defer deinitEntity(infos, info, &entity, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), Seen.calls);
+    try std.testing.expectEqual(@as(usize, 2), Seen.rows);
+    try std.testing.expect(Seen.known);
 }
