@@ -21,7 +21,34 @@ pub const SQLiteDriver = struct {
     /// nested statements on the same thread while holding the lock.
     mutex: RecursiveMutex = .{},
 
+    /// How `open` / `openWithOptions` configure the connection they hand back.
+    pub const OpenOptions = struct {
+        /// Issue `PRAGMA foreign_keys = ON` on the new connection and verify the
+        /// read-back (`enforceForeignKeys`).
+        ///
+        /// **Defaults to true, and turning it off is giving up referential
+        /// integrity.** SQLite ships the pragma OFF, so the `FOREIGN KEY` clauses
+        /// `migrateSchema` writes are recorded and never checked: an insert
+        /// naming a parent row that does not exist lands, and deleting or
+        /// dropping the referenced row leaves the children pointing at nothing.
+        /// Set false only for a database that already holds dangling references
+        /// and must stay writable — the reason belongs in a comment where it is
+        /// set, because nothing downstream can see the difference.
+        enforce_foreign_keys: bool = true,
+    };
+
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SQLiteDriver {
+        return openWithOptions(allocator, path, .{});
+    }
+
+    /// Open a connection with explicit options; `open` is this with the defaults
+    /// (foreign keys enforced).
+    ///
+    /// This is the only place the driver opens a handle, so it is the only place
+    /// the per-connection setup can be missed: `PRAGMA foreign_keys` is
+    /// **per connection**, and a handle that skipped it enforces nothing while
+    /// its neighbour refuses the same statement.
+    pub fn openWithOptions(allocator: std.mem.Allocator, path: []const u8, options: OpenOptions) !SQLiteDriver {
         const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
@@ -37,7 +64,50 @@ pub const SQLiteDriver = struct {
         }
         const default_busy_timeout: c_int = 5000;
         _ = c.sqlite3_busy_timeout(db.?, default_busy_timeout);
-        return SQLiteDriver{ .db = db.?, .allocator = allocator, .default_busy_timeout = default_busy_timeout };
+        var drv = SQLiteDriver{ .db = db.?, .allocator = allocator, .default_busy_timeout = default_busy_timeout };
+        if (options.enforce_foreign_keys) {
+            drv.enforceForeignKeys() catch |err| {
+                // Fail closed: a connection whose FK switch could not be set is
+                // not one this driver should hand out, because every statement
+                // through it would answer a different question than the caller
+                // asked (a dangling reference would be accepted).
+                _ = c.sqlite3_close(drv.db);
+                return err;
+            };
+        }
+        return drv;
+    }
+
+    /// Turn foreign-key enforcement on for this connection, and confirm it with
+    /// the read-back.
+    ///
+    /// SQLite parses `FOREIGN KEY` clauses whether or not the switch is on — the
+    /// switch decides whether they are checked — and every DDL path here writes
+    /// them (`createTableSQLAlloc` emits `FOREIGN KEY (…) REFERENCES … ON DELETE
+    /// CASCADE ON UPDATE CASCADE`), so with the pragma OFF the constraint is
+    /// documentation. `checkSchema` cannot see the difference either: it compares
+    /// the DDL shape, so `missing_foreign_key` means "not declared" and a clean
+    /// result means "declared", never "enforced".
+    ///
+    /// The read-back is not decoration. `PRAGMA foreign_keys` is a **silent
+    /// no-op inside a transaction** and reports `SQLITE_OK` either way, so the
+    /// statement's own success says nothing about the switch; and the setting is
+    /// per connection, so a connection that is never asked is a connection that
+    /// enforces nothing.
+    pub fn enforceForeignKeys(self: *SQLiteDriver) !void {
+        _ = try self.exec("PRAGMA foreign_keys = ON", &.{});
+        if (!try self.foreignKeysEnforced()) return error.SqliteForeignKeysNotEnabled;
+    }
+
+    /// Whether this connection enforces foreign keys right now.
+    pub fn foreignKeysEnforced(self: *SQLiteDriver) !bool {
+        var rows = try self.query("PRAGMA foreign_keys", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse {
+            if (rows.nextError()) |err| return err;
+            return error.SqliteForeignKeysUnknown;
+        };
+        return row.getBool(0) orelse false;
     }
 
     pub fn close(self: *SQLiteDriver) void {
@@ -1175,4 +1245,97 @@ test "SQLite: the statements whose count sqlite3_changes does not report" {
     }) |sql| {
         try std.testing.expect(!SQLiteDriver.writesWithoutReportingChanges(sql));
     }
+}
+
+test "SQLite: every way of opening a connection enforces foreign keys" {
+    const allocator = std.testing.allocator;
+
+    // The pragma is per connection and SQLite ships it OFF, so a handle is only
+    // constrained if the path that opened it asked. There is one such path
+    // (`openWithOptions`, which `open` forwards to) and this pins both public
+    // spellings, because a second entry point added later is exactly how half
+    // the connections of a pool would end up unenforced.
+    var by_open = try SQLiteDriver.open(allocator, ":memory:");
+    defer by_open.close();
+    try std.testing.expect(try by_open.foreignKeysEnforced());
+
+    var by_options = try SQLiteDriver.openWithOptions(allocator, ":memory:", .{});
+    defer by_options.close();
+    try std.testing.expect(try by_options.foreignKeysEnforced());
+
+    // The one spelling that does not, so the two above are not an accident of a
+    // driver that always answers "yes".
+    var opted_out = try SQLiteDriver.openWithOptions(allocator, ":memory:", .{ .enforce_foreign_keys = false });
+    defer opted_out.close();
+    try std.testing.expect(!try opted_out.foreignKeysEnforced());
+}
+
+test "SQLite: a dangling reference is refused, and the opt-out accepts it" {
+    const allocator = std.testing.allocator;
+    const ddl = [_][]const u8{
+        "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_parent (id))",
+    };
+
+    var enforced = try SQLiteDriver.open(allocator, ":memory:");
+    defer enforced.close();
+    for (ddl) |stmt| _ = try enforced.exec(stmt, &.{});
+
+    // `999` names a parent row that is not there. Before the pragma was issued
+    // at open this insert landed and the row stayed invisible to every join,
+    // while `checkSchema` reported the schema as clean — it compares the DDL
+    // shape and cannot see the switch.
+    try std.testing.expectError(
+        error.ForeignKeyViolation,
+        enforced.exec("INSERT INTO fk_child (id, parent_id) VALUES (1, 999)", &.{}),
+    );
+
+    // The refusal is a refusal, not a partial write.
+    {
+        var rows = try enforced.query("SELECT COUNT(*) FROM fk_child", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+    }
+
+    // The same statement lands once the row it names exists, so what was
+    // refused above was the reference and not the statement.
+    _ = try enforced.exec("INSERT INTO fk_parent (id) VALUES (999)", &.{});
+    _ = try enforced.exec("INSERT INTO fk_child (id, parent_id) VALUES (1, 999)", &.{});
+
+    // And on a connection that gave the guarantee up, the dangling row is
+    // stored — the switch is what decides, not the DDL.
+    var opted_out = try SQLiteDriver.openWithOptions(allocator, ":memory:", .{ .enforce_foreign_keys = false });
+    defer opted_out.close();
+    for (ddl) |stmt| _ = try opted_out.exec(stmt, &.{});
+    _ = try opted_out.exec("INSERT INTO fk_child (id, parent_id) VALUES (1, 999)", &.{});
+    var rows = try opted_out.query("SELECT COUNT(*) FROM fk_child", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try std.testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+}
+
+test "SQLite: a referenced table cannot be dropped while its children point at it" {
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    _ = try drv.exec("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)", &.{});
+    _ = try drv.exec("CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_parent (id))", &.{});
+    _ = try drv.exec("INSERT INTO fk_parent (id) VALUES (1)", &.{});
+    _ = try drv.exec("INSERT INTO fk_child (id, parent_id) VALUES (1, 1)", &.{});
+
+    // `DROP TABLE` performs an implicit `DELETE FROM` before dropping, so a
+    // parent whose children still reference it is refused — this is the write
+    // shape that turns a test's cleanup order into a failure, and the same one
+    // MySQL reports as errno 3730 and PostgreSQL as "other objects depend on
+    // it".
+    try std.testing.expectError(error.ForeignKeyViolation, drv.exec("DROP TABLE fk_parent", &.{}));
+
+    // The table is still there and still usable: the failed drop changed nothing.
+    _ = try drv.exec("INSERT INTO fk_child (id, parent_id) VALUES (2, 1)", &.{});
+
+    // Child first, and the parent goes.
+    _ = try drv.exec("DROP TABLE fk_child", &.{});
+    _ = try drv.exec("DROP TABLE fk_parent", &.{});
 }

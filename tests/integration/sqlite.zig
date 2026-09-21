@@ -4,6 +4,7 @@
 const std = @import("std");
 const zent = @import("zent");
 const SQLiteDriver = zent.sql_sqlite.SQLiteDriver;
+const ConnPool = zent.sql_pool.ConnPool;
 const sql_statement = zent.sql_statement;
 const Dialect = zent.sql_dialect.Dialect;
 const scanRow = zent.sql_scan.scanRow;
@@ -1906,10 +1907,10 @@ test "SQLite: database-level cascade delete" {
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
 
-    // SQLite parses FK constraints by default but enforces them only when
-    // foreign_keys is enabled per connection.
-    _ = try drv.exec("PRAGMA foreign_keys = ON", &.{});
-
+    // Nothing here turns `PRAGMA foreign_keys` on: `open` does, on every
+    // connection. The delete below therefore cascades because the switch is on,
+    // not because this test asked for it — and the DDL's action is `CASCADE`
+    // because that is `ForeignKeyDef`'s default.
     try migrate.migrateSchema(allocator, drv.asDriver(), infos);
 
     _ = try drv.exec("INSERT INTO user (id, name) VALUES (1, 'alice')", &.{});
@@ -5579,4 +5580,154 @@ test "SQLite: an eager-loaded target is scanned by field order, not the table's 
         try testing.expectEqual(@as(i64, 5), t.qty);
         try testing.expectEqual(@as(i64, 1), t.app_id);
     }
+}
+
+// ------------------------------------------------------------------
+// Foreign keys: declared is not the same as enforced
+// ------------------------------------------------------------------
+
+test "SQLite: migrateSchema's foreign keys are enforced, not just declared" {
+    // `checkSchema` compares the DDL shape and cannot see `PRAGMA foreign_keys`,
+    // so a clean `assertSchema` has always meant "the constraint is declared" —
+    // never "it is enforced". SQLite ships the pragma OFF and the driver's
+    // `open` turns it on; this is the end-to-end half: the DDL `migrateSchema`
+    // emits now refuses a reference to a row that is not there.
+    const allocator = testing.allocator;
+
+    const FkOwner = schema("FkOwner", .{
+        .fields = &.{ field.Int("id"), field.String("name") },
+    });
+    const FkPet = schema("FkPet", .{
+        .fields = &.{ field.Int("id"), field.String("name") },
+        .edges = &.{edge.From("owner", FkOwner).Required()},
+    });
+
+    const graph = comptime buildGraph(&.{ FkOwner, FkPet });
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // A pet whose owner does not exist. Before the pragma was issued this
+    // insert landed, and the row stayed invisible to every join the edge
+    // produces while `checkSchema` reported the schema as clean.
+    try testing.expectError(
+        error.ForeignKeyViolation,
+        drv.exec("INSERT INTO fk_pet (id, name, owner_id) VALUES (1, 'rex', 4242)", &.{}),
+    );
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    var ob = try client.fk_owner.Create();
+    defer ob.deinit();
+    _ = try ob.setFieldValue("name", "alice");
+    var owner = try ob.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &owner, allocator);
+
+    var pb = try client.fk_pet.Create();
+    defer pb.deinit();
+    _ = try pb.setFieldValue("name", "rex");
+    _ = try pb.setFieldValue("owner_id", owner.id);
+    var pet = try pb.Save();
+    defer zent.codegen.deinitEntity(infos, infos[1], &pet, allocator);
+
+    // The DDL is `ON DELETE CASCADE ON UPDATE CASCADE` — `ForeignKeyDef`'s
+    // defaults, which `createTableSQLAlloc` emits for every dialect — so
+    // deleting the owner takes the pet with it, the same answer PostgreSQL and
+    // MySQL give for the same DDL (pinned across all three in
+    // `dialect_matrix.zig`).
+    _ = try drv.exec("DELETE FROM fk_owner WHERE id = 1", &.{});
+    var rows = try drv.query("SELECT COUNT(*) FROM fk_pet", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
+}
+
+test "SQLite: migrateSchema creates a child table before its parent and the FK still bites" {
+    // A `REFERENCES` clause whose parent table does not exist yet is *recorded*,
+    // not checked: SQLite resolves the parent when a statement runs, and
+    // `CREATE TABLE` is not such a statement. That is what makes
+    // `createTables`' order — declaration order, junction tables afterwards —
+    // work with the pragma on, and it is measured here rather than assumed: the
+    // graph below lists the dependent entity first, so its table is created
+    // before the one it points at.
+    const allocator = testing.allocator;
+
+    const User = schema("FkUserSecond", .{
+        .fields = &.{ field.Int("id"), field.String("name") },
+    });
+    const Order = schema("FkOrderFirst", .{
+        .fields = &.{field.Int("id")},
+        .edges = &.{edge.From("user", User).Required()},
+    });
+
+    const graph = comptime buildGraph(&.{ Order, User });
+    const infos = graph.types;
+    try testing.expectEqualStrings("fk_order_first", infos[0].table_name);
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // Both tables exist (the child's `REFERENCES` to a non-existent parent did
+    // not stop `CREATE TABLE`), and the constraint is live now that the parent
+    // is there: a row naming a missing user is refused, a row naming a real one
+    // is accepted.
+    try testing.expectError(
+        error.ForeignKeyViolation,
+        drv.exec("INSERT INTO fk_order_first (id, user_id) VALUES (1, 99)", &.{}),
+    );
+    _ = try drv.exec("INSERT INTO fk_user_second (id, name) VALUES (99, 'alice')", &.{});
+    _ = try drv.exec("INSERT INTO fk_order_first (id, user_id) VALUES (1, 99)", &.{});
+
+    // Nothing was left half-created: the schema check agrees.
+    const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, drifts);
+    try testing.expectEqual(@as(usize, 0), drifts.len);
+}
+
+test "SQLite: a pooled connection enforces foreign keys too" {
+    // `PRAGMA foreign_keys` is per connection, so a pool whose factory opened a
+    // handle by any route other than `SQLiteDriver.open` would hand out
+    // unenforced connections — and the pool is where "some connections accept
+    // dangling references and others do not" would be hardest to notice. The
+    // pool's factory here is the ordinary `open`, which is the point.
+    const allocator = testing.allocator;
+
+    const pool_path = "tests/integration/.fk_pragma_pool.db";
+    std.Io.Dir.cwd().deleteFile(testing.io, pool_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(testing.io, pool_path) catch {};
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, pool_path);
+            }
+        }.f,
+        .min_connections = 2,
+        .max_connections = 2,
+        .io = testing.io,
+    });
+    defer pool.deinit();
+
+    // Both warm connections, held at once: with one still borrowed, the second
+    // borrow cannot hand the first one back.
+    const first = try pool.borrow();
+    defer pool.release(first);
+    try testing.expect(try first.foreignKeysEnforced());
+
+    const second = try pool.borrow();
+    defer pool.release(second);
+    try testing.expect(second != first);
+    try testing.expect(try second.foreignKeysEnforced());
+
+    // And it is live on a borrowed handle, not merely reported: the same
+    // dangling insert the driver-level test refuses.
+    _ = try first.exec("CREATE TABLE fk_pool_parent (id INTEGER PRIMARY KEY)", &.{});
+    _ = try first.exec("CREATE TABLE fk_pool_child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_pool_parent (id))", &.{});
+    try testing.expectError(
+        error.ForeignKeyViolation,
+        first.exec("INSERT INTO fk_pool_child (id, parent_id) VALUES (1, 7)", &.{}),
+    );
 }

@@ -2147,17 +2147,24 @@ test "Postgres: eager-load interceptor scope is unambiguous on JOIN edges (m2o +
     const tag_info = infos[2];
     const post_info = infos[3];
 
+    // Leftovers from an interrupted run, junction table first: `pg_xj_post_tag`
+    // holds foreign keys to both `pg_xj_post` and `pg_xj_tag`. The cleanup
+    // `defer`s are registered in the opposite order for the same reason — they
+    // run in reverse, so the junction table (registered last) is dropped first.
+    // `CASCADE` would paper over the wrong order here (dropping a parent drops
+    // the child's constraint with it), which is exactly why the order is stated
+    // rather than left to it.
     _ = try drv.exec("DROP TABLE IF EXISTS pg_xj_post_tag CASCADE", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS pg_xj_image CASCADE", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS pg_xj_tag CASCADE", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS pg_xj_post CASCADE", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS pg_xj_file CASCADE", &.{});
     try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
-    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_post_tag CASCADE", &.{}) catch {};
-    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_image CASCADE", &.{}) catch {};
-    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_tag CASCADE", &.{}) catch {};
-    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_post CASCADE", &.{}) catch {};
     defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_file CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_post CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_tag CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_image CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_xj_post_tag CASCADE", &.{}) catch {};
 
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     defer Client.DeinitClient(infos, &client);
@@ -3635,13 +3642,15 @@ test "Postgres: checkSchema reports a missing M2M junction table" {
     defer drv.close();
 
     // Leftovers from an interrupted run. The junction table goes first: it
-    // holds foreign keys to both entity tables.
+    // holds foreign keys to both entity tables. The cleanup `defer`s are
+    // registered in the opposite order for the same reason — they run in
+    // reverse, so the junction table (registered last) is dropped first.
     _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_pg_member_zent_jc_pg_tag", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_pg_member", &.{});
     _ = try drv.exec("DROP TABLE IF EXISTS zent_jc_pg_tag", &.{});
-    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_member_zent_jc_pg_tag", &.{}) catch {};
-    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_member", &.{}) catch {};
     defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_tag", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_member", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_jc_pg_member_zent_jc_pg_tag", &.{}) catch {};
 
     const ZentJcPgMemberBase = schema("ZentJcPgMember", .{ .fields = &.{field.String("name")} });
     const ZentJcPgTagBase = schema("ZentJcPgTag", .{ .fields = &.{field.String("label")} });
