@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ## [0.73.1] - 2026-09-21
 
+### Fixed
+- **The integration suites compile again.** v0.73.0 renamed
+  `CrudService.get` to `getOwned` and two call sites in
+  `tests/integration/` were missed, so `zig build test-integration` did not
+  build there (the library itself was unaffected — the unit suite, and any
+  consumer using the library rather than these tests, was fine). Pin v0.73.1
+  rather than v0.73.0 if you run this repository's integration suite.
+
 ## [0.73.0] - 2026-09-21
 
 ### Breaking
@@ -39,16 +47,6 @@ All notable changes to this project will be documented in this file.
   (MySQL BLOB/TEXT/JSON, where the create-table path warns too). A deploy whose
   data already violates the declaration fails loudly on the `CREATE UNIQUE
   INDEX` and rolls back, rather than leaving the promise unkept.
-
-## [0.73.1] - 2026-09-21
-
-### Fixed
-- **The integration suites compile again.** v0.73.0 renamed
-  `CrudService.get` to `getOwned` and two call sites in
-  `tests/integration/` were missed, so `zig build test-integration` did not
-  build there (the library itself was unaffected — the unit suite, and any
-  consumer using the library rather than these tests, was fine). Pin v0.73.1
-  rather than v0.73.0 if you run this repository's integration suite.
 
 ## [0.72.0] - 2026-09-21
 
