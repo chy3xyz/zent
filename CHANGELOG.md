@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-09-21
+
 ### Breaking
 - **SQLite now enforces foreign keys.** `SQLiteDriver.open` issues
   `PRAGMA foreign_keys = ON` on every connection it returns and **verifies the
