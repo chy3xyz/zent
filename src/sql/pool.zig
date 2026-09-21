@@ -112,17 +112,23 @@ pub fn ConnPool(comptime D: type) type {
             /// `max_retries` + `retry_backoff_ms` attempts, which used to make
             /// the documented budget overshoot by their sum.
             ///
-            /// When non-zero, borrowers block on the pool condition variable
-            /// instead of polling and are woken as soon as a connection is
-            /// released (see `borrow` for the waiting/fairness contract).
+            /// When non-zero, a borrower blocks on the pool condition variable
+            /// instead of polling **while waiting can be served** — the pool at
+            /// its ceiling with every connection lent out — and is woken as soon
+            /// as a connection is released. With room below the ceiling the
+            /// attempt is retried on the `max_retries` / `retry_backoff_ms` path
+            /// rather than parked on a wake-up nobody can send (see `borrow` for
+            /// the waiting/fairness contract).
             /// `borrowWithTimeout` / `borrowCtx` cap this per call: their own
             /// budget can only shorten the wait, never extend it.
             ///
-            /// Zero (the default) means non-blocking: no waiting happens and a
-            /// failed attempt immediately returns `error.PoolExhausted` (after
-            /// the legacy retries). This preserves the historical behavior —
-            /// including for `borrowWithTimeout`, which cannot turn a
-            /// non-blocking pool back into a blocking one.
+            /// Zero (the default) means non-blocking: no waiting happens, and a
+            /// failed attempt is retried `max_retries` times before it reports
+            /// why — `error.PoolExhausted` when the pool sat at its ceiling with
+            /// everything lent out, the connection error itself otherwise (a
+            /// health check that failed, a refused connect). A
+            /// `borrowWithTimeout` cannot turn a non-blocking pool back into a
+            /// blocking one.
             max_wait_ms: u32 = 0,
             /// Elapsed time in milliseconds at which a pooled query/exec is
             /// reported through `Metrics.onSlowQuery`. Zero disables reporting.
@@ -429,7 +435,7 @@ pub fn ConnPool(comptime D: type) type {
 
                 if (checked) |_| {
                     return selected.entry;
-                } else |_| {
+                } else |err| {
                     self.closeConnection(selected.entry);
                     // Closing frees room below `max_connections`, so a parked
                     // borrower may be able to open a fresh one instead of
@@ -438,10 +444,19 @@ pub fn ConnPool(comptime D: type) type {
                     // A *pooled* connection that fails its check is dropped and
                     // the next idle one is tried, as before. A freshly opened
                     // one that fails means the server is refusing everything:
-                    // report no selection so the caller's wait/retry logic
-                    // decides, instead of spinning here opening and discarding
+                    // report no selection so the caller's retry logic decides,
+                    // instead of spinning here opening and discarding
                     // connections.
-                    if (selected.fresh) return null;
+                    //
+                    // The ping's own error is what the caller ends up being told
+                    // (`last_attempt_error`): "the health check failed" is the
+                    // reason no connection could be handed out, and
+                    // `PoolExhausted` would claim the pool is too small, which it
+                    // is not — the pool just made room by closing this entry.
+                    if (selected.fresh) {
+                        self.last_attempt_error = err;
+                        return null;
+                    }
                     continue;
                 }
             }
@@ -462,6 +477,37 @@ pub fn ConnPool(comptime D: type) type {
             // sorted by arrival and the head is the oldest waiting ticket.
             if (self.wait_tickets.items[0] >= ticket) return false;
             return self.available.items.len > 0 or self.all.items.len < self.options.max_connections;
+        }
+
+        /// Whether parking this borrower could ever be served. A parked
+        /// borrower is only ever woken by somebody else's `release` (or by a
+        /// close that frees a slot), so waiting is meaningful exactly when the
+        /// pool is at its ceiling with every connection lent out.
+        ///
+        /// With room below the ceiling, or with an idle connection left behind
+        /// by another thread, there is nothing to wait for: the pool can hand
+        /// out or open a connection right now, so a borrower that failed its
+        /// attempt retries instead of spending the caller's budget on a signal
+        /// nobody can send. That is the shape behind a real stall: a *freshly
+        /// opened* connection fails its health check, `tryBorrowNoLock` drops it
+        /// and reports no selection — and because that close is also what freed
+        /// the room, a pool that parked here waited out `max_wait_ms` with
+        /// nobody left to wake it, reporting `PoolWaitTimeout` instead of the
+        /// connection error that actually happened.
+        ///
+        /// The caller must hold `self.mutex`.
+        fn atCeilingNoLock(self: *Self) bool {
+            return self.available.items.len == 0 and self.all.items.len >= self.options.max_connections;
+        }
+
+        /// Milliseconds still left of this call's budget, measured from `start`;
+        /// `budget_ms` when the call has no budget, and never negative. The
+        /// retry path uses it to keep a budgeted borrow inside its budget while
+        /// it retries.
+        fn budgetRemainingMs(io: std.Io, start: ?std.Io.Clock.Timestamp, budget_ms: u32) i64 {
+            const from = start orelse return budget_ms;
+            const elapsed_ms = from.untilNow(io).raw.toMilliseconds();
+            return @max(@as(i64, budget_ms) - elapsed_ms, 0);
         }
 
         /// Claim the next waiter ticket and record it as waiting. Returns null
@@ -503,18 +549,27 @@ pub fn ConnPool(comptime D: type) type {
         ///
         /// With the default `max_wait_ms == 0` the call is non-blocking: a
         /// failed attempt is retried up to `max_retries` times with linear
-        /// `retry_backoff_ms` backoff, then reports `error.PoolExhausted`.
+        /// `retry_backoff_ms` backoff, then reports why no connection could be
+        /// handed out — `error.PoolExhausted` when the pool was at its ceiling
+        /// with everything lent out, the connection error itself otherwise.
         ///
-        /// When `max_wait_ms > 0` and no connection can be handed out or
-        /// opened (the pool is exhausted, or opening one failed), the caller
-        /// blocks on the pool condition variable instead of polling, and is
-        /// woken as soon as a connection is released. `max_wait_ms` is the
-        /// total budget for the whole call, measured from entry, and it is a
-        /// **hard upper bound**: when it runs out the call reports
-        /// `error.PoolWaitTimeout` rather than adding the legacy
-        /// retry/backoff attempts on top of it. A failure that kept connections
-        /// away (a refused connect, a failed health check, OOM) is still
-        /// reported as itself; a closed pool reports `error.PoolClosed`.
+        /// When `max_wait_ms > 0` the caller blocks on the pool condition
+        /// variable instead of polling — but only while waiting can actually be
+        /// served: at the pool's ceiling with every connection lent out, where
+        /// the only thing that can hand a connection back is another borrower's
+        /// `release`. With room below the ceiling a failed attempt is retried
+        /// instead (up to `max_retries` times with linear `retry_backoff_ms`
+        /// backoff), because the pool can open a connection itself and no
+        /// release is coming: parking there waited out the whole budget with
+        /// nobody able to wake the borrower, and reported `error.PoolWaitTimeout`
+        /// in place of the connection error that actually happened.
+        /// `max_wait_ms` is the total budget for the whole call, measured from
+        /// entry, and it is a **hard upper bound** for waiting *and* for those
+        /// retries: when it runs out the call reports `error.PoolWaitTimeout`
+        /// rather than adding the legacy retry/backoff attempts on top of it. A
+        /// failure that kept connections away (a refused connect, a failed
+        /// health check, OOM) is reported as itself when it is what ended the
+        /// call; a closed pool reports `error.PoolClosed`.
         ///
         /// Waiting is **best-effort fair, not strict FIFO**: every blocked
         /// borrower holds a ticket and defers to a lower (older) ticket that is
@@ -581,9 +636,10 @@ pub fn ConnPool(comptime D: type) type {
             var deferrals: u32 = 0;
             var wait_done = !waiting_enabled;
             var attempt: u32 = 0;
-            // Set when the blocked wait itself ran out: the caller had a budget
-            // and the budget is what ended the call, which is a different
-            // answer from "the pool is too small".
+            // Set when this call's budget is what ended it: either the blocked
+            // wait ran out or the retry path ran out of budget. The caller had a
+            // budget and the budget is the answer, which is a different one from
+            // "the pool is too small".
             var timed_out = false;
 
             while (true) {
@@ -594,6 +650,10 @@ pub fn ConnPool(comptime D: type) type {
                 var was_closed = false;
                 var deferred = false;
                 var started_waiting = false;
+                // Set when the attempt failed with room left below the ceiling:
+                // there is no release to wait for, so this call retries on the
+                // bounded path below instead of parking (see `atCeilingNoLock`).
+                var retry_instead_of_park = false;
 
                 self.mutex.lockUncancelable(io);
                 {
@@ -608,7 +668,7 @@ pub fn ConnPool(comptime D: type) type {
                     } else if (self.tryBorrowNoLock()) |entry| {
                         self.dropTicketNoLock(&ticket);
                         borrowed = entry;
-                    } else if (!wait_done) {
+                    } else if (!wait_done and self.atCeilingNoLock()) {
                         if (ticket == null) {
                             ticket = self.registerWaiterNoLock();
                             started_waiting = ticket != null;
@@ -633,6 +693,23 @@ pub fn ConnPool(comptime D: type) type {
                             // No ticket available, so do not block untracked.
                             wait_done = true;
                         }
+                    } else if (!wait_done) {
+                        // The pool has room below its ceiling (or an idle
+                        // connection was left behind while this attempt pinged
+                        // one outside the mutex), so the attempt failed for a
+                        // connection reason — a refused open, a fresh connection
+                        // that failed its health check — rather than for
+                        // capacity. Nobody can signal a borrower here: the only
+                        // thing that hands a connection back is a `release`, and
+                        // the pool does not need one, it can open a connection
+                        // itself. Parking would spend the caller's budget on a
+                        // wake-up that never comes and report `PoolWaitTimeout`
+                        // in place of the error that actually happened, so retry
+                        // instead, and keep the ticket off the waiting set while
+                        // doing it so no waiter defers to a borrower that is not
+                        // waiting.
+                        self.dropTicketNoLock(&ticket);
+                        retry_instead_of_park = true;
                     }
                 }
                 self.mutex.unlock(io);
@@ -656,28 +733,45 @@ pub fn ConnPool(comptime D: type) type {
                     io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
                     continue;
                 }
-                if (!wait_done) continue;
-                // With a budget in effect, that budget is the whole budget:
-                // once the wait ends, the legacy retry/backoff attempts would
-                // silently overshoot the documented ceiling by
-                // `max_retries × retry_backoff_ms`. The non-blocking path keeps
-                // them.
-                if (waiting_enabled) break;
+                if (!retry_instead_of_park) {
+                    if (!wait_done) continue;
+                    // With a budget in effect, that budget is the whole budget:
+                    // once the wait ends, the legacy retry/backoff attempts would
+                    // silently overshoot the documented ceiling by
+                    // `max_retries × retry_backoff_ms`. The non-blocking path
+                    // keeps them, and so does a retry that never parked.
+                    if (waiting_enabled) break;
+                }
 
                 if (attempt >= self.options.max_retries) break;
                 const backoff_ms: i64 = @as(i64, self.options.retry_backoff_ms) * (@as(i64, attempt) + 1);
+                // A budget in effect is a hard ceiling for this call too: a
+                // backoff that would land past it ends the call here (and the
+                // reason says the budget did), and one that only partly fits is
+                // shortened to what is left.
+                const remaining_ms = budgetRemainingMs(io, wait_start, budget_ms);
+                if (waiting_enabled and remaining_ms <= 0) {
+                    timed_out = true;
+                    break;
+                }
                 attempt += 1;
-                io.sleep(std.Io.Duration.fromMilliseconds(backoff_ms), .awake) catch {};
+                const sleep_ms: i64 = if (waiting_enabled) @min(backoff_ms, remaining_ms) else backoff_ms;
+                io.sleep(std.Io.Duration.fromMilliseconds(sleep_ms), .awake) catch {};
             }
 
             // `PoolExhausted` only when the pool really is at its ceiling with
             // everything lent out and nothing in this call ran out of time;
             // otherwise the failure that actually happened travels to the
             // caller, and a consumer can tell "capacity" from
-            // "misconfiguration" (see `ZENT_IMPROVEMENTS.md` item 3).
+            // "misconfiguration" (see `ZENT_IMPROVEMENTS.md` item 3). A budget
+            // that ran out is the third case and wins over a reason recorded
+            // earlier in the call: "I gave up after my budget" is the answer to
+            // why this call has no connection, whatever it ran into on the way.
             self.exhausted_total += 1;
-            const reason: anyerror = self.last_attempt_error orelse
-                if (timed_out) error.PoolWaitTimeout else error.PoolExhausted;
+            const reason: anyerror = if (timed_out)
+                error.PoolWaitTimeout
+            else
+                self.last_attempt_error orelse error.PoolExhausted;
             if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, reason);
             // Silent exhaustion was the other half of that report: the pool had
             // no log line at all.
@@ -1591,13 +1685,352 @@ test "ConnPool evicts connection on failed health check during borrow" {
     });
     defer pool.deinit();
 
-    // The only available connection fails the health check, so it is closed
-    // and the borrow returns PoolExhausted (no retries and no new connection).
-    try std.testing.expectError(error.PoolExhausted, pool.borrow());
+    // The only available connection fails the health check, so it is closed;
+    // the pool (which is below its ceiling after that close) opens another, and
+    // that fresh connection fails too. The borrow reports the failure it ran
+    // into — the ping's own error, which is what `last_attempt_error` carries —
+    // rather than `PoolExhausted`: the pool is not out of capacity, it is out of
+    // connections that pass their check, and telling the caller "too small"
+    // sends it to resize a pool that is not the problem.
+    try std.testing.expectError(error.ConnectionFailed, pool.borrow());
     // One ping for the initial idle connection and one for the newly created
     // connection that also failed the health check.
     try std.testing.expectEqual(@as(usize, 2), MockDriver.pings);
     try std.testing.expectEqual(@as(usize, 2), MockDriver.closes);
+}
+
+test "a fresh connection failing its health check fails fast, not after the budget" {
+    // A health check that fails on a connection the pool has just opened means
+    // the server is refusing everything. The borrow used to park on the pool
+    // condition variable until `max_wait_ms` ran out — and the failed check is
+    // what closed the candidate and freed the room to open another, so with no
+    // other borrower in the pool there was nobody left to signal it. The caller
+    // spent its whole budget waiting for a wake-up that could not come and was
+    // told `PoolWaitTimeout`, not what actually happened. Waiting is worth
+    // something only at the ceiling, where another borrower's `release` is what
+    // can serve the waiter.
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+        pub var pings: usize = 0;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {
+            pings += 1;
+            return error.PingFailed;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            return false;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
+        };
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+    MockDriver.pings = 0;
+
+    const allocator = std.testing.allocator;
+    const P = ConnPool(MockDriver);
+    var pool = try P.init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = true,
+        .max_wait_ms = 5000,
+        .max_retries = 0,
+    });
+    defer pool.deinit();
+
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PingFailed, pool.borrow());
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+
+    // Timing evidence: the budget is 5 s and the failing check has to end the
+    // call on its own. A parked borrow would spend every millisecond of it —
+    // this pool has one connection and nobody else to release a second one.
+    try std.testing.expect(elapsed_ms < 1000);
+    // It never parked: no ticket was taken and no wait path was entered.
+    try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
+    // The two candidates it tried: the warm-up connection, then a fresh one.
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.opens);
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.pings);
+    try std.testing.expectEqual(@as(usize, 2), MockDriver.closes);
+    try std.testing.expectEqual(@as(u64, 1), pool.stats().exhausted_total);
+}
+
+test "a failed health check is reported as that error, not PoolWaitTimeout" {
+    // The reason a caller hears has to be the one the pool ran into. With a
+    // budget in effect it used to always be `PoolWaitTimeout` — the budget
+    // expiring — because the borrow parked on a signal nobody could send; the
+    // health check it actually met never reached the caller, and neither did
+    // the metrics callback, which is what a dashboard classifies on. The
+    // bounded retries keep the driver's own error.
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+        pub var pings: usize = 0;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {
+            pings += 1;
+            // A driver-level failure that is not named `PingFailed`, so the
+            // assertion below cannot pass by the pool substituting a constant.
+            return error.ConnectionFailed;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            return false;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
+        };
+    };
+    const OnError = struct {
+        fn f(ctx: ?*anyopaque, err: anyerror) void {
+            const slot: *?anyerror = @ptrCast(@alignCast(ctx.?));
+            slot.* = err;
+        }
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+    MockDriver.pings = 0;
+
+    const allocator = std.testing.allocator;
+    const P = ConnPool(MockDriver);
+    var seen: ?anyerror = null;
+    var pool = try P.init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 2,
+        .health_check_on_borrow = true,
+        .max_wait_ms = 5000,
+        .max_retries = 2,
+        .retry_backoff_ms = 5,
+        .metrics = .{ .context = &seen, .onError = OnError.f },
+    });
+    defer pool.deinit();
+
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.ConnectionFailed, pool.borrow());
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+
+    // Same timing evidence as above: 5 s of budget were available and the
+    // failing checks, not the budget, ended the call.
+    try std.testing.expect(elapsed_ms < 1000);
+    try std.testing.expectEqual(@as(?anyerror, error.ConnectionFailed), seen);
+    try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
+    // One attempt plus `max_retries` retries, each a fresh connection and its
+    // check: the retry/backoff path is what the failed attempt went through
+    // instead of the wait path.
+    try std.testing.expectEqual(@as(usize, 4), MockDriver.opens);
+    try std.testing.expectEqual(@as(usize, 4), MockDriver.pings);
+    try std.testing.expectEqual(@as(usize, 4), MockDriver.closes);
+}
+
+test "a pool at its ceiling still parks, and its budget still ends the borrow" {
+    // The other half of the rule: waiting belongs to a pool at its ceiling with
+    // everything lent out, where a release is the only thing that can serve the
+    // borrower. A failing health check does not change that — a pool with
+    // nowhere to put a connection it opened has nothing to hand out — so the
+    // wait still happens and `max_wait_ms` still ends it with
+    // `PoolWaitTimeout`.
+    const MockDriver = struct {
+        pub var opens: usize = 0;
+        pub var closes: usize = 0;
+        pub var pings: usize = 0;
+        pub var ping_should_fail: bool = false;
+
+        id: usize = 0,
+
+        pub fn asDriver(self: *@This()) driver.Driver {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        pub fn close(self: *@This()) void {
+            _ = self;
+            closes += 1;
+        }
+
+        fn mockExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Result {
+            unreachable;
+        }
+        fn mockQuery(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const Value) driver.Error!driver.Rows {
+            unreachable;
+        }
+        fn mockBeginTx(_: *anyopaque) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
+            unreachable;
+        }
+        fn mockClose(_: *anyopaque) void {
+            unreachable;
+        }
+        fn mockDialect(_: *anyopaque) Dialect {
+            return .sqlite;
+        }
+        fn mockPing(_: *anyopaque) driver.Error!void {
+            pings += 1;
+            if (ping_should_fail) return error.PingFailed;
+        }
+        fn mockInTransaction(_: *anyopaque) bool {
+            // `release` asks this of every connection it takes back.
+            return false;
+        }
+
+        const vtable = driver.Driver.VTable{
+            .exec = mockExec,
+            .query = mockQuery,
+            .beginTx = mockBeginTx,
+            .close = mockClose,
+            .dialect = mockDialect,
+            .ping = mockPing,
+            .inTransaction = mockInTransaction,
+            .beginSavepoint = mockBeginSavepoint,
+        };
+    };
+    const CountWait = struct {
+        fn f(ctx: ?*anyopaque) void {
+            const waits: *usize = @ptrCast(@alignCast(ctx.?));
+            waits.* += 1;
+        }
+    };
+
+    MockDriver.opens = 0;
+    MockDriver.closes = 0;
+    MockDriver.pings = 0;
+    MockDriver.ping_should_fail = false;
+
+    const allocator = std.testing.allocator;
+    const P = ConnPool(MockDriver);
+    var waits: usize = 0;
+    var pool = try P.init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !MockDriver {
+                _ = a;
+                MockDriver.opens += 1;
+                return MockDriver{};
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = true,
+        .max_wait_ms = 200,
+        .max_retries = 0,
+        .metrics = .{ .context = &waits, .onWait = CountWait.f },
+    });
+    defer pool.deinit();
+
+    // Take the only connection while the pool still answers its checks, so the
+    // second borrow finds the pool at its ceiling.
+    const held = try pool.borrow();
+    defer pool.release(held);
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.pings);
+
+    // Every check from here on fails. The ceiling, not the health check, is
+    // what decides whether this borrower waits — it is the state the wait was
+    // always meant for.
+    MockDriver.ping_should_fail = true;
+
+    const started = std.Io.Clock.Timestamp.now(pool.io, .awake);
+    try std.testing.expectError(error.PoolWaitTimeout, pool.borrow());
+    const elapsed_ms = started.untilNow(pool.io).raw.toMilliseconds();
+
+    try std.testing.expect(elapsed_ms >= 150);
+    // It really waited — `onWait` fires when a borrower commits to parking —
+    // and left no ticket behind for later waiters to defer to.
+    try std.testing.expectEqual(@as(usize, 1), waits);
+    try std.testing.expectEqual(@as(usize, 0), pool.wait_tickets.items.len);
+    // The ceiling held: with nothing to hand out the pool opened no connection
+    // and so never reached a health check.
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.opens);
+    try std.testing.expectEqual(@as(usize, 1), MockDriver.pings);
 }
 
 test "ConnPool evicts connection exceeding max lifetime on release" {
@@ -2721,12 +3154,13 @@ const StressState = struct {
     ///
     /// The check right after the pool opened a connection has to pass, which is
     /// why this counts checks per connection rather than connections: a *fresh*
-    /// connection that fails its check makes `borrow` park until its budget
-    /// runs out even though the pool has room to open another, and with a
-    /// borrower holding a connection for the whole storm there is nobody left
-    /// to signal it. That stall is a real behaviour of this pool (it is not
-    /// what these tests are about), and it is not what makes a connection get
-    /// dropped while another is in flight — the later checks are.
+    /// connection that fails its check is dropped, and the borrow that opened it
+    /// ends without a connection (`tryBorrowNoLock` reports no selection). The
+    /// pool then has room and retries, but with the storms' `max_retries = 0`
+    /// there is no retry left to take, so the borrowers would count
+    /// `borrow_errors` instead of doing the work these tests are about. What
+    /// drops a connection while another is in flight is the *later* checks, and
+    /// that is what this knob is for.
     fail_ping_after: usize = 0,
     /// Tells the threads that outlive the borrowers (the reaper, the holder)
     /// that the storm is over.
