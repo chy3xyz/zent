@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.71.0] - 2026-09-21
+
 ### Fixed
 - **A uuid primary key the caller never set is `error.MissingPrimaryKey` on
   every dialect, decided before the statement runs.** The RETURNING path
