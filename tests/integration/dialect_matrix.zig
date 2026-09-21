@@ -614,6 +614,15 @@ fn caseCrudHelpersIncrementZeroDelta(a: std.mem.Allocator, drv: Driver) ![]const
 /// table that predates the declaration. The DDL is the portable subset —
 /// `INTEGER PRIMARY KEY` and `TEXT` are accepted by all three, and no
 /// auto-increment is needed since the case never inserts a row without an id.
+/// Whether the report holds the `.unique_constraint` drift for the column this
+/// case declares UNIQUE.
+fn hasUniqueConstraintDrift(drifts: []const zent.sql_schema.SchemaDrift) bool {
+    for (drifts) |d| {
+        if (d.kind == .unique_constraint and std.mem.eql(u8, d.column, "email")) return true;
+    }
+    return false;
+}
+
 fn caseUniqueIndexAddedToExistingTable(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     const allocator = testing.allocator;
     const DmUqRow = schema("DmUqRow", .{
@@ -625,22 +634,45 @@ fn caseUniqueIndexAddedToExistingTable(a: std.mem.Allocator, drv: Driver) ![]con
     const infos = graph.types;
     dropTable(drv, "dm_uq_row");
     defer dropTable(drv, "dm_uq_row");
-    _ = try drv.exec("CREATE TABLE dm_uq_row (id INTEGER PRIMARY KEY, email TEXT NOT NULL)", &.{});
+
+    // The table as a database that predates the `Unique()` has it: the column
+    // exists, nothing forces it. Written per dialect because the schema's own
+    // types are dialect-specific (`field.String` is `TEXT` on SQLite and
+    // `VARCHAR(255)` elsewhere, `field.Int` is `INTEGER` on SQLite and `BIGINT`
+    // elsewhere) — getting those wrong would add a *type* drift and make the
+    // count below a different question.
+    const ddl = if (std.mem.eql(u8, drv.dialect().name, "sqlite3"))
+        "CREATE TABLE dm_uq_row (id INTEGER PRIMARY KEY, email TEXT NOT NULL)"
+    else
+        "CREATE TABLE dm_uq_row (id BIGINT PRIMARY KEY, email VARCHAR(255) NOT NULL)";
+    _ = try drv.exec(ddl, &.{});
 
     const before = try zent.sql_schema.checkSchema(allocator, drv, infos);
     defer zent.sql_schema.freeSchemaDrift(allocator, before);
 
+    // No duplicate row is planted before this: the migration would refuse to
+    // build the index over data that already violates it (which is the point of
+    // the fix — loud, and rolled back — but a different observation).
     try zent.sql_schema.migrateSchema(allocator, drv, infos);
 
     const after = try zent.sql_schema.checkSchema(allocator, drv, infos);
     defer zent.sql_schema.freeSchemaDrift(allocator, after);
 
+    // The id is supplied rather than left to the server: `INTEGER PRIMARY KEY`
+    // is a rowid alias on SQLite but a plain column elsewhere, so an id-less
+    // insert would be a dialect difference of its own.
     const insert = try withPlaceholders(a, drv, "INSERT INTO dm_uq_row (id, email) VALUES (?, ?)");
     _ = try drv.exec(insert, &.{ .{ .int = 1 }, .{ .string = "dup@example.test" } });
-    const second = resultName(drv.exec(insert, &.{ .{ .int = 2 }, .{ .string = "dup@example.test" } }));
+    const duplicate = resultName(drv.exec(insert, &.{ .{ .int = 2 }, .{ .string = "dup@example.test" } }));
 
-    return std.fmt.allocPrint(a, "drift_before={d}|drift_after={d}|refused={s}", .{
-        before.len, after.len, if (std.mem.eql(u8, second, "ok")) "false" else "true",
+    // The question is this drift, not the length of the list: a hand-written
+    // table can differ from the schema in ways that have nothing to do with the
+    // declaration under test (an auto-increment column's default, say), and
+    // those differences belong to other cases.
+    return std.fmt.allocPrint(a, "unique_drift_before={s}|unique_drift_after={s}|duplicate={s}", .{
+        if (hasUniqueConstraintDrift(before)) "yes" else "no",
+        if (hasUniqueConstraintDrift(after)) "yes" else "no",
+        if (std.mem.eql(u8, duplicate, "ok")) "accepted" else "refused",
     });
 }
 
@@ -1297,7 +1329,7 @@ const cases = [_]Case{
     },
     .{
         .name = "migrate: a column-level UNIQUE is enforced on a table that already exists",
-        .expect = "drift_before=1|drift_after=0|refused=true",
+        .expect = "unique_drift_before=yes|unique_drift_after=no|duplicate=refused",
         .run = caseUniqueIndexAddedToExistingTable,
     },
     .{
