@@ -999,6 +999,7 @@ Everything the schema declares, against what `checkSchema` compares:
 | an index's uniqueness | `index_uniqueness` | always |
 | a view | `missing_view` | always — any relation of that name, view or table |
 | an M2M junction table (implicit) | `missing_junction_table`, plus `missing_column` / `junction_pair_uniqueness` / `missing_foreign_key` for a **present** one | existence always; the shape is compared against `junctionTableForEdge` when the relation is there. Only `.m2m` edges without `Through` need one |
+| a junction name that is also a **declared entity's table** | `junction_name_collision` — reported *instead of* the shape questions, which are its consequences | always; asked before the relation is read, because it is a fact about the schema rather than the database |
 | a field's `Unique()` | `unique_constraint` | unless a unique index forces that column alone, or a *unique* unreadable index makes it undecidable |
 | a foreign key | `missing_foreign_key` | by shape; `ON DELETE`/`ON UPDATE` not compared |
 
@@ -1008,7 +1009,6 @@ right":
 | Not covered | Consequence |
 |---|---|
 | a present junction table's column **types**, its `NOT NULL`, and any **extra** column it carries | the two columns the relation query names, the pair's key and the two foreign keys *are* compared; a wider type or an extra column is not drift |
-| a junction name **colliding** with a declared entity table | `CREATE TABLE IF NOT EXISTS` silently keeps whichever ran first |
 | **view definitions** | a changed `view_sql` is not reported — the database stores a canonical rewrite (PostgreSQL) or its own normalization, so comparing would fire on every database |
 | a declared index **missing** from the database | only indexes present under both are compared; a missing one is a performance matter, never reported |
 | the primary key's shape | columns, order and name are not compared |
@@ -1018,12 +1018,19 @@ right":
 
 Two more things worth knowing:
 
-- **`missing_view`, `missing_junction_table` and a junction's missing column are
-  read-breaking**, unlike every index and constraint kind: a
-  missing view or junction table makes the read fail outright, so
-  `read_breaking_only` blocks a deploy on them exactly as it does for a missing
-  table — while `.junction_pair_uniqueness` does **not** (whether the pair is
+- **`missing_view`, `missing_junction_table`, `junction_name_collision` and a
+  junction's missing column are read-breaking**, unlike every index and
+  constraint kind: a
+  missing view or junction table makes the read fail outright (and a junction
+  whose name an entity's table took has the relation query read that table's
+  columns), so `read_breaking_only` blocks a deploy on them exactly as it does
+  for a missing table — while `.junction_pair_uniqueness` does **not** (whether the pair is
   keyed affects writes, not reads).
+- **A colliding junction name is reported, never repaired**, because only one of
+  the two names can exist: `checkSchema` names both surfaces, and
+  `migrateSchema` says the same thing at `warn` while it plans the junction's
+  `CREATE TABLE IF NOT EXISTS` (the dry run included). Renaming is the caller's
+  decision.
 - **`unique_constraint` and `missing_foreign_key` are reports, not repairs.**
   `migrateSchema` still does not add either with `ALTER TABLE … ADD CONSTRAINT`;
   non-destructiveness is deliberate.

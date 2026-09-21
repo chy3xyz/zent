@@ -286,6 +286,18 @@ pub const SchemaDrift = struct {
         /// a duplicate puts on the page are the duplicate write's doing, not the
         /// read's.)
         junction_pair_uniqueness,
+        /// The name `junctionTableForEdge` derives for an M2M edge is **also the
+        /// table of a declared entity** — `<a>_<b>` is a name any entity can
+        /// take, and the derivation does not know about it.
+        ///
+        /// Reported instead of the shape questions (`missing_column` and the
+        /// rest), because those are its consequences: `migrateSchema` creates
+        /// entity tables before junctions and emits `CREATE TABLE IF NOT EXISTS`
+        /// for both, so whichever ran first wins and the other surface reads a
+        /// table with the wrong columns. There is nothing to repair here — the
+        /// two names have to differ — so the report names both surfaces and
+        /// stops.
+        junction_name_collision,
         /// The schema declares an index the database has under the same name
         /// with a **different key list**. Only reported when the database's
         /// key list could be read reliably (`ExistingIndex.columns_comparable`).
@@ -377,7 +389,16 @@ pub const SchemaDrift = struct {
     /// hold the same pair twice is `.junction_pair_uniqueness` and is not.
     pub fn breaksReads(self: SchemaDrift) bool {
         return switch (self.kind) {
-            .missing_table, .missing_column, .missing_view, .missing_junction_table => true,
+            // A junction name taken by an entity table is read-breaking on the
+            // relational surface: the edge's relation query selects the
+            // junction's columns from that name. `missing_junction_table` — the
+            // same surface — is classified the same way.
+            .junction_name_collision,
+            .missing_table,
+            .missing_column,
+            .missing_view,
+            .missing_junction_table,
+            => true,
             .nullability => !self.schema_optional and self.db_nullable,
             .extra_column,
             .type_mismatch,
@@ -780,23 +801,23 @@ pub fn checkSchema(
                     if (!already_seen) {
                         try seen_junctions.append(jtable.name);
 
-                        var junction_relation = try getExistingColumns(allocator, driver, jtable.name);
-                        defer freeExistingColumns(allocator, &junction_relation);
-
-                        if (junction_relation.items.len == 0) {
+                        // Asked first and unconditionally: the collision is a fact
+                        // about the schema, not about the database, and on a
+                        // database the entity's table has not reached yet the
+                        // shape questions below would report it as merely missing.
+                        // The collision is a fact about the schema, not about the
+                        // database, so it is asked first and answered alone: on a
+                        // database that has not been migrated the shape questions
+                        // below would report the same name as merely missing, which
+                        // is a different (and repairable) thing.
+                        if (comptime junctionNameOwner(infos, jtable)) |owner| {
                             try drifts.append(.{
                                 .table = jtable.name,
-                                .kind = .missing_junction_table,
-                                .index_detail = comptime missingJunctionTableDetail(info, e),
+                                .kind = .junction_name_collision,
+                                .index_detail = comptime junctionNameCollisionDetail(info, e, owner),
                             });
                         } else {
-                            // A relation *is* there, so the shape questions get
-                            // asked. They are the same three the entity loop asks
-                            // of a table the schema declares, against the shape
-                            // `junctionTableForEdge` derives — the definition
-                            // `migrateSchema` creates the table from and
-                            // `buildEdgeStep` builds the relation query against.
-                            try appendJunctionShapeDrifts(allocator, driver, &drifts, info, e, junction_relation.items);
+                            try appendJunctionRelationDrifts(allocator, driver, &drifts, info, e, jtable);
                         }
                     }
                 }
@@ -808,6 +829,40 @@ pub fn checkSchema(
 
 /// Compare a **present** junction table against the shape the M2M edge derives,
 /// and append what differs. `existing` is the relation's column list, which the
+/// The relation-side report for a junction whose name nothing else took: either
+/// no relation of that name exists, or one does and gets the shape questions.
+///
+/// Split out of `checkSchema` so the collision branch above can answer alone —
+/// a runtime `continue` is comptime control flow inside the unrolled edge loop,
+/// which 0.17 rejects, and nesting the two halves in one `if` would have the
+/// shape questions read as conditional on the collision.
+fn appendJunctionRelationDrifts(
+    allocator: std.mem.Allocator,
+    driver: sql_driver.Driver,
+    drifts: *std.array_list.Managed(SchemaDrift),
+    comptime info: TypeInfo,
+    comptime edge: EdgeInfo,
+    comptime jtable: TableDef,
+) !void {
+    var junction_relation = try getExistingColumns(allocator, driver, jtable.name);
+    defer freeExistingColumns(allocator, &junction_relation);
+
+    if (junction_relation.items.len == 0) {
+        try drifts.append(.{
+            .table = jtable.name,
+            .kind = .missing_junction_table,
+            .index_detail = comptime missingJunctionTableDetail(info, edge),
+        });
+    } else {
+        // A relation *is* there, so the shape questions get asked. They are the
+        // same three the entity loop asks of a table the schema declares,
+        // against the shape `junctionTableForEdge` derives — the definition
+        // `migrateSchema` creates the table from and `buildEdgeStep` builds the
+        // relation query against.
+        try appendJunctionShapeDrifts(allocator, driver, drifts, info, edge, junction_relation.items);
+    }
+}
+
 /// caller has already read (a missing relation is `.missing_junction_table` and
 /// never reaches here).
 ///
@@ -1046,6 +1101,34 @@ fn missingJunctionTableDetail(comptime info: TypeInfo, comptime edge: EdgeInfo) 
 /// schema. This clause is what does let the reader find the expectation: it names
 /// the edge they declared, and the relation and columns `migrateSchema` derives
 /// from it.
+/// The declared entity whose table *is* this junction's name, if any — the
+/// collision `.junction_name_collision` reports.
+///
+/// Comptime: both the derived junction name and every entity's table name are
+/// known at that point, so the question costs nothing at runtime and cannot
+/// disagree with what `migrateSchema` will create.
+fn junctionNameOwner(comptime infos: []const TypeInfo, comptime jtable: TableDef) ?TypeInfo {
+    comptime {
+        for (infos) |other| {
+            if (std.mem.eql(u8, other.table_name, jtable.name)) return other;
+        }
+        return null;
+    }
+}
+
+/// The `.junction_name_collision` report. A comptime literal (see
+/// `ownsIndexDetail`), and it names both surfaces: which pair of entities
+/// derived the name, and which declared entity answers to it.
+fn junctionNameCollisionDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime owner: TypeInfo) []const u8 {
+    comptime {
+        return junctionShapeClause(info, edge) ++
+            ", but that name is the table of the entity " ++ owner.name ++
+            " (schema '" ++ owner.name ++ "'); both are created with IF NOT EXISTS and entities are created first, " ++
+            "so the junction's CREATE is a no-op and the relation query reads the other table's columns — " ++
+            "give the entity a different table name or rename the edge's target";
+    }
+}
+
 fn junctionShapeClause(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
     comptime {
         const source_table = info.table_name;
@@ -3816,6 +3899,24 @@ fn planMigrateStatements(
         inline for (info.edges) |e| {
             if (e.relation == .m2m and e.through == null) {
                 const jtable = comptime junctionTableForEdge(e, info);
+                // The name is an entity's table (see
+                // `.junction_name_collision`): the CREATE below is a no-op
+                // against the table that entity's own step just created, so
+                // the relation surface ends up reading the wrong columns. It
+                // cannot be repaired here — only one of the two names can
+                // exist — so it is said out loud at the moment it is created,
+                // in the dry run too.
+                // Only from the side whose table name sorts first — the side the junction
+                // name is derived *from*. Both sides of a symmetric edge reach this line,
+                // and one junction deserves one warning.
+                if (comptime std.mem.lessThan(u8, info.table_name, toSnakeCase(e.target_name))) {
+                    if (comptime junctionNameOwner(infos, jtable)) |owner| {
+                        std.log.warn(
+                            "zent: the M2M edge {s} <-> {s} joins through '{s}', which is already the table of entity {s}; the junction's CREATE TABLE IF NOT EXISTS is a no-op and the relation query will read that table's columns — give the entity a different table name or rename one side",
+                            .{ info.table_name, comptime toSnakeCase(e.target_name), jtable.name, owner.name },
+                        );
+                    }
+                }
                 const version = computeMigrationVersion(jtable.name, "create_junction", "");
                 if (!versionContains(applied, version)) {
                     try plan.append(.{ .sql = try createTableSQLAlloc(allocator, jtable, dialect), .version = version });
@@ -6832,4 +6933,74 @@ test "migrateSchema adds the unique index a column-level UNIQUE needs on an exis
     const again = try checkSchema(allocator, drv.asDriver(), infos);
     defer freeSchemaDrift(allocator, again);
     try std.testing.expectEqual(@as(usize, 0), again.len);
+}
+
+test "checkSchema names a junction table whose name is a declared entity's table" {
+    // `<a>_<b>` is a name any entity can take, and `junctionTableForEdge` does
+    // not know about it. Both the junction and the entity are created with
+    // `CREATE TABLE IF NOT EXISTS`, and `migrateSchema` creates entities first,
+    // so the junction's CREATE is a no-op and the M2M relation query selects its
+    // columns from the other table — every traversal of that edge reads the
+    // wrong thing, and the shape drifts it produces (`missing_column` and the
+    // rest) name the symptom rather than the cause.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const edge = @import("../../core/edge.zig");
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const allocator = std.testing.allocator;
+
+    // The derived junction name for two M2M sides is `<left>_<right>`, sorted,
+    // so this entity's table name is exactly the collision.
+    const Left = schema("CnLeft", .{ .fields = &.{field.String("name")} });
+    const Right = schema("CnRight", .{ .fields = &.{field.String("name")} });
+    const Sides = struct {
+        pub const schema_name = "CnLeft";
+        pub const fields = Left.fields;
+        pub const edges = &.{edge.To("rights", Right)};
+        pub const indexes = Left.indexes;
+    };
+    const Other = struct {
+        pub const schema_name = "CnRight";
+        pub const fields = Right.fields;
+        pub const edges = &.{edge.To("lefts", Sides)};
+        pub const indexes = Right.indexes;
+    };
+    const Unfortunate = schema("CnLeftCnRight", .{
+        .table_name = "cn_left_cn_right",
+        .fields = &.{field.String("payload")},
+    });
+
+    const graph = comptime buildGraph(&.{ Sides, Other, Unfortunate });
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    const drifts = try checkSchema(allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(allocator, drifts);
+
+    try std.testing.expectEqual(@as(usize, 1), drifts.len);
+    try std.testing.expectEqual(SchemaDrift.Kind.junction_name_collision, drifts[0].kind);
+    try std.testing.expectEqualStrings("cn_left_cn_right", drifts[0].table);
+    // The report names both surfaces: the pair that derived the name, and the
+    // entity that answers to it.
+    try std.testing.expect(std.mem.indexOf(u8, drifts[0].index_detail, "cn_left <-> cn_right") != null);
+    try std.testing.expect(std.mem.indexOf(u8, drifts[0].index_detail, "the entity CnLeftCnRight") != null);
+    // A detail borrowed from comptime literals, not owned (see ownsIndexDetail).
+    try std.testing.expect(!ownsIndexDetail(drifts[0].kind));
+
+    // Read-breaking, and deliberately so: the relation query reads a table that
+    // does not have the junction's columns. A deploy gate therefore stops on it
+    // rather than printing a warning nobody reads.
+    try std.testing.expect(drifts[0].breaksReads());
+    try std.testing.expectError(error.SchemaDrift, assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only));
+
+    // And the shape questions are *not* asked on top of it: with the cause
+    // reported, three consequences would only bury it.
+    for (drifts) |d| {
+        try std.testing.expect(d.kind != .missing_column);
+        try std.testing.expect(d.kind != .junction_pair_uniqueness);
+    }
 }

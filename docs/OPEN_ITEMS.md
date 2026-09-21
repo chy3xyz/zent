@@ -25,7 +25,11 @@ kept — now pinned in comments so they are not "fixed" into something worse:
 bounded set `asDriver` needs; the unmapped name stays in the warn log) and
 `driverInTransaction` answering `false` on a failed borrow (the `beginTxCtx`
 preflight routes `false` to `beginTx`, whose own borrow surfaces the real
-error). Resolved in v0.73.0: `CrudService.getOwned` names the row's allocator and
+error). Resolved in v0.75.0: a junction name that is also a declared entity's table is
+reported as its own `junction_name_collision` drift (both surfaces named, and
+classified read-breaking, so a deploy gate stops on it) instead of surfacing as
+the shape symptoms, and `migrateSchema` warns at the moment it plans the
+junction's `CREATE TABLE IF NOT EXISTS`. Resolved in v0.73.0: `CrudService.getOwned` names the row's allocator and
 `deinitRowWith` is the release that matches it, a column-level `UNIQUE` is
 enforced on an existing table (the migration adds the unique index), and
 `Sum`/`Avg` answer `error.EmptyAggregate` for an empty set instead of the
@@ -52,7 +56,6 @@ with no runtime failure shapes to audit.
 
 | Item | Evidence | Why it needs you |
 |---|---|---|
-| **A junction table name colliding with a declared entity table is undetected** | `junctionTableForEdge` derives `<a>_<b>`, and `createTableSQLAlloc` emits `CREATE TABLE IF NOT EXISTS`, so the first one created wins silently. An entity whose table is literally that pair's name is enough | Detecting it means either validating names at graph build (a new compile-time error) or reporting it in `checkSchema` (a new drift kind) |
 | **`zig build migrate-rollback` does not inherit the caller's DSN** | `build.zig`'s `migrate-rollback` step calls `setEnvironmentVariable`, which materialises the env map into the long-lived build-server process; `migrate` (`build.zig:205`) does not and works. So the rollback step cannot be pointed at a database from the shell | Fixing it means changing how the step passes env — worth doing, but it touches the build's structure |
 | **`Count` / `Sum` / `Avg` / `Max` / `Min` read one row of a grouped query** | With `GroupBy` set, these read the first row only — the first group's aggregate is presented as *the* answer — and zero groups makes `Count()` answer `NotFound` where 0 is the expected count (`query.zig:1130-1145` via `buildCountQuery:1600-1620`, and `buildAggregateQuery:1622-1653`). Either reject group/order/limit on these methods (a compile-time or runtime error) or wrap the grouped select in a subquery | Rejecting breaks callers that pass a GroupBy today; the subquery wrap changes the emitted SQL on all three dialects |
 | **EntQL speaks physical column names, not field names** | `parseComparison` (`entql/parser.zig:433-440`) never maps an ident through `columnName`, so on a schema using `.StorageKey`, `WhereEntQL("name = …")` addresses the literal column `name`. v0.74.0 closed the dangerous half — an ident the entity in scope does not have is now `error.UnknownField` before any SQL is built, including inside `has(...)`, and **either** spelling of a field is accepted — so what is left is the naming question: map idents to `columnName` at lowering, or state in the EntQL docs that this expression language addresses physical columns. Decide | Mapping needs the whole parse tree lowered with the schema in hand (the codegen layer has it); documenting is a docs-only change but leaves the ambiguity for a schema that declares both columns |

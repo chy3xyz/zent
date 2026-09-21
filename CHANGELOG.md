@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A junction table whose name is also a declared entity's table is named, not
+  left to its symptoms.** `junctionTableForEdge` derives `<a>_<b>`, which is a
+  name any entity can take, and both are created with `CREATE TABLE IF NOT
+  EXISTS` — with entities created first, so the junction's `CREATE` was a no-op
+  and every traversal of that edge selected its columns from the *other* table.
+  `checkSchema` reported that as `missing_column` and the other shape drifts,
+  which name the symptom: the table exists, the name is wrong for it.
+  `junction_name_collision` is now reported instead — naming the pair of
+  entities that derived the name and the entity that answers to it — and
+  classified **read-breaking**, so `assertSchema(…, .read_breaking_only)` stops a
+  deploy on it rather than printing a warning nobody reads.
+  `migrateSchema` says the same thing at `warn` when it plans the junction's
+  `CREATE TABLE IF NOT EXISTS` (the dry run included), because nothing can be
+  repaired here: only one of the two names can exist, and which one to rename is
+  the caller's call.
+
 ## [0.74.2] - 2026-09-21
 
 ### Fixed
