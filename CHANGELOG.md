@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A restore is scoped by the policy's filters and the interceptor chain.**
+  `Delete().Restore(id)` checked the policy's decision and then dropped
+  `result.getFilters()`, and never ran the interceptor chain — the one write
+  path that did neither, where every sibling (`Save`, both soft/hard deletes,
+  both bulk paths) appends both. A policy that scopes rows by tenant therefore
+  let a caller resurrect any row it could name, and a multi-tenant interceptor
+  never reached the restore statement. An out-of-scope restore now matches no
+  row and answers `false`.
+- **`queryTargets*` / `QueryEdge` answer a mid-read driver failure instead of a
+  short page.** `queryTargetsImpl` read `next() == null` as "finished" without
+  asking `nextError()`, so a step failure after the first row — a deadline
+  firing mid-read, a server error mid-consume — handed the caller the rows read
+  so far as the whole neighbour list, with no error and no flag. Every other
+  bulk reader in the tree asks; this one was the exception. Its error path also
+  freed the list buffer but not the already-scanned entities' heap strings.
+- **`IDs()` projects the primary key.** It built its projection from
+  `info.fields[0]`, and a custom `pk` keeps the declaration order (`fromSchema`
+  injects `id` first only for the default key) — so on a schema whose key is
+  not the first declared field it answered with that field's values. A textual
+  key is now a compile error: the alternative is the driver coercing a uuid
+  into a number that names no row.
+- **The EntQL `has()` / `not_has()` lowerings and the `WithEdgeOptions` inner
+  join keep the target's soft-delete scope.** They built
+  `.has_neighbors_with` without the flag — which defaults to `false` — while the
+  typed `Has{Edge}()` / `NotHas{Edge}()` predicates have always carried it, so
+  `has(cars)` was satisfied by a parent whose only car was trashed and
+  `not_has(cars)` was not: both disagreeing with the typed predicates, and an
+  inner-joined page keeping a parent whose `edges` then came back null.
+- **An m2m existence predicate is qualified to the target table.** The m2m
+  EXISTS body joins the junction `j` and the target `t`, and the junction's
+  columns are literally `<table>_id`, so a predicate left bare could bind to the
+  junction: an EntQL `has(groups, user_id = …)` on a Group without a `user_id`
+  column became a filter on the junction's `user_id` — already constrained to
+  the outer row's id — and answered with no error. Such a field now fails at
+  prepare time.
+
 ## [0.71.0] - 2026-09-21
 
 ### Fixed

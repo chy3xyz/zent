@@ -25,7 +25,23 @@ kept — now pinned in comments so they are not "fixed" into something worse:
 bounded set `asDriver` needs; the unmapped name stays in the warn log) and
 `driverInTransaction` answering `false` on a failed borrow (the `beginTxCtx`
 preflight routes `false` to `beginTx`, whose own borrow surfaces the real
-error). This file is pruned as items land; history lives in `CHANGELOG.md`._
+error). Resolved in v0.72.0: `Restore` is scoped by the policy's filters and the
+interceptor chain, `queryTargets*`/`QueryEdge` report a mid-read failure instead
+of a short page, `IDs()` projects the primary key, the EntQL `has()`/`not_has()`
+lowerings and the `WithEdgeOptions` inner join carry the target's soft-delete
+scope, and an m2m existence predicate is qualified to the target table. This
+file is pruned as items land; history lives in `CHANGELOG.md`._
+
+**Negative results from the v0.72.0 audit** (recorded so the ground is known to
+be covered): `update_delete.zig`'s edge-write branches — `SetEdgeIDs`,
+`ClearEdge`, `AddEdgeIDs`, `RemoveEdgeIDs` — are idempotent by construction
+(`INSERT OR IGNORE` / `DELETE` / `SET fk = NULL`), scope themselves with the
+same predicate set as the main UPDATE (policy filters and interceptor
+predicates included), and their partial-write-on-error shape is documented;
+`bench/` holds nothing beyond a benchmark-only instance of the `nextError()`
+shape (there is no production path in it); `codegen/graph.zig`, `meta.zig`,
+`graph/step.zig`, `mermaid.zig` and `doc_exporter.zig` are comptime or pure data
+with no runtime failure shapes to audit.
 
 ## Needs a decision before it can be fixed
 
@@ -33,11 +49,15 @@ error). This file is pruned as items land; history lives in `CHANGELOG.md`._
 |---|---|---|
 | **A junction table name colliding with a declared entity table is undetected** | `junctionTableForEdge` derives `<a>_<b>`, and `createTableSQLAlloc` emits `CREATE TABLE IF NOT EXISTS`, so the first one created wins silently. An entity whose table is literally that pair's name is enough | Detecting it means either validating names at graph build (a new compile-time error) or reporting it in `checkSchema` (a new drift kind) |
 | **`zig build migrate-rollback` does not inherit the caller's DSN** | `build.zig`'s `migrate-rollback` step calls `setEnvironmentVariable`, which materialises the env map into the long-lived build-server process; `migrate` (`build.zig:205`) does not and works. So the rollback step cannot be pointed at a database from the shell | Fixing it means changing how the step passes env — worth doing, but it touches the build's structure |
+| **`Sum` / `Avg` report an empty aggregate as a type error** | An aggregate over zero rows (or an all-NULL column) is SQL NULL, and `query.zig`'s `row.getFloat(0) orelse return error.TypeMismatch` names that a *type* problem. A caller cannot tell "no rows" from a driver type failure; `SumOrZero` covers only SUM, and by answering 0 it hides the case rather than distinguishing it (`query.zig:1283-1305`). Options: return `?f64`, or a named `error.EmptyAggregate` | Both are API-breaking; the current behavior is documented, so it is a deliberate choice rather than an oversight |
+| **`Count` / `Sum` / `Avg` / `Max` / `Min` read one row of a grouped query** | With `GroupBy` set, these read the first row only — the first group's aggregate is presented as *the* answer — and zero groups makes `Count()` answer `NotFound` where 0 is the expected count (`query.zig:1130-1145` via `buildCountQuery:1600-1620`, and `buildAggregateQuery:1622-1653`). Either reject group/order/limit on these methods (a compile-time or runtime error) or wrap the grouped select in a subquery | Rejecting breaks callers that pass a GroupBy today; the subquery wrap changes the emitted SQL on all three dialects |
+| **EntQL speaks physical column names, not field names** | `parseComparison` (`entql/parser.zig:433-440`) never maps an ident through `columnName`, so on a schema using `.StorageKey` a `WhereEntQL("name = …")` filters the literal column `name` rather than the mapped one. Fail-closed today (prepare error), unless the table happens to have both columns. Decide: map idents at lowering (needs the schema, which only the codegen layer has) or document that EntQL addresses physical columns | Mapping needs the whole parse tree to be lowered with the schema in hand; documenting it is a docs-only change but leaves `.StorageKey` schemas an easy trap |
 
 ## Open, with a known shape
 
 | Item | Evidence |
 |---|---|
+| **A comparison predicate on a junction-only column can still bind to the junction** | `sql.appendQualifiedPred` (`builder.zig:613`) rewrites only the shapes whose column is a plain name (`eq`, `is_null`, `is_not_null`) and appends the rest verbatim, because rewriting arbitrary SQL text is not safe. The m2m existence body now qualifies through it (v0.72.0), so `has(groups, user_id = …)` fails at prepare time — but a non-eq EntQL comparison naming a column the target lacks, where the junction has a `<x>_id` of that name, still binds there. The tracked fix is validating EntQL field names against the target schema at lowering (`error.UnknownField`), the same shape as `QueryView.whereEq`'s sink |
 | **`SaveOne` / `ExecOne` lose `rows_affected_known` at the `usize` boundary** | They return `usize`, so a driver that could not count reads as "0 rows" and answers `NotFound`. `UPDATE`/`DELETE` counts are known on all three dialects, so it is unreachable today — it is the one place the v0.63.0 distinction does not reach |
 | **`sql.MultiInsert`'s length assertion does not validate what the rows set** | It asserts `values.len == columns.len * row_count`, which holds because the buffer is sized from the column list. The insert layer now checks the rows against each other (v0.69.0), so the assert is no longer the only guard — but it is still about the buffer, not the input |
 | **MySQL's prepared `exec` path never drains its result set** | So a parameterised `SELECT` through `exec` reports `rows_affected_known = false` where the unprepared path reports the row count (v0.63.0 documented the difference). Draining would make the two agree at the cost of materialising a result set `exec` is about to discard |
@@ -60,6 +80,6 @@ error). This file is pruned as items land; history lives in `CHANGELOG.md`._
 | Gap | Why it matters |
 |---|---|
 | **MariaDB differences are still found after the tag is pushed** | The new `tests/integration/dialect_matrix.zig` now compares the dialects directly, which covers the semantic half. What it cannot cover is a difference neither harness knows to ask about, and this session's three escapes (`column_default` quoting, functional indexes, `BEGIN` through prepare) were all of that kind. The only root fix is a local MariaDB or a working container runtime |
-| **Modules the audit method has not reached** | `codegen/query.zig`'s full branches (2422 lines; entry/scope/cursor read so far), `graph.zig` / `meta.zig`, `update_delete.zig`'s edge-write branches, the drivers' dialect-specific edges, `bench/`, and `examples/` other than `check_sql` and `migrate`. The method's hit rate has stayed high — `catch {}` 20 sites → 1 defect, `catch null`/`catch 0` 10 → 2, the high-level modules → 4 including a privilege escalation, the unaudited modules → an EntQL fail-open — so this is where a defect is most likely to be found rather than reported |
+| **Modules the audit method has not reached** | `codegen/query.zig`'s full branches, `codegen/graph.zig` / `meta.zig`, `graph/step.zig`, `update_delete.zig`'s edge-write branches and `bench/` were audited in the v0.72.0 pass (5 defects, all fixed; the negative results are recorded above). Still unread: the drivers' dialect-specific edges (`sql/sqlite.zig`, `mysql.zig`, `postgres.zig` beyond the result-decoding paths), `crud.zig` / `helpers.zig` / `shard.zig`, `privacy/`'s rule evaluation, and `examples/` other than `check_sql` and `migrate`. The method's hit rate has stayed high — `catch {}` 20 sites → 1 defect, `catch null`/`catch 0` 10 → 2, the high-level modules → 4 including a privilege escalation, the unaudited modules → an EntQL fail-open, the v0.72.0 sweep → 5 (two of them scope bypasses) — so this is where a defect is most likely to be found rather than reported |
 | **Log text is not assertable** | This repository has no `logFn`, so warnings cannot be captured in tests. Several fixes in this series are therefore pinned only at the level below the message (the renderer, or the value a callback receives), and each one says so rather than claiming an end-to-end assertion |
 | **`migrations/001_create_users.up.sql` is SQLite-only DDL** | It uses `INTEGER PRIMARY KEY AUTOINCREMENT`, so the `migrate` example's own migrations fail on MySQL and PostgreSQL (`errno=1064` / equivalent). The example is otherwise dialect-aware |
