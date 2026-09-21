@@ -328,10 +328,17 @@ pub fn lowerHasEdge(
             // Comptime edge-name -> Step table (Step values are runtime
             // readable), matched by the runtime edge_name string.
             const edge_steps = comptime blk: {
-                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step } = undefined;
+                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step, soft_delete: bool } = undefined;
                 for (info.edges, 0..) |e, i| {
                     const target_info = edgeTargetInfo(infos, info, e);
-                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info) };
+                    // The lowered predicate is an EXISTS over the *target*
+                    // table, so it carries the target's soft-delete scope
+                    // exactly as the typed `Has{Edge}()` / `NotHas{Edge}()`
+                    // predicates above do — a trashed row cannot satisfy an
+                    // existence filter. Dropping it here made `has(...)` pass
+                    // for a parent whose rows are all trashed, and `not_has(...)`
+                    // fail, both disagreeing with the typed predicates.
+                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info), .soft_delete = target_info.soft_delete };
                 }
                 break :blk steps;
             };
@@ -343,9 +350,9 @@ pub fn lowerHasEdge(
                         const preds = try allocator.alloc(sql.Predicate, 1);
                         preds[0] = nested.*;
                         allocator.destroy(nested);
-                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = preds } };
+                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = preds, .soft_delete = es.soft_delete } };
                     } else {
-                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{} } };
+                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{}, .soft_delete = es.soft_delete } };
                     }
                     lowered = true;
                     break;
@@ -355,10 +362,17 @@ pub fn lowerHasEdge(
         },
         .not_has_edge => |*h| {
             const edge_steps = comptime blk: {
-                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step } = undefined;
+                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step, soft_delete: bool } = undefined;
                 for (info.edges, 0..) |e, i| {
                     const target_info = edgeTargetInfo(infos, info, e);
-                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info) };
+                    // The lowered predicate is an EXISTS over the *target*
+                    // table, so it carries the target's soft-delete scope
+                    // exactly as the typed `Has{Edge}()` / `NotHas{Edge}()`
+                    // predicates above do — a trashed row cannot satisfy an
+                    // existence filter. Dropping it here made `has(...)` pass
+                    // for a parent whose rows are all trashed, and `not_has(...)`
+                    // fail, both disagreeing with the typed predicates.
+                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info), .soft_delete = target_info.soft_delete };
                 }
                 break :blk steps;
             };
@@ -366,7 +380,7 @@ pub fn lowerHasEdge(
             for (edge_steps) |es| {
                 if (std.mem.eql(u8, es.name, h.edge_name)) {
                     const inner = try allocator.create(sql.Predicate);
-                    inner.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{} } };
+                    inner.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{}, .soft_delete = es.soft_delete } };
                     pred.* = .{ .not_ = inner };
                     lowered = true;
                     break;

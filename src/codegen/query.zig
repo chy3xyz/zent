@@ -1107,10 +1107,21 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         pub fn IDs(self: *Self) QueryError!std.array_list.Managed(i64) {
+            // A textual (uuid) primary key has no id to hand back: SQLite
+            // coerces the text to a number (a leading-digit prefix, else 0)
+            // and the other dialects would refuse outright, so a list of
+            // integers that name no row is the one answer this must not give.
+            if (comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) != i64) {
+                @compileError("IDs() requires an i64 primary key; a textual key has no id to return");
+            }
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
-            var q = try self.buildQuery(1); // only id column
+            // The primary key, not the first declared field: a custom `pk`
+            // keeps the declaration order (`fromSchema` injects `id` first only
+            // for the default key), so `fields[0]` is the key only by
+            // convention.
+            var q = try self.buildQueryWithFirst(1, pkColumn(info));
             defer q.deinit();
             self.ensureDeadline();
             var rows = try self.driver.queryCtx(&self.execution_context, q.sql, q.args);
@@ -1481,10 +1492,23 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {
+            return self.buildQueryWithFirst(column_count, null);
+        }
+
+        /// `buildQuery`, with the first projected column named explicitly.
+        /// `IDs()` uses it to project the primary key — which is not
+        /// necessarily the first declared field — and, by naming its own
+        /// column, also ignores a caller-supplied `Select(...)`: the method's
+        /// contract is the keys of the matching rows, not a projection.
+        fn buildQueryWithFirst(self: *Self, comptime column_count: usize, comptime first_col: ?[]const u8) !sql.OwnedQuery {
             const t = sql.Table(info.table_name);
             var all_cols: [column_count][]const u8 = undefined;
             inline for (info.fields[0..column_count], 0..) |f, i| all_cols[i] = f.column_name;
-            const cols: []const []const u8 = self.select_cols orelse all_cols[0..column_count];
+            if (comptime first_col) |fc| all_cols[0] = fc;
+            const cols: []const []const u8 = if (comptime first_col != null)
+                all_cols[0..column_count]
+            else
+                self.select_cols orelse all_cols[0..column_count];
             var columns: [info.fields.len]sql.ColumnRef = undefined;
             // `Select` stores field names; emit their physical columns.
             for (cols, 0..) |cname, i| columns[i] = t.c(columnName(info, cname));
@@ -2551,5 +2575,182 @@ test "WithEdgeOptions inner join filters parents and honors SQL limit" {
             users.deinit();
         }
         try std.testing.expectEqual(@as(usize, 3), users.items.len);
+    }
+}
+
+test "IDs projects the primary key, not the first declared field" {
+    // `buildQuery(1)` projected `info.fields[0]`, and a custom `pk` keeps the
+    // declaration order (`fromSchema` injects `id` first only for the default
+    // key), so `IDs()` answered with whatever the first declared field held.
+    // Nothing in the tree exercised `IDs()`, which is why it went unnoticed.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const Item = schema("IdsItem", .{
+        .table_name = "ids_item",
+        .pk = "push_id",
+        .fields = &.{ field.Int("age"), field.Int("push_id") },
+    });
+    const info = comptime fromSchema(Item);
+    const infos = &[_]TypeInfo{info};
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const Client = client_mod.EntityClient(infos, info);
+    const client = Client.init(allocator, driver.asDriver());
+
+    for ([_][2]i64{ .{ 7, 100 }, .{ 9, 200 } }) |pair| {
+        var b = try client.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("age", pair[0]);
+        _ = try b.setFieldValue("push_id", pair[1]);
+        var row = try b.Save();
+        deinitEntity(infos, info, &row, allocator);
+    }
+
+    var q = client.Query();
+    defer q.deinit();
+    var ids = try q.IDs();
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+    // Sorted here rather than ordered by the query: the assertion is about
+    // *which* column came back, not about the rows' order.
+    std.mem.sort(i64, ids.items, {}, std.sort.asc(i64));
+    try std.testing.expectEqualSlices(i64, &.{ 100, 200 }, ids.items);
+}
+
+test "EntQL has/not_has and WithEdgeOptions inner join keep the target's soft-delete scope" {
+    // The lowers built `.has_neighbors_with` without the target's soft-delete
+    // flag (the payload defaults to false), while the typed `Has{Edge}()` /
+    // `NotHas{Edge}()` predicates have always carried it — "a trashed row
+    // cannot satisfy an existence filter". So `has(cars)` passed for a parent
+    // whose only car was trashed and `not_has(cars)` failed, both disagreeing
+    // with the typed predicates, and an inner-joined eager load kept a parent
+    // whose `edges.cars` then came back null.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const migrate = @import("../sql/schema/migrate.zig");
+    const SoftDeleteMixin = @import("../core/mixin.zig").SoftDeleteMixin;
+
+    const UserBase = Schema("SoftUser", .{ .fields = &.{field.String("name")} });
+    const Car = Schema("SoftCar", .{
+        .fields = &.{ field.Int("soft_user_id"), field.String("model") },
+        .edges = &.{edge.From("owner", UserBase).Field("soft_user_id")},
+        .mixins = &.{SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const User = Schema("SoftUser", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("cars", Car)},
+    });
+
+    const graph = comptime buildGraph(&.{ User, Car });
+    const infos = graph.types;
+    const user_info = comptime fromSchema(User);
+    const preds = comptime @import("predicate.zig").makePredicates(infos, user_info);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    // One user with exactly one car, then the car is trashed — the user has no
+    // live car left, so no existence filter may be satisfied by it.
+    var user_id: i64 = 0;
+    {
+        var b = try root.soft_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "u1");
+        var row = try b.Save();
+        defer deinitEntity(infos, user_info, &row, allocator);
+        user_id = row.id;
+    }
+    {
+        var b = try root.soft_car.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("soft_user_id", user_id);
+        _ = try b.setFieldValue("model", "c1");
+        var row = try b.Save();
+        defer deinitEntity(infos, fromSchema(Car), &row, allocator);
+    }
+    {
+        var d = root.soft_car.Delete();
+        defer d.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try d.Exec());
+    }
+
+    // The typed predicates are the reference answer: one user, no live car.
+    {
+        var q = root.soft_user.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.HasCars()});
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 0), users.items.len);
+    }
+    {
+        var q = root.soft_user.Query();
+        defer q.deinit();
+        _ = try q.Where(.{preds.NotHasCars()});
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+    }
+
+    // The EntQL lowering must answer the same as the typed predicates.
+    {
+        var q = root.soft_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(cars)");
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 0), users.items.len);
+    }
+    {
+        var q = root.soft_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("not_has(cars)");
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+    }
+
+    // The inner-joined eager load applies the same EXISTS, so the parent is
+    // gone from the page rather than present with a null `edges.cars`.
+    {
+        var q = root.soft_user.Query();
+        defer q.deinit();
+        _ = try q.WithEdgeOptions("cars", .{ .join = .inner });
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 0), users.items.len);
     }
 }
