@@ -106,7 +106,24 @@ fn connectFromDsn(allocator: std.mem.Allocator, dsn: []const u8) !AnyDriver {
         return error.UnsupportedDriver;
     }
 
+    // libpq takes its own keyword/value conninfo (`host=… dbname=… user=…`),
+    // not only a URI — and that is the shape `PG_DSN` has in CI. Stopping at
+    // the URI made this example unusable with the DSN a project already has in
+    // its environment. Same detection as `examples/check_sql/cli.zig`.
+    if (comptime build_options.have_pg) {
+        if (isPgKeywordConninfo(dsn)) {
+            return .{ .postgres = try PostgresDriver.connect(allocator, dsn) };
+        }
+    }
+
     return error.UnsupportedDriver;
+}
+
+/// `host=… dbname=…`: a keyword/value conninfo rather than a URI or a path.
+fn isPgKeywordConninfo(dsn: []const u8) bool {
+    const equals = std.mem.indexOfScalar(u8, dsn, '=') orelse return false;
+    const colon = std.mem.indexOfScalar(u8, dsn, ':');
+    return colon == null or colon.? > equals;
 }
 
 const MysqlDsn = struct {

@@ -602,6 +602,48 @@ fn caseCrudHelpersIncrementZeroDelta(a: std.mem.Allocator, drv: Driver) ![]const
 /// injected rewrite did — the count caught it, the timestamp did not). Planting
 /// `999` makes "the second call wrote nothing" observable on its own, without a
 /// sleep and without a clock reading.
+/// A column-level `UNIQUE` lives inside `CREATE TABLE`, so a table created
+/// before the field was marked unique has nothing enforcing it — and with no
+/// unique index the statement `SaveOrUpdateOn` builds is rejected by the server
+/// ("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" on
+/// SQLite and PostgreSQL), so every upsert against that table fails at runtime
+/// while the schema says it works. The migration adds the index; the refused
+/// duplicate is the observable, and it is the same one on all three servers.
+///
+/// The table is created by hand here because that is the state under test: a
+/// table that predates the declaration. The DDL is the portable subset —
+/// `INTEGER PRIMARY KEY` and `TEXT` are accepted by all three, and no
+/// auto-increment is needed since the case never inserts a row without an id.
+fn caseUniqueIndexAddedToExistingTable(a: std.mem.Allocator, drv: Driver) ![]const u8 {
+    const allocator = testing.allocator;
+    const DmUqRow = schema("DmUqRow", .{
+        .table_name = "dm_uq_row",
+        .fields = &.{field.String("email").Unique()},
+    });
+
+    const graph = comptime buildGraph(&.{DmUqRow});
+    const infos = graph.types;
+    dropTable(drv, "dm_uq_row");
+    defer dropTable(drv, "dm_uq_row");
+    _ = try drv.exec("CREATE TABLE dm_uq_row (id INTEGER PRIMARY KEY, email TEXT NOT NULL)", &.{});
+
+    const before = try zent.sql_schema.checkSchema(allocator, drv, infos);
+    defer zent.sql_schema.freeSchemaDrift(allocator, before);
+
+    try zent.sql_schema.migrateSchema(allocator, drv, infos);
+
+    const after = try zent.sql_schema.checkSchema(allocator, drv, infos);
+    defer zent.sql_schema.freeSchemaDrift(allocator, after);
+
+    const insert = try withPlaceholders(a, drv, "INSERT INTO dm_uq_row (id, email) VALUES (?, ?)");
+    _ = try drv.exec(insert, &.{ .{ .int = 1 }, .{ .string = "dup@example.test" } });
+    const second = resultName(drv.exec(insert, &.{ .{ .int = 2 }, .{ .string = "dup@example.test" } }));
+
+    return std.fmt.allocPrint(a, "drift_before={d}|drift_after={d}|refused={s}", .{
+        before.len, after.len, if (std.mem.eql(u8, second, "ok")) "false" else "true",
+    });
+}
+
 fn caseRepeatSoftDelete(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     const allocator = testing.allocator;
     const DmSoftRow = schema("DmSoftRow", .{
@@ -1252,6 +1294,11 @@ const cases = [_]Case{
         .name = "batchSaveOrUpdate: the created/updated split is per row, not per changed row",
         .expect = "first=2/0|second=0/2",
         .run = caseBatchSaveOrUpdateCounts,
+    },
+    .{
+        .name = "migrate: a column-level UNIQUE is enforced on a table that already exists",
+        .expect = "drift_before=1|drift_after=0|refused=true",
+        .run = caseUniqueIndexAddedToExistingTable,
     },
     .{
         .name = "bulk delete without a predicate: one named error, nothing deleted",
