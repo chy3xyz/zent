@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.74.2] - 2026-09-21
+
 ### Fixed
 - **The 0.74.1 section is listed once, and the versions are newest-first.**
   That section had been written by hand *and* promoted from `[Unreleased]` by
