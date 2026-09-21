@@ -315,6 +315,16 @@ changed-vs-matched family (after `crud.update`, `crud_helpers.update` and
 `increment`), and the first one found by comparison rather than by report — which
 is the argument for the matrix existing.
 
+### Z37–Z38 — two user-approved semantics fixes (v0.70.0)
+
+Both were on the "needs a decision" list in `docs/OPEN_ITEMS.md`; the user
+approved them, and both are now resolved.
+
+| # | Item | What it was | Fix |
+|---|---|---|---|
+| Z37 | **The pool parks a borrower that has room to be served** | Found by the pool stress tests (v0.61.0): a health check failing on a *freshly opened* connection closed that connection — freeing room below `max_connections` — and the borrow then parked on the condition variable, where nothing could wake it (the only signal is another borrower's `release`), so the caller waited out `max_wait_ms` and got `PoolWaitTimeout` instead of the connection error | Waiting now happens **only while it can be served**: the pool at its ceiling with everything lent out. With room below the ceiling the borrow retries on the bounded `max_retries`/`retry_backoff_ms` path, and a call that only met failed health checks reports that error (`PingFailed`/`ConnectionFailed`) rather than `PoolExhausted` |
+| Z38 | **SQLite declares foreign keys but does not enforce them** | `zent` never issued `PRAGMA foreign_keys` and SQLite defaults it OFF, so FK clauses in the DDL accepted dangling references; `checkSchema` compares the DDL shape and cannot see the switch | `openWithOptions` issues the pragma on every handle and **verifies the read-back** (a no-op inside a transaction, so issuing it is not evidence), with an explicit `.enforce_foreign_keys = false` opt-out. Its cross-dialect case exposed a PostgreSQL bug: `sqlstateToError` read the condition at offset 2, so `23502`/`23503` both answered `UniqueViolation` — fixed at offset 3/4 |
+
 ## Tracking
 
 | ID | Title | P | Status |
@@ -354,6 +364,8 @@ is the argument for the matrix existing.
 | Z34 | No-predicate `BulkDelete` is a silent `0` or a full-table delete | P1 | **Fixed** v0.66.0 — `error.NoPredicate`, the shape v0.45.0 chose for a `SET`-less UPDATE; the duplicated bodies were merged. Its verification also found the bulk soft-delete path dropping the policy's row filters (fixed v0.66.0) and both soft-delete paths re-trashing an already-trashed row (fixed v0.67.0) |
 | Z35 | An eager-loaded target is scanned in table order, so a migrated database reads every target's values into the wrong fields | P1 | **Fixed** v0.68.0 — the SELECT list is the target's columns in field order (`Step.to_columns`); `explainScanFailure` now names the column for a misaligned projection, and the eager-load target scan calls it at all |
 | Z36 | `Restore` on a live row answers `true` on SQLite/PG and `false` on MySQL | P1 | **Fixed** v0.69.0 — scoped to `deleted_at IS NOT NULL`; found by the new `dialect_matrix` on its first run |
+| Z37 | The pool parks a borrower even when it has room to serve them | P1 | **Fixed** v0.70.0 — waiting now means at the ceiling with everything lent out; a health-check-only failure reports the driver error |
+| Z38 | SQLite declares foreign keys but does not enforce them | P1 | **Fixed** v0.70.0 — `PRAGMA foreign_keys` on every handle with a read-back; its matrix case also exposed the PG `23502`/`23503` → `UniqueViolation` bug, fixed |
 | Z32 | Sub-query predicates do not scope the inner table | P2 | **Partly fixed** v0.52.0 — `Has*` targets scoped; bare `sql.InSelect` documented as out of reach |
 
 **On IDs.** `Z<n>` numbers are allocated once and never reused; before v0.56.0 the

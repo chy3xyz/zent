@@ -4,6 +4,70 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+- **SQLite now enforces foreign keys.** `SQLiteDriver.open` issues
+  `PRAGMA foreign_keys = ON` on every connection it returns and **verifies the
+  read-back** — the pragma is per connection, and it is a silent no-op inside a
+  transaction while still answering `SQLITE_OK`, so issuing it is not evidence
+  it took. SQLite ships the switch OFF, so until now the `FOREIGN KEY` clauses
+  `migrateSchema` writes were recorded and never checked: a dangling reference
+  was accepted, a cascading delete removed nothing, and dropping a referenced
+  parent succeeded. An insert naming a parent row that does not exist is now
+  refused with `error.ForeignKeyViolation`, a cascading delete really removes
+  the children, and `DROP TABLE` of a referenced table fails while rows still
+  point at it — check your test and database cleanup order (drop the child or
+  junction table first); SQLite reports the same failure MySQL reports as
+  errno 3730.
+
+  Every connect path was checked: `openWithOptions` holds the only
+  `sqlite3_open` in library code, and the pool's caller-supplied factories all
+  call `open`. A consumer that builds a `SQLiteDriver` around its own handle
+  still bypasses the pragma — `enforceForeignKeys()` is public for exactly that.
+  A database that already holds dangling references can opt out per connection
+  with `.{ .enforce_foreign_keys = false }`, which means what it says: references
+  are no longer checked.
+
+### Fixed
+- **The pool no longer waits out its budget while it has room to serve you.**
+  A health check failing on a *freshly opened* connection closed that
+  connection — which is exactly what freed room below `max_connections` — and
+  the borrow then parked on the condition variable, where nothing could wake
+  it: the only signal a waiter can get is another borrower's `release`, so with
+  no other borrower in the pool it spent the whole `max_wait_ms` and reported
+  `PoolWaitTimeout` instead of the error that actually happened. Reachable
+  behind a proxy or a half-open connection. **Waiting now happens only while it
+  can be served**: the pool at its ceiling with every connection lent out. With
+  room below the ceiling the attempt goes to the bounded `max_retries` /
+  `retry_backoff_ms` path instead, each backoff capped by the caller's remaining
+  budget, so `max_wait_ms` stays a hard upper bound.
+- **A borrow that only met failed health checks reports that error**
+  (`PingFailed` / `ConnectionFailed`) rather than `PoolExhausted` or
+  `PoolWaitTimeout`. `PoolExhausted` keeps its meaning — at the ceiling with
+  everything lent out — and a budget that runs out during either the wait or
+  the retries is still `PoolWaitTimeout`, so the budget outranks an error
+  recorded earlier in the call. One existing test's expectation moved with it:
+  "evicts connection on failed health check during borrow" now expects
+  `ConnectionFailed`, because it had pinned the misattributed reason while its
+  eviction assertions are unchanged.
+- **PostgreSQL: a not-null or foreign-key violation is no longer reported as
+  `UniqueViolation`.** `sqlstateToError` read the SQLSTATE condition at offset 2,
+  which is `5` for the whole `235xx` family, so `23502` (not-null) and `23503`
+  (foreign-key) both matched the unique-violation arm. A consumer branching on
+  `ForeignKeyViolation` — or using `UniqueViolation` for an upsert fallback —
+  took the wrong branch on PostgreSQL. Found by the cross-dialect matrix's new
+  foreign-key case, which pins the same answer on all three dialects; the
+  condition is read at offset 3/4 now, and shorter-than-5-character codes are
+  guarded instead of read past their end.
+
+### Notes
+- Three test-local cleanup orders were also wrong (children must drop before
+  parents): MySQL's missing-junction test produced two errno-3730 errors per
+  run and PostgreSQL's produced "other objects depend on it", both swallowed by
+  `catch {}`; a third PG block survived only on `CASCADE`. All are fixed, which
+  is what let the matrix case assert one answer everywhere.
+- `SQLiteDriver.openWithOptions(allocator, path, .{ .enforce_foreign_keys = false })`
+  is the supported opt-out for a database that already holds dangling references.
+
 ## [0.69.0] - 2026-09-21
 
 ### Added

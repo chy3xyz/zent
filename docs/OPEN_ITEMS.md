@@ -15,13 +15,15 @@ or source that says something the docs do not.
 
 ---
 
+_Resolved in v0.70.0: the pool no longer parks when it has room to serve, and
+SQLite now enforces foreign keys. This file is pruned as items land; history
+lives in `CHANGELOG.md`._
+
 ## Needs a decision before it can be fixed
 
 | Item | Evidence | Why it needs you |
 |---|---|---|
-| **A failed borrow-time health check on a newly created connection parks the borrower for the whole budget** | Found by the pool stress tests (v0.61.0). With `health_check_on_borrow` and a wait budget, the ping fails on a connection the pool just opened, the borrower parks — and if no other thread holds a connection, nothing can signal it, so the caller waits out `max_wait_ms` and gets `PoolWaitTimeout` instead of the connection error. Reachable behind a proxy or a half-open connection | The fix is a policy choice: retry with a fresh connection (more work on the borrow path) or fail fast (the caller sees the real error) |
 | **A junction table name colliding with a declared entity table is undetected** | `junctionTableForEdge` derives `<a>_<b>`, and `createTableSQLAlloc` emits `CREATE TABLE IF NOT EXISTS`, so the first one created wins silently. An entity whose table is literally that pair's name is enough | Detecting it means either validating names at graph build (a new compile-time error) or reporting it in `checkSchema` (a new drift kind) |
-| **SQLite declares foreign keys but does not enforce them** | `zent` never issues `PRAGMA foreign_keys`, and SQLite defaults it OFF, so an FK in the DDL accepts dangling references. `checkSchema` compares the DDL shape and cannot see the switch — `missing_foreign_key` means "not declared", a clean result means "declared", not "enforced" | Turning it on changes write behaviour for existing consumers (some inserts would start failing) |
 | **`zig build migrate-rollback` does not inherit the caller's DSN** | `build.zig`'s `migrate-rollback` step calls `setEnvironmentVariable`, which materialises the env map into the long-lived build-server process; `migrate` (`build.zig:205`) does not and works. So the rollback step cannot be pointed at a database from the shell | Fixing it means changing how the step passes env — worth doing, but it touches the build's structure |
 
 ## Open, with a known shape

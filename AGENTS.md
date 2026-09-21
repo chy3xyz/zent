@@ -6,12 +6,12 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.69.0** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.70.0** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (445 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (452 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -51,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 445, integration 231 passed + 3 skipped
+`baseline` counts move with this: unit 452, integration 234 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -224,6 +224,17 @@ Entities and queries are explicitly owned by the caller. See the contract:
   `planMigrateStatements`; a second, hand-rolled "what would we do" branch is how
   a preview starts disagreeing with the run it is previewing. Anything added to
   the migration has to be added to the plan, once.
+- **SQLite enforces foreign keys, and the pragma's success is not evidence.**
+  `SQLiteDriver.open` / `openWithOptions` issue `PRAGMA foreign_keys = ON` on
+  every handle and verify the read-back — the pragma is per connection and a
+  silent no-op inside a transaction. `openWithOptions` holds the only
+  `sqlite3_open` in library code; a new open path that skips `enforceForeignKeys`
+  silently hands out a connection that accepts dangling references. The opt-out
+  is `.enforce_foreign_keys = false` and its doc says what it costs.
+- **The pool waits only where a waiter can be served.** Waiting means the pool
+  is at its ceiling with every connection lent out; with room below the ceiling
+  the borrow retries on the bounded path instead, and a call that only met
+  failed health checks reports that error rather than `PoolExhausted`.
 - **An eager-loaded target's SELECT list is the target's columns in field order,
   never `*`.** The result set is scanned positionally, and `<table>.*` follows the
   *table's* physical order — which `ALTER TABLE … ADD COLUMN` breaks on any

@@ -989,12 +989,21 @@ Two more things worth knowing:
 - **`unique_constraint` and `missing_foreign_key` are reports, not repairs.**
   `migrateSchema` still does not add either with `ALTER TABLE … ADD CONSTRAINT`;
   non-destructiveness is deliberate.
-- **On SQLite, an FK in the DDL is not necessarily enforced.** SQLite ships with
-  `PRAGMA foreign_keys = OFF`, so dangling references are accepted unless the
-  connection turns it on. `checkSchema` compares the **DDL shape** — it cannot
-  see that switch — so `missing_foreign_key` means "the constraint is not
-  declared", and a *clean* result means "it is declared", not "it is enforced".
-  Turn the pragma on per connection if you rely on it.
+- **On SQLite, the pragma is what enforces an FK, and the driver turns it on.**
+  SQLite ships `PRAGMA foreign_keys = OFF`, so a `FOREIGN KEY` clause is only
+  worth what the connection carrying it is worth — and the pragma is **per
+  connection**. `SQLiteDriver.open` / `openWithOptions` issue it on every handle
+  they return and verify the read-back, so under this library an FK in the DDL
+  is enforced, on pooled connections too. Two things still hold: `checkSchema`
+  compares the **DDL shape** and cannot see the switch, so `missing_foreign_key`
+  means "the constraint is not declared" and a *clean* result means "it is
+  declared" (enforcement is the driver's default, not something the check can
+  observe); and a connection you open yourself — a raw `sqlite3_open`, or a
+  `SQLiteDriver{ … }` literal around your own handle — enforces nothing until
+  you call `SQLiteDriver.enforceForeignKeys` on it. `openWithOptions(…, .{
+  .enforce_foreign_keys = false })` is the supported way to keep a database that
+  already holds dangling references writable, and it means exactly that:
+  references are no longer checked.
 
 Everything in that table is also what `checkSchema` reports, which is the point:
 the migration path is not a substitute for the check.
