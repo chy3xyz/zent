@@ -3935,9 +3935,78 @@ fn planMigrateStatements(
                 });
             }
         }
+
+        // A **column** declared UNIQUE, on a table that already exists. The
+        // declaration is inline in `CREATE TABLE` (and `ALTER TABLE ADD COLUMN`
+        // cannot carry it — see `alterTableAddColumnSQL`, which drops it on
+        // purpose), so a table created before the field was marked unique never
+        // gets the constraint. That is not a cosmetic drift: with no unique
+        // index the statement `SaveOrUpdateOn` builds is rejected outright
+        // ("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+        // constraint" on SQLite and PostgreSQL), so every upsert call site
+        // against that table fails at runtime while the schema says it works.
+        // The dialect-neutral form is a unique index over the one column — no
+        // table rebuild, no data moved.
+        //
+        // Silent when a unique index exists whose keys could not be read
+        // (`lower(email)`, `email(10)`, a `WHERE`): such an index does
+        // constrain the column, so "is it constrained?" has no answer and a
+        // second index would be a guess. The primary key is skipped by
+        // `uniqueColumnChecked` — it is unique by construction.
+        if (!created[i] and !hasUnreadableUniqueIndex(existing_idxs.items)) {
+            inline for (table.columns) |col| {
+                try planUniqueColumnIndex(allocator, &plan, info, table, col, existing_idxs.items, dialect);
+            }
+        }
     }
 
     return plan;
+}
+
+/// Plan the unique index a **column-level** `UNIQUE` needs on a table that
+/// already exists — see the call site in `planMigrateStatements` for why the
+/// declaration is not there already.
+///
+/// Returns without planning anything when the constraint is already the
+/// primary key's (`uniqueColumnChecked`), when some unique index already forces
+/// exactly this column (`indexForcesColumnAlone`), or when the name it would
+/// use is taken — the last one after trying a suffixed name, because an index
+/// of that name which does *not* force the column leaves the promise unkept.
+fn planUniqueColumnIndex(
+    allocator: std.mem.Allocator,
+    plan: *std.array_list.Managed(PlannedStatement),
+    comptime info: TypeInfo,
+    table: TableDef,
+    col: ColumnDef,
+    existing_idxs: []const ExistingIndex,
+    dialect: Dialect,
+) !void {
+    if (!uniqueColumnChecked(col, table)) return;
+    if (indexForcesColumnAlone(existing_idxs, col.name)) return;
+
+    var name_buf: [256]u8 = undefined;
+    var idx_name = std.fmt.bufPrint(&name_buf, "uq_{s}_{s}", .{ table.name, col.name }) catch return;
+    if (indexExists(existing_idxs, idx_name)) {
+        idx_name = std.fmt.bufPrint(&name_buf, "uq_{s}_{s}_zent", .{ table.name, col.name }) catch return;
+        if (indexExists(existing_idxs, idx_name)) return;
+    }
+
+    const uniq_def = IndexDef{ .name = idx_name, .columns = &[_][]const u8{col.name}, .unique = true };
+    if (findMySqlTextRestriction(table, &.{uniq_def}, dialect)) |_| {
+        // MySQL cannot index a BLOB/TEXT/JSON key without a key length, and a
+        // prefix would change what the UNIQUE index means. The create-table
+        // path warns for the same column; skipping keeps the migration alive
+        // on a server that refuses the index outright.
+        std.log.warn(
+            "zent: MySQL cannot index {s}.{s} ({s}, errno 1170), so no UNIQUE index was created for it; use field.String (VARCHAR(255) on MySQL) or drop the uniqueness",
+            .{ table.name, col.name, columnSQLType(col, dialect) },
+        );
+        return;
+    }
+    try plan.append(.{
+        .sql = try createIndexSQLForTableAlloc(allocator, uniq_def, table, dialect),
+        .version = computeMigrationVersion(info.table_name, "create_unique_index", col.name),
+    });
 }
 
 /// Migrate schema: create missing tables, add missing columns, create missing
@@ -6713,4 +6782,54 @@ test "a declared type longer than the stack buffer is still compared" {
     const db = try normalizeTypeForCompare(alloc, "INTEGER", &db_buf);
     defer db.deinit(alloc);
     try std.testing.expect(!std.mem.eql(u8, long.text, db.text));
+}
+
+test "migrateSchema adds the unique index a column-level UNIQUE needs on an existing table" {
+    // The declaration is inline in `CREATE TABLE` and `ALTER TABLE ADD COLUMN`
+    // cannot carry it, so a table created before the field was marked unique
+    // never gets the constraint. With no unique index the statement
+    // `SaveOrUpdateOn` builds is rejected outright — "ON CONFLICT clause does
+    // not match any PRIMARY KEY or UNIQUE constraint" on SQLite and PostgreSQL
+    // — so every upsert call site against that table fails at runtime while the
+    // schema says it works. The duplicate insert at the end is the proof that
+    // the migration closed it.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const allocator = std.testing.allocator;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // The table as a database that predates the `Unique()` has it: nullable and
+    // unconstrained.
+    _ = try drv.exec("CREATE TABLE uq_fix_item (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL)", &.{});
+
+    const UqFixItem = schema("UqFixItem", .{ .fields = &.{field.String("email").Unique()} });
+    const info = comptime fromSchema(UqFixItem);
+    const infos = &[_]TypeInfo{info};
+
+    // Before: the drift is real, and `assertSchema(.any)` is the only mode that
+    // reports it (`breaksReads` is false — a duplicate row is a write the
+    // database accepts, not a broken read).
+    try std.testing.expectError(error.SchemaDrift, assertSchema(allocator, drv.asDriver(), infos, .any));
+
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    const after = try checkSchema(allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(allocator, after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+
+    _ = try drv.exec("INSERT INTO uq_fix_item (email) VALUES ('a@example.test')", &.{});
+    try std.testing.expectError(
+        error.UniqueViolation,
+        drv.exec("INSERT INTO uq_fix_item (email) VALUES ('a@example.test')", &.{}),
+    );
+
+    // Idempotent: a second run finds the index and plans nothing.
+    try migrateSchema(allocator, drv.asDriver(), infos);
+    const again = try checkSchema(allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(allocator, again);
+    try std.testing.expectEqual(@as(usize, 0), again.len);
 }
