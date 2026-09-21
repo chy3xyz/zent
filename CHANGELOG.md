@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **EntQL rejects a field the entity in scope does not have.** The parser is
+  schema-unaware, so an ident reached the statement exactly as written: a typo
+  failed at the server (loud, but late and per dialect), and an ident naming a
+  *junction* column inside `has(...)`, where the target does not have it, bound
+  to the junction table — whose `<fk> = <outer>.id` is already in the statement
+  — so the filter degenerated into a condition on the outer row and answered
+  with no error at all. The check now runs on the parsed tree, before lowering
+  (afterwards the tuple form no longer says which entity the column belonged
+  to), switches scope with each `has(...)`, and accepts either spelling of a
+  field — API name or physical column name — so `.StorageKey` schemas keep
+  working. `error.UnknownField` is the answer `QueryView.whereEq`'s sink gives
+  for the same mistake.
+- **`examples/migrate` accepts a libpq keyword/value conninfo.** It recognised
+  only a `postgres://` URI, so it could not be pointed at a deployment whose DSN
+  a project already has in its environment — the shape `PG_DSN` has in CI, which
+  `examples/check_sql` has handled all along.
+- **`migrations/` is portable DDL.** `001_create_users.up.sql` used
+  `INTEGER PRIMARY KEY AUTOINCREMENT` (SQLite-only) and `CREATE INDEX IF NOT
+  EXISTS` (MySQL rejects it), so the example's own migrations failed on the
+  servers the example claims to support; the down file used
+  `DROP INDEX IF EXISTS`, which MySQL also lacks. Idempotency comes from the
+  runner's version table, so the portable subset is enough. Verified against
+  SQLite and PostgreSQL locally, and the `migrate` example's DDL now runs on
+  both.
+
 ## [0.73.2] - 2026-09-21
 
 ## [0.73.1] - 2026-09-21
