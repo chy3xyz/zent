@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.73.0] - 2026-09-21
+
 ### Breaking
 - **`CrudService.get` is `getOwned`.** The method returns a row copied into the
   caller's allocator, while `client.<entity>.deinitRow(&e)` frees with the
