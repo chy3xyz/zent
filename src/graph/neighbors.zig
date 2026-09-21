@@ -348,7 +348,19 @@ pub fn appendHasNeighborsWith(b: *sql.Builder, step: Step, preds: []const sql.Pr
         try b.writeString(" AND (");
         for (preds, 0..) |pred, i| {
             if (i > 0) try b.writeString(" AND ");
-            try pred.appendTo(b);
+            // The M2M body joins the junction `j` and the target `t`, and the
+            // junction's columns are literally `<table>_id`, so a predicate
+            // column left bare can bind to the junction instead of the target:
+            // `has(groups, user_id = 7)` on a Group without a `user_id` column
+            // became a filter on the *outer* row's id and answered with no
+            // error at all. The predicate is about the target, so qualify it
+            // there — `appendQualifiedPred` rewrites the shapes whose column is
+            // a plain name and appends the rest verbatim (a predicate carrying
+            // its own SQL text cannot be rewritten safely), which leaves an
+            // EntQL comparison on a column that exists only on the junction
+            // binding there; validating EntQL field names against the target's
+            // schema is the tracked follow-up.
+            try sql.appendQualifiedPred(b, pred, if (step.edge_rel == .m2m) "t" else null);
         }
         try b.writeByte(')');
     }

@@ -2754,3 +2754,109 @@ test "EntQL has/not_has and WithEdgeOptions inner join keep the target's soft-de
         try std.testing.expectEqual(@as(usize, 0), users.items.len);
     }
 }
+
+test "an m2m has() predicate is qualified to the target table" {
+    // The M2M EXISTS body joins the junction `j` and the target `t`, and the
+    // junction's columns are literally `<table>_id`. The caller's predicates
+    // were rendered bare, so an EntQL `has(groups, user_id = …)` — a field
+    // Group does not have — bound to `j.user_id`, and since `j.user_id =
+    // <outer>.id` is already in the statement the filter degenerated into "the
+    // outer row's id is …" and answered without an error. A predicate about the
+    // target belongs qualified to it, which makes the unknown field fail at
+    // prepare time instead.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const migrate = @import("../sql/schema/migrate.zig");
+
+    const GroupBase = Schema("D5QualGroup", .{ .fields = &.{field.String("name")} });
+    const UserBase = Schema("D5QualUser", .{ .fields = &.{field.String("name")} });
+    const Group = struct {
+        pub const schema_name = GroupBase.schema_name;
+        pub const fields = GroupBase.fields;
+        pub const edges = &.{edge.To("users", UserBase)};
+        pub const indexes = GroupBase.indexes;
+    };
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{edge.To("groups", GroupBase)};
+        pub const indexes = UserBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ User, Group });
+    const infos = graph.types;
+    const user_info = comptime fromSchema(User);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    var group_ids: [2]i64 = undefined;
+    for ([_][]const u8{ "x", "y" }, 0..) |name, i| {
+        var b = try root.d5_qual_group.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", name);
+        var row = try b.Save();
+        defer deinitEntity(infos, fromSchema(Group), &row, allocator);
+        group_ids[i] = row.id;
+    }
+    var user_ids: [2]i64 = undefined;
+    for ([_][]const u8{ "u1", "u2" }, 0..) |name, i| {
+        var b = try root.d5_qual_user.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", name);
+        var row = try b.Save();
+        defer deinitEntity(infos, user_info, &row, allocator);
+        user_ids[i] = row.id;
+    }
+    // u1 belongs to group "x", u2 to group "y".
+    for (0..2) |i| {
+        var u = root.d5_qual_user.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", if (i == 0) "u1" else "u2");
+        _ = try u.Where(.{root.d5_qual_user.predicates.idEQ(.{ .int = user_ids[i] })});
+        _ = try u.AddEdgeIDs("groups", &.{group_ids[i]});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+
+    // A predicate on a real target column keeps working — the qualification
+    // does not cost the ordinary case. (This half passes unqualified too: only
+    // the target has a `name` column, so it is a regression guard.)
+    {
+        var q = root.d5_qual_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(groups, name = \"x\")");
+        const users = try q.All();
+        defer {
+            for (users.items) |*e| deinitEntity(infos, user_info, e, allocator);
+            users.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+        try std.testing.expectEqualStrings("u1", users.items[0].name);
+    }
+
+    // The field Group does not have must not resolve to the junction's column:
+    // the statement has to fail, not answer a filtered-by-accident row set.
+    {
+        const entql_sql = try std.fmt.allocPrint(allocator, "has(groups, user_id = {d})", .{user_ids[0]});
+        defer allocator.free(entql_sql);
+        var q = root.d5_qual_user.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL(entql_sql);
+        if (q.All()) |users| {
+            var leaked = users;
+            defer {
+                for (leaked.items) |*e| deinitEntity(infos, user_info, e, allocator);
+                leaked.deinit();
+            }
+            return error.ExpectedPrepareFailure;
+        } else |_| {}
+    }
+}
