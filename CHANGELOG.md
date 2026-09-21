@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-09-21
+
 ### Fixed
 - **EntQL rejects a field the entity in scope does not have.** The parser is
   schema-unaware, so an ident reached the statement exactly as written: a typo
