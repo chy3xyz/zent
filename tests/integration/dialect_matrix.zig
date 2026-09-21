@@ -504,7 +504,7 @@ fn caseCrudServiceIdempotentPut(a: std.mem.Allocator, drv: Driver) ![]const u8 {
 
     const id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "widget", .price_cents = 100 }, 1);
 
-    var got = (try svc.get(allocator, 1, id)) orelse return error.NoRow;
+    var got = (try svc.getOwned(allocator, 1, id)) orelse return error.NoRow;
     defer zent.codegen.deinitEntity(infos, infos[0], &got, allocator);
 
     const idempotent = try svc.update(got, 1);

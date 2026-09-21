@@ -47,6 +47,15 @@ Rule of thumb: default to `crud_helpers` for terse reads/writes; reach for
 `CrudService` when several entities share the same tenant column and you want
 created/updated/deleted events emitted consistently (e.g. to feed the outbox).
 
+`CrudService.getOwned(allocator, tenant_id, id)` copies the row into **your**
+allocator, so release it with that allocator — `client.<entity>.deinitRowWith(allocator, &e)`
+or `deinitEntity(infos, info, &e, allocator)`. `client.<entity>.deinitRow(&e)`
+frees with the *client's* allocator and is for rows the client produced
+(`All()`, `First()`, `Create().Save()`); mixing the two is a mismatched free —
+an arena's bookkeeping corrupted, or "free of invalid memory" taking the process
+down. The name `getOwned` is the reminder; the release call states the
+allocator out loud.
+
 **Rule of thumb**: typed builders cover single-table + aggregates. Anything
 that references two tables, computes a `CASE`, or needs a correlated subquery
 goes to the raw driver. Don't force `Query()` to express a JOIN you could

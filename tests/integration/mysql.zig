@@ -202,7 +202,7 @@ test "MySQL: crud.update answers true for an idempotent PUT (changed vs matched 
 
     const id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "widget", .price_cents = 100 }, 1);
 
-    var got = (try svc.get(allocator, 1, id)).?;
+    var got = (try svc.getOwned(allocator, 1, id)).?;
     defer zent.codegen.deinitEntity(infos, infos[0], &got, allocator);
 
     // Idempotent PUT: the fetched row written back unchanged. This server
