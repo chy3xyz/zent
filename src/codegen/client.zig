@@ -690,15 +690,27 @@ fn queryTargetsImpl(
     defer rows.deinit();
 
     var result = std.array_list.Managed(TargetEntity).init(allocator);
-    errdefer result.deinit();
+    errdefer {
+        for (result.items) |*e| deinitEntity(infos, target_info, e, allocator);
+        result.deinit();
+    }
 
     while (rows.next()) |row| {
         // The projection is `target.*` followed by a trailing `__fk` column.
         // Positional scanRow reads only the entity's own (leading) columns,
         // so the extra `__fk` is ignored; no name-based scan is needed.
-        const entity = try sql_scan.scanRow(TargetEntity, allocator, row);
+        var entity = try sql_scan.scanRow(TargetEntity, allocator, row);
+        errdefer deinitEntity(infos, target_info, &entity, allocator);
         try result.append(entity);
     }
+    // `next() == null` means "finished" or "broke"; only `nextError()` says
+    // which. Reading a mid-read failure as the end of the set would hand the
+    // rows read so far back as the whole neighbour list — with a deadline or a
+    // server error mid-consume, the missing rows are exactly the ones after
+    // the failure point. The entities already scanned are released above
+    // (`errdefer`), so the caller gets an error, not a partial page and not a
+    // leak.
+    if (rows.nextError()) |e| return e;
     return result;
 }
 
@@ -1767,3 +1779,151 @@ test "withInterceptors borrows: DeinitClient leaves the external chain alive" {
     try chain.use(.{ .intercept = noop });
     try std.testing.expectEqual(@as(usize, 2), chain.interceptors.items.len);
 }
+
+test "queryTargets reports a mid-read driver failure instead of a short page" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const edge = @import("../core/edge.zig");
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Car = Schema("PeCar", .{ .fields = &.{field.String("model")} });
+    const UserBase = Schema("PeUser", .{ .fields = &.{field.String("name")} });
+    const User = struct {
+        pub const schema_name = UserBase.schema_name;
+        pub const fields = UserBase.fields;
+        pub const edges = &.{edge.To("cars", Car)};
+        pub const indexes = UserBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ User, Car });
+    const infos = graph.types;
+
+    // One row, then a step failure — the shape a deadline or a server error
+    // mid-consume produces. `next()` answers null both for the end of a set
+    // and for the failure, so only `nextError()` tells them apart: a read that
+    // took the failure for "finished" would hand the one row back as the whole
+    // neighbour list, with no error and no flag.
+    var stub = PartialRowsDriver{};
+    try std.testing.expectError(
+        error.ExecFailed,
+        queryTargets(infos, "PeUser", "cars", &.{1}, allocator, stub.asDriver(), null, null),
+    );
+}
+
+/// A driver whose one query delivers a single target row and then reports the
+/// step failure through `nextError()`. The row answers generously: a
+/// positional scan reads only the columns the entity declares, and
+/// `requireColumns` asks that they exist rather than that they stop there.
+/// The row owns nothing, so `deinit` has nothing to release — which is also
+/// how a leak in the failing reader shows up (the test allocator reports it).
+const PartialRowsDriver = struct {
+    const Dialect = @import("../sql/dialect.zig").Dialect;
+
+    const row_vtable = sql_driver.Row.VTable{
+        .columnCount = rowColumnCount,
+        .columnName = rowColumnName,
+        .getBool = rowGetBool,
+        .getInt = rowGetInt,
+        .getFloat = rowGetFloat,
+        .getText = rowGetText,
+        .getBlob = rowGetBlob,
+        .isNull = rowIsNull,
+    };
+    const rows_vtable = sql_driver.Rows.VTable{
+        .next = rowsNext,
+        .deinit = rowsDeinit,
+        .nextError = rowsNextError,
+    };
+    const vtable = sql_driver.Driver.VTable{
+        .exec = drvExec,
+        .query = drvQuery,
+        .beginTx = drvBeginTx,
+        .close = drvClose,
+        .dialect = drvDialect,
+        .ping = drvPing,
+        .inTransaction = drvInTransaction,
+        .beginSavepoint = drvBeginSavepoint,
+    };
+
+    delivered: bool = false,
+
+    fn asDriver(self: *@This()) sql_driver.Driver {
+        return sql_driver.Driver{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn drvQuery(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        return sql_driver.Rows{ .ptr = ptr, .vtable = &rows_vtable };
+    }
+
+    fn rowsNext(ptr: *anyopaque) ?sql_driver.Row {
+        const self: *PartialRowsDriver = @ptrCast(@alignCast(ptr));
+        if (self.delivered) return null;
+        self.delivered = true;
+        return sql_driver.Row{ .ptr = self, .vtable = &row_vtable };
+    }
+
+    fn rowsDeinit(_: *anyopaque) void {}
+
+    fn rowsNextError(_: *anyopaque) ?sql_driver.Error {
+        return error.ExecFailed;
+    }
+
+    fn rowColumnCount(_: *anyopaque) usize {
+        return 8;
+    }
+
+    fn rowColumnName(_: *anyopaque, _: usize) []const u8 {
+        return "";
+    }
+
+    fn rowGetBool(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+
+    fn rowGetInt(_: *anyopaque, _: usize) ?i64 {
+        return 1;
+    }
+
+    fn rowGetFloat(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+
+    fn rowGetText(_: *anyopaque, _: usize) ?[]const u8 {
+        return "c1";
+    }
+
+    fn rowGetBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+
+    fn rowIsNull(_: *anyopaque, _: usize) bool {
+        return false;
+    }
+
+    fn drvExec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        unreachable;
+    }
+
+    fn drvBeginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        unreachable;
+    }
+
+    fn drvBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        unreachable;
+    }
+
+    fn drvClose(_: *anyopaque) void {}
+
+    fn drvDialect(_: *anyopaque) Dialect {
+        return .sqlite;
+    }
+
+    fn drvPing(_: *anyopaque) sql_driver.Error!void {
+        unreachable;
+    }
+
+    fn drvInTransaction(_: *anyopaque) bool {
+        return false;
+    }
+};
