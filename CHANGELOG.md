@@ -4,7 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The 0.74.1 section is listed once, and the versions are newest-first.**
+  That section had been written by hand *and* promoted from `[Unreleased]` by
+  `scripts/release.sh`, which the repository's own `check-version` gate rejects
+  — so the 0.74.0 and 0.74.1 tags carry a CHANGELOG that fails it. Documentation
+  only; no code changed.
+
 ## [0.74.1] - 2026-09-21
+
+### Fixed
+- **The cross-dialect case for the unique-index migration asks a
+  dialect-independent question.** v0.74.0's integration job failed on it: the
+  case planted a duplicate row *before* migrating, and the migration correctly
+  refuses to build a unique index over data that already violates the
+  declaration (loud, inside the transaction, nothing left behind) — the case
+  was failing on its own setup, which is the fix working. A hand-written table
+  also differs from the schema in ways that have nothing to do with the
+  declaration (MariaDB reported an extra `type_mismatch` for `INTEGER` against
+  `BIGINT`; PostgreSQL reported two drifts of its own), so the observable is now
+  the question itself: the `.unique_constraint` drift for that column is present
+  before the migration and gone after, and a duplicate is refused. SQLite and
+  PostgreSQL agree locally; MariaDB runs it in CI.
 
 ## [0.74.0] - 2026-09-21
 
@@ -33,22 +54,6 @@ All notable changes to this project will be documented in this file.
   runner's version table, so the portable subset is enough. Verified against
   SQLite and PostgreSQL locally, and the `migrate` example's DDL now runs on
   both.
-
-## [0.74.1] - 2026-09-21
-
-### Fixed
-- **The cross-dialect case for the unique-index migration asks a
-  dialect-independent question.** v0.74.0's integration job failed on it: the
-  case planted a duplicate row *before* migrating, and the migration correctly
-  refuses to build a unique index over data that already violates the
-  declaration (loud, inside the transaction, nothing left behind) — the case
-  was failing on its own setup, which is the fix working. A hand-written table
-  also differs from the schema in ways that have nothing to do with the
-  declaration (MariaDB reported an extra `type_mismatch` for `INTEGER` against
-  `BIGINT`; PostgreSQL reported two drifts of its own), so the observable is now
-  the question itself: the `.unique_constraint` drift for that column is present
-  before the migration and gone after, and a duplicate is refused. SQLite and
-  PostgreSQL agree locally; MariaDB runs it in CI.
 
 ## [0.73.2] - 2026-09-21
 
