@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-09-21
+
 ### Fixed
 - **A junction table whose name is also a declared entity's table is named, not
   left to its symptoms.** `junctionTableForEdge` derives `<a>_<b>`, which is a
