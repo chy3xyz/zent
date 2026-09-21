@@ -537,6 +537,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const lowerHasEdge = @import("predicate.zig").lowerHasEdge;
             var parsed = try entql.parse(self.allocator, input);
             errdefer entql.deinitPred(self.allocator, &parsed);
+            // Checked before lowering: that step rewrites `has(...)` into the
+            // tuple form, and the edge name — the only thing that says which
+            // entity a nested ident belongs to — is gone from it afterwards.
+            try validateEntqlFields(infos, info, parsed);
             try lowerHasEdge(infos, info, self.allocator, &parsed);
             try self.predicates.append(parsed);
             try self.entql_owned.append(parsed);
@@ -2074,6 +2078,85 @@ test "query contract tests" {
     }
 }
 
+/// Reject an EntQL expression that names a field the entity in scope does not
+/// have.
+///
+/// The parser is schema-unaware, so an ident reached the statement exactly as
+/// written. Two things followed. On a schema using `.StorageKey` the filter
+/// addressed the literal column rather than the declared one. And — the case
+/// that made this a defect — an ident naming a *junction* column inside
+/// `has(...)`, where the target does not have it, bound to the junction table,
+/// which already carries `j.<fk> = <outer>.id`: the filter degenerated into a
+/// condition on the outer row and answered with no error at all.
+///
+/// A name is accepted when it matches the field's API name **or** its physical
+/// column name, so both spellings keep working (EntQL has always addressed
+/// physical columns); anything else is `error.UnknownField`, the answer
+/// `QueryView.whereEq`'s sink gives for the same mistake. Edge names are
+/// validated as before, by `lowerHasEdge`'s own `error.UnknownEdge`.
+fn validateEntqlFields(comptime infos: []const TypeInfo, comptime scoped: TypeInfo, pred: sql.Predicate) error{UnknownField}!void {
+    switch (pred) {
+        .eq, .ne, .gt, .lt, .gte, .lte, .like, .eq_fold => |op| {
+            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        },
+        .in, .not_in => |op| {
+            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        },
+        .or_in => |op| {
+            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        },
+        .like_escaped => |op| {
+            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        },
+        .is_null, .is_not_null => |column| {
+            if (!entqlFieldKnown(scoped, column)) return error.UnknownField;
+        },
+        .in_subquery => |op| {
+            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        },
+        .and_ => |op| {
+            try validateEntqlFields(infos, scoped, op.left.*);
+            try validateEntqlFields(infos, scoped, op.right.*);
+        },
+        .or_ => |op| {
+            try validateEntqlFields(infos, scoped, op.left.*);
+            try validateEntqlFields(infos, scoped, op.right.*);
+        },
+        .not_ => |inner| try validateEntqlFields(infos, scoped, inner.*),
+        // The nested expression addresses the *target* entity, so the scope
+        // switches with the edge — which is why this runs before lowering.
+        .has_edge => |h| {
+            if (h.pred) |nested| {
+                inline for (scoped.edges) |e| {
+                    if (std.mem.eql(u8, e.name, h.edge_name)) {
+                        try validateEntqlFields(infos, edgeTargetInfo(infos, scoped, e), nested.*);
+                    }
+                }
+            }
+        },
+        // Nothing to check: no column of ours, or a fragment the library did
+        // not build (`raw`, policy filters, subquery text).
+        .not_has_edge,
+        .raw,
+        .raw_args,
+        .exists_subquery,
+        .exists_fn,
+        .not_exists_fn,
+        .has_neighbors_with,
+        .in_select,
+        => {},
+    }
+}
+
+/// Whether `name` addresses `scoped` — its API field name or its physical
+/// column name (`StorageKey`).
+fn entqlFieldKnown(comptime scoped: TypeInfo, name: []const u8) bool {
+    inline for (scoped.fields) |f| {
+        if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, f.column_name, name)) return true;
+    }
+    return false;
+}
+
 test "Query builder Explain prefixes SQL" {
     const field = @import("../core/field.zig");
     const schema = @import("../core/schema.zig").Schema;
@@ -2876,21 +2959,95 @@ test "an m2m has() predicate is qualified to the target table" {
         try std.testing.expectEqualStrings("u1", users.items[0].name);
     }
 
-    // The field Group does not have must not resolve to the junction's column:
-    // the statement has to fail, not answer a filtered-by-accident row set.
+    // The field Group does not have must not resolve to the junction's column.
+    // It is rejected while the expression is being read — before any SQL is
+    // built — because the ident's scope (the target entity) is only known
+    // there; after lowering, the tuple form no longer says which entity the
+    // column belonged to. (Before the qualification fix this answered a
+    // filtered-by-accident row set with no error at all.)
     {
         const entql_sql = try std.fmt.allocPrint(allocator, "has(groups, user_id = {d})", .{user_ids[0]});
         defer allocator.free(entql_sql);
         var q = root.d5_qual_user.Query();
         defer q.deinit();
-        _ = try q.WhereEntQL(entql_sql);
-        if (q.All()) |users| {
-            var leaked = users;
-            defer {
-                for (leaked.items) |*e| deinitEntity(infos, user_info, e, allocator);
-                leaked.deinit();
-            }
-            return error.ExpectedPrepareFailure;
-        } else |_| {}
+        try std.testing.expectError(error.UnknownField, q.WhereEntQL(entql_sql));
+    }
+}
+
+test "WhereEntQL rejects a field the entity does not have" {
+    // The parser is schema-unaware, so an ident used to reach the statement as
+    // written: a typo failed at the server (loud, but late and per-dialect),
+    // and inside `has(...)` an ident naming a junction column bound to the
+    // junction and answered without an error. The check runs on the parsed
+    // tree, before lowering, and accepts either spelling of a field.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+    const migrate = @import("../sql/schema/migrate.zig");
+
+    const Pet = Schema("VfPet", .{ .fields = &.{ field.String("nick"), field.Int("age") } });
+    const OwnerBase = Schema("VfOwner", .{
+        .fields = &.{ field.String("name"), field.String("display").StorageKey("full_name") },
+    });
+    const Owner = struct {
+        pub const schema_name = OwnerBase.schema_name;
+        pub const fields = OwnerBase.fields;
+        pub const edges = &.{edge.To("pets", Pet)};
+        pub const indexes = OwnerBase.indexes;
+    };
+
+    const graph = comptime buildGraph(&.{ Owner, Pet });
+    const infos = graph.types;
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    // A name the entity does not carry, at the top level and inside `has(...)`.
+    {
+        var q = root.vf_owner.Query();
+        defer q.deinit();
+        try std.testing.expectError(error.UnknownField, q.WhereEntQL("nope = 1"));
+    }
+    {
+        var q = root.vf_owner.Query();
+        defer q.deinit();
+        try std.testing.expectError(error.UnknownField, q.WhereEntQL("has(pets, nope = 1)"));
+    }
+    {
+        // The nested ident is checked against the *target*: `name` is the
+        // owner's field, not the pet's.
+        var q = root.vf_owner.Query();
+        defer q.deinit();
+        try std.testing.expectError(error.UnknownField, q.WhereEntQL("has(pets, name = \"x\")"));
+    }
+
+    // Both spellings of a field are accepted, `StorageKey` included: EntQL has
+    // always addressed physical columns, and mapping idents is a separate
+    // decision (docs/OPEN_ITEMS.md).
+    {
+        var q = root.vf_owner.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("display = \"x\"");
+    }
+    {
+        var q = root.vf_owner.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("full_name = \"x\"");
+    }
+    {
+        var q = root.vf_owner.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(pets, nick = \"x\") AND name = \"y\"");
+        // `age` belongs to the pet, not to the owner a top-level AND is read
+        // against — the same scope rule, from the other side.
+        var q2 = root.vf_owner.Query();
+        defer q2.deinit();
+        try std.testing.expectError(error.UnknownField, q2.WhereEntQL("has(pets, nick = \"x\") AND age > 3"));
     }
 }
