@@ -70,9 +70,18 @@ pub fn CrudService(
             return q.paged(page, size);
         }
 
-        /// Single row scoped to the tenant. Caller frees via
-        /// `zent.codegen.deinitEntity(infos, info, &e, alloc)`.
-        pub fn get(self: *Self, allocator: std.mem.Allocator, tenant_id: i64, id: i64) !?Entity {
+        /// Single row scoped to the tenant, **copied into `allocator`**.
+        ///
+        /// The returned `Entity` is not a row this client produced: its strings
+        /// belong to `allocator`, so release it with that same allocator —
+        /// `zent.codegen.deinitEntity(infos, info, &e, allocator)` or
+        /// `client.<entity>.deinitRowWith(allocator, &e)`. Handing it to
+        /// `client.<entity>.deinitRow(&e)` frees it with the *client's*
+        /// allocator, and a mismatched free is UB (a request arena corrupted,
+        /// or "free of invalid memory" taking the process down). That is why
+        /// the name says `Owned`: every row from here carries its own allocator
+        /// with it, the way `Query().All()` rows do not.
+        pub fn getOwned(self: *Self, allocator: std.mem.Allocator, tenant_id: i64, id: i64) !?Entity {
             var q = self.client.Query();
             defer q.deinit();
             _ = try q.Where(.{ self.tenantPred(tenant_id), self.idPred(id) });
@@ -333,11 +342,11 @@ test "CrudService list/get/create/update/delete with events and tenant isolation
     defer page2.deinit();
     try std.testing.expectEqual(@as(usize, 1), page2.items.items.len);
 
-    var got = (try svc.get(allocator, 1, a_id)).?;
+    var got = (try svc.getOwned(allocator, 1, a_id)).?;
     defer deinitEntity(infos, info, &got, allocator);
     try std.testing.expectEqualStrings("a", got.name);
     // Tenant isolation: tenant 2 must not see tenant 1's row.
-    try std.testing.expect((try svc.get(allocator, 2, a_id)) == null);
+    try std.testing.expect((try svc.getOwned(allocator, 2, a_id)) == null);
 
     var updated = got;
     updated.name = "a2";
@@ -380,7 +389,7 @@ test "CrudService get with mismatched allocator (arena copy)" {
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var got = (try svc.get(arena.allocator(), 7, id)).?;
+    var got = (try svc.getOwned(arena.allocator(), 7, id)).?;
     defer deinitEntity(infos, info, &got, arena.allocator());
     try std.testing.expectEqualStrings("hello-world", got.name);
 
@@ -388,8 +397,8 @@ test "CrudService get with mismatched allocator (arena copy)" {
     // parameter is what is written, not the caller's entity. Before this both
     // reads below found the row, because the write loop copied the entity's
     // tenant column and the interceptor only fills a column it finds missing.
-    try std.testing.expect((try svc.get(arena.allocator(), 8, id)) == null);
-    try std.testing.expect((try svc.get(arena.allocator(), 0, id)) == null);
+    try std.testing.expect((try svc.getOwned(arena.allocator(), 8, id)) == null);
+    try std.testing.expect((try svc.getOwned(arena.allocator(), 0, id)) == null);
 }
 
 test "CrudService insertMany/upsertMany batch writes" {
@@ -487,11 +496,11 @@ test "CrudService handles optional string fields in create/get" {
     const a_id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "a", .description = null }, 1);
     const b_id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "b", .description = "desc" }, 1);
 
-    var got_a = (try svc.get(allocator, 1, a_id)).?;
+    var got_a = (try svc.getOwned(allocator, 1, a_id)).?;
     defer deinitEntity(infos, info, &got_a, allocator);
     try std.testing.expect(got_a.description == null);
 
-    var got_b = (try svc.get(allocator, 1, b_id)).?;
+    var got_b = (try svc.getOwned(allocator, 1, b_id)).?;
     defer deinitEntity(infos, info, &got_b, allocator);
     try std.testing.expectEqualStrings("desc", got_b.description.?);
 }
@@ -714,7 +723,7 @@ test "CrudService update idempotent write-back on sqlite returns true; missing r
 
     const id = try svc.create(.{ .id = 0, .tenant_id = 0, .name = "a", .price_cents = 100 }, 1);
 
-    var got = (try svc.get(allocator, 1, id)).?;
+    var got = (try svc.getOwned(allocator, 1, id)).?;
     defer deinitEntity(infos, info, &got, allocator);
     // Idempotent PUT: the fetched row written back unchanged. On MySQL the
     // UPDATE counts 0 changed rows; on SQLite it counts the matched row —
@@ -727,4 +736,55 @@ test "CrudService update idempotent write-back on sqlite returns true; missing r
     var gone = got;
     gone.id = 999999;
     try std.testing.expect(!(try svc.update(gone, 1)));
+}
+
+test "an owned row is released through deinitRowWith, with its own allocator" {
+    // `getOwned` copies into the caller's allocator while `All()` rows belong
+    // to the client's; both are the same `Entity` type, so nothing but the call
+    // site says which allocator must free. `deinitRowWith` is that choice
+    // spelled out — and `std.testing.allocator` fails on any leak or invalid
+    // free, so this asserts the pairing instead of describing it.
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+    const TypeInfo = @import("codegen/graph.zig").TypeInfo;
+
+    const OwRow = Schema("OwRow", .{ .fields = &.{
+        field.Int("tenant_id"),
+        field.String("name"),
+    } });
+    const info = comptime fromSchema(OwRow);
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const root = @import("codegen/client.zig").makeClient(infos, allocator, driver.asDriver());
+    const client = root.ow_row;
+    var svc = Service.init(allocator, client);
+
+    const id = try svc.create(.{ .id = 0, .tenant_id = 1, .name = "owned" }, 1);
+
+    // The owned copy: freed with the allocator that produced it.
+    var got = (try svc.getOwned(allocator, 1, id)).?;
+    try std.testing.expectEqualStrings("owned", got.name);
+    client.deinitRowWith(allocator, &got);
+
+    // The client's own row: freed with the client's allocator, as before.
+    var q = client.Query();
+    defer q.deinit();
+    _ = try q.Where(.{client.predicates.idEQ(.{ .int = id })});
+    var rows = try q.All();
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    client.deinitRows(&rows);
+
+    // The manual pair stays available and equivalent.
+    var again = (try svc.getOwned(allocator, 1, id)).?;
+    deinitEntity(infos, info, &again, allocator);
 }

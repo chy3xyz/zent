@@ -232,6 +232,21 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             deinitEntity(infos, info, entity, self.allocator);
         }
 
+        /// Free one entity a client did **not** allocate, with the allocator
+        /// that did — the release for rows that carry their own allocator, such
+        /// as `CrudService.getOwned(allocator, …)`.
+        ///
+        /// The allocator is a parameter here precisely because it is not this
+        /// client's: `deinitRow` would free the same struct with a different
+        /// one, which is UB (an arena's state corrupted, or "free of invalid
+        /// memory" killing the process). Passing the wrong allocator is still
+        /// possible — nothing in the type says which one a given row came from
+        /// — but the call site now has to state which allocator it means.
+        pub fn deinitRowWith(self: Self, allocator: std.mem.Allocator, entity: *Entity) void {
+            _ = self;
+            deinitEntity(infos, info, entity, allocator);
+        }
+
         /// Free every entity in a page this client produced (`Query().All()`),
         /// plus the list itself. Safe to call twice; the list is left empty
         /// and reusable.
