@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.76.2] - 2026-09-24
+
 ### Fixed
 - **The dead-code gate is green again.** v0.76.1's new test file carried an
   unused `Dialect` import, which `scripts/check-deadcode.sh` reports as a new
