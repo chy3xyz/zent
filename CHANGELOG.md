@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.76.1] - 2026-09-24
+
 ### Fixed
 - **Three out-of-memory paths leaked.** All the same shape — ownership handed
   over by an earlier `try` while a later one in the same expression could still
