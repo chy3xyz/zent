@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Per-driver build options, so a consumer stops paying for drivers it does not
+  link.** `translate-c` over the driver headers is the bulk of a consumer's first
+  build — measured at ~26 s and ~590 MB peak **per driver**, and zent translated
+  one for every driver whose headers happened to be installed on the machine, so
+  a PostgreSQL-only deployment paid for three. Forward the options through the
+  dependency:
+
+  ```zig
+  const zent = b.dependency("zent", .{ .target = target, .optimize = optimize,
+                                       .sqlite = false, .mysql = false });
+  ```
+
+  The defaults are unchanged (headers present means translated), and turning off
+  a driver you *do* link fails with `no module named 'pg_c'` (or `sqlite3_c` /
+  `mysql_c`) at its first use. README's "Build cost, and how to cut it on a small
+  machine" has the full measurements — the per-step peaks, the cold-vs-warm
+  global cache, the roughly linear ~1.4 MB/entity of the codegen half, and the
+  `-j` knob for a memory-tight host.
+
 ## [0.75.0] - 2026-09-21
 
 ### Fixed

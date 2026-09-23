@@ -27,6 +27,18 @@ for f in README.md README_CN.md; do
   fi
 done
 
+# AGENTS.md carries the version too, and drifted for four releases (v0.74.0 →
+# v0.75.0) because nothing checked it: the file that tells an agent which
+# version it is working on was the one file the release flow did not touch.
+AGENTS_VERSION="$(sed -n 's/^- Version: \*\*v\([0-9.]*\)\*\*.*$/\1/p' AGENTS.md | head -1)"
+if [[ -z "$AGENTS_VERSION" ]]; then
+  echo "check-version: cannot read the version from AGENTS.md" >&2
+  fail=1
+elif [[ "$AGENTS_VERSION" != "$VERSION" ]]; then
+  echo "check-version: AGENTS.md says $AGENTS_VERSION but build.zig.zon is $VERSION" >&2
+  fail=1
+fi
+
 # The comptime mirror consumers read must match the package manifest.
 MIRROR="$(sed -n 's/^pub const version = "\([0-9.]*\)";$/\1/p' src/version.zig | head -1)"
 if [[ -z "$MIRROR" ]]; then

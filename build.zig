@@ -8,19 +8,35 @@ pub fn build(b: *std.Build) void {
     // Translate-C steps: convert C headers -> Zig binding modules
     // -------------------------------------------------------------
 
-    // sqlite3 — always available
-    const sqlite_tc = b.addTranslateC(.{
-        .root_source_file = b.path("src/sql/sqlite3_include.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    sqlite_tc.linkSystemLibrary("sqlite3", .{});
-    const sqlite_c_mod = sqlite_tc.createModule();
+    // Which driver bindings to translate. The default is unchanged — a driver
+    // whose headers are on the machine is translated — but "the headers are
+    // installed" is the wrong question for a build host: a PostgreSQL-only
+    // deployment was paying for three `translate-c` steps, which on a cold
+    // global cache is ~30 s and up to ~570 MB peak *each*, i.e. the bulk of a
+    // consumer's first build. A consumer that links one driver can now say so:
+    //   zig build -Dsqlite=false -Dmysql=false     // PostgreSQL only
+    // Turning off a driver you *do* link fails with "no module named
+    // sqlite3_c/pg_c/mysql_c" at the first use, which names the mistake.
+    const use_sqlite = b.option(bool, "sqlite", "translate the SQLite driver bindings (default: true)") orelse true;
+    const want_pg = b.option(bool, "pg", "translate the PostgreSQL driver bindings when libpq headers are present (default: true)") orelse true;
+    const want_mysql = b.option(bool, "mysql", "translate the MySQL driver bindings when the MariaDB/MySQL headers are present (default: true)") orelse true;
+
+    // sqlite3 — translated unless the consumer says it links no SQLite.
+    const sqlite_c_mod: ?*std.Build.Module = if (use_sqlite) blk: {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("src/sql/sqlite3_include.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        tc.linkSystemLibrary("sqlite3", .{});
+        break :blk tc.createModule();
+    } else null;
 
     // PostgreSQL client — optional, only if libpq headers are installed.
     var pg_include_dir: ?[]const u8 = null;
     var pg_lib_dir: ?[]const u8 = null;
     const pg_c_mod = blk: {
+        if (!want_pg) break :blk null;
         const info = discoverPg(b) orelse break :blk null;
         pg_include_dir = info.include_dir;
         pg_lib_dir = info.lib_dir;
@@ -39,6 +55,7 @@ pub fn build(b: *std.Build) void {
     var my_include_dir: ?[]const u8 = null;
     var my_lib_dir: ?[]const u8 = null;
     const my_c_mod = blk: {
+        if (!want_mysql) break :blk null;
         const info = discoverMySQL(b) orelse break :blk null;
         my_include_dir = info.include_dir;
         my_lib_dir = info.lib_dir;
@@ -61,7 +78,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    zent_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| zent_mod.addImport("sqlite3_c", sqlite_c);
     if (pg_c_mod) |m| zent_mod.addImport("pg_c", m);
     if (my_c_mod) |m| zent_mod.addImport("mysql_c", m);
 
@@ -81,7 +98,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    test_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| test_mod.addImport("sqlite3_c", sqlite_c);
     if (pg_c_mod) |m| test_mod.addImport("pg_c", m);
     if (my_c_mod) |m| test_mod.addImport("mysql_c", m);
     test_mod.addImport("build_options", build_options_mod);
@@ -103,7 +120,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     start_mod.addImport("zent", zent_mod);
-    start_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| start_mod.addImport("sqlite3_c", sqlite_c);
     start_mod.linkSystemLibrary("sqlite3", .{});
     const start_exe = b.addExecutable(.{
         .name = "start",
@@ -124,7 +141,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     complex_mod.addImport("zent", zent_mod);
-    complex_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| complex_mod.addImport("sqlite3_c", sqlite_c);
     complex_mod.linkSystemLibrary("sqlite3", .{});
     const complex_exe = b.addExecutable(.{
         .name = "complex",
@@ -145,7 +162,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pool_mod.addImport("zent", zent_mod);
-    pool_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| pool_mod.addImport("sqlite3_c", sqlite_c);
     pool_mod.linkSystemLibrary("sqlite3", .{});
     const pool_exe = b.addExecutable(.{
         .name = "pool",
@@ -166,7 +183,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     advanced_mod.addImport("zent", zent_mod);
-    advanced_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| advanced_mod.addImport("sqlite3_c", sqlite_c);
     advanced_mod.linkSystemLibrary("sqlite3", .{});
     const advanced_exe = b.addExecutable(.{
         .name = "advanced",
@@ -188,7 +205,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     migrate_mod.addImport("zent", zent_mod);
-    migrate_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| migrate_mod.addImport("sqlite3_c", sqlite_c);
     if (pg_c_mod) |m| migrate_mod.addImport("pg_c", m);
     if (my_c_mod) |m| migrate_mod.addImport("mysql_c", m);
     migrate_mod.addImport("build_options", build_options_mod);
@@ -220,7 +237,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     interceptor_mod.addImport("zent", zent_mod);
-    interceptor_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| interceptor_mod.addImport("sqlite3_c", sqlite_c);
     interceptor_mod.linkSystemLibrary("sqlite3", .{});
     const interceptor_exe = b.addExecutable(.{
         .name = "interceptor",
@@ -244,7 +261,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     check_sql_cli_mod.addImport("zent", zent_mod);
-    check_sql_cli_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| check_sql_cli_mod.addImport("sqlite3_c", sqlite_c);
     if (pg_c_mod) |m| check_sql_cli_mod.addImport("pg_c", m);
     if (my_c_mod) |m| check_sql_cli_mod.addImport("mysql_c", m);
     check_sql_cli_mod.addImport("build_options", build_options_mod);
@@ -286,7 +303,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     bench_mod.addImport("zent", zent_mod);
-    bench_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| bench_mod.addImport("sqlite3_c", sqlite_c);
     bench_mod.linkSystemLibrary("sqlite3", .{});
     const bench_exe = b.addExecutable(.{
         .name = "benchmark",
@@ -314,7 +331,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     integ_mod.addImport("zent", zent_mod);
-    integ_mod.addImport("sqlite3_c", sqlite_c_mod);
+    if (sqlite_c_mod) |sqlite_c| integ_mod.addImport("sqlite3_c", sqlite_c);
     if (pg_c_mod) |m| integ_mod.addImport("pg_c", m);
     if (my_c_mod) |m| integ_mod.addImport("mysql_c", m);
     integ_mod.addImport("build_options", build_options_mod);

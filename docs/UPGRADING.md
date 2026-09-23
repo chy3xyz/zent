@@ -94,6 +94,9 @@ use `field.JSON(name, T)`; untyped documents use `field.JSONValue(name)`
 
 ## 7a. Comptime budget (large schemas)
 
+- Build cost is dominated by driver-header translation, not by the comptime
+  budget below — see README "Build cost, and how to cut it on a small machine"
+  (`-Dsqlite=false` / `-Dpg=false` / `-Dmysql=false`, the global cache, `-j`).
 - Codegen runs under `@setEvalBranchQuota(1_000_000)` in
   `src/codegen/graph.zig` and `src/codegen/predicate.zig`.
 - **Measured limits** (enforced by the "Graph stress" tests in

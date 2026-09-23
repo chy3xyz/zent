@@ -247,6 +247,58 @@ After every zent release the pinned hash must be refreshed:
 zig fetch --save git+https://github.com/chy3xyz/zent.git#vX.Y.Z
 ```
 
+### Build cost, and how to cut it on a small machine
+
+Most of a consumer's **first** build is not zent's codegen — it is `translate-c`
+over the driver headers, one process per driver, and zent translates one for
+every driver whose headers are installed on the machine. Measured with a
+consumer-style project (80 entities, macOS/arm64, empty `ZIG_GLOBAL_CACHE_DIR`):
+
+| Step | Wall | Peak RSS |
+|---|---|---|
+| `translate-c`, one driver (sqlite3, libpq or mariadb-connector-c) | ~26 s | ~590 MB |
+| the consumer's own compile — zent codegen for 80 entities | ~4 s | ~440 MB |
+
+With a warm global cache the same build is ~13 s / ~384 MB, and the codegen half
+grows roughly linearly: ~+1.4 MB and ~+0.1 s per entity (20 / 40 / 80 entities
+measured at 7.8 s / 298 MB, 9.0 s / 319 MB, 12.6 s / 384 MB). So a
+memory-constrained build host is usually fighting the header translation, not
+the comptime work.
+
+Three knobs, in the order they pay off:
+
+1. **Translate only the drivers you link.** Each enabled driver is one
+   `translate-c` process and they run concurrently, so a box with all three sets
+   of headers installed pays that peak three times over at once. Forward the
+   options through the dependency:
+
+   ```zig
+   const zent = b.dependency("zent", .{
+       .target = target,
+       .optimize = optimize,
+       .sqlite = false, // a PostgreSQL-only deployment
+       .mysql = false,
+   });
+   ```
+
+   The defaults are unchanged — a driver whose headers are present is
+   translated — and turning off a driver you *do* link fails with
+   `no module named 'pg_c'` (or `sqlite3_c` / `mysql_c`) at its first use, which
+   names the mistake.
+
+2. **Keep the global cache.** `ZIG_GLOBAL_CACHE_DIR` on a persistent volume makes
+   the translation a one-off per machine instead of per build — ~75 MB for one
+   driver set — and a cache-less build also recompiles the build runner, which
+   was ~60 s of the 87 s first build above.
+
+3. **Cap the concurrency**: `zig build -j2` (or `-j1`) on a memory-tight host.
+   The peak above is per process, so what a small VM runs out of is the sum.
+   Slower, but it fits.
+
+Unrelated but worth knowing: `zig build test` in the zent repository itself peaks
+around 1 GB, because it compiles every test root at once. Run that in CI, not on
+the machine that ships the service.
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
