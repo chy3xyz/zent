@@ -95,6 +95,9 @@ be set up at all on one server, create it only there and say why in a comment.
 | `_ = <error union>` | `try` / `catch` (bare statement OK, `_ =` is not) |
 | unused fn params | `_`-prefix them (0.17 errors otherwise) |
 | query rows | `All()` returns `std.array_list.Managed(Entity)`: `deinitEntity` per item, then `users.deinit()` (never pair a per-item free with a slice free) |
+| `std.array_list.Managed` (204 sites) | **Not** deprecated in 0.17 — it is the owning-list wrapper, while `std.ArrayList` is the unmanaged shape. Do not mass-migrate for style |
+| `std.time.Instant` / `std.time.timestamp()` | Gone in 0.17 (clocks live under `std.Io.Clock`). The clock sources are libc (`std.c.clock_gettime` / `gettimeofday`) with a documented fallback in `sql/driver.zig` and `sql/logger.zig` — not a defect to "fix" into `std.time` |
+| allocation-failure coverage | `src/test/allocation_failures.zig` fails every allocation in turn and holds the byte ledger (0.17's `std.testing.checkAllAllocationFailures`). Add a path there when you add an assembly routine; it found three leaks in `sql/builder.zig` on its first run |
 
 ## Memory ownership
 

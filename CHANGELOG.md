@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Three out-of-memory paths leaked.** All the same shape — ownership handed
+  over by an earlier `try` while a later one in the same expression could still
+  fail:
+
+  | Site | Leaked |
+  |---|---|
+  | `Builder.initCapacity` (`sql/builder.zig`) | the SQL buffer, when the *args* preallocation failed |
+  | `Builder.takeQuery` | the SQL slice, when the args `toOwnedSlice` failed — and the list it came from no longer owned it |
+  | `Selector.init` | the builder's two buffers, when the select-column preallocation failed |
+
+  Each is unconditional (OOM is the only trigger) and invisible in every
+  non-OOM run. Found by the new allocation-failure sweep rather than by
+  inspection: `std.testing.checkAllAllocationFailures` fails every allocation in
+  turn and holds the byte ledger, so it names the index and the bytes rather
+  than "a leak somewhere".
+
+### Added
+- **`src/test/allocation_failures.zig`**: the sweep above, over three assembly
+  paths — `scope.forTable` (a scoped fragment: predicates, then the builder
+  buffer, then the ownership hand-over), `scope.withClause` (a second owned copy
+  of the same fragment) and an assembled `SELECT` (identifiers, predicates,
+  bound args, `takeQuery`). This is the mechanical version of a hunt that has
+  been done by hand before — the insert log sites, the eager-load cleanup,
+  `CrudService`'s partial-dupe teardown — and it found three defects on its
+  first run. More paths are worth adding: the same file documents which.
+
 ## [0.76.0] - 2026-09-24
 
 ### Added

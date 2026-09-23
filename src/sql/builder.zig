@@ -41,6 +41,13 @@ pub const Builder = struct {
     /// the default of 0 keeps every existing output byte-identical.
     arg_base: usize = 0,
 
+    /// Cannot fail: the two capacities below are an optimization, and a
+    /// failure here falls back to empty lists whose first append reports the
+    /// out-of-memory (every caller writes something before it reads). A
+    /// previous version leaked the SQL buffer when the *second* preallocation
+    /// failed — the struct literal had already taken ownership of the first —
+    /// which `std.testing.checkAllAllocationFailures` in
+    /// `src/test/allocation_failures.zig` now pins.
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect) Builder {
         return initCapacity(allocator, 256, 8, dialect) catch Builder{
             .allocator = allocator,
@@ -53,9 +60,13 @@ pub const Builder = struct {
     /// Pre-allocate the buffer and args arrays to avoid repeated reallocs
     /// while the SQL string is being assembled item-by-item.
     pub fn initCapacity(allocator: std.mem.Allocator, sql_cap: usize, args_cap: usize, dialect: Dialect) !Builder {
+        var buffer = try std.array_list.Managed(u8).initCapacity(allocator, sql_cap);
+        // The args list is allocated second, so a failure there has to release
+        // the buffer the first `try` already handed to this frame.
+        errdefer buffer.deinit();
         return .{
             .allocator = allocator,
-            .buffer = try std.array_list.Managed(u8).initCapacity(allocator, sql_cap),
+            .buffer = buffer,
             .args = try std.array_list.Managed(Value).initCapacity(allocator, args_cap),
             .dialect = dialect,
         };
@@ -73,9 +84,17 @@ pub const Builder = struct {
     /// Transfer ownership of the SQL buffer and args to the caller. After this
     /// call the Builder is in a valid but empty state; the caller MUST call
     /// `OwnedQuery.deinit` (typically via `defer`) to free the memory.
+    ///
+    /// The two conversions are ordered and guarded: `toOwnedSlice` **moves**
+    /// the memory out of the list, so a failure of the second one has to free
+    /// what the first already handed over (the list it came from no longer
+    /// owns it, and the caller never received it). Measured by
+    /// `checkAllAllocationFailures` in `src/test/allocation_failures.zig`.
     pub fn takeQuery(b: *Builder) !OwnedQuery {
+        const sql = try b.buffer.toOwnedSlice();
+        errdefer b.allocator.free(sql);
         return .{
-            .sql = try b.buffer.toOwnedSlice(),
+            .sql = sql,
             .args = try b.args.toOwnedSlice(),
             .allocator = b.allocator,
             .dialect = b.dialect,
@@ -951,9 +970,23 @@ pub const Selector = struct {
     cte_dialect: ?Dialect = null,
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, columns: []const ColumnRef) !Selector {
+        // The two allocations that can fail are made inside a block whose
+        // errdefers cover exactly the window where neither is owned by a
+        // `Selector` yet. Written as a struct literal they leaked: `.b` is
+        // evaluated first, so a failure of `.columns` left the builder's two
+        // buffers unreachable (`checkAllAllocationFailures` in
+        // `src/test/allocation_failures.zig` pins this).
+        var b: Builder = undefined;
+        var columns_buf: std.array_list.Managed(ColumnRef) = undefined;
+        {
+            b = try Builder.initCapacity(allocator, 512, 16, dialect);
+            errdefer b.deinit();
+            columns_buf = try std.array_list.Managed(ColumnRef).initCapacity(allocator, columns.len);
+            errdefer columns_buf.deinit();
+        }
         var s = Selector{
-            .b = try Builder.initCapacity(allocator, 512, 16, dialect),
-            .columns = try std.array_list.Managed(ColumnRef).initCapacity(allocator, columns.len),
+            .b = b,
+            .columns = columns_buf,
             .table = null,
             .joins = std.array_list.Managed(Join).init(allocator),
             .predicates = std.array_list.Managed(Predicate).init(allocator),
@@ -968,6 +1001,7 @@ pub const Selector = struct {
             .ctes = std.array_list.Managed(CTE).init(allocator),
             .cte_dialect = null,
         };
+        errdefer s.deinit();
         try s.columns.appendSlice(columns);
         return s;
     }
