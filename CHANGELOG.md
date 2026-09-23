@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-09-24
+
 ### Added
 - **Per-driver build options, so a consumer stops paying for drivers it does not
   link.** `translate-c` over the driver headers is the bulk of a consumer's first
