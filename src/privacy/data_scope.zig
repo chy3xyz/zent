@@ -21,6 +21,7 @@ const std = @import("std");
 const sql = @import("../sql/builder.zig");
 const privacy = @import("policy.zig");
 const rtp = @import("../runtime/privacy.zig");
+const zent_log = @import("../runtime/log.zig");
 
 /// Data scope semantics, mirroring Rbac.DataScope / zmsaas DataPermission.
 pub const DataScope = enum {
@@ -102,7 +103,7 @@ pub const DataScopeFilter = struct {
                     // (An empty IN list is not portable SQL either: PostgreSQL
                     // and MySQL reject `dept_id IN ()` as a syntax error, and
                     // SQLite accepts it and matches nothing.)
-                    std.log.warn(
+                    zent_log.warn(
                         "data scope: the dept list is empty, so the scope matches no department; denying it rather than reading as no restriction (use `.all` for an unrestricted scope)",
                         .{},
                     );
@@ -117,7 +118,7 @@ pub const DataScopeFilter = struct {
                     // as an unrestricted query. Deny instead and say why, the
                     // same way `runtime.privacy.evalPolicy` handles a policy
                     // with more filters than it can hold.
-                    std.log.warn(
+                    zent_log.warn(
                         "data scope: {d} dept ids exceed max_dept_ids ({d}); denying the scope rather than truncating or dropping it",
                         .{ self.dept_ids.len, max_dept_ids },
                     );
@@ -149,7 +150,7 @@ pub const DataScopeFilter = struct {
     /// restriction" — an unscoped query over every row.
     fn call(ctx: rtp.PrivacyContext) ?*const anyopaque {
         const extra = ctx.extra orelse {
-            std.log.warn(
+            zent_log.warn(
                 "data scope: the privacy context carries no DataScopeFilter; denying the scope instead of leaving the query unscoped",
                 .{},
             );
@@ -378,12 +379,41 @@ test "DataScopeFilter over-long dept list fails closed, not open" {
     try testing.expectEqual(@as(usize, max_dept_ids), out2.args.len);
 }
 
+/// Captures the line `zent_log` routes, so this module's diagnostics can be
+/// asserted as text and not only through their effect on the query.
+const LogCapture = struct {
+    var level: zent_log.Level = .info;
+    var count: usize = 0;
+    var text: [512]u8 = undefined;
+    var len: usize = 0;
+
+    fn sink(l: zent_log.Level, message: []const u8) void {
+        level = l;
+        count += 1;
+        len = @min(message.len, text.len);
+        @memcpy(text[0..len], message[0..len]);
+    }
+
+    fn reset() void {
+        count = 0;
+        len = 0;
+    }
+
+    fn last() []const u8 {
+        return text[0..len];
+    }
+};
+
 test "DataScopeFilter empty dept list fails closed, not open" {
     // `.all` is a first-class way to say "no restriction", so an empty dept
     // list has no second meaning to carry: it says the caller sits in no
     // department, i.e. sees no rows. It used to leave `pred` null — the value
     // that spells "no restriction" — and so ran the query over every row.
+    zent_log.setSink(LogCapture.sink);
+    defer zent_log.setSink(null);
+
     inline for (.{ .dept_custom, .dept_and_child }) |scope| {
+        LogCapture.reset();
         var f = DataScopeFilter.init("dept_id", "owner_id", scope, .{ .dept_ids = &.{} });
         var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
         defer b.deinit();
@@ -397,6 +427,16 @@ test "DataScopeFilter empty dept list fails closed, not open" {
         // by handing a predicate over, so the empty list must not answer null.
         const ctx = f.context(.{ .user_id = 7 });
         try testing.expect(DataScopeFilter.call(ctx) != null);
+
+        // The deny is explained on the sink the module routes to, once per
+        // materialization, with the same text the default `std.log` path
+        // prints. A call site left on `std.log` would leave the sink empty.
+        try testing.expectEqual(@as(usize, 1), LogCapture.count);
+        try testing.expectEqual(zent_log.Level.warn, LogCapture.level);
+        try testing.expectEqualStrings(
+            "data scope: the dept list is empty, so the scope matches no department; denying it rather than reading as no restriction (use `.all` for an unrestricted scope)",
+            LogCapture.last(),
+        );
     }
 }
 

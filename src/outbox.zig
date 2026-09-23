@@ -29,6 +29,7 @@ const TypeInfo = @import("codegen/graph.zig").TypeInfo;
 const deinitEntity = @import("codegen/entity.zig").deinitEntity;
 const sql_driver = @import("sql/driver.zig");
 const sql = @import("sql/builder.zig");
+const zent_log = @import("runtime/log.zig");
 
 /// Outbox table schema - include this type in your schema list so the
 /// generated client exposes the `outbox_message` entity.
@@ -468,7 +469,7 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
                     // without this line "the queue was empty" and "every row
                     // failed" produce the same `0` and the publisher's reason
                     // never reaches a log anywhere.
-                    std.log.warn(
+                    zent_log.warn(
                         "outbox: publish failed for row {d} (event '{s}', attempt {d}/{d}): {s}",
                         .{ e.id, e.event_type, next, max_attempts, @errorName(err) },
                     );

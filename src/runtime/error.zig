@@ -1,4 +1,5 @@
 const std = @import("std");
+const zent_log = @import("log.zig");
 
 /// Centralized error set for zent ORM.
 ///
@@ -47,7 +48,7 @@ pub fn formatError(err: anyerror) []const u8 {
 
 /// Wrapper that logs and returns the error.
 pub fn logAndReturn(comptime src: std.builtin.SourceLocation, err: anyerror) anyerror {
-    std.log.err("zent error at {s}:{d}: {s}", .{ src.file, src.line, @errorName(err) });
+    zent_log.err("zent error at {s}:{d}: {s}", .{ src.file, src.line, @errorName(err) });
     return err;
 }
 
