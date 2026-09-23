@@ -33,6 +33,7 @@ const sql_driver = @import("sql/driver.zig");
 const Value = @import("sql/builder.zig").Value;
 const deinitEntity = @import("codegen/entity.zig").deinitEntity;
 const deinitEntityList = @import("codegen/entity.zig").deinitEntityList;
+const zent_log = @import("runtime/log.zig");
 
 /// Resolve the `QueryError!?Entity` result type of an entity accessor's
 /// `Query()` builder via its `First()` method signature.
@@ -541,7 +542,7 @@ pub fn withTx(
 
     execTxCallback(tx_fn, &tx) catch |err| {
         tx.rollback() catch |rb_err| {
-            std.log.warn(
+            zent_log.warn(
                 "crud_helpers.withTx: rollback failed after the callback returned '{s}' ({s}); the transaction may still be open on the connection",
                 .{ @errorName(err), @errorName(rb_err) },
             );
