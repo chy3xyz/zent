@@ -69,6 +69,10 @@ pub const runtime = struct {
     pub const intercept = @import("runtime/intercept.zig");
     pub const err = @import("runtime/error.zig");
     pub const privacy = @import("runtime/privacy.zig");
+    /// Where this library's own diagnostics go: `std.log` by default, an
+    /// installable sink otherwise (`zent.runtime.log.setSink`). See
+    /// `runtime/log.zig` for why a library needs its own.
+    pub const log = @import("runtime/log.zig");
 };
 
 pub const graph = struct {
@@ -114,4 +118,7 @@ test {
     // because the modules above expose generated types rather than namespaces.
     _ = @import("codegen/query_aggregate_test.zig");
     _ = @import("test/allocation_failures.zig");
+    // `refAllDecls` above reaches one level, so a test inside a *nested*
+    // namespace (`runtime.log`) is only run when its file is imported here.
+    _ = @import("runtime/log.zig");
 }
