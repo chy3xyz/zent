@@ -51,6 +51,9 @@ sed -i '' "s/^pub const version = \"$OLD\";$/pub const version = \"$VERSION\";/"
 for f in README.md README_CN.md; do
     if [[ -f "$f" ]]; then sed -i '' "s/$OLD/$VERSION/g" "$f"; fi
 done
+# AGENTS.md carries the version too, and scripts/check-version.sh checks it —
+# it drifted for four releases (v0.74.0 → v0.75.0) while nothing looked at it.
+sed -i '' "s/^- Version: \*\*v$OLD\*\*/- Version: **v$VERSION**/" AGENTS.md
 
 # 2. CHANGELOG: promote Unreleased to the new version.
 if ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
