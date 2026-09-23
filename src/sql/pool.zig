@@ -10,6 +10,7 @@ const assert = std.debug.assert;
 const driver = @import("driver.zig");
 const Dialect = @import("dialect.zig").Dialect;
 const Value = @import("builder.zig").Value;
+const zent_log = @import("../runtime/log.zig");
 
 extern fn time(time_t: [*c]c_long) c_long;
 
@@ -780,7 +781,7 @@ pub fn ConnPool(comptime D: type) type {
                 @intCast(@max(start.untilNow(io).raw.toMilliseconds(), 0))
             else
                 0;
-            std.log.warn(
+            zent_log.warn(
                 "zent pool: no connection could be handed out after {d} attempt(s) and {d} ms of waiting: {s}",
                 .{ attempt + 1, waited_ms, @errorName(reason) },
             );
@@ -2952,8 +2953,37 @@ test "an unusable factory reports its own error instead of PoolExhausted" {
     }
     // Nothing is available and the pool is below its ceiling, so this one has to
     // open a connection — and the factory refuses.
+    //
+    // The line this failure produces is the one a consumer greps for, and it
+    // travels through `runtime.log` like every other diagnostic in this
+    // directory. Pin its text here: a sink is the only way to read the pool's
+    // own copy back, and without this a rewording is invisible until someone's
+    // log gate breaks.
+    const Capture = struct {
+        var level: zent_log.Level = .warn;
+        var count: usize = 0;
+        var message: [256]u8 = undefined;
+        var len: usize = 0;
+
+        fn sink(l: zent_log.Level, text: []const u8) void {
+            level = l;
+            count += 1;
+            len = @min(text.len, message.len);
+            @memcpy(message[0..len], text[0..len]);
+        }
+    };
+    Capture.count = 0;
+    zent_log.setSink(Capture.sink);
+    defer zent_log.setSink(null);
+
     try std.testing.expectError(error.ConnectionFailed, pool.borrow());
     try std.testing.expectEqual(@as(?anyerror, error.ConnectionFailed), seen);
+    try testing.expectEqual(@as(usize, 1), Capture.count);
+    try testing.expectEqual(zent_log.Level.warn, Capture.level);
+    try testing.expectEqualStrings(
+        "zent pool: no connection could be handed out after 1 attempt(s) and 0 ms of waiting: ConnectionFailed",
+        Capture.message[0..Capture.len],
+    );
     try testing.expectEqual(@as(u64, 1), pool.stats().exhausted_total);
     pool.release(first);
     {

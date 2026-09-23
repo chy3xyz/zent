@@ -4,6 +4,7 @@ const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
 const cache_mod = @import("cache.zig");
+const zent_log = @import("../runtime/log.zig");
 
 const PreparedCache = cache_mod.PreparedCache;
 
@@ -55,7 +56,7 @@ const ReportedRows = struct {
 fn reportedRowsFromCommandTag(tag: []const u8) error{DriverFailed}!ReportedRows {
     if (tag.len == 0) return .{ .rows = 0, .known = false };
     const rows = std.fmt.parseInt(usize, tag, 10) catch {
-        std.log.warn("postgres: PQcmdTuples reported a row count of '{s}', which is not a number", .{tag});
+        zent_log.warn("postgres: PQcmdTuples reported a row count of '{s}', which is not a number", .{tag});
         return error.DriverFailed;
     };
     return .{ .rows = rows, .known = true };
@@ -121,7 +122,7 @@ pub const PostgresDriver = struct {
             // warn (not err): a refused connection is an expected, recoverable
             // outcome (server not running / integration-test skip path), and
             // the test framework fails on err-level logs even in skipped tests.
-            std.log.warn("postgres connect failed: {s}", .{std.mem.span(msg)});
+            zent_log.warn("postgres connect failed: {s}", .{std.mem.span(msg)});
             return error.PostgresConnectFailed;
         }
         // Set client encoding to UTF8 for consistent text handling.
@@ -162,7 +163,7 @@ pub const PostgresDriver = struct {
         // alerts on it — and, concretely, a test could not exercise a failure path at
         // all, because Zig's test runner treats a logged error as a test failure.
         // `connect` failures have been `warn` for the same reason.
-        std.log.warn("postgres error ({s}): {s}", .{ context, std.mem.span(msg) });
+        zent_log.warn("postgres error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
     /// Extract diagnostic detail from a PGresult for richer error logging.
@@ -172,7 +173,7 @@ pub const PostgresDriver = struct {
         const detail = if (result) |r| c.PQresultErrorField(r, c.PG_DIAG_MESSAGE_DETAIL) else null;
         if (table != null or column != null) {
             if (detail) |d| {
-                std.log.warn("postgres ({s}) table={s} col={s}: {s}", .{
+                zent_log.warn("postgres ({s}) table={s} col={s}: {s}", .{
                     context,
                     if (table) |t| std.mem.span(t) else "?",
                     if (column) |col| std.mem.span(col) else "?",
@@ -400,7 +401,7 @@ pub const PostgresDriver = struct {
             const hash = std.hash.Wyhash.hash(0, sql);
             var name_buf: [20]u8 = std.mem.zeroes([20]u8);
             const name_str = std.fmt.bufPrint(&name_buf, "p_{x}", .{hash}) catch {
-                std.log.err("postgres: bufPrint for prepared name failed", .{});
+                zent_log.err("postgres: bufPrint for prepared name failed", .{});
                 return error.DriverFailed;
             };
             const name_z: [*:0]const u8 = @ptrCast(name_str.ptr);
@@ -823,7 +824,7 @@ const PostgresSavepoint = struct {
 
     fn deinit(self: *PostgresSavepoint) void {
         self.rollback() catch |err| {
-            std.log.warn("postgres savepoint deinit: rollback failed ({s})", .{@errorName(err)});
+            zent_log.warn("postgres savepoint deinit: rollback failed ({s})", .{@errorName(err)});
         };
         self.driver.allocator.free(self.name);
         self.driver.allocator.destroy(self);
@@ -852,7 +853,7 @@ const PostgresTx = struct {
         const self: *PostgresTx = @ptrCast(@alignCast(ptr));
         if (self.state == .active) {
             _ = self.driver.exec("ROLLBACK", &.{}) catch |err| {
-                std.log.warn("postgres tx deinit: rollback failed ({s})", .{@errorName(err)});
+                zent_log.warn("postgres tx deinit: rollback failed ({s})", .{@errorName(err)});
             };
         }
         self.driver.allocator.destroy(self);

@@ -6,6 +6,7 @@ const EdgeInfo = @import("../../codegen/graph.zig").EdgeInfo;
 const Dialect = @import("../dialect.zig").Dialect;
 const sql_driver = @import("../driver.zig");
 const Value = @import("../builder.zig").Value;
+const zent_log = @import("../../runtime/log.zig");
 
 extern fn time(time_t: [*c]c_long) c_long;
 
@@ -1278,7 +1279,7 @@ pub fn assertSchema(
     defer freeSchemaDrift(allocator, drifts);
     for (drifts) |d| {
         if (strictness == .read_breaking_only and !d.breaksReads()) continue;
-        std.log.warn("zent: schema drift on {s}.{s}: {s}{s}{s}", .{
+        zent_log.warn("zent: schema drift on {s}.{s}: {s}{s}{s}", .{
             d.table,
             if (d.column.len > 0)
                 d.column
@@ -1402,7 +1403,7 @@ fn reportNullabilityDrift(drifts: []const NullabilityDrift) void {
     var breaking: usize = 0;
     for (drifts) |d| {
         if (d.breaksReads()) breaking += 1;
-        std.log.debug(
+        zent_log.debug(
             "zent: nullability drift on {s}.{s}: schema says {s}, database says {s}",
             .{
                 d.table,
@@ -1412,7 +1413,7 @@ fn reportNullabilityDrift(drifts: []const NullabilityDrift) void {
             },
         );
     }
-    std.log.warn(
+    zent_log.warn(
         "zent: {d} column(s) differ in nullability between the schema and the database{s}; call sql_schema.checkNullability for the list",
         .{
             drifts.len,
@@ -1589,19 +1590,19 @@ pub fn findMySqlTextRestriction(table: TableDef, indexes: []const IndexDef, dial
 /// error anyway.
 fn reportMySqlTextRestriction(restriction: MySqlTextRestriction) MySqlTextError {
     switch (restriction.kind) {
-        .default_value => std.log.warn(
+        .default_value => zent_log.warn(
             "zent: MySQL rejects a DEFAULT on {s}.{s} ({s}, errno 1101: BLOB/TEXT/JSON cannot have a default value); use field.String (VARCHAR(255) on MySQL) or drop the default",
             .{ restriction.table, restriction.column, restriction.sql_type },
         ),
-        .unique => std.log.warn(
+        .unique => zent_log.warn(
             "zent: MySQL cannot index {s}.{s} ({s}, errno 1170: BLOB/TEXT/JSON key specification without a key length), so its UNIQUE constraint has no DDL; use field.String (VARCHAR(255) on MySQL) or drop the uniqueness",
             .{ restriction.table, restriction.column, restriction.sql_type },
         ),
-        .primary_key => std.log.warn(
+        .primary_key => zent_log.warn(
             "zent: MySQL cannot index {s}.{s} ({s}, errno 1170: BLOB/TEXT/JSON key specification without a key length), so it cannot be a PRIMARY KEY; use field.String or a narrower type",
             .{ restriction.table, restriction.column, restriction.sql_type },
         ),
-        .index => std.log.warn(
+        .index => zent_log.warn(
             "zent: MySQL cannot index {s}.{s} ({s}, errno 1170: BLOB/TEXT/JSON key specification without a key length), so index {s} cannot be created; use field.String (VARCHAR(255) on MySQL) or drop the column from the index",
             .{ restriction.table, restriction.column, restriction.sql_type, restriction.index_name },
         ),
@@ -1754,7 +1755,7 @@ fn lockMigration(drv: sql_driver.Driver, timeout_ms: u32) MigrationLockError!boo
         var waited: u32 = 0;
         while (true) {
             var rows = drv.query(sql, &.{}) catch |err| {
-                std.log.warn("zent migrations: pg advisory lock unavailable ({s}); continuing without lock", .{@errorName(err)});
+                zent_log.warn("zent migrations: pg advisory lock unavailable ({s}); continuing without lock", .{@errorName(err)});
                 return false;
             };
             defer rows.deinit();
@@ -1774,7 +1775,7 @@ fn lockMigration(drv: sql_driver.Driver, timeout_ms: u32) MigrationLockError!boo
         const secs: u32 = @max(1, timeout_ms / 1000);
         const sql = std.fmt.bufPrint(&sql_buf, "SELECT GET_LOCK('{s}', {d})", .{ mysql_lock_name, secs }) catch return false;
         var rows = drv.query(sql, &.{}) catch |err| {
-            std.log.warn("zent migrations: MySQL GET_LOCK unavailable ({s}); continuing without lock", .{@errorName(err)});
+            zent_log.warn("zent migrations: MySQL GET_LOCK unavailable ({s}); continuing without lock", .{@errorName(err)});
             return false;
         };
         defer rows.deinit();
@@ -1783,7 +1784,7 @@ fn lockMigration(drv: sql_driver.Driver, timeout_ms: u32) MigrationLockError!boo
             if (v == 1) return true;
             if (v == 0) return error.MigrationLockTimeout;
         }
-        std.log.warn("zent migrations: MySQL GET_LOCK returned NULL; continuing without lock", .{});
+        zent_log.warn("zent migrations: MySQL GET_LOCK returned NULL; continuing without lock", .{});
         return false;
     }
 
@@ -1798,13 +1799,13 @@ fn unlockMigration(drv: sql_driver.Driver) void {
         var sql_buf: [128]u8 = undefined;
         const sql = std.fmt.bufPrint(&sql_buf, "SELECT pg_advisory_unlock({d})", .{advisory_lock_key}) catch return;
         _ = drv.exec(sql, &.{}) catch |err| {
-            std.log.warn("zent migrations: pg advisory unlock failed ({s})", .{@errorName(err)});
+            zent_log.warn("zent migrations: pg advisory unlock failed ({s})", .{@errorName(err)});
         };
     } else if (std.mem.eql(u8, name, "mysql")) {
         var sql_buf: [160]u8 = undefined;
         const sql = std.fmt.bufPrint(&sql_buf, "SELECT RELEASE_LOCK('{s}')", .{mysql_lock_name}) catch return;
         _ = drv.exec(sql, &.{}) catch |err| {
-            std.log.warn("zent migrations: MySQL RELEASE_LOCK failed ({s})", .{@errorName(err)});
+            zent_log.warn("zent migrations: MySQL RELEASE_LOCK failed ({s})", .{@errorName(err)});
         };
     }
 }
@@ -1818,7 +1819,7 @@ fn verifyFileChecksums(applied: []const AppliedMigration, files: []const Migrati
             if (m.version != f.version) continue;
             if (m.checksum) |stored| {
                 if (!std.mem.eql(u8, stored, f.checksum)) {
-                    std.log.warn(
+                    zent_log.warn(
                         "zent migrations: checksum mismatch for migration {d} ({s}): recorded {s}, file now {s}; refusing to continue",
                         .{ f.version, f.name, stored, f.checksum },
                     );
@@ -2646,7 +2647,7 @@ fn sqlitePragmaNameUsable(name: []const u8) bool {
 /// `warn`, because this is a diagnostic the caller is about to see as a
 /// returned error, not a failed statement of its own.
 fn reportUnusableSqliteName(pragma: []const u8, table_name: []const u8) void {
-    std.log.warn(
+    zent_log.warn(
         "zent: refusing to build SQLite PRAGMA {s} for table {s} — the name contains a quote or NUL that would end the statement early; rename the table or reach it through a dialect that binds the name",
         .{ pragma, table_name },
     );
@@ -3527,7 +3528,7 @@ fn alterTableAddColumnSQL(
             // `warn`, like the drift report: an `err` line is what a failing
             // migration says, and the error this returns is the signal — the
             // log only adds the column name an error tag cannot carry.
-            std.log.warn(
+            zent_log.warn(
                 "zent: cannot add NOT NULL column {s}.{s} without a DEFAULT — the rows already in the table have no value to take; give the field a default, or make it Optional() and backfill it yourself",
                 .{ table_name, col.name },
             );
@@ -3911,7 +3912,7 @@ fn planMigrateStatements(
                 // and one junction deserves one warning.
                 if (comptime std.mem.lessThan(u8, info.table_name, toSnakeCase(e.target_name))) {
                     if (comptime junctionNameOwner(infos, jtable)) |owner| {
-                        std.log.warn(
+                        zent_log.warn(
                             "zent: the M2M edge {s} <-> {s} joins through '{s}', which is already the table of entity {s}; the junction's CREATE TABLE IF NOT EXISTS is a no-op and the relation query will read that table's columns — give the entity a different table name or rename one side",
                             .{ info.table_name, comptime toSnakeCase(e.target_name), jtable.name, owner.name },
                         );
@@ -4098,7 +4099,7 @@ fn planUniqueColumnIndex(
         // prefix would change what the UNIQUE index means. The create-table
         // path warns for the same column; skipping keeps the migration alive
         // on a server that refuses the index outright.
-        std.log.warn(
+        zent_log.warn(
             "zent: MySQL cannot index {s}.{s} ({s}, errno 1170), so no UNIQUE index was created for it; use field.String (VARCHAR(255) on MySQL) or drop the uniqueness",
             .{ table.name, col.name, columnSQLType(col, dialect) },
         );

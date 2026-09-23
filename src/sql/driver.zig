@@ -2,6 +2,7 @@ const std = @import("std");
 const Value = @import("builder.zig").Value;
 const OwnedQuery = @import("builder.zig").OwnedQuery;
 const Dialect = @import("dialect.zig").Dialect;
+const zent_log = @import("../runtime/log.zig");
 
 pub const Result = struct {
     rows_affected: usize,
@@ -381,7 +382,7 @@ pub fn monotonicNs() i64 {
     // ReleaseFast and would abort the process in ReleaseSafe. Degrade to the
     // wall clock (non-monotonic, so deadline arithmetic is approximate) and
     // say so rather than trapping.
-    std.log.warn("clock_gettime(CLOCK_MONOTONIC) failed; timing falls back to the wall clock", .{});
+    zent_log.warn("clock_gettime(CLOCK_MONOTONIC) failed; timing falls back to the wall clock", .{});
     if (readClockNs(std.c.CLOCK.REALTIME)) |ns| return ns;
     // Both clocks failed: report 0 so deadlines computed from here still
     // compare consistently (a deadline is `now + budget`).
