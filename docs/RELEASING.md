@@ -19,8 +19,16 @@ Manual equivalent:
 ```bash
 scripts/bump-version.sh 0.19.0   # bumps + tags locally
 bash scripts/check-version.sh    # CI gate, verifies docs + tag/version order
+ZMODU=<zmodu> bash scripts/check-deadcode.sh   # CI gate: no new dead declarations
+ZENT_DSN=... zig build test-integration        # CI gate: the integration roots compile
 git push origin main --tags
 ```
+
+The last two are here because a tag has shipped red for exactly these reasons:
+`zig build test` does not compile `tests/integration/` (a rename in the library
+left that suite unbuildable, v0.73.0), and it says nothing about dead code (an
+unused import in a new test file, v0.76.1). Both were green locally and red in
+CI. Run the gates the way CI runs them.
 
 ## Rules
 

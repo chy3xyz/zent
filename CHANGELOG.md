@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The dead-code gate is green again.** v0.76.1's new test file carried an
+  unused `Dialect` import, which `scripts/check-deadcode.sh` reports as a new
+  dead declaration — the one CI step whose failure `zig build test` cannot show.
+  The import is gone, and `docs/RELEASING.md`'s manual checklist now runs that
+  gate (and the integration build) before a tag is cut, alongside the two other
+  reasons a tag has shipped red in this series.
+
 ## [0.76.1] - 2026-09-24
 
 ### Fixed

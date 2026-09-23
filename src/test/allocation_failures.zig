@@ -22,7 +22,6 @@ const graph_mod = @import("../codegen/graph.zig");
 const privacy = @import("../privacy/policy.zig");
 const field = @import("../core/field.zig");
 const schema_mod = @import("../core/schema.zig");
-const Dialect = @import("../sql/dialect.zig").Dialect;
 const TypeInfo = graph_mod.TypeInfo;
 
 var caaf_scope_pred: sql.Predicate = undefined;
