@@ -786,11 +786,19 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
         const ExplainError = error{ OutOfMemory, BuildFailed, InvalidCursor, UnsupportedDialect };
-        /// `Sum` / `Avg` only. A separate set rather than a member of
+        /// `Sum` / `Avg` / `Max` / `Min`: the four methods that answer from a
+        /// single aggregate value. A separate set rather than a member of
         /// `QueryError`, which every reader shares: adding to that one would
         /// widen `All()`, `First()` and the rest with an error none of them can
         /// return, and break callers that switch over the set exhaustively.
-        const AggregateError = QueryError || error{EmptyAggregate};
+        ///
+        /// The members are not uniform across the four. `Sum` / `Avg` answer
+        /// `error.EmptyAggregate` on an empty set — SQL's `SUM`/`AVG` is NULL
+        /// there — while `Max` / `Min` hand that NULL back as `sql.Value.null`,
+        /// so for them the member is not reachable. All four answer
+        /// `error.GroupByNotSupported`, because a grouped query has one
+        /// aggregate value per group and each of these returns exactly one.
+        const AggregateError = QueryError || error{ EmptyAggregate, GroupByNotSupported };
 
         /// Return the dialect-prefixed EXPLAIN SQL for the current query.
         /// The caller owns the returned `ExplainResult` and must call `deinit`.
@@ -1299,7 +1307,12 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// that is not a number. `SumOrZero` is the variant that answers `0`
         /// instead of the error, and `Max` / `Min` answer `sql.Value` so their
         /// NULL stays visible in the value.
+        ///
+        /// `error.GroupByNotSupported` on a grouped query: `GROUP BY` yields one
+        /// SUM per group and this returns one value, so it would answer for the
+        /// first group alone. `AggregateBy` is the grouped form.
         pub fn Sum(self: *Self, comptime field_name: []const u8) AggregateError!f64 {
+            if (self.group_cols.items.len > 0) return error.GroupByNotSupported;
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -1322,7 +1335,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// empty set, exactly as `Sum` (see its doc; `getFloat` answers null
         /// both for a SQL NULL and for a value it cannot read as a number, so
         /// the column's own null check is what tells the two apart).
+        ///
+        /// `error.GroupByNotSupported` on a grouped query, as `Sum`.
         pub fn Avg(self: *Self, comptime field_name: []const u8) AggregateError!f64 {
+            if (self.group_cols.items.len > 0) return error.GroupByNotSupported;
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -1340,7 +1356,14 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return row.getFloat(0) orelse if (row.isNull(0)) error.EmptyAggregate else error.TypeMismatch;
         }
 
-        pub fn Max(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
+        /// `MAX(col)` over the matching rows, as `sql.Value` so an empty set
+        /// stays the SQL NULL it is (`Sum` names it `error.EmptyAggregate`
+        /// instead, having no value to carry it in).
+        ///
+        /// `error.GroupByNotSupported` on a grouped query, as `Sum`: one
+        /// MAX per group, one value returned.
+        pub fn Max(self: *Self, comptime field_name: []const u8) AggregateError!sql.Value {
+            if (self.group_cols.items.len > 0) return error.GroupByNotSupported;
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -1366,7 +1389,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return error.TypeMismatch;
         }
 
-        pub fn Min(self: *Self, comptime field_name: []const u8) QueryError!sql.Value {
+        /// `MIN(col)` over the matching rows — `Max`'s mirror, `sql.Value.null`
+        /// on an empty set and `error.GroupByNotSupported` on a grouped query.
+        pub fn Min(self: *Self, comptime field_name: []const u8) AggregateError!sql.Value {
+            if (self.group_cols.items.len > 0) return error.GroupByNotSupported;
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -2060,7 +2086,7 @@ test "Query builder execution methods expose explicit driver error union" {
     const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
 
     comptime {
-        const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist", "Max", "Min" };
+        const method_names = .{ "All", "Iterate", "First", "Only", "IDs", "Count", "Exist" };
         for (method_names) |method_name| {
             const return_type = @typeInfo(@TypeOf(@field(UserQuery, method_name))).@"fn".return_type.?;
             if (@typeInfo(return_type).error_union.error_set != QueryError) {
@@ -2070,12 +2096,15 @@ test "Query builder execution methods expose explicit driver error union" {
     }
 
     comptime {
-        // `Sum` / `Avg` add `error.EmptyAggregate` — an empty set makes SQL's
-        // aggregate NULL, which is not the type problem `TypeMismatch` names —
-        // and only they do: the five readers above keep the set they had, so a
-        // caller switching over `QueryError` is not disturbed by it.
-        const AggregateError = QueryError || error{EmptyAggregate};
-        const aggregate_names = .{ "Sum", "Avg" };
+        // The four single-value aggregates carry two extra members. `Sum` / `Avg`
+        // name an empty set `error.EmptyAggregate` — SQL's `SUM`/`AVG` is NULL
+        // there, which is not the type problem `TypeMismatch` names. All four
+        // refuse a grouped query with `error.GroupByNotSupported`, because
+        // `GROUP BY` yields one aggregate per group while these answer with one
+        // value, i.e. the first group's. The readers above keep the set they had,
+        // so a caller switching over `QueryError` is disturbed by neither member.
+        const AggregateError = QueryError || error{ EmptyAggregate, GroupByNotSupported };
+        const aggregate_names = .{ "Sum", "Avg", "Max", "Min" };
         for (aggregate_names) |method_name| {
             const return_type = @typeInfo(@TypeOf(@field(UserQuery, method_name))).@"fn".return_type.?;
             if (@typeInfo(return_type).error_union.error_set != AggregateError) {
