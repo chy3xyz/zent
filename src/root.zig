@@ -118,6 +118,7 @@ test {
     // because the modules above expose generated types rather than namespaces.
     _ = @import("codegen/query_aggregate_test.zig");
     _ = @import("test/allocation_failures.zig");
+    _ = @import("test/allocation_failures_plan.zig");
     // `refAllDecls` above reaches one level, so a test inside a *nested*
     // namespace (`runtime.log`) is only run when its file is imported here.
     _ = @import("runtime/log.zig");

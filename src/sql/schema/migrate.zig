@@ -2933,8 +2933,15 @@ fn getSQLiteIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver,
             // Column 4 is `partial`, available since SQLite 3.16; a partial
             // index has no equivalent in an IndexDef, so it is never compared.
             const partial = row.columnCount() > 4 and (row.getInt(4) orelse 0) != 0;
+            // The name is duplicated before the list grows, and growing it is
+            // an allocation: an `append(.{ .name = try dupe(…) })` whose
+            // `append` fails leaves the copy owned by nobody. The `errdefer` is
+            // dropped at the end of this iteration, so it covers exactly the
+            // window between the copy and the item entering the list.
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
             try result.append(.{
-                .name = try allocator.dupe(u8, name),
+                .name = owned_name,
                 .unique = (row.getInt(2) orelse 0) != 0,
                 .columns_comparable = !partial,
             });
@@ -2969,7 +2976,12 @@ fn getSQLiteIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver,
                 columns_readable = false;
                 continue;
             }
-            try keys.append(try allocator.dupe(u8, column.?));
+            // Same window as the name above: the copy exists before the append
+            // that would hand it to `keys`, so the append's failure has to
+            // release it.
+            const owned_column = try allocator.dupe(u8, column.?);
+            errdefer allocator.free(owned_column);
+            try keys.append(owned_column);
         }
         if (rows.nextError()) |err| return err;
 
@@ -3790,14 +3802,39 @@ test "ALTER COLUMN nullability renders on PostgreSQL, refuses elsewhere" {
 /// it); `version` is the `zent_schema_migrations` history row recorded after a
 /// successful exec, or null for the statements the migration deliberately does
 /// not record (DROP COLUMN, nullability convergence).
-const PlannedStatement = struct {
+pub const PlannedStatement = struct {
     sql: []const u8,
     version: ?i64,
 };
 
-fn freePlannedStatements(allocator: std.mem.Allocator, plan: *std.array_list.Managed(PlannedStatement)) void {
+/// Release a plan (its statements' SQL and the list itself).
+///
+/// `pub` for the same sweep as `planMigrateStatements`, which owns the plan it
+/// gets back and has to free it.
+pub fn freePlannedStatements(allocator: std.mem.Allocator, plan: *std.array_list.Managed(PlannedStatement)) void {
     for (plan.items) |s| allocator.free(s.sql);
     plan.deinit();
+}
+
+/// Append one statement to a plan, releasing that statement's SQL when the
+/// append itself fails.
+///
+/// `plan.append(.{ .sql = try createX(…) })` builds the statement **before**
+/// the list grows, and the growth is an allocation that can fail: the new item
+/// never reaches `plan.items`, so the caller's `errdefer
+/// freePlannedStatements` (which walks exactly that list) cannot see it and the
+/// SQL buffer leaks. Routing every append through here makes the error path
+/// own the statement from the moment it exists. The list itself is unchanged
+/// when `append` fails (`ensureUnusedCapacity` then `appendAssumeCapacity`), so
+/// freeing here is the whole cleanup.
+fn appendPlanned(
+    allocator: std.mem.Allocator,
+    plan: *std.array_list.Managed(PlannedStatement),
+    statement_sql: []const u8,
+    version: ?i64,
+) !void {
+    errdefer allocator.free(statement_sql);
+    try plan.append(.{ .sql = statement_sql, .version = version });
 }
 
 /// Compute the ordered statement list a `migrateSchemaWithOptions` run would
@@ -3825,7 +3862,11 @@ fn freePlannedStatements(allocator: std.mem.Allocator, plan: *std.array_list.Man
 /// column *existing* in the introspected state, which a not-yet-created table
 /// fails for every column — and the named-index check still runs, matching the
 /// real path, which creates named indexes even on a table it just created.
-fn planMigrateStatements(
+///
+/// `pub` for the alloc-failure sweep in `src/test/allocation_failures_plan.zig`
+/// — its only caller outside this module; `migrateSchemaWithOptions` is still
+/// the only one inside it.
+pub fn planMigrateStatements(
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
     comptime infos: []const TypeInfo,
@@ -3845,14 +3886,14 @@ fn planMigrateStatements(
         if (info.is_view) {
             const version = computeMigrationVersion(info.table_name, "create_view", "");
             if (!versionContains(applied, version)) {
-                try plan.append(.{ .sql = try createViewSQLAlloc(allocator, info, dialect), .version = version });
+                try appendPlanned(allocator, &plan, try createViewSQLAlloc(allocator, info, dialect), version);
             } else {
                 // Version is recorded but the view may have been dropped
                 // out-of-band. If the view no longer exists, re-create it.
                 var existing = try getExistingColumns(allocator, driver, info.table_name);
                 if (existing.items.len == 0) {
                     existing.deinit();
-                    try plan.append(.{ .sql = try createViewSQLAlloc(allocator, info, dialect), .version = version });
+                    try appendPlanned(allocator, &plan, try createViewSQLAlloc(allocator, info, dialect), version);
                 } else {
                     freeExistingColumns(allocator, &existing);
                 }
@@ -3869,7 +3910,7 @@ fn planMigrateStatements(
             // CREATE TABLE IF NOT EXISTS is a no-op and the real path still
             // diffs — and adds to — the existing table.
             if (!versionContains(applied, version)) {
-                try plan.append(.{ .sql = try createTableSQLAlloc(allocator, table, dialect), .version = version });
+                try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, table, dialect), version);
                 var existing = try getExistingColumns(allocator, driver, table.name);
                 if (existing.items.len == 0) {
                     existing.deinit();
@@ -3883,7 +3924,7 @@ fn planMigrateStatements(
                 var existing = try getExistingColumns(allocator, driver, table.name);
                 if (existing.items.len == 0) {
                     existing.deinit();
-                    try plan.append(.{ .sql = try createTableSQLAlloc(allocator, table, dialect), .version = version });
+                    try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, table, dialect), version);
                     created[i] = true;
                 } else {
                     freeExistingColumns(allocator, &existing);
@@ -3919,14 +3960,14 @@ fn planMigrateStatements(
                 }
                 const version = computeMigrationVersion(jtable.name, "create_junction", "");
                 if (!versionContains(applied, version)) {
-                    try plan.append(.{ .sql = try createTableSQLAlloc(allocator, jtable, dialect), .version = version });
+                    try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, jtable, dialect), version);
                 } else {
                     // Version is recorded but the junction table may have
                     // been dropped out-of-band. Re-create it if missing.
                     var existing = try getExistingColumns(allocator, driver, jtable.name);
                     if (existing.items.len == 0) {
                         existing.deinit();
-                        try plan.append(.{ .sql = try createTableSQLAlloc(allocator, jtable, dialect), .version = version });
+                        try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, jtable, dialect), version);
                     } else {
                         freeExistingColumns(allocator, &existing);
                     }
@@ -3950,10 +3991,12 @@ fn planMigrateStatements(
         if (!created[i]) {
             inline for (table.columns) |col| {
                 if (!columnExists(existing_cols.items, col.name)) {
-                    try plan.append(.{
-                        .sql = try alterTableAddColumnSQL(allocator, table.name, col, dialect, opts.allow_nullability_change),
-                        .version = computeMigrationVersion(info.table_name, "add_column", col.name),
-                    });
+                    try appendPlanned(
+                        allocator,
+                        &plan,
+                        try alterTableAddColumnSQL(allocator, table.name, col, dialect, opts.allow_nullability_change),
+                        computeMigrationVersion(info.table_name, "add_column", col.name),
+                    );
                 }
             }
         }
@@ -3965,10 +4008,12 @@ fn planMigrateStatements(
         if (opts.drop_columns) {
             for (existing_cols.items) |existing_col| {
                 if (!columnExistsTableDef(table, existing_col.name)) {
-                    try plan.append(.{
-                        .sql = try dropColumnSQL(allocator, table.name, existing_col.name, dialect),
-                        .version = null,
-                    });
+                    try appendPlanned(
+                        allocator,
+                        &plan,
+                        try dropColumnSQL(allocator, table.name, existing_col.name, dialect),
+                        null,
+                    );
                 }
             }
         }
@@ -3991,10 +4036,12 @@ fn planMigrateStatements(
                         if (dialect.name[0] != 's') {
                             const version = computeMigrationVersion(info.table_name, "alter_type", col.name);
                             if (!versionContains(applied, version)) {
-                                try plan.append(.{
-                                    .sql = try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect),
-                                    .version = version,
-                                });
+                                try appendPlanned(
+                                    allocator,
+                                    &plan,
+                                    try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect),
+                                    version,
+                                );
                             }
                         }
                     }
@@ -4010,10 +4057,12 @@ fn planMigrateStatements(
             inline for (table.columns) |col| {
                 if (getExistingColumnByName(existing_cols.items, col.name)) |existing_col| {
                     if (db_nullableOf(existing_col) != !col.not_null) {
-                        try plan.append(.{
-                            .sql = try alterColumnNullabilitySQL(allocator, table.name, col.name, col.not_null, dialect),
-                            .version = null,
-                        });
+                        try appendPlanned(
+                            allocator,
+                            &plan,
+                            try alterColumnNullabilitySQL(allocator, table.name, col.name, col.not_null, dialect),
+                            null,
+                        );
                     }
                 }
             }
@@ -4030,10 +4079,12 @@ fn planMigrateStatements(
             };
             if (!indexExists(existing_idxs.items, idx_def.name)) {
                 const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
-                try plan.append(.{
-                    .sql = try createIndexSQLForTableAlloc(allocator, idx_def, table, dialect),
-                    .version = version,
-                });
+                try appendPlanned(
+                    allocator,
+                    &plan,
+                    try createIndexSQLForTableAlloc(allocator, idx_def, table, dialect),
+                    version,
+                );
             }
         }
 
@@ -4104,10 +4155,12 @@ fn planUniqueColumnIndex(
         );
         return;
     }
-    try plan.append(.{
-        .sql = try createIndexSQLForTableAlloc(allocator, uniq_def, table, dialect),
-        .version = computeMigrationVersion(info.table_name, "create_unique_index", col.name),
-    });
+    try appendPlanned(
+        allocator,
+        plan,
+        try createIndexSQLForTableAlloc(allocator, uniq_def, table, dialect),
+        computeMigrationVersion(info.table_name, "create_unique_index", col.name),
+    );
 }
 
 /// Migrate schema: create missing tables, add missing columns, create missing
