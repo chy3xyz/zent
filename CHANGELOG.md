@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.78.0] - 2026-09-24
+
 ### Breaking
 - **The seven single-value aggregates refuse a grouped query.** `Sum`, `Avg`,
   `Max`, `Min`, `SumOrZero`, `AggregateOne` and `AggregateText` built
