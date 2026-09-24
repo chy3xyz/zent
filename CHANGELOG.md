@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **An out-of-memory inside JSON parsing is no longer reported as a value
+  problem.** `scanColumn`'s two JSON paths did
+  `std.json.parseFromSliceLeaky(...) catch return error.TypeMismatch`, so an
+  allocation failure while parsing a JSON column arrived as `TypeMismatch` — and
+  the lenient scanners, which substitute the field's default for exactly that
+  error, turned it into **data**. The `OutOfMemory` now passes through and a
+  malformed document still answers `TypeMismatch`. This is also what unblocked
+  the arena half of the allocation sweep: it was previously unreachable, because
+  the sweep fails on any error that is not `OutOfMemory` before it examines the
+  byte ledger.
+
+### Added
+- **The allocation sweep covers the JSON/arena half of the read path.**
+  `src/test/allocation_failures_read.zig` gains an entity with a JSON struct
+  field, which exercises the parser's allocations *and* the split ownership the
+  arena design implies: the duplicated strings belong to the frame (`freeDto`
+  walks only `[]u8` fields), the parsed document belongs to the arena
+  (`arena.deinit()`), and a failure in either has to leave the other releaseable.
+  Without the narrowing above this case fails with `FAIL (TypeMismatch)` at the
+  first fail index that lands inside the parser — measured, not assumed.
+
 ## [0.77.0] - 2026-09-24
 
 ### Added

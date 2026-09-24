@@ -21,17 +21,17 @@
 //!    shape), and a run that swallows the failure is reported by the sweep as
 //!    `error.SwallowedOutOfMemoryError`. The neighbour test therefore starts
 //!    from `initCapacity`, exactly as `Selector.init` does.
-//!  * No entity here carries a JSON field. `scanColumn` parses JSON through
-//!    `catch return error.TypeMismatch`, so an `OutOfMemory` raised *inside* the
-//!    parser reaches the sweep as `TypeMismatch` — and the sweep fails on any
-//!    error that is not `OutOfMemory`, before the ledger is ever examined.
-//!    Measured, not assumed: adding a `{ theme: []const u8 }` JSON field to the
-//!    entity below fails this file with `FAIL (TypeMismatch)` at the first
-//!    fail_index that lands inside `std.json`. The arena half of the entity read
-//!    path therefore stays unswept until that conversion is narrowed; the string
-//!    fields of such an entity are the same ones the non-JSON case below covers,
-//!    and `freeDtoValue` (which walks only `[]u8` fields) is what releases them,
-//!    so no arena memory is touched.
+//!  * The arena half *is* covered, but only since `scanColumn`'s JSON
+//!    conversion stopped reporting an `OutOfMemory` raised inside `std.json` as
+//!    `TypeMismatch` (v0.77.1). Before that narrowing the sweep failed on any
+//!    error that is not `OutOfMemory` before it ever examined the ledger —
+//!    measured, not assumed: a `{ theme: []const u8 }` field made this file fail
+//!    with `FAIL (TypeMismatch)` at the first fail_index inside the parser. What
+//!    the JSON case below then checks is the split ownership the arena design
+//!    implies: the duplicated strings belong to the frame (released by
+//!    `freeDto`, which walks only `[]u8` fields), the parsed document belongs to
+//!    the arena (released by the frame's `arena.deinit()`), and a failure in
+//!    either has to leave the other releaseable.
 
 const std = @import("std");
 const driver_mod = @import("../sql/driver.zig");
@@ -228,6 +228,29 @@ const FixtureDriver = struct {
 // Read path
 // ------------------------------------------------------------------
 
+/// Entity with a JSON struct field: parsed through `std.json` into a caller
+/// arena, so the sweep reaches the parser's allocations too — and the arena's
+/// own buffer growth, since the arena is the frame's to release.
+const Settings = struct {
+    theme: []const u8,
+    flags: []const bool,
+};
+
+const DocEntity = struct {
+    id: i64,
+    title: []const u8,
+    settings: Settings,
+};
+
+const doc_columns = [_][]const u8{ "id", "title", "settings" };
+
+const first_doc = FixtureRow{
+    .names = &doc_columns,
+    .ints = &.{ 21, null, null },
+    .texts = &.{ null, "a doc", "{\"theme\":\"dark\",\"flags\":[true,false,true]}" },
+    .nulls = &.{ false, false, false },
+};
+
 test "scanRowWithArena unwinds cleanly when any single allocation fails" {
     // The codegen entry point for a non-JSON entity (`scanEntity` in
     // `src/codegen/query.zig`): a positional scan whose string fields are each
@@ -357,6 +380,29 @@ const neighbor_preds = [_]sql.Predicate{
     // the same call the second half of this test makes directly.
     .{ .has_neighbors_with = .{ .step = reply_step, .preds = &.{sql.EQ("kind", .{ .string = "reply" })}, .soft_delete = true } },
 };
+
+test "an entity with a JSON field unwinds cleanly when any single allocation fails" {
+    // Both owners are in this frame: the arena that holds the parsed document
+    // and the allocator that holds the duplicated strings. Every failure point
+    // in between has to leave both releasable, which is why the two `defer`s
+    // are declared before anything is scanned.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+
+            const entity = try scan.scanRowWithArena(DocEntity, allocator, first_doc.asRow(), &arena);
+            defer scan.freeDto(DocEntity, allocator, &entity);
+
+            try std.testing.expectEqual(@as(i64, 21), entity.id);
+            try std.testing.expectEqualStrings("a doc", entity.title);
+            try std.testing.expectEqualStrings("dark", entity.settings.theme);
+            try std.testing.expectEqual(@as(usize, 3), entity.settings.flags.len);
+            try std.testing.expect(entity.settings.flags[0]);
+            try std.testing.expect(!entity.settings.flags[1]);
+        }
+    }.run, .{});
+}
 
 test "neighbour fragment assembly unwinds cleanly when any single allocation fails" {
     // Both entry points at once, assembled into one owned statement: the

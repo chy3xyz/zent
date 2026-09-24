@@ -618,7 +618,15 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
             // back to the caller's allocator, so those strings stay
             // caller-owned (unfreed by deinitEntity).
             const a = if (json_arena) |arena| arena.allocator() else allocator;
-            return std.json.parseFromSliceLeaky(T, a, text, json_parse_options) catch return error.TypeMismatch;
+            // A malformed document is a *value* problem (`TypeMismatch`); an
+            // allocation failure inside the parse is not, and must not be
+            // folded into one. It used to be: the lenient scanners then turned
+            // it into the field's default, i.e. an out-of-memory became data,
+            // and the allocation sweep could not tell the two apart.
+            return std.json.parseFromSliceLeaky(T, a, text, json_parse_options) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.TypeMismatch,
+            };
         },
         .@"union" => {
             // Only std.json.Value (field.JSONValue) is supported as an
@@ -627,7 +635,11 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
                 @compileError("Unsupported union type for scanning: " ++ @typeName(T));
             const text = row.getText(index) orelse return error.TypeMismatch;
             const a = if (json_arena) |arena| arena.allocator() else allocator;
-            return std.json.parseFromSliceLeaky(std.json.Value, a, text, json_parse_options) catch return error.TypeMismatch;
+            // As above: an OOM while parsing is an OOM, not a bad value.
+            return std.json.parseFromSliceLeaky(std.json.Value, a, text, json_parse_options) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.TypeMismatch,
+            };
         },
         .@"enum" => {
             if (row.getInt(index)) |v| {
