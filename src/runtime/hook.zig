@@ -5,6 +5,7 @@ const Value = builder.Value;
 
 const privacy = @import("privacy.zig");
 const PrivacyContext = privacy.PrivacyContext;
+const zent_log = @import("log.zig");
 
 /// Operation type for hooks.
 pub const Op = enum {
@@ -112,7 +113,7 @@ pub const HookChain = struct {
                         // the request. Warn (not err) so the test runner does not
                         // treat an intentional failure-path exercise as a suite
                         // failure.
-                        std.log.warn(
+                        zent_log.warn(
                             "after-hook failed on table '{s}' ({s}): {s}",
                             .{ ctx.table_name, @tagName(ctx.op), @errorName(err) },
                         );

@@ -1,4 +1,5 @@
 const std = @import("std");
+const zent_log = @import("log.zig");
 
 /// Maximum number of filter predicates retained inline by a DecisionSet.
 const max_filters = 8;
@@ -89,7 +90,7 @@ pub fn evalPolicy(
                         // closed instead: deny, and say why. (warn, not err:
                         // the deny is the signal, and an err-level log would
                         // fail any test whose policy exercises this path.)
-                        std.log.warn(
+                        zent_log.warn(
                             "privacy: policy produced more than {d} row filters; denying rather than dropping one",
                             .{result.filters.len},
                         );
