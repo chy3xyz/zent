@@ -2773,7 +2773,11 @@ fn closeExistingIndex(
 ///
 /// MySQL has no partial indexes and InnoDB only btree access methods, so those
 /// two cases are the whole of it here.
-fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
+///
+/// `pub` for the alloc-failure sweep in `src/test/allocation_failures_plan.zig`
+/// — its only caller outside this module; `getExistingIndexes` remains the only
+/// one inside it.
+pub fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
     errdefer freeExistingIndexes(allocator, &result);
 
@@ -2799,9 +2803,10 @@ fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, 
             try closeExistingIndex(&result, current, &keys, comparable);
             // The copy is made first and released by `errdefer` when `append`
             // fails — declared inside the loop body, so it covers this
-            // iteration only. Same shape as `getSQLiteIndexes`, which the sweep
-            // in `src/test/allocation_failures_plan.zig` pins; this dialect is
-            // fixed by inspection there, the stub being SQLite-only.
+            // iteration only. Same shape as `getSQLiteIndexes`, and pinned the
+            // same way: the sweep in `src/test/allocation_failures_plan.zig`
+            // reaches this line through its MySQL catalog stub and fails each
+            // `append` in turn.
             const owned_name = try allocator.dupe(u8, name);
             errdefer allocator.free(owned_name);
             try result.append(.{
@@ -2839,7 +2844,11 @@ fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, 
 /// columns of the table — expression keys, `WHERE` predicates, non-btree
 /// access methods, `INCLUDE` payload columns, invalid indexes, or a key list
 /// that does not add up — is reported as not comparable.
-fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
+///
+/// `pub` for the alloc-failure sweep in `src/test/allocation_failures_plan.zig`
+/// — its only caller outside this module; `getExistingIndexes` remains the only
+/// one inside it.
+pub fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
     errdefer freeExistingIndexes(allocator, &result);
 
@@ -2884,6 +2893,8 @@ fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
             try closeExistingIndex(&result, current, &keys, comparable and seen_keys == expected_keys);
             // As in `getMySQLIndexes`: the copy is made first, and released by
             // an `errdefer` scoped to this loop iteration when `append` fails.
+            // The sweep in `src/test/allocation_failures_plan.zig` reaches this
+            // line through its PostgreSQL catalog stub.
             const owned_name = try allocator.dupe(u8, name);
             errdefer allocator.free(owned_name);
             try result.append(.{

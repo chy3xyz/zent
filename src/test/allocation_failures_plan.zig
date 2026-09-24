@@ -20,6 +20,16 @@
 //! execs), so a fixed set of `PRAGMA` answers is the whole surface it needs,
 //! and each existence gate — "this table is there", "nothing is there", "this
 //! index exists and its keys are readable" — can be exercised on demand.
+//!
+//! The index introspection itself is per dialect, and all three implementations
+//! share one teardown shape: the index name — and every key column — is
+//! duplicated *before* the `append` that would hand it to a list, so an
+//! `append` that fails has to release the copy (the `errdefer` is declared
+//! inside the loop body, which is what scopes it to the iteration). The SQLite
+//! stub above covers `getSQLiteIndexes`; the MySQL and PostgreSQL stubs at the
+//! bottom cover the other two helpers, each serving the catalog queries its
+//! dialect issues, so those sites are verified by the sweep rather than fixed
+//! by inspection.
 
 const std = @import("std");
 const driver = @import("../sql/driver.zig");
@@ -148,21 +158,34 @@ const PlanTag = struct {
 
 const plan_infos = graph_mod.buildGraph(&.{ PlanDoc, PlanTag }).types;
 
-/// A row of the stub catalog: `text[i]` for the string columns a `PRAGMA`
-/// answers and `int[i]` for the integer ones. Six columns is what the two
-/// catalog reads the planner makes need — `table_info` (name, type, notnull,
-/// pk at 1/2/3/5) and `index_list` (name, unique at 1/2/4).
+/// A row of a stub catalog: `text[i]` for the string columns a catalog answers
+/// and `int[i]` for the integer ones. Both are **slices**, so a row spells out
+/// only the columns its dialect's read touches and every position past the end
+/// answers NULL — which is also how a driver reports a column the accessor
+/// asked for and the result set does not have.
+///
+/// The positions each dialect reads: SQLite's `table_info` (name, type,
+/// notnull, pk at 1/2/3/5) and `index_list` (name, unique at 1/2/4); MySQL's
+/// `information_schema.columns` (name, type, `is_nullable` at 0/1/2) and
+/// `statistics` (name, `non_unique`, column, `sub_part` at 0..3); PostgreSQL's
+/// `information_schema.columns` (same three) and its `pg_index` join, which is
+/// the widest at eight columns — `attname` last, at 7.
 const StubRow = struct {
-    text: [6]?[]const u8 = @splat(null),
-    int: [6]?i64 = @splat(null),
+    text: []const ?[]const u8 = &.{},
+    int: []const ?i64 = &.{},
 };
 
 fn stubRowOf(ptr: *anyopaque) *const StubRow {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn stubColumnCount(_: *anyopaque) usize {
-    return 6;
+/// The fixture's width, which is what a driver reports for a result set: the
+/// longer of the two column lists. SQLite's `index_list` read only asks whether
+/// there is a column past 4 (the `partial` flag), so a row with the six columns
+/// that read uses still answers.
+fn stubColumnCount(ptr: *anyopaque) usize {
+    const row = stubRowOf(ptr);
+    return @max(row.text.len, row.int.len);
 }
 
 fn stubColumnName(_: *anyopaque, _: usize) []const u8 {
@@ -170,13 +193,15 @@ fn stubColumnName(_: *anyopaque, _: usize) []const u8 {
 }
 
 fn stubGetBool(ptr: *anyopaque, i: usize) ?bool {
-    if (i >= 6) return null;
-    return if (stubRowOf(ptr).int[i]) |n| n != 0 else null;
+    const row = stubRowOf(ptr);
+    if (i >= row.int.len) return null;
+    return if (row.int[i]) |n| n != 0 else null;
 }
 
 fn stubGetInt(ptr: *anyopaque, i: usize) ?i64 {
-    if (i >= 6) return null;
-    return stubRowOf(ptr).int[i];
+    const row = stubRowOf(ptr);
+    if (i >= row.int.len) return null;
+    return row.int[i];
 }
 
 fn stubGetFloat(_: *anyopaque, _: usize) ?f64 {
@@ -184,8 +209,9 @@ fn stubGetFloat(_: *anyopaque, _: usize) ?f64 {
 }
 
 fn stubGetText(ptr: *anyopaque, i: usize) ?[]const u8 {
-    if (i >= 6) return null;
-    return stubRowOf(ptr).text[i];
+    const row = stubRowOf(ptr);
+    if (i >= row.text.len) return null;
+    return row.text[i];
 }
 
 fn stubGetBlob(_: *anyopaque, _: usize) ?[]const u8 {
@@ -193,9 +219,8 @@ fn stubGetBlob(_: *anyopaque, _: usize) ?[]const u8 {
 }
 
 fn stubIsNull(ptr: *anyopaque, i: usize) bool {
-    if (i >= 6) return true;
     const row = stubRowOf(ptr);
-    return row.text[i] == null and row.int[i] == null;
+    return (i >= row.text.len or row.text[i] == null) and (i >= row.int.len or row.int[i] == null);
 }
 
 const stub_row_vtable = driver.Row.VTable{
@@ -269,7 +294,7 @@ fn stubExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _:
     return error.ExecFailed;
 }
 
-fn stubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) driver.Error!driver.Rows {
+fn sqliteStubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) driver.Error!driver.Rows {
     const self: *CatalogStub = @ptrCast(@alignCast(ptr));
     self.queries += 1;
     if (std.mem.indexOf(u8, query_sql, "table_info") != null) {
@@ -290,7 +315,7 @@ fn stubBeginTx(_: *anyopaque) driver.Error!driver.Tx {
 
 fn stubClose(_: *anyopaque) void {}
 
-fn stubDialect(_: *anyopaque) dialect.Dialect {
+fn sqliteStubDialect(_: *anyopaque) dialect.Dialect {
     return .sqlite;
 }
 
@@ -304,25 +329,36 @@ fn stubBeginSavepoint(_: *anyopaque, _: []const u8) driver.Error!driver.Tx {
     return error.TxFailed;
 }
 
-const stub_vtable = driver.Driver.VTable{
-    .exec = stubExec,
-    .query = stubQuery,
-    .beginTx = stubBeginTx,
-    .close = stubClose,
-    .dialect = stubDialect,
-    .ping = stubPing,
-    .inTransaction = stubInTransaction,
-    .beginSavepoint = stubBeginSavepoint,
-};
+/// The vtable every stub shares, with the two fields a dialect stub answers
+/// differently — the statement shapes it recognises and the dialect it reports
+/// — supplied by the caller. The parameters carry `Driver.VTable`'s own field
+/// types, so a stub cannot be wired up with the wrong signature.
+fn stubVTable(
+    comptime query_fn: *const fn (ptr: *anyopaque, ctx: ?*const driver.ExecutionContext, query: []const u8, args: []const sql.Value) driver.Error!driver.Rows,
+    comptime dialect_fn: *const fn (ptr: *anyopaque) dialect.Dialect,
+) driver.Driver.VTable {
+    return .{
+        .exec = stubExec,
+        .query = query_fn,
+        .beginTx = stubBeginTx,
+        .close = stubClose,
+        .dialect = dialect_fn,
+        .ping = stubPing,
+        .inTransaction = stubInTransaction,
+        .beginSavepoint = stubBeginSavepoint,
+    };
+}
+
+const stub_vtable = stubVTable(sqliteStubQuery, sqliteStubDialect);
 
 /// The columns `alloc_plan_doc` has once it exists: its id and the two declared
 /// fields, nothing else — so the ADD COLUMN branch stays out of the way and the
 /// plan is about the table that is there.
 const alloc_plan_doc_columns = [_]StubRow{
-    .{ .text = .{ null, "id", "INTEGER", null, null, null }, .int = .{ null, null, null, 1, null, 1 } },
-    .{ .text = .{ null, "tenant_id", "INTEGER", null, null, null }, .int = .{ null, null, null, 1, null, 0 } },
-    .{ .text = .{ null, "title", "TEXT", null, null, null }, .int = .{ null, null, null, 1, null, 0 } },
-    .{ .text = .{ null, "slug", "TEXT", null, null, null }, .int = .{ null, null, null, 1, null, 0 } },
+    .{ .text = &.{ null, "id", "INTEGER", null, null, null }, .int = &.{ null, null, null, 1, null, 1 } },
+    .{ .text = &.{ null, "tenant_id", "INTEGER", null, null, null }, .int = &.{ null, null, null, 1, null, 0 } },
+    .{ .text = &.{ null, "title", "TEXT", null, null, null }, .int = &.{ null, null, null, 1, null, 0 } },
+    .{ .text = &.{ null, "slug", "TEXT", null, null, null }, .int = &.{ null, null, null, 1, null, 0 } },
 };
 
 /// One unique index the catalog already has, over `tenant_id` — a column the
@@ -332,12 +368,12 @@ const alloc_plan_doc_columns = [_]StubRow{
 /// *live*: an unreadable unique index would make the planner stay silent.
 /// `PRAGMA index_list` shape: name at 1, unique at 2, `partial` at 4.
 const catalog_unique_index = [_]StubRow{
-    .{ .text = .{ null, "uq_stub_alloc_plan_doc_tenant", null, null, null, null }, .int = .{ null, null, 1, null, 0, null } },
+    .{ .text = &.{ null, "uq_stub_alloc_plan_doc_tenant", null, null, null, null }, .int = &.{ null, null, 1, null, 0, null } },
 };
 
 /// Its single key — `PRAGMA index_info` shape: `cid` at 1, column name at 2.
 const catalog_unique_index_keys = [_]StubRow{
-    .{ .text = .{ null, null, "tenant_id", null, null, null }, .int = .{ null, 0, null, null, null, null } },
+    .{ .text = &.{ null, null, "tenant_id", null, null, null }, .int = &.{ null, 0, null, null, null, null } },
 };
 
 test "planning a migration unwinds cleanly when any single allocation fails" {
@@ -383,6 +419,236 @@ test "planning a migration unwinds cleanly when any single allocation fails" {
             // `CREATE TABLE IF NOT EXISTS` — the second is the no-op the real
             // path executes too), and the two indexes.
             try std.testing.expectEqual(@as(usize, 6), plan.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Plan.run, .{&stub});
+}
+
+// ------------------------------------------------------------------
+// (c) the MySQL and PostgreSQL index catalogs
+// ------------------------------------------------------------------
+//
+// `getSQLiteIndexes` is reached through the SQLite stub above, which pins its
+// two copy-then-append sites. `getMySQLIndexes` and `getPostgresIndexes` have
+// the same two sites, and had no mechanical coverage at all: the sweep's catalog
+// answered `table_info`/`index_list`/`index_info` and nothing else. Each stub
+// below serves the statements its dialect's helper actually issues — the shapes
+// are read off the call sites — so the planner reaches that helper with a
+// multi-key index to read and the failing allocator lands inside the copy
+// window. `unmatched` is the guard on the other side: a statement neither stub
+// recognises is counted, and the case fails rather than letting a new
+// introspection query be answered "nothing exists".
+
+/// True when a catalog read is about `table`. Both MySQL and PostgreSQL bind
+/// the name (`?` / `$1`) rather than interpolating it, so the stub reads it
+/// back out of the argument list: a read about any other table gets the "no
+/// such table" answer — the same gate `CatalogStub.existing_table` applies to
+/// a SQLite `PRAGMA`, and the reason a second table in a schema under test
+/// cannot be told it exists when the catalog has no rows for it.
+fn bindsTable(args: []const sql.Value, table: []const u8) bool {
+    if (args.len == 0) return false;
+    const bound = switch (args[0]) {
+        .string => |s| s,
+        else => return false,
+    };
+    return std.mem.eql(u8, bound, table);
+}
+
+/// MySQL's catalog: the two statement shapes the planner issues on this
+/// dialect, in the order it issues them — the `information_schema.columns`
+/// existence/diff read (step 1, then step 2) and the
+/// `information_schema.statistics` read `getMySQLIndexes` makes.
+const MysqlCatalogStub = struct {
+    /// The one table the catalog has rows for.
+    existing_table: []const u8 = "",
+    columns_rows: []const StubRow = &.{},
+    index_rows: []const StubRow = &.{},
+    unmatched: usize = 0,
+    queries: usize = 0,
+    cursor: Cursor = .{ .rows = &.{} },
+
+    fn asDriver(self: *MysqlCatalogStub) driver.Driver {
+        return .{ .ptr = self, .vtable = &mysql_stub_vtable };
+    }
+
+    fn answering(self: *MysqlCatalogStub, rows: []const StubRow) driver.Rows {
+        self.cursor = .{ .rows = rows };
+        return .{ .ptr = &self.cursor, .vtable = &cursor_vtable };
+    }
+};
+
+fn mysqlStubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const sql.Value) driver.Error!driver.Rows {
+    const self: *MysqlCatalogStub = @ptrCast(@alignCast(ptr));
+    self.queries += 1;
+    if (std.mem.indexOf(u8, query_sql, "information_schema.columns") != null) {
+        return self.answering(if (bindsTable(args, self.existing_table)) self.columns_rows else &.{});
+    }
+    if (std.mem.indexOf(u8, query_sql, "information_schema.statistics") != null) {
+        return self.answering(if (bindsTable(args, self.existing_table)) self.index_rows else &.{});
+    }
+    self.unmatched += 1;
+    return self.answering(&.{});
+}
+
+fn mysqlStubDialect(_: *anyopaque) dialect.Dialect {
+    return .mysql;
+}
+
+const mysql_stub_vtable = stubVTable(mysqlStubQuery, mysqlStubDialect);
+
+/// PostgreSQL's catalog, the same two reads: `information_schema.columns` and
+/// the `pg_index`/`pg_class`/`pg_attribute` join whose rows are the widest the
+/// stubs serve (eight columns, `attname` last).
+const PostgresCatalogStub = struct {
+    /// The one table the catalog has rows for.
+    existing_table: []const u8 = "",
+    columns_rows: []const StubRow = &.{},
+    index_rows: []const StubRow = &.{},
+    unmatched: usize = 0,
+    queries: usize = 0,
+    cursor: Cursor = .{ .rows = &.{} },
+
+    fn asDriver(self: *PostgresCatalogStub) driver.Driver {
+        return .{ .ptr = self, .vtable = &postgres_stub_vtable };
+    }
+
+    fn answering(self: *PostgresCatalogStub, rows: []const StubRow) driver.Rows {
+        self.cursor = .{ .rows = rows };
+        return .{ .ptr = &self.cursor, .vtable = &cursor_vtable };
+    }
+};
+
+fn postgresStubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const sql.Value) driver.Error!driver.Rows {
+    const self: *PostgresCatalogStub = @ptrCast(@alignCast(ptr));
+    self.queries += 1;
+    if (std.mem.indexOf(u8, query_sql, "information_schema.columns") != null) {
+        return self.answering(if (bindsTable(args, self.existing_table)) self.columns_rows else &.{});
+    }
+    if (std.mem.indexOf(u8, query_sql, "pg_index") != null) {
+        return self.answering(if (bindsTable(args, self.existing_table)) self.index_rows else &.{});
+    }
+    self.unmatched += 1;
+    return self.answering(&.{});
+}
+
+fn postgresStubDialect(_: *anyopaque) dialect.Dialect {
+    return .postgres;
+}
+
+const postgres_stub_vtable = stubVTable(postgresStubQuery, postgresStubDialect);
+
+/// The table the MySQL case plans against: it is already in the stub catalog
+/// (`created[i]` stays false) with the two-key index the schema declares, so
+/// step 2 reaches `getMySQLIndexes` and finds the index it wants.
+const MysqlPlanDoc = Schema("AllocMysqlPlanDoc", .{
+    .table_name = "alloc_mysql_plan_doc",
+    .fields = &.{
+        field.Int("tenant_id"),
+        field.String("title"),
+    },
+    .indexes = &.{index.Named("idx_alloc_mysql_plan_doc_pair", &.{ "tenant_id", "title" })},
+});
+
+const mysql_plan_infos = graph_mod.buildGraph(&.{MysqlPlanDoc}).types;
+
+/// `information_schema.columns` rows — `column_name`, `data_type`,
+/// `is_nullable` at 0/1/2 — covering every column the schema declares, so the
+/// plan carries no ALTER.
+const mysql_plan_doc_columns = [_]StubRow{
+    .{ .text = &.{ "id", "bigint", "NO" } },
+    .{ .text = &.{ "tenant_id", "bigint", "NO" } },
+    .{ .text = &.{ "title", "varchar", "NO" } },
+};
+
+/// `information_schema.statistics` rows — `index_name`, `non_unique`,
+/// `column_name`, `sub_part` at 0/1/2/3 — as the query's `ORDER BY index_name,
+/// seq_in_index` delivers them. The first is the declared index, in key order;
+/// the second is one the schema does not declare, which gives the name loop a
+/// second iteration and the key accumulator a second lifecycle. A NULL
+/// `sub_part` on every row keeps both key lists comparable, which is what makes
+/// the helper read the columns at all.
+const mysql_plan_doc_indexes = [_]StubRow{
+    .{ .text = &.{ "idx_alloc_mysql_plan_doc_pair", null, "tenant_id", null }, .int = &.{ null, 1 } },
+    .{ .text = &.{ "idx_alloc_mysql_plan_doc_pair", null, "title", null } },
+    .{ .text = &.{ "idx_stub_mysql_single_key", null, "title", null }, .int = &.{ null, 1 } },
+};
+
+/// The PostgreSQL case's table, with the same two-key index — read through the
+/// `pg_index` join instead of `information_schema.statistics`.
+const PostgresPlanDoc = Schema("AllocPostgresPlanDoc", .{
+    .table_name = "alloc_postgres_plan_doc",
+    .fields = &.{
+        field.Int("tenant_id"),
+        field.String("title"),
+    },
+    .indexes = &.{index.Named("idx_alloc_postgres_plan_doc_pair", &.{ "tenant_id", "title" })},
+});
+
+const postgres_plan_infos = graph_mod.buildGraph(&.{PostgresPlanDoc}).types;
+
+/// The same three columns, PostgreSQL-flavoured.
+const postgres_plan_doc_columns = [_]StubRow{
+    .{ .text = &.{ "id", "bigint", "NO" } },
+    .{ .text = &.{ "tenant_id", "bigint", "NO" } },
+    .{ .text = &.{ "title", "text", "NO" } },
+};
+
+/// `pg_index`-join rows: `relname`, `indisunique`, `indisvalid`, `indpred`,
+/// `indnatts <> indnkeyatts`, `indnkeyatts`, `amname`, `attname` at 0..7, in
+/// key order. `indnkeyatts` counts both rows of the two-key index, which is
+/// what the helper's `seen_keys == expected_keys` check needs — a key list that
+/// does not add up is reported as not comparable, and then no key column is
+/// read at all.
+const postgres_plan_doc_indexes = [_]StubRow{
+    .{ .text = &.{ "idx_alloc_postgres_plan_doc_pair", null, null, null, null, null, "btree", "tenant_id" }, .int = &.{ null, 0, 1, 0, 0, 2 } },
+    .{ .text = &.{ "idx_alloc_postgres_plan_doc_pair", null, null, null, null, null, "btree", "title" }, .int = &.{ null, 0, 1, 0, 0, 2 } },
+    .{ .text = &.{ "idx_stub_postgres_single_key", null, null, null, null, null, "btree", "title" }, .int = &.{ null, 0, 1, 0, 0, 1 } },
+};
+
+test "a MySQL index introspection unwinds cleanly when any single allocation fails" {
+    var stub = MysqlCatalogStub{
+        .existing_table = "alloc_mysql_plan_doc",
+        .columns_rows = &mysql_plan_doc_columns,
+        .index_rows = &mysql_plan_doc_indexes,
+    };
+    const Plan = struct {
+        fn run(child: std.mem.Allocator, s: *MysqlCatalogStub) !void {
+            var plan = try migrate.planMigrateStatements(child, s.asDriver(), mysql_plan_infos, .{}, &.{});
+            defer migrate.freePlannedStatements(child, &plan);
+            try std.testing.expect(s.queries > 0);
+            try std.testing.expectEqual(@as(usize, 0), s.unmatched);
+
+            // The table is there with every column the schema declares, so the
+            // only statement is the CREATE TABLE the missing migration version
+            // makes the planner emit.
+            try std.testing.expectEqual(@as(usize, 1), plan.items.len);
+            try std.testing.expect(std.mem.indexOf(u8, plan.items[0].sql, "CREATE TABLE IF NOT EXISTS") != null);
+            // The declared index is *in* the catalog, so it is not created
+            // again. This is also the assertion that `getMySQLIndexes` was read
+            // rather than answered "nothing exists": an empty answer would plan
+            // exactly the CREATE INDEX checked for here.
+            try std.testing.expect(std.mem.indexOf(u8, plan.items[0].sql, "idx_alloc_mysql_plan_doc_pair") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Plan.run, .{&stub});
+}
+
+test "a PostgreSQL index introspection unwinds cleanly when any single allocation fails" {
+    var stub = PostgresCatalogStub{
+        .existing_table = "alloc_postgres_plan_doc",
+        .columns_rows = &postgres_plan_doc_columns,
+        .index_rows = &postgres_plan_doc_indexes,
+    };
+    const Plan = struct {
+        fn run(child: std.mem.Allocator, s: *PostgresCatalogStub) !void {
+            var plan = try migrate.planMigrateStatements(child, s.asDriver(), postgres_plan_infos, .{}, &.{});
+            defer migrate.freePlannedStatements(child, &plan);
+            try std.testing.expect(s.queries > 0);
+            try std.testing.expectEqual(@as(usize, 0), s.unmatched);
+
+            try std.testing.expectEqual(@as(usize, 1), plan.items.len);
+            try std.testing.expect(std.mem.indexOf(u8, plan.items[0].sql, "CREATE TABLE IF NOT EXISTS") != null);
+            try std.testing.expect(std.mem.indexOf(u8, plan.items[0].sql, "idx_alloc_postgres_plan_doc_pair") == null);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Plan.run, .{&stub});
