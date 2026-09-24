@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.77.3] - 2026-09-24
+
 ### Fixed
 - **The pool eviction stress test no longer depends on the scheduler.** It
   spawned its eight borrowers *before* the thread that holds a connection for
