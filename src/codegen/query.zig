@@ -915,6 +915,41 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             );
         }
 
+        /// A page that owns its list as well as its rows: `deinit()` is the
+        /// whole release, with no per-entity loop and no separate
+        /// `deinitRows(&rows)` call to pair up with the right page.
+        ///
+        /// `items` is the same `std.array_list.Managed(Entity)` `All()` hands
+        /// back, so reading a page is identical either way.
+        pub const OwnedRows = struct {
+            items: std.array_list.Managed(Entity),
+
+            /// Free every entity and then the list. The list is left empty and
+            /// reusable (allocator kept, capacity zero), so calling this twice
+            /// is a no-op rather than a double free — the same guarantee
+            /// `deinitRows` makes, through the same helper.
+            pub fn deinit(self: *OwnedRows) void {
+                deinitEntityList(infos, info, self.items.allocator, &self.items);
+            }
+        };
+
+        /// Fetch every matching row with the page and its list under one owner.
+        ///
+        /// This is the recommended entry for new code: one name owns both the
+        /// rows and the list, where `All()` hands the rows back bare for a
+        /// separate `deinitRows(&rows)`, and `paged()` answers a third shape — a
+        /// `PagedResult` whose `deinit()` also frees rows and list, but which
+        /// additionally carries a `total`. `OwnedRows` exists so a caller
+        /// migrating between those two cannot pair one shape's release with
+        /// another shape's page — `docs/OPEN_ITEMS.md` records the consumer's
+        /// side of that, where `paged` was the one "touch nothing" special case
+        /// across 177 migrated call sites.
+        ///
+        /// For a page whose whole lifetime is one arena, use `AllIn`.
+        pub fn AllOwned(self: *Self) QueryError!OwnedRows {
+            return .{ .items = try self.All() };
+        }
+
         /// `All`, with every byte the page owns coming from `arena`: the row
         /// slice, every `[]const u8` / slice field, every JSON payload (its
         /// per-entity arena is a child of `arena`), and every eager-loaded
@@ -3050,5 +3085,187 @@ test "WhereEntQL rejects a field the entity does not have" {
         var q2 = root.vf_owner.Query();
         defer q2.deinit();
         try std.testing.expectError(error.UnknownField, q2.WhereEntQL("has(pets, nick = \"x\") AND age > 3"));
+    }
+}
+
+test "AllOwned answers the same rows as All under one release" {
+    // The additive contract has to be behaviour-identical to `All()` or a
+    // migration onto it changes what a caller sees; only the release differs,
+    // so the rows are compared one by one. `owned.deinit()` frees every
+    // string field as well as the list, which `std.testing.allocator` reports
+    // as a leak if it does not.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const User = Schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+    const user_info = comptime fromSchema(User);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+    for (0..3) |i| {
+        var b = try root.user.Create();
+        defer b.deinit();
+        const name = try std.fmt.allocPrint(allocator, "u{d}", .{i});
+        defer allocator.free(name);
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("age", 30);
+        var row = try b.Save();
+        defer deinitEntity(infos, user_info, &row, allocator);
+    }
+
+    var q = root.user.Query();
+    defer q.deinit();
+    var owned = try q.AllOwned();
+    defer owned.deinit();
+
+    var q_plain = root.user.Query();
+    defer q_plain.deinit();
+    var plain = try q_plain.All();
+    defer q_plain.deinitRows(&plain);
+
+    try std.testing.expectEqual(@as(usize, 3), owned.items.items.len);
+    try std.testing.expectEqual(plain.items.len, owned.items.items.len);
+    for (plain.items, owned.items.items) |expected, actual| {
+        try std.testing.expectEqual(expected.id, actual.id);
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqual(expected.age, actual.age);
+    }
+}
+
+test "OwnedRows deinit twice is a no-op, not a double free" {
+    // The list comes back empty from the shared helper, so the second call
+    // finds nothing to free — the same guarantee `deinitRows` gives a bare
+    // page. A caller that runs both `defer owned.deinit()` and an explicit
+    // call must not crash.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const User = Schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+    const user_info = comptime fromSchema(User);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+    for (0..2) |i| {
+        var b = try root.user.Create();
+        defer b.deinit();
+        const name = try std.fmt.allocPrint(allocator, "u{d}", .{i});
+        defer allocator.free(name);
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("age", 30);
+        var row = try b.Save();
+        defer deinitEntity(infos, user_info, &row, allocator);
+    }
+
+    var q = root.user.Query();
+    defer q.deinit();
+    var owned = try q.AllOwned();
+    // Non-empty first: a second deinit of an empty page proves nothing about
+    // whether the first one released the rows.
+    try std.testing.expectEqual(@as(usize, 2), owned.items.items.len);
+
+    owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owned.items.items.len);
+    owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owned.items.items.len);
+}
+
+test "an OwnedRows and a PagedResult release in either order" {
+    // The confusion this type exists to prevent: both shapes are released by
+    // one `deinit()`, and reading the wrong one's release for the other is a
+    // double free. They own disjoint memory, so either order works — and the
+    // memory of whichever is still alive stays readable after the other is
+    // released.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const User = Schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const graph = comptime buildGraph(&.{User});
+    const infos = graph.types;
+    const user_info = comptime fromSchema(User);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+    for (0..3) |i| {
+        var b = try root.user.Create();
+        defer b.deinit();
+        const name = try std.fmt.allocPrint(allocator, "u{d}", .{i});
+        defer allocator.free(name);
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("age", 30);
+        var row = try b.Save();
+        defer deinitEntity(infos, user_info, &row, allocator);
+    }
+
+    // Rows first, then the page.
+    {
+        var q = root.user.Query();
+        defer q.deinit();
+        var owned = try q.AllOwned();
+
+        var q_paged = root.user.Query();
+        defer q_paged.deinit();
+        var page = try q_paged.paged(1, 2);
+        try std.testing.expectEqual(@as(i64, 3), page.total);
+        try std.testing.expectEqual(@as(usize, 2), page.items.items.len);
+
+        owned.deinit();
+        // The page is its own list and its own entities; releasing the page
+        // here would be the migration bug, so it is still fully readable.
+        try std.testing.expectEqualStrings("u0", page.items.items[0].name);
+        page.deinit();
+    }
+
+    // Page first, then the rows.
+    {
+        var q = root.user.Query();
+        defer q.deinit();
+        var owned = try q.AllOwned();
+
+        var q_paged = root.user.Query();
+        defer q_paged.deinit();
+        var page = try q_paged.paged(2, 2);
+        try std.testing.expectEqual(@as(usize, 1), page.items.items.len);
+
+        page.deinit();
+        try std.testing.expectEqual(@as(usize, 3), owned.items.items.len);
+        try std.testing.expectEqualStrings("u2", owned.items.items[2].name);
+        owned.deinit();
     }
 }
