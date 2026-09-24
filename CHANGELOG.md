@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The pool eviction stress test no longer depends on the scheduler.** It
+  spawned its eight borrowers *before* the thread that holds a connection for
+  the whole storm, so on a machine with few free cores the borrowers finished
+  their entire loop before the holder ever got a connection — the run then
+  observed a peak of one borrowed connection and the coverage guard
+  (`peak >= 2`) failed. That is what CI's Linux runner hit at v0.77.2 while
+  macOS passed. The holder now starts first and the borrowers are spawned only
+  once it is holding, which makes "a connection stayed lent while the others
+  borrowed" a fact about the run's construction; the invariant assertions
+  (double lends, holder violations, guard violations, every borrower served) are
+  unchanged, and a holder that never borrows now reports
+  `error.HolderNeverBorrowed` instead of a peak assertion.
+
 ## [0.77.2] - 2026-09-24
 
 ### Added

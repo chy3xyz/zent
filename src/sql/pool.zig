@@ -3698,12 +3698,36 @@ test "ConnPool stress: eviction racing with borrow never recycles a live connect
         try std.testing.expect(idle_now > 0);
     }
 
-    // Start the borrowers first (they never wait on `stop`), then the thread
-    // that holds one connection for the whole storm, then the reaper: every
-    // spawn failure below has a bounded way out, so a failure cannot leave a
-    // thread running past the test body.
+    // The holder goes first, and the borrowers are not spawned until it is
+    // actually holding: "a connection stayed lent for the whole storm" is then a
+    // construction rather than a hope about the scheduler. Spawning the
+    // borrowers first (as this test used to) let them finish their whole loop
+    // before the holder ever got a connection on a machine with few free cores,
+    // and the run then observed a peak of one — the coverage guard below failed
+    // on CI's Linux runner for exactly that reason while passing everywhere
+    // else. Every spawn failure below still has a bounded way out, so a failure
+    // cannot leave a thread running past the test body.
+    var holder = StressHolder{ .state = &state, .pool = &pool };
+    const holder_thread = std.Thread.spawn(.{}, StressHolder.run, .{&holder}) catch |err| {
+        return err;
+    };
+    var spins: usize = 0;
+    while (!holder.holding.load(.acquire) and spins < 5000) : (spins += 1) {
+        pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const holder_started = holder.holding.load(.acquire);
+    if (!holder_started) {
+        // Nothing to storm against: the holder never got a connection, so the
+        // run would be about the setup rather than about the race. Unwind and
+        // report it as the failure it is.
+        state.stop.store(true, .release);
+        holder_thread.join();
+        return error.HolderNeverBorrowed;
+    }
+
     var workers: [thread_count]StressWorker = undefined;
     var threads: [thread_count]std.Thread = undefined;
+    var spawned: usize = 0;
     for (&workers, &threads, 0..) |*worker, *thread, i| {
         // One borrower in four drops the connection it was given instead of
         // pooling it, so `closeConnection` keeps running against live borrows
@@ -3719,25 +3743,20 @@ test "ConnPool stress: eviction racing with borrow never recycles a live connect
             .iterations = iterations,
             .evict_on_release = (i % 4) == 3,
         };
-        thread.* = try std.Thread.spawn(.{}, StressWorker.run, .{worker});
+        thread.* = std.Thread.spawn(.{}, StressWorker.run, .{worker}) catch |err| {
+            state.stop.store(true, .release);
+            for (threads[0..spawned]) |*t| t.join();
+            holder_thread.join();
+            return err;
+        };
+        spawned += 1;
     }
-
-    var holder = StressHolder{ .state = &state, .pool = &pool };
-    const holder_thread = std.Thread.spawn(.{}, StressHolder.run, .{&holder}) catch |err| {
-        for (&threads) |*thread| thread.join();
-        return err;
-    };
-    var spins: usize = 0;
-    while (!holder.holding.load(.acquire) and spins < 5000) : (spins += 1) {
-        pool.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-    }
-    const holder_started = holder.holding.load(.acquire);
 
     var reaper = StressReaper{ .state = &state, .pool = &pool };
     const reaper_thread = std.Thread.spawn(.{}, StressReaper.run, .{&reaper}) catch |err| {
         state.stop.store(true, .release);
-        holder_thread.join();
         for (&threads) |*thread| thread.join();
+        holder_thread.join();
         return err;
     };
     // Wait for a full pass before letting the storm end, so "the idle scans ran
@@ -3755,7 +3774,10 @@ test "ConnPool stress: eviction racing with borrow never recycles a live connect
     holder_thread.join();
 
     // Invariant 2: the connection was in one borrower's hands for the whole
-    // storm, and it is still the entry the pool lent out.
+    // storm, and it is still the entry the pool lent out. The peak is a fact
+    // about the run's construction rather than about the scheduler: the holder
+    // was holding before the first borrower was spawned, so any borrower that
+    // borrowed at all makes it two.
     try std.testing.expect(holder_started);
     try std.testing.expect(holder.intact.load(.acquire));
     try std.testing.expect(state.peak >= 2);
