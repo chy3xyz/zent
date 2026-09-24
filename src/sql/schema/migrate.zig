@@ -2797,15 +2797,24 @@ fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, 
         const name = row.getText(0) orelse continue;
         if (current == null or !std.mem.eql(u8, result.items[current.?].name, name)) {
             try closeExistingIndex(&result, current, &keys, comparable);
+            // The copy is made first and released by `errdefer` when `append`
+            // fails — declared inside the loop body, so it covers this
+            // iteration only. Same shape as `getSQLiteIndexes`, which the sweep
+            // in `src/test/allocation_failures_plan.zig` pins; this dialect is
+            // fixed by inspection there, the stub being SQLite-only.
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
             try result.append(.{
-                .name = try allocator.dupe(u8, name),
+                .name = owned_name,
                 .unique = (row.getInt(1) orelse 1) == 0,
             });
             current = result.items.len - 1;
             comparable = true;
         }
         if (row.getText(2)) |column| {
-            try keys.append(try allocator.dupe(u8, column));
+            const owned_column = try allocator.dupe(u8, column);
+            errdefer allocator.free(owned_column);
+            try keys.append(owned_column);
         } else {
             comparable = false; // functional index: the key is an expression
         }
@@ -2873,8 +2882,12 @@ fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
         const name = row.getText(0) orelse continue;
         if (current == null or !std.mem.eql(u8, result.items[current.?].name, name)) {
             try closeExistingIndex(&result, current, &keys, comparable and seen_keys == expected_keys);
+            // As in `getMySQLIndexes`: the copy is made first, and released by
+            // an `errdefer` scoped to this loop iteration when `append` fails.
+            const owned_name = try allocator.dupe(u8, name);
+            errdefer allocator.free(owned_name);
             try result.append(.{
-                .name = try allocator.dupe(u8, name),
+                .name = owned_name,
                 .unique = (row.getInt(1) orelse 0) != 0,
             });
             current = result.items.len - 1;
@@ -2890,7 +2903,9 @@ fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Drive
             // A NULL attname is an expression key (attnum 0), which no
             // declared column list can be equal to.
             if (row.getText(7)) |column| {
-                try keys.append(try allocator.dupe(u8, column));
+                const owned_column = try allocator.dupe(u8, column);
+                errdefer allocator.free(owned_column);
+                try keys.append(owned_column);
             } else {
                 comparable = false;
             }
