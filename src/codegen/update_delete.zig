@@ -231,6 +231,22 @@ fn buildTargetAttachQuery(
     return ub.takeQuery();
 }
 
+/// The contract the three *singleton* entry points share — `SaveOne` /
+/// `ExecOne` / `ForceExecOne` — is "the statement moved exactly one row".
+///
+/// `NotFound` and `NotSingular` are both claims about a count, so a driver
+/// that never obtained one has to be told apart from one that counted zero:
+/// `rows_affected == 0` is a placeholder in the first case and "nothing
+/// matched" in the second, and reporting the placeholder as `NotFound` tells
+/// the caller a row is missing when the driver never said so. `Save`/`Exec`
+/// keep the placeholder — their `usize` return has no room to say otherwise —
+/// which is exactly why the flag has to be read here, before the number.
+fn requireExactlyOne(res: sql_driver.Result) error{ RowsAffectedUnknown, NotFound, NotSingular }!void {
+    if (!res.rows_affected_known) return error.RowsAffectedUnknown;
+    if (res.rows_affected == 0) return error.NotFound;
+    if (res.rows_affected > 1) return error.NotSingular;
+}
+
 /// Generate an Update builder for an entity.
 ///
 /// Edge writes (`AddEdgeIDs` / `RemoveEdgeIDs` / `SetEdgeIDs` / `ClearEdge`)
@@ -631,10 +647,23 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
         }
 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed, NoFieldsToUpdate };
-        const SaveOneError = SaveError || error{ NotFound, NotSingular };
+        const SaveOneError = SaveError || error{ NotFound, NotSingular, RowsAffectedUnknown };
 
         /// Execute the UPDATE and return rows affected.
+        ///
+        /// `usize` has no room for "the driver obtained no count", so a write
+        /// the driver could not count reads as `0` here — the placeholder
+        /// `driver.Result` says such a driver answers. A caller that needs the
+        /// two told apart uses `SaveOne`, which refuses an unknown count rather
+        /// than reading it as `NotFound`.
         pub fn Save(self: *Self) SaveError!usize {
+            return (try self.execUpdate()).rows_affected;
+        }
+
+        /// The UPDATE itself. `Save` reports only the count, but the singleton
+        /// path also needs the "did the driver obtain one?" flag beside it, and
+        /// `usize` folds that away.
+        fn execUpdate(self: *Self) SaveError!sql_driver.Result {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .update;
@@ -852,14 +881,12 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                 });
             }
 
-            return res.rows_affected;
+            return res;
         }
 
         /// Execute the UPDATE and expect exactly one row to be affected.
         pub fn SaveOne(self: *Self) SaveOneError!void {
-            const affected = try self.Save();
-            if (affected == 0) return error.NotFound;
-            if (affected > 1) return error.NotSingular;
+            try requireExactlyOne(try self.execUpdate());
         }
     };
 }
@@ -973,34 +1000,45 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
         }
 
         const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
-        const ExecOneError = ExecError || error{ NotFound, NotSingular };
+        const ExecOneError = ExecError || error{ NotFound, NotSingular, RowsAffectedUnknown };
 
         /// Execute the DELETE and return rows affected.
         /// If the entity has soft_delete enabled, this updates deleted_at instead.
+        ///
+        /// `usize` has no room for "the driver obtained no count", so a write
+        /// the driver could not count reads as `0` here — the placeholder
+        /// `driver.Result` says such a driver answers. A caller that needs the
+        /// two told apart uses `ExecOne`, which refuses an unknown count rather
+        /// than reading it as `NotFound`.
         pub fn Exec(self: *Self) ExecError!usize {
-            if (info.soft_delete) {
-                return self.execSoftDelete();
-            }
-            return self.execHardDelete();
+            return (try self.execDelete()).rows_affected;
         }
 
-        /// Force a hard DELETE even if soft_delete is enabled.
+        /// Force a hard DELETE even if soft_delete is enabled. The count reads
+        /// the same way `Exec`'s does: an uncounted statement answers the
+        /// placeholder, and `ForceExecOne` is where that is refused.
         pub fn ForceExec(self: *Self) ExecError!usize {
-            return self.execHardDelete();
+            return (try self.execHardDelete()).rows_affected;
         }
 
         /// Execute the DELETE and expect exactly one row to be affected.
         pub fn ExecOne(self: *Self) ExecOneError!void {
-            const affected = try self.Exec();
-            if (affected == 0) return error.NotFound;
-            if (affected > 1) return error.NotSingular;
+            try requireExactlyOne(try self.execDelete());
         }
 
         /// Force a hard DELETE and expect exactly one row to be affected.
         pub fn ForceExecOne(self: *Self) ExecOneError!void {
-            const affected = try self.ForceExec();
-            if (affected == 0) return error.NotFound;
-            if (affected > 1) return error.NotSingular;
+            try requireExactlyOne(try self.execHardDelete());
+        }
+
+        /// The soft/hard dispatch `Exec` and `ExecOne` share. It returns the
+        /// driver's `Result` rather than its count so the singleton path can
+        /// still read `rows_affected_known`.
+        fn execDelete(self: *Self) ExecError!sql_driver.Result {
+            if (info.soft_delete) {
+                return self.execSoftDelete();
+            }
+            return self.execHardDelete();
         }
 
         /// Restore a soft-deleted row (clears `deleted_at`). Compile error
@@ -1056,7 +1094,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             return res.rows_affected_known and res.rows_affected > 0;
         }
 
-        fn execSoftDelete(self: *Self) ExecError!usize {
+        fn execSoftDelete(self: *Self) ExecError!sql_driver.Result {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .delete;
@@ -1173,10 +1211,10 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 });
             }
 
-            return res.rows_affected;
+            return res;
         }
 
-        fn execHardDelete(self: *Self) ExecError!usize {
+        fn execHardDelete(self: *Self) ExecError!sql_driver.Result {
             if (info.policy) |p| {
                 var ctx = self.privacy_ctx orelse return error.PrivacyDenied;
                 ctx.op = .delete;
@@ -1272,7 +1310,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                 });
             }
 
-            return res.rows_affected;
+            return res;
         }
     };
 }
@@ -1952,9 +1990,11 @@ test "Update and delete execution methods expose explicit driver error unions" {
     const BulkUpd = BulkUpdateBuilder(info);
     const BulkDel = BulkDeleteBuilder(info);
     const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, ImmutableField, ValidationFailed, InterceptFailed, NoFieldsToUpdate };
-    const SaveOneError = SaveError || error{ NotFound, NotSingular };
+    // The singleton sets carry `RowsAffectedUnknown` beside `NotFound`: a driver
+    // that obtained no count cannot be read as "the row is gone".
+    const SaveOneError = SaveError || error{ NotFound, NotSingular, RowsAffectedUnknown };
     const ExecError = sql_driver.Error || HookError || error{ PrivacyDenied, InterceptFailed };
-    const ExecOneError = ExecError || error{ NotFound, NotSingular };
+    const ExecOneError = ExecError || error{ NotFound, NotSingular, RowsAffectedUnknown };
     // Bulk delete refuses a call that constrains nothing, before any statement
     // is handed to the driver; `Delete.Exec` keeps its set, so this inequality
     // is asserted rather than papered over by widening the shared name.
@@ -2991,6 +3031,121 @@ test "a write the driver could not count reaches the log without a row count" {
 
         try std.testing.expectEqual(@as(usize, 1), Seen.calls);
         try std.testing.expect(!Seen.known);
+    }
+}
+
+test "the singleton write paths refuse a count the driver never obtained" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Doc = Schema("OneDoc", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("title"),
+        },
+    });
+    const doc_info = comptime fromSchema(Doc);
+    const Upd = UpdateBuilder(&.{doc_info}, doc_info);
+    const Del = DeleteBuilder(doc_info);
+
+    const Post = Schema("OnePost", .{
+        .fields = &.{
+            field.Int("id"),
+            field.String("title"),
+        },
+        .mixins = &.{@import("../core/mixin.zig").SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const post_info = comptime fromSchema(Post);
+    const PostDel = DeleteBuilder(post_info);
+
+    // Each singleton asks "did exactly one row move?", and a driver that never
+    // obtained a count cannot answer it: the `0` it leaves in `rows_affected`
+    // is a placeholder, and reading it as `NotFound` tells the caller a row is
+    // gone when the driver never said so. All three are covered, and on both
+    // delete paths because `ForceExecOne` skips the soft-delete branch.
+    {
+        var mock = UncountedDriver{};
+        var u = Upd.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer u.deinit();
+        _ = try u.setFieldValue("title", "edited");
+        try std.testing.expectError(error.RowsAffectedUnknown, u.SaveOne());
+    }
+    {
+        var mock = UncountedDriver{};
+        var d = Del.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer d.deinit();
+        try std.testing.expectError(error.RowsAffectedUnknown, d.ExecOne());
+    }
+    {
+        var mock = UncountedDriver{};
+        var d = PostDel.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer d.deinit();
+        try std.testing.expectError(error.RowsAffectedUnknown, d.ExecOne());
+    }
+    {
+        var mock = UncountedDriver{};
+        var d = PostDel.init(std.testing.allocator, mock.asDriver(), &.{}, null);
+        defer d.deinit();
+        try std.testing.expectError(error.RowsAffectedUnknown, d.ForceExecOne());
+    }
+
+    // A non-zero placeholder beside "I did not count" is still not a count, so
+    // `NotSingular` is wrong here too: the flag decides, not the number.
+    {
+        var placeholder = UncountedDriver{ .rows_while_unknown = 7 };
+        var u = Upd.init(std.testing.allocator, placeholder.asDriver(), &.{}, null);
+        defer u.deinit();
+        _ = try u.setFieldValue("title", "edited");
+        try std.testing.expectError(error.RowsAffectedUnknown, u.SaveOne());
+
+        var d = Del.init(std.testing.allocator, placeholder.asDriver(), &.{}, null);
+        defer d.deinit();
+        try std.testing.expectError(error.RowsAffectedUnknown, d.ExecOne());
+    }
+
+    // The controls: a count the driver *did* obtain keeps every meaning it
+    // had. Zero is "nothing matched" and stays `NotFound`.
+    {
+        var zeroed = UncountedDriver{ .known = true, .rows = 0 };
+        var u = Upd.init(std.testing.allocator, zeroed.asDriver(), &.{}, null);
+        defer u.deinit();
+        _ = try u.setFieldValue("title", "edited");
+        try std.testing.expectError(error.NotFound, u.SaveOne());
+
+        var d = Del.init(std.testing.allocator, zeroed.asDriver(), &.{}, null);
+        defer d.deinit();
+        try std.testing.expectError(error.NotFound, d.ExecOne());
+
+        var pd = PostDel.init(std.testing.allocator, zeroed.asDriver(), &.{}, null);
+        defer pd.deinit();
+        try std.testing.expectError(error.NotFound, pd.ExecOne());
+
+        var pf = PostDel.init(std.testing.allocator, zeroed.asDriver(), &.{}, null);
+        defer pf.deinit();
+        try std.testing.expectError(error.NotFound, pf.ForceExecOne());
+    }
+
+    // One is exactly one.
+    {
+        var one = UncountedDriver{ .known = true, .rows = 1 };
+        var u = Upd.init(std.testing.allocator, one.asDriver(), &.{}, null);
+        defer u.deinit();
+        _ = try u.setFieldValue("title", "edited");
+        try u.SaveOne();
+
+        var d = Del.init(std.testing.allocator, one.asDriver(), &.{}, null);
+        defer d.deinit();
+        try d.ExecOne();
+
+        var pd = PostDel.init(std.testing.allocator, one.asDriver(), &.{}, null);
+        defer pd.deinit();
+        try pd.ExecOne();
+
+        var pf = PostDel.init(std.testing.allocator, one.asDriver(), &.{}, null);
+        defer pf.deinit();
+        try pf.ForceExecOne();
     }
 }
 
