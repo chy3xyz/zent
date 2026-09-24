@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.77.0] - 2026-09-24
+
 ### Added
 - **A log sink: `zent.runtime.log`.** `std.log` stays the default, and the
   forwarded call is the same spelling at the same scope, so the emitted text is
