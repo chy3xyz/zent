@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **A log sink: `zent.runtime.log`.** `std.log` stays the default, and the
+  forwarded call is the same spelling at the same scope, so the emitted text is
+  unchanged — a consumer grep-gate reads those lines. What the sink adds is what
+  a library cannot otherwise offer: `std_options.logFn` belongs to the root
+  module, so a consumer had no way to receive these lines in its own handler and
+  a test had none either.
+  `zent.runtime.log.setSink(fn (level, message) void)` installs one, `setSink(null)`
+  restores the default. Every diagnostic in `src/` now goes through it — 70 call
+  sites across the drivers, the pool, migrations, the codegen, privacy, the
+  outbox and the data-scope filters — with the per-query logger
+  (`sql_logger.Logger`) deliberately left alone: it carries SQL, args, duration
+  and row counts, which a line-oriented sink would flatten.
+- **The allocation-failure sweep now covers the read and planning paths.**
+  `src/test/allocation_failures_read.zig` sweeps the row scanners
+  (`scanRowWithArena`, `scanRowNamed`, the lenient variant) and `queryAll` with a
+  fake row source; `src/test/allocation_failures_plan.zig` sweeps
+  `planMigrateStatements` (now `pub` for it) against a catalog stub, which
+  exercises both the create and the diff gates plus the unique-index planning,
+  and `CrudService.getOwned` through a real `:memory:` database. `ownedCopy` came
+  back clean, which is a result, not a gap.
+
+### Fixed
+- **Eight more out-of-memory leaks, all the same shape as the three v0.76.1
+  fixed** — a value produced by one `try` and handed to a container whose
+  `append` could still fail:
+
+  | Site | Leaked |
+  |---|---|
+  | `scanRowWithArena`, `scanRowLenientWithArena`, `scanRowNamedImpl`, `scanRowInner` (`sql/scan.zig`) | every string field already copied, when a later field's copy failed |
+  | `queryAllImpl` (`sql/scan.zig`) | the scanned item, when the list append failed |
+  | `planMigrateStatements` (`sql/schema/migrate.zig`) | the statement SQL, at all twelve `plan.append(.{ .sql = try … })` sites (now one `appendPlanned`) |
+  | `getSQLiteIndexes` | the index name, then each key column |
+  | `getMySQLIndexes`, `getPostgresIndexes` — same shape, fixed by inspection: the sweep's stub is SQLite-only | the index name and each key column |
+
+  Every one is unconditional and invisible in any non-OOM run. The byte-level
+  failure reports are in the commits; the sweep is the mechanical form of a hunt
+  that had only been done by hand before.
+
 ## [0.76.2] - 2026-09-24
 
 ### Fixed
