@@ -1646,8 +1646,16 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         fn buildCountQuery(self: *Self) !sql.OwnedQuery {
+            // A grouped count is the number of groups, not the size of one
+            // group. `SELECT COUNT(*) … GROUP BY …` answers one row per group,
+            // so reading its first row counts the first group only, and a
+            // predicate that matches nothing produces no row at all — which the
+            // caller would see as `error.NotFound` rather than a count of zero.
+            // Project a constant per group and count the rows of that derived
+            // table: one number either way, and 0 when there is no group.
+            const grouped = self.group_cols.items.len > 0;
             const t = sql.Table(info.table_name);
-            const count_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
+            const count_col = sql.ColumnRef{ .table = null, .name = if (grouped) "1" else "COUNT(*)", .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{count_col});
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
@@ -1664,7 +1672,23 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (self.having_pred) |pred| {
                 _ = selector.having(pred);
             }
-            return selector.takeQuery() catch |err| return mapBuildError(err);
+            if (!grouped) return selector.takeQuery() catch |err| return mapBuildError(err);
+
+            var inner = selector.takeQuery() catch |err| return mapBuildError(err);
+            defer inner.deinit();
+            // The alias is load-bearing: PostgreSQL refuses a derived table
+            // without one (42601), and it is the spelling SQLite and MySQL
+            // accept too. The wrapper binds no argument of its own, so the
+            // inner statement's list is the outer's list in the same order —
+            // copied, because `inner` owns the original.
+            const text = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM ({s}) AS __zent_groups", .{inner.sql});
+            errdefer self.allocator.free(text);
+            return .{
+                .sql = text,
+                .args = try self.allocator.dupe(sql.Value, inner.args),
+                .allocator = self.allocator,
+                .dialect = self.driver.dialect(),
+            };
         }
 
         fn buildAggregateQuery(self: *Self, comptime agg_expr: []const u8) !sql.OwnedQuery {
@@ -1962,6 +1986,61 @@ test "Query builder GroupBy and Having" {
     _ = (try q.GroupBy(&.{"age"})).Having(sql.GT("COUNT(*)", .{ .int = 1 }));
     try std.testing.expectEqual(@as(usize, 1), q.group_cols.items.len);
     try std.testing.expectEqualStrings("age", q.group_cols.items[0]);
+}
+
+test "Count() on a grouped query answers the group count, not one group's rows" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const CountGroup = schema("CountGroup", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+    const graph = comptime buildGraph(&.{CountGroup});
+    const infos = graph.types;
+    const info = comptime fromSchema(CountGroup);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    // Three rows in "a" and one in "b": the number of groups (2) and the size
+    // of the first group (3) are different numbers on purpose, so a count that
+    // reads one group's row cannot come out looking right.
+    inline for (.{ "a", "a", "a", "b" }) |name| {
+        var b = try root.count_group.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("age", @as(i64, 1));
+        var row = try b.Save();
+        defer deinitEntity(infos, info, &row, allocator);
+    }
+
+    var q = root.count_group.Query();
+    defer q.deinit();
+    _ = try q.GroupBy(&.{"name"});
+    try std.testing.expectEqual(@as(i64, 2), try q.Count());
+
+    // A predicate that matches nothing must answer 0. The aggregate spelling
+    // produces no group row to read, so this call used to fail with
+    // `error.NotFound` — "the query broke", not "the answer is zero".
+    var q_none = root.count_group.Query();
+    defer q_none.deinit();
+    _ = try q_none.GroupBy(&.{"name"});
+    _ = try q_none.Where(.{root.count_group.predicates.nameEQ(.{ .string = "zzz" })});
+    try std.testing.expectEqual(@as(i64, 0), try q_none.Count());
+
+    // Ungrouped Count() stays the plain row count: the derived table is only
+    // for a grouped query, and must not change what an ordinary count means.
+    var q_all = root.count_group.Query();
+    defer q_all.deinit();
+    try std.testing.expectEqual(@as(i64, 4), try q_all.Count());
 }
 
 test "Query builder execution methods expose explicit driver error union" {
