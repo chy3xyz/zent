@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.77.2] - 2026-09-24
+
 ### Added
 - **Mechanical verification for the MySQL and PostgreSQL index introspection.**
   Their four copy-then-append leak sites were fixed by inspection at v0.77.0
