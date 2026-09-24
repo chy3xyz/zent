@@ -10,6 +10,7 @@ const debugLogger = @import("../sql/logger.zig").debugLogger;
 const migrate = @import("../sql/schema/migrate.zig");
 const Hook = @import("../runtime/hook.zig").Hook;
 const intercept = @import("../runtime/intercept.zig");
+const zent_log = @import("../runtime/log.zig");
 const privacy = @import("../privacy/policy.zig");
 
 const EntityGen = @import("entity.zig").Entity;
@@ -378,7 +379,7 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
         pub fn takePendingEvents(self: *@This()) [][]u8 {
             const alloc = self.client.allocator;
             const out = alloc.dupe([]u8, self.events.items) catch |err| {
-                std.log.warn("zent: takePendingEvents could not hand over {d} pending transaction event(s) ({s}); they stay queued on the TxClient", .{ self.events.items.len, @errorName(err) });
+                zent_log.warn("zent: takePendingEvents could not hand over {d} pending transaction event(s) ({s}); they stay queued on the TxClient", .{ self.events.items.len, @errorName(err) });
                 return &.{};
             };
             self.events.deinit(alloc);

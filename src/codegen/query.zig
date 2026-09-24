@@ -54,12 +54,12 @@ fn explainScanFailure(comptime info: TypeInfo, comptime T: type, row: sql_driver
         const idx = col;
         col += 1;
         if (idx >= row.columnCount()) {
-            std.log.warn("zent: scanning table '{s}' failed: the result set has {d} column(s) but field '{s}' needs column {d} ({s})", .{ info.table_name, row.columnCount(), fname, idx + 1, @typeName(ftype) });
+            zent_log.warn("zent: scanning table '{s}' failed: the result set has {d} column(s) but field '{s}' needs column {d} ({s})", .{ info.table_name, row.columnCount(), fname, idx + 1, @typeName(ftype) });
             return;
         }
         if (@typeInfo(ftype) == .optional) continue;
         if (row.isNull(idx)) {
-            std.log.warn("zent: table '{s}' column '{s}' is NULL, but field '{s}' ({s}) is not optional — the database allows NULL where the schema does not; make the field Optional()/Nillable(), or fix the column", .{ info.table_name, row.columnName(idx), fname, @typeName(ftype) });
+            zent_log.warn("zent: table '{s}' column '{s}' is NULL, but field '{s}' ({s}) is not optional — the database allows NULL where the schema does not; make the field Optional()/Nillable(), or fix the column", .{ info.table_name, row.columnName(idx), fname, @typeName(ftype) });
             return;
         }
     }
@@ -83,11 +83,11 @@ fn explainScanFailure(comptime info: TypeInfo, comptime T: type, row: sql_driver
         _ = sql_scan.scanColumn(ftype, arena.allocator(), row, col2, null) catch {
             const col_name = if (col2 < row.columnCount()) row.columnName(col2) else "<past the end>";
             const value = if (col2 < row.columnCount()) (row.getText(col2) orelse "<null>") else "<none>";
-            std.log.warn("zent: scanning table '{s}' failed: column {d} is '{s}' with value '{s}', which field '{s}' ({s}) cannot hold — the projection does not line up with the schema's field order (an eager-loaded target is scanned positionally, so its SELECT list must be the target's columns in field order)", .{ info.table_name, col2 + 1, col_name, value, fname, @typeName(ftype) });
+            zent_log.warn("zent: scanning table '{s}' failed: column {d} is '{s}' with value '{s}', which field '{s}' ({s}) cannot hold — the projection does not line up with the schema's field order (an eager-loaded target is scanned positionally, so its SELECT list must be the target's columns in field order)", .{ info.table_name, col2 + 1, col_name, value, fname, @typeName(ftype) });
             return;
         };
     }
-    std.log.warn("zent: scanning table '{s}' failed: no NULL found among the {d} projected column(s), so a value does not fit its field's type (check the SELECT projection order against the schema)", .{ info.table_name, row.columnCount() });
+    zent_log.warn("zent: scanning table '{s}' failed: no NULL found among the {d} projected column(s), so a value does not fit its field's type (check the SELECT projection order against the schema)", .{ info.table_name, row.columnCount() });
 }
 
 /// Like `scanEntity` for the name-based (partial projection) scanner. The
@@ -129,6 +129,7 @@ fn toPrivacyOp(op: intercept_op.Op) privacy_op.Op {
 }
 const hook = @import("../runtime/hook.zig");
 const intercept = @import("../runtime/intercept.zig");
+const zent_log = @import("../runtime/log.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;

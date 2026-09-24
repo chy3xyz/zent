@@ -17,6 +17,7 @@ const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const rthook = @import("../runtime/hook.zig");
 const intercept = @import("../runtime/intercept.zig");
+const zent_log = @import("../runtime/log.zig");
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
@@ -675,7 +676,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                     for (self.hooks) |h| {
                         if (h.op == .update) {
                             if (h.after) |f| f(&hook_ctx) catch |err| {
-                                std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                                zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                             };
                         }
                     }
@@ -821,7 +822,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.after) |f| f(&hook_ctx) catch |err| {
-                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                     };
                 }
             }
@@ -1090,7 +1091,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     for (self.hooks) |h| {
                         if (h.op == .delete) {
                             if (h.after) |f| f(&hook_ctx) catch |err| {
-                                std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                                zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                             };
                         }
                     }
@@ -1155,7 +1156,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch |err| {
-                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                     };
                 }
             }
@@ -1210,7 +1211,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
                     for (self.hooks) |h| {
                         if (h.op == .delete) {
                             if (h.after) |f| f(&hook_ctx) catch |err| {
-                                std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                                zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                             };
                         }
                     }
@@ -1254,7 +1255,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch |err| {
-                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                     };
                 }
             }
@@ -1451,7 +1452,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 for (self.hooks) |h| {
                     if (h.op == .update) {
                         if (h.after) |f| f(&hook_ctx) catch |err| {
-                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                            zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                         };
                     }
                 }
@@ -1479,7 +1480,7 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
             for (self.hooks) |h| {
                 if (h.op == .update) {
                     if (h.after) |f| f(&hook_ctx) catch |err| {
-                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                     };
                 }
             }
@@ -1702,7 +1703,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 for (self.hooks) |h| {
                     if (h.op == .delete) {
                         if (h.after) |f| f(&hook_ctx) catch |err| {
-                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                            zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                         };
                     }
                 }
@@ -1724,7 +1725,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             for (self.hooks) |h| {
                 if (h.op == .delete) {
                     if (h.after) |f| f(&hook_ctx) catch |err| {
-                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                     };
                 }
             }

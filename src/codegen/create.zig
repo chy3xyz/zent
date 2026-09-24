@@ -14,6 +14,7 @@ const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const rthook = @import("../runtime/hook.zig");
+const zent_log = @import("../runtime/log.zig");
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
@@ -309,7 +310,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 for (self.hooks) |h| {
                     if (h.op == .create) {
                         if (h.after) |f| f(&hook_ctx) catch |err| {
-                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                            zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                         };
                     }
                 }
@@ -610,7 +611,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.after) |f| f(&hook_ctx) catch |err| {
-                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                     };
                 }
             }
@@ -825,12 +826,12 @@ pub fn fillAuditUser(
         values.append(.{ .name = "created_by", .value = .{ .int = user.? } }) catch |err| {
             // Audit columns are best-effort; the write still proceeds, but an
             // OOM dropping created_by silently would corrupt the audit trail.
-            std.log.warn("fillAuditUser: created_by dropped ({s})", .{@errorName(err)});
+            zent_log.warn("fillAuditUser: created_by dropped ({s})", .{@errorName(err)});
         };
     }
     if (has_updated_by and !set(values.items, "updated_by")) {
         values.append(.{ .name = "updated_by", .value = .{ .int = user.? } }) catch |err| {
-            std.log.warn("fillAuditUser: updated_by dropped ({s})", .{@errorName(err)});
+            zent_log.warn("fillAuditUser: updated_by dropped ({s})", .{@errorName(err)});
         };
     }
 }
@@ -1219,7 +1220,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 for (self.hooks) |h| {
                     if (h.op == .create) {
                         if (h.after) |f| f(&hook_ctx) catch |err| {
-                            std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                            zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                         };
                     }
                 }
@@ -1259,12 +1260,12 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             const first_row = self.rows.items[0];
             for (self.rows.items[1..], 1..) |row, row_index| {
                 if (row.items.len != first_row.items.len) {
-                    std.log.warn("bulk insert into '{s}': row {d} sets {d} field(s) where row 0 sets {d} — the batch was not executed", .{ info.table_name, row_index, row.items.len, first_row.items.len });
+                    zent_log.warn("bulk insert into '{s}': row {d} sets {d} field(s) where row 0 sets {d} — the batch was not executed", .{ info.table_name, row_index, row.items.len, first_row.items.len });
                     return error.InconsistentRowFields;
                 }
                 for (row.items, first_row.items, 0..) |fv, first_fv, field_index| {
                     if (!std.mem.eql(u8, fv.name, first_fv.name)) {
-                        std.log.warn("bulk insert into '{s}': row {d} sets '{s}' at position {d} where row 0 sets '{s}' — the batch was not executed", .{ info.table_name, row_index, fv.name, field_index, first_fv.name });
+                        zent_log.warn("bulk insert into '{s}': row {d} sets '{s}' at position {d} where row 0 sets '{s}' — the batch was not executed", .{ info.table_name, row_index, fv.name, field_index, first_fv.name });
                         return error.InconsistentRowFields;
                     }
                 }
@@ -1397,7 +1398,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             for (self.hooks) |h| {
                 if (h.op == .create) {
                     if (h.after) |f| f(&hook_ctx) catch |err| {
-                        std.log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
+                        zent_log.warn("after-hook failed on table '{s}' ({s}): {s}", .{ hook_ctx.table_name, @tagName(hook_ctx.op), @errorName(err) });
                     };
                 }
             }
@@ -2355,4 +2356,71 @@ test "create: the MySQL exec path logs the driver's row count" {
     try std.testing.expectEqual(@as(usize, 1), Seen.calls);
     try std.testing.expectEqual(@as(usize, 2), Seen.rows);
     try std.testing.expect(Seen.known);
+}
+
+test "create: the after-hook failure warning reaches an installed log sink" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+    const deinitEntity = @import("entity.zig").deinitEntity;
+    const zent = @import("../root.zig");
+
+    // What the sink saw lives at container level: the callback carries no user
+    // pointer (same shape as the `Seen` captures above).
+    const Capture = struct {
+        var level: zent.runtime.log.Level = .debug;
+        var count: usize = 0;
+        var text: [256]u8 = undefined;
+        var len: usize = 0;
+
+        fn sink(l: zent.runtime.log.Level, message: []const u8) void {
+            level = l;
+            count += 1;
+            len = @min(message.len, text.len);
+            @memcpy(text[0..len], message[0..len]);
+        }
+
+        fn last() []const u8 {
+            return text[0..len];
+        }
+    };
+
+    const FailingAfter = struct {
+        fn after(_: *HookContext) HookError!void {
+            return error.HookFailed;
+        }
+    };
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, UserEntity);
+
+    zent.runtime.log.setSink(Capture.sink);
+    defer zent.runtime.log.setSink(null);
+    Capture.count = 0;
+    Capture.len = 0;
+
+    const hooks = [_]Hook{Hook.initAfter(.create, FailingAfter.after)};
+    var drv = IdScriptDriver{ .script = &.{7} };
+    defer drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, drv.asDriver(), &hooks, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+
+    // The row is written and `Save` succeeds: the hook failure is surfaced,
+    // not propagated. It used to go to `std.log` unconditionally, where a
+    // consumer had no way to receive it.
+    var entity = try b.Save();
+    defer deinitEntity(infos, info, &entity, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), Capture.count);
+    try std.testing.expectEqual(zent.runtime.log.Level.warn, Capture.level);
+    try std.testing.expectEqualStrings("after-hook failed on table 'user' (create): HookFailed", Capture.last());
 }
