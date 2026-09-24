@@ -792,10 +792,12 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// widen `All()`, `First()` and the rest with an error none of them can
         /// return, and break callers that switch over the set exhaustively.
         ///
-        /// The members are not uniform across the four. `Sum` / `Avg` answer
-        /// `error.EmptyAggregate` on an empty set — SQL's `SUM`/`AVG` is NULL
-        /// there — while `Max` / `Min` hand that NULL back as `sql.Value.null`,
-        /// so for them the member is not reachable. All four answer
+        /// The members are not uniform across the seven methods that share it.
+        /// `Sum` / `Avg` answer `error.EmptyAggregate` on an empty set — SQL's
+        /// `SUM`/`AVG` is NULL there — while `Max`, `Min`, `SumOrZero`,
+        /// `AggregateOne` and `AggregateText` hand that NULL back in their value
+        /// (`sql.Value.null`, a coalesced `0`, a null slice), so for them the
+        /// member is not reachable. All seven answer
         /// `error.GroupByNotSupported`, because a grouped query has one
         /// aggregate value per group and each of these returns exactly one.
         const AggregateError = QueryError || error{ EmptyAggregate, GroupByNotSupported };
@@ -1453,7 +1455,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         /// COALESCE(SUM(field), 0): an empty set yields 0 instead of the
         /// `error.TypeMismatch` a bare `Sum` returns on SQL NULL.
-        pub fn SumOrZero(self: *Self, comptime field_name: []const u8) QueryError!f64 {
+        pub fn SumOrZero(self: *Self, comptime field_name: []const u8) AggregateError!f64 {
+            // As the four aggregates above: one value cannot answer a grouped
+            // query, where there is one aggregate per group. `AggregateBy` is
+            // the API for that.
+            if (self.group_cols.items.len > 0) return error.GroupByNotSupported;
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -1474,7 +1480,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// The expression is emitted verbatim — never interpolate user input.
         /// String results are duped; free with the query allocator when
         /// the returned value is `.string`/`.bytes`.
-        pub fn AggregateOne(self: *Self, comptime agg_expr: []const u8) QueryError!sql.Value {
+        pub fn AggregateOne(self: *Self, comptime agg_expr: []const u8) AggregateError!sql.Value {
+            // As the four aggregates above: one value cannot answer a grouped
+            // query, where there is one aggregate per group. `AggregateBy` is
+            // the API for that.
+            if (self.group_cols.items.len > 0) return error.GroupByNotSupported;
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -1493,7 +1503,11 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// Exact text form of an aggregate (e.g. DECIMAL `SUM`), avoiding
         /// float rounding for money columns. Returns null on SQL NULL.
         /// Caller owns the returned slice (free with the query allocator).
-        pub fn AggregateText(self: *Self, comptime agg_expr: []const u8) QueryError!?[]u8 {
+        pub fn AggregateText(self: *Self, comptime agg_expr: []const u8) AggregateError!?[]u8 {
+            // As the four aggregates above: one value cannot answer a grouped
+            // query, where there is one aggregate per group. `AggregateBy` is
+            // the API for that.
+            if (self.group_cols.items.len > 0) return error.GroupByNotSupported;
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
             try self.runInterceptors(.query);
@@ -2131,7 +2145,7 @@ test "Query builder execution methods expose explicit driver error union" {
     }
 
     comptime {
-        // The four single-value aggregates carry two extra members. `Sum` / `Avg`
+        // The seven single-value aggregates carry two extra members. `Sum` / `Avg`
         // name an empty set `error.EmptyAggregate` — SQL's `SUM`/`AVG` is NULL
         // there, which is not the type problem `TypeMismatch` names. All four
         // refuse a grouped query with `error.GroupByNotSupported`, because
@@ -2139,7 +2153,7 @@ test "Query builder execution methods expose explicit driver error union" {
         // value, i.e. the first group's. The readers above keep the set they had,
         // so a caller switching over `QueryError` is disturbed by neither member.
         const AggregateError = QueryError || error{ EmptyAggregate, GroupByNotSupported };
-        const aggregate_names = .{ "Sum", "Avg", "Max", "Min" };
+        const aggregate_names = .{ "Sum", "Avg", "Max", "Min", "SumOrZero", "AggregateOne", "AggregateText" };
         for (aggregate_names) |method_name| {
             const return_type = @typeInfo(@TypeOf(@field(UserQuery, method_name))).@"fn".return_type.?;
             if (@typeInfo(return_type).error_union.error_set != AggregateError) {

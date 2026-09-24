@@ -1141,10 +1141,11 @@ test "Postgres: only a reported decimal command tag counts as a known row count"
     try std.testing.expectEqual(@as(usize, 42), many.rows);
     try std.testing.expect(many.known);
 
-    // A tag that is neither: 0 here would be a lie no caller could detect —
-    // `UpdateBuilder.Save` compares it against 0 for the version lock, and
-    // `SaveOne` turns it into `error.NotFound`, so a write that did happen
-    // would be reported as "no such row".
+    // A tag that is neither: a reported 0 would be a lie the flag cannot undo
+    // at this layer — `UpdateBuilder.Save` compares it against 0 for the version
+    // lock, and `SaveOne` would answer `error.NotFound` for a write that did
+    // happen. Failing here leaves the flag false, which the singleton paths
+    // report as `error.RowsAffectedUnknown` instead.
     try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("INSERT 0 1"));
     try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("-1"));
     try std.testing.expectError(error.DriverFailed, reportedRowsFromCommandTag("n/a"));

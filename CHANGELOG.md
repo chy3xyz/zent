@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+- **The seven single-value aggregates refuse a grouped query.** `Sum`, `Avg`,
+  `Max`, `Min`, `SumOrZero`, `AggregateOne` and `AggregateText` built
+  `GROUP BY` into their statement and read the first row — the **first group's**
+  aggregate, presented as the answer for the whole set. They now answer
+  `error.GroupByNotSupported` instead, before any SQL is built. A grouped query
+  has one value per group and these return one: `AggregateBy` and `GroupCount`
+  are the APIs that express that. The member lives in the set shared by exactly
+  these seven (`QueryError || error{ EmptyAggregate, GroupByNotSupported }`), so
+  a caller switching over `QueryError` is not disturbed.
+- **`SaveOne` / `ExecOne` / `ForceExecOne` answer `error.RowsAffectedUnknown`
+  instead of `error.NotFound` when the driver never obtained a count.** The
+  primitives (`Save`, `Exec`, `ForceExec`) keep their `usize` and their
+  documented behaviour — an uncounted write reads as `0` there — but "I could
+  not count" is no longer reported to the singleton callers as "no row matched".
+  Unreachable with the three in-tree drivers (all of them count `UPDATE` and
+  `DELETE`), and pinned by a test driven by the file's existing
+  `UncountedDriver`.
+
+### Added
+- **`Query().AllOwned()` — an owning page.** `All()` returns a list the caller
+  releases with `q.deinitRows(&rows)`, while `paged()` returns a `PagedResult`
+  whose `deinit()` frees rows and list; both are correct and both are
+  documented, but the two shapes are easy to confuse in a mechanical migration
+  (a consumer reports `paged` being the single "touch nothing" case in 177
+  migrated call sites). `AllOwned()` returns an `OwnedRows` whose `items` are
+  `All()`'s rows byte for byte and whose `deinit()` frees both, leaving the
+  struct empty so a second call is safe. `All()`, `deinitRows` and `PagedResult`
+  are untouched — `All()` alone has 607 in-tree call sites — and the new entry
+  is documented as the recommended shape for new code.
+
+### Fixed
+- **A grouped `Count()` answers the number of groups.** It counted the first
+  group's rows (`SELECT COUNT(*) … GROUP BY …` read one row) and answered
+  `error.NotFound` for a grouping that matched nothing. It now wraps the grouped
+  select in a derived table — `SELECT COUNT(*) FROM (SELECT 1 … GROUP BY …) AS
+  __zent_groups` — so the answer is the group count and an empty grouping is
+  `0`. The alias is required by PostgreSQL and accepted by SQLite and MySQL; the
+  cross-dialect matrix case `a grouped Count() answers the number of groups, on
+  every server` pins all three.
+
 ## [0.77.3] - 2026-09-24
 
 ### Fixed

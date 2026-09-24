@@ -608,7 +608,7 @@ test "Sum and Avg name an empty set instead of answering a type error" {
     }
 }
 
-test "Sum, Avg, Max and Min refuse a grouped query" {
+test "the single-value aggregates refuse a grouped query" {
     // `buildAggregateQuery` emits the query's GROUP BY, so a grouped Sum ran
     // `SELECT SUM(amount) ... GROUP BY tenant_id` and read only the first row:
     // the first group's total, presented as the answer for the whole set. A
@@ -630,7 +630,10 @@ test "Sum, Avg, Max and Min refuse a grouped query" {
 
     // Grouped: refused, and refused before the driver is asked anything — no
     // statement reaches it, so there is no half-answer to discard.
-    for ([_][]const u8{ "Sum", "Avg", "Max", "Min" }) |method| {
+    // Seven methods, all of them `buildAggregateQuery` callers: the four that
+    // take a field plus `SumOrZero`, `AggregateOne` and `AggregateText`, which
+    // take an expression and have the same one-value-per-call contract.
+    for ([_][]const u8{ "Sum", "Avg", "Max", "Min", "SumOrZero", "AggregateOne", "AggregateText" }) |method| {
         var mock = MockDriver{ .value = .{ .float = 12.5 }, .capture_sql = true };
         var q = OrderQuery.init(allocator, mock.asDriver(), null);
         defer q.deinit();
@@ -642,8 +645,14 @@ test "Sum, Avg, Max and Min refuse a grouped query" {
             try std.testing.expectError(error.GroupByNotSupported, q.Avg("amount"));
         } else if (std.mem.eql(u8, method, "Max")) {
             try std.testing.expectError(error.GroupByNotSupported, q.Max("amount"));
-        } else {
+        } else if (std.mem.eql(u8, method, "Min")) {
             try std.testing.expectError(error.GroupByNotSupported, q.Min("amount"));
+        } else if (std.mem.eql(u8, method, "SumOrZero")) {
+            try std.testing.expectError(error.GroupByNotSupported, q.SumOrZero("amount"));
+        } else if (std.mem.eql(u8, method, "AggregateOne")) {
+            try std.testing.expectError(error.GroupByNotSupported, q.AggregateOne("COUNT(*)"));
+        } else {
+            try std.testing.expectError(error.GroupByNotSupported, q.AggregateText("GROUP_CONCAT(\"amount\")"));
         }
 
         try std.testing.expectEqual(@as(?[]u8, null), mock.last_sql_owned);
@@ -674,5 +683,25 @@ test "Sum, Avg, Max and Min refuse a grouped query" {
         var q = OrderQuery.init(allocator, mock.asDriver(), null);
         defer q.deinit();
         try expectValueEqual(.{ .float = 12.5 }, try q.Min("amount"));
+    }
+    {
+        var mock = MockDriver{ .value = .{ .float = 12.5 } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try std.testing.expectEqual(@as(f64, 12.5), try q.SumOrZero("amount"));
+    }
+    {
+        var mock = MockDriver{ .value = .{ .float = 12.5 } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try expectValueEqual(.{ .float = 12.5 }, try q.AggregateOne("COUNT(*)"));
+    }
+    {
+        var mock = MockDriver{ .value = .{ .string = "concat" } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        const text = (try q.AggregateText("GROUP_CONCAT(\"amount\")")).?;
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings("concat", text);
     }
 }

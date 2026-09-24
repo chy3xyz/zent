@@ -29,11 +29,12 @@ pub const Result = struct {
     /// **A consumer must read this field before `rows_affected`.** `rows == 0`
     /// asks "did the driver count zero rows?"; `rows_affected_known and rows ==
     /// 0` asks "did the statement match nothing?", which is the question the
-    /// optimistic-lock checks in `codegen/update_delete.zig` and the `NotFound`
-    /// paths of `SaveOne`/`ExecOne` actually mean. An UPDATE or DELETE whose
-    /// count the driver did obtain sets this true on all three dialects, so
-    /// those paths keep their meaning; the default is `true` because every
-    /// in-tree construction site either counts rows itself or is a mock.
+    /// optimistic-lock checks in `codegen/update_delete.zig` mean — and the one
+    /// `SaveOne`/`ExecOne` answer with `error.RowsAffectedUnknown` rather than
+    /// `NotFound` when the flag is false. An UPDATE or DELETE whose count the
+    /// driver did obtain sets this true on all three dialects, so those paths
+    /// keep their meaning; the default is `true` because every in-tree
+    /// construction site either counts rows itself or is a mock.
     rows_affected_known: bool = true,
 };
 

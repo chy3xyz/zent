@@ -47,6 +47,12 @@ Rule of thumb: default to `crud_helpers` for terse reads/writes; reach for
 `CrudService` when several entities share the same tenant column and you want
 created/updated/deleted events emitted consistently (e.g. to feed the outbox).
 
+`Query().AllOwned()` is the one-call shape for a page: `struct { items, deinit() }`
+— `deinit()` frees every entity and the list, and a second call is a no-op. Use it
+for new code; `All()` + `q.deinitRows(&rows)` and `paged()`'s `PagedResult.deinit()`
+stay as they are, and mixing their exits (a `PagedResult`'s inner list handed to
+`deinitRows`, say) is a double free.
+
 `CrudService.getOwned(allocator, tenant_id, id)` copies the row into **your**
 allocator, so release it with that allocator — `client.<entity>.deinitRowWith(allocator, &e)`
 or `deinitEntity(infos, info, &e, allocator)`. `client.<entity>.deinitRow(&e)`
@@ -346,6 +352,22 @@ empty set, `error.TypeMismatch` for a value it cannot read as a number.
 `SumOrZero` is the variant that answers `0` instead, and `Max` / `Min` return
 `sql.Value` so their NULL stays visible in the value.
 
+**Grouped queries.** `Count()` on a builder with `GroupBy` answers the number of
+**groups** (it wraps the grouped select in a derived table, so an empty grouping
+is `0`, not `NotFound`). The single-value aggregates — `Sum`, `Avg`, `Max`,
+`Min`, `SumOrZero`, `AggregateOne`, `AggregateText` — refuse a grouped query
+with `error.GroupByNotSupported`: a grouped set has one aggregate per group and
+each of them returns exactly one value, so the only possible answers are "the
+first group's" (wrong) or an error. Use `GroupCount` or `AggregateBy` instead —
+they return one entry per group:
+
+```zig
+// How many groups, and each group's own value.
+_ = try q.GroupBy(&.{"status"});
+const groups = try q.Count();               // the number of distinct statuses
+var per_group = try q.AggregateBy("SUM(amount)");   // free with freeGroupMetrics
+```
+
 `COUNT(DISTINCT ...)` has no builder form — use the raw driver (§5).
 
 ### Error sets that grow
@@ -354,7 +376,9 @@ The write and query error sets (`SaveError`, `DeleteBuilder.ExecError`,
 `QueryError`, …) are explicit, and a **minor release may add a member** to one:
 v0.67.0 added `error.MissingLastInsertId`, v0.69.0
 `error.InconsistentRowFields` and `error.MissingPrimaryKey`, v0.73.0
-`error.EmptyAggregate` for `Sum`/`Avg` only. Members are added for failures a
+`error.EmptyAggregate` for `Sum`/`Avg` only, v0.78.0
+`error.GroupByNotSupported` for the seven single-value aggregates and
+`error.RowsAffectedUnknown` for `SaveOne`/`ExecOne`/`ForceExecOne`. Members are added for failures a
 caller can act on and are never renamed — but a `switch` over one of these sets
 has to end with `else =>`, or an upgrade stops compiling:
 

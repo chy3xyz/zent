@@ -623,6 +623,67 @@ fn hasUniqueConstraintDrift(drifts: []const zent.sql_schema.SchemaDrift) bool {
     return false;
 }
 
+/// `Count()` on a builder with `GroupBy` set. The library answers the number of
+/// **groups** (`SELECT COUNT(*) FROM (SELECT 1 … GROUP BY …) AS __zent_groups`),
+/// which is a derived table — and a derived table is where the servers differ:
+/// PostgreSQL requires it to be named, SQLite and MySQL accept a name but do not
+/// demand one. A run where only one server accepts the shape would be a
+/// consumer's production surprise rather than a test failure, so the answer is
+/// pinned here.
+///
+/// Before v0.78.0 the same call read the first row of
+/// `SELECT COUNT(*) … GROUP BY …`, i.e. the first group's size (3 here, not 2),
+/// and answered `error.NotFound` for a grouping with no rows at all.
+fn caseGroupedCountTotals(a: std.mem.Allocator, drv: Driver) ![]const u8 {
+    const allocator = testing.allocator;
+    const DmCountRow = schema("DmCountRow", .{
+        .table_name = "dm_count_row",
+        .fields = &.{ field.String("grp"), field.Int("amount") },
+    });
+
+    const graph = comptime buildGraph(&.{DmCountRow});
+    const infos = graph.types;
+    try freshTable(allocator, drv, infos, &.{"dm_count_row"});
+    defer dropTable(drv, "dm_count_row");
+
+    const client = Client.makeClient(infos, allocator, drv);
+
+    // Three rows in "a", one in "b": the first group's size and the group count
+    // differ, so an implementation that reads the first row cannot pass by
+    // accident.
+    for ([_][2][]const u8{
+        .{ "a", "1" },
+        .{ "a", "2" },
+        .{ "a", "3" },
+        .{ "b", "4" },
+    }) |pair| {
+        var b = try client.dm_count_row.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("grp", pair[0]);
+        _ = try b.setFieldValue("amount", std.fmt.parseInt(i64, pair[1], 10) catch unreachable);
+        var row = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &row, allocator);
+    }
+
+    var grouped = client.dm_count_row.Query();
+    defer grouped.deinit();
+    _ = try grouped.GroupBy(&.{"grp"});
+    const groups = try grouped.Count();
+
+    // Nothing matches: the answer is zero groups, not "no such row".
+    var empty = client.dm_count_row.Query();
+    defer empty.deinit();
+    _ = try empty.GroupBy(&.{"grp"});
+    _ = try empty.Where(.{client.dm_count_row.predicates.grpEQ(.{ .string = "zzz" })});
+    const none = empty.Count() catch |err| return std.fmt.allocPrint(a, "empty=err:{s}", .{@errorName(err)});
+
+    var plain = client.dm_count_row.Query();
+    defer plain.deinit();
+    const all = try plain.Count();
+
+    return std.fmt.allocPrint(a, "groups={d}|empty={d}|ungrouped={d}", .{ groups, none, all });
+}
+
 fn caseUniqueIndexAddedToExistingTable(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     const allocator = testing.allocator;
     const DmUqRow = schema("DmUqRow", .{
@@ -1326,6 +1387,11 @@ const cases = [_]Case{
         .name = "batchSaveOrUpdate: the created/updated split is per row, not per changed row",
         .expect = "first=2/0|second=0/2",
         .run = caseBatchSaveOrUpdateCounts,
+    },
+    .{
+        .name = "a grouped Count() answers the number of groups, on every server",
+        .expect = "groups=2|empty=0|ungrouped=4",
+        .run = caseGroupedCountTotals,
     },
     .{
         .name = "migrate: a column-level UNIQUE is enforced on a table that already exists",
