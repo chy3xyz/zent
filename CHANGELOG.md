@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.77.1] - 2026-09-24
+
 ### Fixed
 - **An out-of-memory inside JSON parsing is no longer reported as a value
   problem.** `scanColumn`'s two JSON paths did
