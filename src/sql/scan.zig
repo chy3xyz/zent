@@ -78,6 +78,12 @@ pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row
         .@"struct" => |s| {
             try requireColumns(row, 0, dataFieldCount(s));
             var value: T = undefined;
+            var scanned: usize = 0;
+            // A failure on the k-th field strands the k-1 fields the scanner has
+            // already duplicated: the caller receives neither the value nor a
+            // partial one, so releasing them is this frame's job. Asserted by
+            // `checkAllAllocationFailures` in `src/test/allocation_failures_read.zig`.
+            errdefer freeScannedFields(T, allocator, &value, scanned);
             var col_idx: usize = 0;
             inline for (s.field_names, s.field_types) |field_name, field_type| {
                 if (comptime std.mem.eql(u8, field_name, "edges")) {
@@ -87,6 +93,7 @@ pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row
                 } else {
                     @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx, json_arena);
                     col_idx += 1;
+                    scanned += 1;
                 }
             }
             return value;
@@ -195,6 +202,14 @@ pub fn scanRowLenientWithArena(comptime T: type, allocator: std.mem.Allocator, r
         .@"struct" => |s| {
             try requireColumns(row, 0, dataFieldCount(s));
             var value: T = defaultInit(T);
+            var scanned: usize = 0;
+            // The fields below `scanned` have each been replaced by owned
+            // memory — a duplicated value or an owned copy of the default
+            // (`ownDefault`); a failure on the next one must not strand them.
+            // The ones above it still hold `defaultInit`'s comptime literals,
+            // which are deliberately not freed, and the counter is what keeps
+            // the two apart (`freeScannedFields`).
+            errdefer freeScannedFields(T, allocator, &value, scanned);
             var col_idx: usize = 0;
             inline for (s.field_names, s.field_types) |field_name, field_type| {
                 if (comptime std.mem.eql(u8, field_name, "edges")) {
@@ -215,6 +230,7 @@ pub fn scanRowLenientWithArena(comptime T: type, allocator: std.mem.Allocator, r
                                 return err;
                     }
                     col_idx += 1;
+                    scanned += 1;
                 }
             }
             return value;
@@ -237,6 +253,43 @@ fn dataFieldCount(comptime s: std.builtin.Type.Struct) usize {
         n += 1;
     }
     return n;
+}
+
+/// `edges` and `json_arena` are injected by codegen rather than read from a
+/// column, so they are not part of a positional scan and own nothing that
+/// `freeDtoValue` releases.
+fn isSyntheticField(comptime name: []const u8) bool {
+    return std.mem.eql(u8, name, "edges") or std.mem.eql(u8, name, "json_arena");
+}
+
+/// Release the fields a scan has already produced when a later one fails.
+///
+/// `scanned` is the number of **data** fields the scan has finished, so the walk
+/// stops before the first field it never reached: that one is still `undefined`
+/// in the strict scanners and still holds a comptime default — possibly a
+/// literal, which must not be freed — in the lenient ones. Reading it at all
+/// would be reading memory the scan never wrote.
+///
+/// Every field below `scanned` is owned by this frame, because the caller
+/// received neither the value nor a partial one: the scanner either `dupe`d it
+/// or handed back an owned copy of its default (`ownDefault`), which is exactly
+/// what `freeDtoValue` releases. Fields the scan did *not* allocate — the
+/// arena-held JSON documents — are skipped there, and the entity's arena owner
+/// releases them.
+///
+/// The scan loop is a fixed, comptime-unrolled sequence, so a shared
+/// `errdefer` plus a counter is the shape that fits: a set of per-iteration
+/// `errdefer`s would be dropped at the end of each iteration and would not
+/// cover a failure in a later one.
+fn freeScannedFields(comptime T: type, allocator: std.mem.Allocator, value: *const T, scanned: usize) void {
+    const s = @typeInfo(T).@"struct";
+    var done: usize = 0;
+    inline for (s.field_names, s.field_types) |field_name, field_type| {
+        if (comptime isSyntheticField(field_name)) continue;
+        if (done >= scanned) return;
+        freeDtoValue(field_type, allocator, @field(value.*, field_name));
+        done += 1;
+    }
 }
 
 /// Reject a result set too narrow for a positional scan before any driver
@@ -350,6 +403,11 @@ fn scanRowNamedImpl(
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanRowNamed supports structs only");
     var value: T = if (lenient) defaultInit(T) else zeroInit(T);
+    var scanned: usize = 0;
+    // Same contract as `scanRowWithArena`: the fields below `scanned` are owned
+    // by this frame (duplicated, or an owned copy of a default), the ones above
+    // it are untouched — and must not be read.
+    errdefer freeScannedFields(T, allocator, &value, scanned);
     inline for (info.@"struct".field_names, info.@"struct".field_types) |field_name, field_type| {
         if (comptime std.mem.eql(u8, field_name, "edges")) {
             @field(value, field_name) = @as(@TypeOf(@field(value, field_name)), .{});
@@ -376,6 +434,10 @@ fn scanRowNamedImpl(
                 // default still has to become owned memory.
                 @field(value, field_name) = try ownDefault(field_type, allocator, @field(value, field_name));
             }
+            // Counted even when the column was absent: an unselected field's
+            // zero/empty value frees as a no-op, and counting it keeps the
+            // counter aligned with the loop rather than with the row.
+            scanned += 1;
         }
     }
     return value;
@@ -484,6 +546,10 @@ fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, compti
         .@"struct" => |s| {
             try requireColumns(row, offset, dataFieldCount(s));
             var value: T = undefined;
+            var scanned: usize = 0;
+            // Same contract as `scanRowWithArena`, for the offset projection
+            // an eager-loaded entity is scanned through.
+            errdefer freeScannedFields(T, allocator, &value, scanned);
             var col_idx: usize = offset;
             inline for (s.field_names, s.field_types) |field_name, field_type| {
                 if (comptime std.mem.eql(u8, field_name, "edges")) {
@@ -493,6 +559,7 @@ fn scanRowInner(comptime T: type, allocator: std.mem.Allocator, row: Row, compti
                 } else {
                     @field(value, field_name) = try scanColumn(field_type, allocator, row, col_idx, json_arena);
                     col_idx += 1;
+                    scanned += 1;
                 }
             }
             return value;
@@ -629,6 +696,13 @@ fn queryAllImpl(
     }
     while (rows.next()) |row| {
         const item = if (lenient) try scanRowNamedLenient(T, allocator, row) else try scanRowNamed(T, allocator, row);
+        // Ownership passes to `list` on the next line: if the append itself
+        // fails, the item is still this frame's to release — the caller gets an
+        // error, not a short page. The same shape as the entity readers in
+        // `codegen/query.zig` (`errdefer deinitEntity` before `result.append`).
+        // The `errdefer` below is scoped to this iteration, so it is gone by the
+        // time the next row's scan runs.
+        errdefer freeDto(T, allocator, &item);
         try list.append(item);
     }
     if (rows.nextError()) |err| return err;
