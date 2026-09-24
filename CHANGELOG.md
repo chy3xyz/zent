@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Mechanical verification for the MySQL and PostgreSQL index introspection.**
+  Their four copy-then-append leak sites were fixed by inspection at v0.77.0
+  because the allocation sweep's catalog stub only spoke SQLite. The sweep now
+  carries a stub per dialect, serving the statements those helpers actually
+  issue (`information_schema.columns`/`statistics` with MySQL's own columns;
+  the `pg_index`/`pg_class`/`pg_attribute` join for PostgreSQL) and keeping the
+  `unmatched` counter that refuses to answer an unrecognised introspection query
+  as "nothing exists". Break one of the four fixes and the matching case reports
+  the leak by bytes — verified for the MySQL and PostgreSQL name sites.
+  `getMySQLIndexes` / `getPostgresIndexes` are `pub` for the sweep, their only
+  caller outside the module, with the doc notes saying so.
+
 ## [0.77.1] - 2026-09-24
 
 ### Fixed
