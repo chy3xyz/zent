@@ -4,6 +4,7 @@ const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
 const cache = @import("cache.zig");
+const zent_log = @import("../runtime/log.zig");
 
 /// The value `mysql_affected_rows` and `mysql_stmt_affected_rows` return when
 /// they have no count to give. The C API documents it as `(my_ulonglong)-1`, so
@@ -50,14 +51,14 @@ fn isDistinctErrno(err: driver.Error) bool {
 /// Log a failed mysql_options call (non-fatal: connection can still proceed
 /// with defaults, e.g. a missing socket timeout just loses the guard).
 fn checkOpt(name: []const u8, rc: c_int) void {
-    if (rc != 0) std.log.warn("mysql_options({s}) failed rc={d}", .{ name, rc });
+    if (rc != 0) zent_log.warn("mysql_options({s}) failed rc={d}", .{ name, rc });
 }
 
 /// Hard-fail when a security-relevant option could not be applied. Silently
 /// downgrading SSL enforcement would violate the caller's stated policy.
 fn requireOpt(name: []const u8, rc: c_int) !void {
     if (rc != 0) {
-        std.log.err("mysql_options({s}) failed rc={d}", .{ name, rc });
+        zent_log.err("mysql_options({s}) failed rc={d}", .{ name, rc });
         return error.MySQLConfigFailed;
     }
 }
@@ -233,7 +234,7 @@ pub const MySQLDriver = struct {
             // warn (not err): a refused connection is an expected, recoverable
             // outcome (server not running / integration-test skip path), and
             // the test framework fails on err-level logs even in skipped tests.
-            std.log.warn("mysql connect failed: {s}", .{std.mem.span(msg)});
+            zent_log.warn("mysql connect failed: {s}", .{std.mem.span(msg)});
             return error.MySQLConnectFailed;
         }
 
@@ -313,7 +314,7 @@ pub const MySQLDriver = struct {
         // alerts on it — and, concretely, a test could not exercise a failure path at
         // all, because Zig's test runner treats a logged error as a test failure.
         // `connect` failures have been `warn` for the same reason.
-        std.log.warn("mysql error ({s}) [errno={d}]: {s}", .{ context, errno, std.mem.span(msg) });
+        zent_log.warn("mysql error ({s}) [errno={d}]: {s}", .{ context, errno, std.mem.span(msg) });
     }
 
     const SavedTimeouts = struct {
@@ -367,7 +368,7 @@ pub const MySQLDriver = struct {
                     self.current_server_timeout_ms = null;
                     return;
                 } else |err2| {
-                    std.log.warn("mysql: could not reset server-side statement timeout ({s}, {s})", .{ @errorName(err), @errorName(err2) });
+                    zent_log.warn("mysql: could not reset server-side statement timeout ({s}, {s})", .{ @errorName(err), @errorName(err2) });
                     return;
                 }
             }
@@ -391,7 +392,7 @@ pub const MySQLDriver = struct {
                 self.current_server_timeout_ms = desired;
                 return;
             } else |err2| {
-                std.log.warn("mysql: could not set server-side statement timeout ({s}, {s})", .{ @errorName(err), @errorName(err2) });
+                zent_log.warn("mysql: could not set server-side statement timeout ({s}, {s})", .{ @errorName(err), @errorName(err2) });
             }
         }
     }
@@ -524,7 +525,7 @@ pub const MySQLDriver = struct {
             // handle it, and a test that pins this path could not run at all if
             // the log level made the test runner fail (same reason the SQLite
             // driver logs its statement failures at warn).
-            std.log.warn("mysql: expected {d} params, got {d}", .{ n_params, args.len });
+            zent_log.warn("mysql: expected {d} params, got {d}", .{ n_params, args.len });
             return error.MySQLParamCountMismatch;
         }
 
@@ -603,7 +604,7 @@ pub const MySQLDriver = struct {
             // handle it, and a test that pins this path could not run at all if
             // the log level made the test runner fail (same reason the SQLite
             // driver logs its statement failures at warn).
-            std.log.warn("mysql: expected {d} params, got {d}", .{ n_params, args.len });
+            zent_log.warn("mysql: expected {d} params, got {d}", .{ n_params, args.len });
             return error.MySQLParamCountMismatch;
         }
 
@@ -883,7 +884,7 @@ const MySQLSavepoint = struct {
 
     fn deinit(self: *MySQLSavepoint) void {
         self.rollback() catch |err| {
-            std.log.warn("mysql savepoint deinit: rollback failed ({s})", .{@errorName(err)});
+            zent_log.warn("mysql savepoint deinit: rollback failed ({s})", .{@errorName(err)});
         };
         self.driver.allocator.free(self.name);
         self.driver.allocator.destroy(self);
@@ -915,7 +916,7 @@ const MySQLTx = struct {
         if (self.state == .active) {
             self.driver.in_tx = false;
             _ = self.driver.exec("ROLLBACK", &.{}) catch |err| {
-                std.log.warn("mysql tx deinit: rollback failed ({s})", .{@errorName(err)});
+                zent_log.warn("mysql tx deinit: rollback failed ({s})", .{@errorName(err)});
             };
         }
         self.driver.allocator.destroy(self);
@@ -1227,7 +1228,7 @@ fn prepareMySQLStmt(drv: *MySQLDriver, sql: []const u8) !*c.MYSQL_STMT {
 
     if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
         MySQLDriver.logMySQLError(drv, drv.conn, "stmt_prepare");
-        std.log.debug("mysql stmt_prepare sql: {s}", .{sql});
+        zent_log.debug("mysql stmt_prepare sql: {s}", .{sql});
         return error.MySQLStmtFailed;
     }
     return stmt;

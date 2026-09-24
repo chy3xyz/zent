@@ -4,6 +4,7 @@ const Value = @import("builder.zig").Value;
 const Dialect = @import("dialect.zig").Dialect;
 const driver = @import("driver.zig");
 const cache = @import("cache.zig");
+const zent_log = @import("../runtime/log.zig");
 
 pub const SQLiteDriver = struct {
     db: *c.sqlite3,
@@ -57,7 +58,7 @@ pub const SQLiteDriver = struct {
         if (rc != c.SQLITE_OK or db == null) {
             if (db) |handle| {
                 const msg = c.sqlite3_errmsg(handle);
-                std.log.err("sqlite open failed: {s}", .{msg});
+                zent_log.err("sqlite open failed: {s}", .{msg});
                 _ = c.sqlite3_close(handle);
             }
             return error.SqliteOpenFailed;
@@ -127,7 +128,7 @@ pub const SQLiteDriver = struct {
         // alerts on it — and, concretely, a test could not exercise a failure path at
         // all, because Zig's test runner treats a logged error as a test failure.
         // `connect` failures have been `warn` for the same reason.
-        std.log.warn("SQLite error ({s}): {s}", .{ context, std.mem.span(msg) });
+        zent_log.warn("SQLite error ({s}): {s}", .{ context, std.mem.span(msg) });
     }
 
     fn toDriverError(err: anyerror) driver.Error {
@@ -641,7 +642,7 @@ const SQLiteTx = struct {
 
     fn deinit(self: *SQLiteTx) void {
         if (self.state == .active) {
-            std.log.warn("sqlite tx deinit without commit/rollback; rolling back", .{});
+            zent_log.warn("sqlite tx deinit without commit/rollback; rolling back", .{});
             _ = self.driver.execInner(null, "ROLLBACK", &.{}) catch {};
             self.driver.mutex.unlock();
         }
