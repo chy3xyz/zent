@@ -607,3 +607,72 @@ test "Sum and Avg name an empty set instead of answering a type error" {
         try std.testing.expectEqual(@as(f64, 12.5), try q.Sum("amount"));
     }
 }
+
+test "Sum, Avg, Max and Min refuse a grouped query" {
+    // `buildAggregateQuery` emits the query's GROUP BY, so a grouped Sum ran
+    // `SELECT SUM(amount) ... GROUP BY tenant_id` and read only the first row:
+    // the first group's total, presented as the answer for the whole set. A
+    // grouped aggregate has one value per group; `AggregateBy` is the API that
+    // returns them, so the single-value four refuse instead of answering for
+    // whichever group the driver happened to order first.
+    const allocator = std.testing.allocator;
+
+    const Order = schema("Order", .{
+        .fields = &.{
+            field.Int("tenant_id"),
+            field.Float("amount"),
+        },
+    });
+    const info = comptime fromSchema(Order);
+    const infos = &[_]TypeInfo{info};
+    const OrderEntity = comptime EntityGen(infos, info);
+    const OrderQuery = QueryBuilder(infos, info, OrderEntity);
+
+    // Grouped: refused, and refused before the driver is asked anything — no
+    // statement reaches it, so there is no half-answer to discard.
+    for ([_][]const u8{ "Sum", "Avg", "Max", "Min" }) |method| {
+        var mock = MockDriver{ .value = .{ .float = 12.5 }, .capture_sql = true };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        _ = try q.GroupBy(&.{"tenant_id"});
+
+        if (std.mem.eql(u8, method, "Sum")) {
+            try std.testing.expectError(error.GroupByNotSupported, q.Sum("amount"));
+        } else if (std.mem.eql(u8, method, "Avg")) {
+            try std.testing.expectError(error.GroupByNotSupported, q.Avg("amount"));
+        } else if (std.mem.eql(u8, method, "Max")) {
+            try std.testing.expectError(error.GroupByNotSupported, q.Max("amount"));
+        } else {
+            try std.testing.expectError(error.GroupByNotSupported, q.Min("amount"));
+        }
+
+        try std.testing.expectEqual(@as(?[]u8, null), mock.last_sql_owned);
+    }
+
+    // Ungrouped: the ordinary answer, so the refusal above is the grouping and
+    // not a blanket failure of the four.
+    {
+        var mock = MockDriver{ .value = .{ .float = 12.5 } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try std.testing.expectEqual(@as(f64, 12.5), try q.Sum("amount"));
+    }
+    {
+        var mock = MockDriver{ .value = .{ .float = 12.5 } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try std.testing.expectEqual(@as(f64, 12.5), try q.Avg("amount"));
+    }
+    {
+        var mock = MockDriver{ .value = .{ .float = 12.5 } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try expectValueEqual(.{ .float = 12.5 }, try q.Max("amount"));
+    }
+    {
+        var mock = MockDriver{ .value = .{ .float = 12.5 } };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        try expectValueEqual(.{ .float = 12.5 }, try q.Min("amount"));
+    }
+}
