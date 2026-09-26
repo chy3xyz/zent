@@ -12,7 +12,7 @@
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (494 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (511 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -52,7 +52,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 494, integration 234 passed + 3 skipped
+`baseline` counts move with this: unit 511, integration 236 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -102,6 +102,8 @@ be set up at all on one server, create it only there and say why in a comment.
 | field type | `@FieldType(T, "f")`, not `@TypeOf(@field(v, "f"))` — and never fabricate a value (`zeroInit`, `@as(T, undefined)`) just to ask for a field's type |
 | name derivation (`OrderProduct` → `order_product`) | One definition: `codegen/graph.zig`'s `pub fn toSnakeCase`, which the codegen, the DDL layer and the client alias. Four layers must agree on derived names; v0.78.1's From-edge defect was two of them disagreeing |
 | dialect dispatch | Branch on `dialect.kind()` (`Dialect.Kind`), never on `dialect.name`: a string comparison cannot be checked, and one asked for `"sqlite"` while `Dialect.sqlite.name` is `"sqlite3"`, so the branch never ran. `Dialect{ .name = "sqlite" }` is *not* `Dialect.sqlite` — tests that want SQLite must use the constant |
+| `std.json.Value` (`field.JSONValue`) | Arena-owned tree: its `.string` / `.number_string` bytes, `.array` items and `.object` keys/values live in the entity's `json_arena`. A struct copy — or `dupeDeep`'s generic tagged-union branch — keeps pointers into an arena the caller is about to free. `dupeDeep` has a dedicated recursive branch for it (`dupeJsonDeep`); do not widen it back to a by-value copy |
+| libpq argument values | `PQconnectdbParams` with one array entry per keyword, never a `key=value` conninfo string built by `allocPrint`: a value with a space is truncated (its tail read as a stray keyword) and `x sslmode=disable` overrides the keyword, because libpq honours the last occurrence |
 | allocation-failure coverage | `src/test/allocation_failures*.zig` fail every allocation in turn and hold the byte ledger (0.17's `std.testing.checkAllAllocationFailures`). Add a path there when you add an assembly routine — they have found fourteen leaks so far, none visible in a non-OOM run |
 | diagnostics | Library code emits through `zent.runtime.log` (`src/runtime/log.zig`), which forwards to `std.log` byte-for-byte unless a sink is installed. Do not call `std.log` directly; `sql/logger.zig`'s per-query `Logger` keeps its own contract |
 
@@ -113,6 +115,7 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) MUST be `deinit`'d.
 - **Arena pages are one-way.** `AllIn` / `FirstIn` / `SaveIn` / `queryRowsIn` take `*std.heap.ArenaAllocator` and return a plain slice owned by that arena. The release is `arena.deinit()` and **nothing else** — never call `deinitEntity` / `deinitRow` / `deinitRows` / `freeOwnedStrings` on such a page (double free). Do not mix the two shapes on one page.
 - `driver.Tx` MUST be `deinit`'d exactly once, regardless of `commit`/`rollback`.
+- **A PostgreSQL cache entry owns a server-side statement, not just a `PGresult`.** Releasing one is `DEALLOCATE "<name>"` first (`PostgresDriver.releaseStmt`), then `PQclear`, then the handle. `PQclear` alone leaves the statement on the server, and the next `PQprepare` under the same content-hash name fails with 42P05 — while after a DDL the kept plan fails with 0A000 (`cached plan must not change result type`). Tolerating 42P05 is not a fix for either. The handle is `*PostgresDriver.PgStmt` because the release hook is handed the handle alone, with no SQL and no name.
 - `sql.QueryResult` (`{ sql, args }`) borrows from the builder; `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) transfers ownership and MUST be `deinit`'d.
 - The root `Client` lazily heap-allocates its `InterceptorChain` on first `client_mod.UseInterceptor(infos, &client, i)`; release it with `client_mod.DeinitClient(infos, &client)` **once, on the value that registered**. Value copies (helpers, `withContext`, tx clients) borrow the same chain and must not be deinit'd; `withInterceptors(chain)` borrows a caller-owned chain, which `DeinitClient` leaves alone. `StoreEnv`/`PooledEnv`/`ShardedEnv` release the clients they created on `deinit` (each shard client individually). Register before `beginTx` — the tx client borrows the same chain.
 - Use `std.testing.allocator` in tests so `zig build test` reports leaks with non-zero exit.
@@ -121,8 +124,13 @@ Entities and queries are explicitly owned by the caller. See the contract:
 
 - **Interceptor `whereEq` dedupes on the (column, value) pair, never the
   column.** Column-only dedupe lets a caller predicate suppress the
-  interceptor's own value = a tenant bypass. All eight `add_eq_fn` sinks go
-  through `sql.appendEqUnlessPresent`; the two create-path sinks are a
+  interceptor's own value = a tenant bypass. Of the eight `add_eq_fn` sinks,
+  the six that *add* a constraint go through `sql.appendEqUnlessPresent` (or its
+  unmanaged twin `appendEqUnlessPresentUnmanaged`, for a sink that collects into
+  a `std.ArrayListUnmanaged`; both call the same `eqUnlessPresent` rule — the
+  edge-target sink was the one that appended a raw predicate, so a chain scoping
+  twice emitted the duplicated injected predicate behind the `Column … is
+  ambiguous` incident); the two create-path sinks are a
   *filler* (an explicitly set field wins), so a write constraint the caller
   must not override belongs in a privacy policy, not an interceptor.
 - **Both bulk neighbour readers share the target read contract.** `WithEdge`

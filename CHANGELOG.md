@@ -64,6 +64,35 @@ All notable changes to this project will be documented in this file.
   result list's `append` ran out of memory**, and `queryRows` leaked the row it
   had just mapped. Both bind the value to a local and release it with the
   allocator that built it before propagating the error.
+- **A `field.JSONValue` document was copied shallowly, so the copy kept pointers
+  into the source entity's `json_arena`.** A `std.json.Value` document is a tree
+  of arena-owned nodes — its `.string` / `.number_string` bytes, its `.array`
+  items and its `.object` keys and values — so both `dupeEntityTo` (public) and
+  the new `dupeJsonInto` handed back a document that dangled as soon as the
+  source arena was freed, which is what `CrudService.getOwned` does before it
+  returns. `dupeDeep` now has a recursive branch for the untyped document
+  (`dupeJsonDeep`); every other tagged union still copies by value, which is
+  right for an inline union with no arena-owned payload.
+- **The edge-target interceptor sink did not dedupe its predicates.** `WithEdge`
+  and `client.queryTargets*` collect interceptor predicates through
+  `EdgeInterceptorSink.addEq`, which appended a raw predicate, while the six
+  sibling sinks went through `sql.appendEqUnlessPresent` — so an interceptor
+  chain scoping on the same column twice emitted `… AND app_id = ? AND app_id =
+  ?`, the duplicated injected predicate behind the earlier `Column … is
+  ambiguous` failure of an eager-loaded target query. The dedupe rule (the
+  **(column, value) pair**, never the column alone) now has one definition
+  (`sql.eqUnlessPresent`) with a managed and an unmanaged entry point, and the
+  edge sink uses the unmanaged one for its `std.ArrayListUnmanaged`.
+- **`PostgresDriver.connectDb` interpolated host, port, dbname, user and
+  password into a libpq conninfo string.** libpq's conninfo grammar is
+  whitespace-separated `key=value`, so a password containing a space was
+  truncated and its tail read as a stray keyword, and a value shaped like
+  `x sslmode=disable` could override a keyword (libpq honours the last
+  occurrence). The values now go through `PQconnectdbParams` as one array entry
+  per keyword, with `sslmode=prefer` and `connect_timeout=10` kept; the
+  keyword/value construction is a separate pure function so it can be asserted
+  without a live server, and both entry points share `adoptConnection` for the
+  error handling.
 
 ### Breaking
 
