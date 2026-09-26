@@ -345,7 +345,7 @@ test "Postgres: prepared statement cache hit" {
     defer drv.close();
 
     // Enable the prepared-statement cache.
-    drv.cache = PreparedCache(16, *pg_c.PGresult){};
+    drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
 
     _ = try drv.exec("DROP TABLE IF EXISTS pg_cache_test", &.{});
     _ = try drv.exec("CREATE TABLE pg_cache_test (id SERIAL PRIMARY KEY, val INT)", &.{});
@@ -373,6 +373,80 @@ test "Postgres: prepared statement cache hit" {
     defer rows3.deinit();
     const row3 = rows3.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 3), row3.getInt(0).?);
+}
+
+test "Postgres: an evicted cached statement is released server-side" {
+    // The cache names a prepared statement after a content hash of its SQL, so
+    // evicting an entry and then executing that SQL again means `PQprepare`
+    // under a name the server still holds. PostgreSQL keeps a prepared
+    // statement until the session ends, and a second `PREPARE` under the same
+    // name is SQLSTATE 42P05 (`prepared statement "p_x" already exists`), which
+    // the driver collapses to `DriverFailed` — so every parameterised statement
+    // stopped working after the session's first DDL, and after 16 distinct
+    // statements' worth of LRU pressure.
+    //
+    // The `SELECT *` half is why "treat 42P05 as success" is not a fix: the
+    // statement the server kept is re-planned, and a `SELECT *` whose table
+    // gained a column fails with 0A000 (`cached plan must not change result
+    // type`). Only actually dropping the server-side statement survives both.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+    drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_evict_test", &.{});
+    _ = try drv.exec("CREATE TABLE pg_evict_test (id SERIAL PRIMARY KEY, val INT)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_evict_test", &.{}) catch {};
+
+    const insert_sql = "INSERT INTO pg_evict_test (val) VALUES ($1)";
+    const select_sql = "SELECT * FROM pg_evict_test WHERE val >= $1";
+
+    // First use of each: prepared under the content-hash name and cached.
+    try testing.expectEqual(@as(usize, 1), (try drv.exec(insert_sql, &.{.{ .int = 1 }})).rows_affected);
+    try testing.expectEqual(@as(usize, 1), (try drv.exec(select_sql, &.{.{ .int = 1 }})).rows_affected);
+
+    // DDL evicts every cached statement.
+    _ = try drv.exec("ALTER TABLE pg_evict_test ADD COLUMN extra TEXT", &.{});
+
+    // Both re-prepare under the names they used before — the second `PQprepare`
+    // under a name the server still holds is the 42P05 failure.
+    try testing.expectEqual(@as(usize, 1), (try drv.exec(insert_sql, &.{.{ .int = 2 }})).rows_affected);
+    try testing.expectEqual(@as(usize, 2), (try drv.exec(select_sql, &.{.{ .int = 1 }})).rows_affected);
+
+    // And the re-prepared `SELECT *` resolves the table's *new* shape: the
+    // added column is there, so the result has three columns.
+    var rows = try drv.query(select_sql, &.{.{ .int = 1 }});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqual(@as(usize, 3), row.columnCount());
+}
+
+test "Postgres: a statement the cache will not keep is still released" {
+    // `PreparedCache` refuses SQL past its `max_sql_len` (2048 bytes) and hands
+    // the caller a statement the cache does not own. That one is released after
+    // the call all the same — a server-side statement the cache has forgotten
+    // is the same 42P05 on the next execution, and the handle is the driver's
+    // allocation to free.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+    drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_long_test", &.{});
+    _ = try drv.exec("CREATE TABLE pg_long_test (id SERIAL PRIMARY KEY, val INT)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_long_test", &.{}) catch {};
+
+    // The statement is padded to sit past the cache's SQL length limit; the
+    // trailing spaces are the comment-free way to do that.
+    var long_sql_buf: [2200]u8 = undefined;
+    @memset(&long_sql_buf, ' ');
+    const prefix = "INSERT INTO pg_long_test (val) VALUES ($1)";
+    @memcpy(long_sql_buf[0..prefix.len], prefix);
+    const long_sql = long_sql_buf[0..];
+    try testing.expect(long_sql.len > 2048);
+
+    try testing.expectEqual(@as(usize, 1), (try drv.exec(long_sql, &.{.{ .int = 1 }})).rows_affected);
+    try testing.expectEqual(@as(usize, 1), (try drv.exec(long_sql, &.{.{ .int = 2 }})).rows_affected);
 }
 
 test "Postgres: an empty command tag is 0 rows, a DML count is the count" {
@@ -403,7 +477,7 @@ test "Postgres: an empty command tag is 0 rows, a DML count is the count" {
 
     // The cached prepared path (PQexecPrepared, args present) parses the same
     // tags: the second UPDATE reuses the statement the first one prepared.
-    drv.cache = PreparedCache(16, *pg_c.PGresult){};
+    drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
     try testing.expectEqual(@as(usize, 1), (try drv.exec("INSERT INTO pg_tag_test (n) VALUES ($1)", &.{.{ .int = 4 }})).rows_affected);
     try testing.expectEqual(@as(usize, 1), (try drv.exec("UPDATE pg_tag_test SET n = $1 WHERE n = 4", &.{.{ .int = 5 }})).rows_affected);
     try testing.expectEqual(@as(usize, 0), (try drv.exec("UPDATE pg_tag_test SET n = $1 WHERE n = 4", &.{.{ .int = -1 }})).rows_affected);
