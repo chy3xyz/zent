@@ -79,7 +79,10 @@ use `field.JSON(name, T)`; untyped documents use `field.JSONValue(name)`
 - `OnCreate` / `OnUpdate` / `OnDelete` / `OnQuery` deny only their own
   operation; other operations pass through. Use `Policy{ .rules = &.{
   OnCreate.rules[0], OnQuery.rules[0] } }` to combine.
-- `Rule.on_op` applies a decision only for a matching operation.
+- `Rule.on_op` applies a decision only for a matching operation. `.allow` is
+  not an allow-list: `allow` is the default decision and only `.deny`
+  restricts, so an `on_op` carrying `.allow` restricts nothing. Name the
+  operations you mean to deny, or deny the rest explicitly.
 
 ## 7. Queries
 

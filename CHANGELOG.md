@@ -4,6 +4,88 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **PostgreSQL: a cached prepared statement is released server-side.** Evicting
+  an entry — a DDL statement, or LRU pressure past the cache's 16 entries — only
+  cleared the local `PGresult`, so the statement stayed on the server until the
+  session ended and the next `PQprepare` under the same content-hash name failed
+  with SQLSTATE 42P05 (`prepared statement "p_…" already exists`), which the
+  driver collapsed to `DriverFailed`. Every parameterised statement therefore
+  stopped working after the session's first DDL, and after sixteen distinct
+  statements' worth of pressure. The release hook now issues
+  `DEALLOCATE "<name>"` (not `PQclosePrepared`, which needs libpq 17), so the
+  name is reusable — and a re-prepared `SELECT *` also sees the table's current
+  shape, where a kept plan fails with 0A000 `cached plan must not change result
+  type` after `ALTER TABLE … ADD COLUMN`. A statement the cache declines to keep
+  (SQL past its 2048-byte limit) is released after the call instead of being
+  left on the server and leaked. Two integration tests cover both, including the
+  `SELECT *` column count after the ALTER that made 42P05 and 0A000 the two
+  halves of the same bug.
+- **PostgreSQL: `bindParams` no longer leaves its parameter lists out of step
+  when an allocation fails.** It sized `owned_lens` after `paramValues`, so a
+  failed resize in between left the pair mismatched and the `defer` in
+  `exec`/`query` indexed `owned_lens` past its end — a panic under ReleaseSafe,
+  an out-of-bounds read under ReleaseFast. The two lists `freeParams` walks are
+  now sized *and* cleared before the others can be populated, and the
+  allocation-failure sweep covers the path.
+- **MySQL: a lost connection is reported as `ConnectionFailed`, not
+  `ExecFailed`/`QueryFailed`.** `isDistinctErrno` omitted `ConnectionFailed`
+  from its whitelist, so the collapse sites discarded a classification
+  `errnoToError` had already computed: the pool could not tell a connection it
+  must discard from a failed statement, and a consumer switching on the error
+  saw a different answer than on PostgreSQL (which returns `ConnectionFailed`
+  for the same condition). The five collapse sites now share one
+  `classifyFailure` helper, so the decision has one definition.
+- **MySQL: a failed `mysql_stmt_prepare` or `mysql_stmt_store_result` now marks
+  the connection dead and reports `ConnectionFailed`.** Neither path set the
+  `dead` flag, so a handle that had lost its connection could be handed to the
+  next pool borrower, and the error was logged against a handle that is no
+  longer usable — the exact shape `dead` exists to prevent.
+- **MySQL: `MySQLTx.deinit` clears `in_tx` only after a successful `ROLLBACK`.**
+  It cleared the flag first, so a rollback that failed for a non-connection
+  reason left `inTransaction()` answering `false`; `ConnPool.release` reads that
+  predicate to decide whether a returned connection still holds a transaction,
+  so a connection with an open server-side transaction went back into
+  `available` and the next borrower ran inside it. The pool fixed this shape for
+  itself in v0.60.1; the driver's half had not followed.
+- **`CrudService.getOwned` returned a copy whose JSON payload still pointed at
+  the scanned row's arena**, which `getOwned` releases before it returns:
+  reading the copy was a use-after-free and releasing it a double free. The
+  owned copy now re-homes its JSON fields into its own arena
+  (`codegen.entity.dupeJsonInto`), so `deinitEntity(infos, info, &copy,
+  allocator)` frees the strings with the allocator and the JSON with that arena
+  — the two halves the release path actually expects.
+- **`CrudService.insertMany` / `upsertMany` wrote the tenant column straight
+  from the caller's entity**, so an entity left at its zero tenant value wrote
+  tenant `0`. Both now take `tenant_id` as a parameter and skip the entity's own
+  tenant field, exactly as `create` already did.
+- **`crud_helpers.batchCreate` leaked the entity it had just created when the
+  result list's `append` ran out of memory**, and `queryRows` leaked the row it
+  had just mapped. Both bind the value to a local and release it with the
+  allocator that built it before propagating the error.
+
+### Breaking
+
+- **`PostgresDriver.cache` is now `?PreparedCache(16, *PostgresDriver.PgStmt)`
+  instead of `?PreparedCache(16, *pg_c.PGresult)`.** The handle has to carry the
+  statement's server-side name for the release hook to `DEALLOCATE` it — the
+  cache hands that hook the handle alone, with no SQL and no name. Setting the
+  cache up is unchanged in shape: `drv.cache = PreparedCache(16,
+  *PostgresDriver.PgStmt){};`.
+- **`CrudService.insertMany` and `upsertMany` now require a `tenant_id`
+  argument** and ignore the entity's own tenant value:
+  `insertMany(self: *Self, entities: []const Entity, tenant_id: i64)` and the
+  same for `upsertMany`. Callers must pass the tenant explicitly.
+- **`crud_helpers.cursorPage` now rejects an optional integer cursor column with
+  `error.NullableCursorColumn`.** It accepted one, and a row whose cursor column
+  was SQL `NULL` produced `next_cursor = null` beside `has_more = true`, so a
+  caller looping `while (has_more)` re-queried with no cursor and received the
+  first page again — an infinite paging loop. A schema using an optional integer
+  cursor column must make the column non-nullable or page on another column.
+  Plain-integer cursors are unchanged; a non-integer column still reports
+  `error.InvalidCursorColumn`.
+
 ## [0.80.2] - 2026-09-27
 
 ### Changed

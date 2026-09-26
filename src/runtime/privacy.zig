@@ -56,6 +56,13 @@ pub const Rule = union(enum) {
     filter: FilterRule,
     /// Applies `decision` only when ctx.op matches `op`; otherwise the rule
     /// is skipped. Flat on purpose (an `on: {op, rule}` would recurse).
+    ///
+    /// `.allow` is not an allow-list. `allow` is already the default decision
+    /// and only `.deny` restricts, so an `on_op` carrying `.allow` restricts
+    /// nothing — not its own operation, not the others. To allow one operation
+    /// and deny the rest, deny the rest (`OnUpdate`, … or one `on_op` per
+    /// operation); reading `.allow` here as "only this op is permitted" would
+    /// make the policy narrower than it is written to be.
     on_op: struct { op: Op, decision: Decision },
 };
 
@@ -296,4 +303,23 @@ test "evalPolicy denies instead of overflowing the filter array" {
     const ok = evalPolicy(PrivacyContext{ .op = .query }, rules[0..max_filters]);
     try std.testing.expectEqual(Decision.allow, ok.decision);
     try std.testing.expectEqual(@as(usize, max_filters), ok.filter_count);
+}
+
+test "evalPolicy: on_op denies its own operation and passes the rest through" {
+    const rules = [_]Rule{.{ .on_op = .{ .op = .delete, .decision = .deny } }};
+    try std.testing.expectEqual(Decision.deny, evalPolicy(.{ .op = .delete }, &rules).decision);
+    try std.testing.expectEqual(Decision.allow, evalPolicy(.{ .op = .query }, &rules).decision);
+}
+
+test "evalPolicy: on_op allow restricts nothing, in either direction" {
+    // Pinned deliberately: `allow` is the default decision and only `.deny`
+    // restricts, so an `on_op` carrying `.allow` is not an allow-list. Its own
+    // operation stays allowed (nothing else would have denied it) and so do the
+    // others. Someone reading it as "only this op is permitted" would be
+    // surprised by the opposite: a policy that restricts nothing at all.
+    const rules = [_]Rule{.{ .on_op = .{ .op = .query, .decision = .allow } }};
+    try std.testing.expectEqual(Decision.allow, evalPolicy(.{ .op = .query }, &rules).decision);
+    try std.testing.expectEqual(Decision.allow, evalPolicy(.{ .op = .create }, &rules).decision);
+    try std.testing.expectEqual(Decision.allow, evalPolicy(.{ .op = .delete }, &rules).decision);
+    try std.testing.expectEqual(@as(usize, 0), evalPolicy(.{ .op = .query }, &rules).filter_count);
 }
