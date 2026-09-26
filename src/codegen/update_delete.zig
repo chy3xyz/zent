@@ -40,10 +40,12 @@ const fillAuditUser = @import("create.zig").fillAuditUser;
 /// Dialect SQL expression producing the current Unix epoch (seconds) as an
 /// integer, matching zent's i64 Time representation.
 fn epochExpr(dialect: anytype) []const u8 {
-    const name: []const u8 = dialect.name;
-    if (std.mem.eql(u8, name, "postgres")) return "EXTRACT(EPOCH FROM now())::bigint";
-    if (std.mem.eql(u8, name, "mysql")) return "UNIX_TIMESTAMP()";
-    return "(unixepoch())";
+    return switch (dialect.kind()) {
+        .postgres => "EXTRACT(EPOCH FROM now())::bigint",
+        .mysql => "UNIX_TIMESTAMP()",
+        // SQLite and anything unnamed fall back to `unixepoch()`, the old `else`.
+        .sqlite, .unknown => "(unixepoch())",
+    };
 }
 
 /// Copy `args` and mask values that came from `sensitive` fields (matched by
@@ -145,7 +147,7 @@ fn buildM2MAddQuery(
     _ = try ib.fromSelect(source_table, &items, preds);
     var q = try ib.takeQuery();
     errdefer q.deinit();
-    if (std.mem.eql(u8, dialect.name, "postgres")) {
+    if (dialect.kind() == .postgres) {
         const full = try std.fmt.allocPrint(allocator, "{s} ON CONFLICT DO NOTHING", .{q.sql});
         allocator.free(q.sql);
         q.sql = full;

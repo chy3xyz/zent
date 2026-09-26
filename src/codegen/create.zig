@@ -335,16 +335,17 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // SQLite 3.35+) we use a query path to fetch the id atomically; for
             // MySQL we fall back to driver.exec and read last_insert_id.
             const dialect = self.driver.dialect();
-            const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
-            const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
-            const is_sqlite = std.mem.eql(u8, dialect.name, "sqlite3");
+            const dialect_kind = dialect.kind();
+            const supports_returning = dialect_kind != .mysql;
+            const is_postgres = dialect_kind == .postgres;
+            const is_sqlite = dialect_kind == .sqlite;
 
             // Build the upsert suffix per dialect. For SQLite we use the
             // built-in InsertOrReplace builder. For PG we append ON CONFLICT
             // (cols) DO UPDATE SET col=excluded.col ... For MySQL we generate
             // ON DUPLICATE KEY UPDATE (the old REPLACE prefix has been removed).
             // For plain Save (or_replace=false) the suffix is empty.
-            const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
+            const is_mysql = dialect_kind == .mysql;
             // Conflict targets are field names on the API surface; translate
             // them to physical column names before emitting SQL.
             const mapped_conflict: ?[]const []const u8 = if (conflict_columns) |cc| blk: {
@@ -1299,9 +1300,10 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
 
             // Build multi-row INSERT SQL.
             const dialect = self.driver.dialect();
-            const supports_returning = !std.mem.eql(u8, dialect.name, "mysql");
-            const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
-            const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
+            const dialect_kind = dialect.kind();
+            const supports_returning = dialect_kind != .mysql;
+            const is_postgres = dialect_kind == .postgres;
+            const is_mysql = dialect_kind == .mysql;
             const mapped_conflict: ?[]const []const u8 = if (conflict_columns) |cc| blk: {
                 const buf = try self.allocator.alloc([]const u8, cc.len);
                 for (cc, 0..) |c, ci| buf[ci] = columnName(info, c);
