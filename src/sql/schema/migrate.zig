@@ -1548,7 +1548,7 @@ fn columnDefByName(table: TableDef, name: []const u8) ?ColumnDef {
 /// failed deploy), and `createIndexSQLForTableAlloc` passes the one index it
 /// is about to emit. That keeps the check honest about the SQL it precedes.
 pub fn findMySqlTextRestriction(table: TableDef, indexes: []const IndexDef, dialect: Dialect) ?MySqlTextRestriction {
-    if (!std.mem.eql(u8, dialect.name, "mysql")) return null;
+    if (dialect.kind() != .mysql) return null;
 
     for (table.columns) |col| {
         const sql_type = columnSQLType(col, dialect);
@@ -1621,16 +1621,15 @@ fn buildRecordInsertSQL(dialect: Dialect, buf: []u8) ![]const u8 {
     const p1 = try dialect.placeholder(buf[0..32], 1);
     const p2 = try dialect.placeholder(buf[32..64], 2);
     const p3 = try dialect.placeholder(buf[64..96], 3);
-    const suffix: []const u8 = if (std.mem.eql(u8, dialect.name, "postgres"))
-        " ON CONFLICT (version) DO NOTHING"
-    else if (std.mem.eql(u8, dialect.name, "mysql"))
-        ""
-    else
-        " ON CONFLICT (version) DO NOTHING";
-    const mysql_suffix: []const u8 = if (std.mem.eql(u8, dialect.name, "mysql"))
-        " ON DUPLICATE KEY UPDATE applied_at = applied_at"
-    else
-        "";
+    const suffix: []const u8 = switch (dialect.kind()) {
+        // SQLite and an unnamed dialect both take the ON CONFLICT clause.
+        .postgres, .sqlite, .unknown => " ON CONFLICT (version) DO NOTHING",
+        .mysql => "",
+    };
+    const mysql_suffix: []const u8 = switch (dialect.kind()) {
+        .mysql => " ON DUPLICATE KEY UPDATE applied_at = applied_at",
+        .sqlite, .postgres, .unknown => "",
+    };
     return std.fmt.bufPrint(
         buf[96..],
         "INSERT INTO zent_schema_migrations (version, applied_at, checksum) VALUES ({s}, {s}, {s}){s}{s}",
@@ -1745,68 +1744,74 @@ fn sleepMs(ms: u32) void {
 /// release on different sessions, making the fence ineffective.
 fn lockMigration(drv: sql_driver.Driver, timeout_ms: u32) MigrationLockError!bool {
     if (timeout_ms == 0) return false;
-    const name = drv.dialect().name;
-    if (std.mem.eql(u8, name, "sqlite")) return false;
 
-    if (std.mem.eql(u8, name, "postgres")) {
-        var sql_buf: [128]u8 = undefined;
-        const sql = std.fmt.bufPrint(&sql_buf, "SELECT pg_try_advisory_lock({d})", .{advisory_lock_key}) catch return false;
-        const poll_ms: u32 = 25;
-        var waited: u32 = 0;
-        while (true) {
+    switch (drv.dialect().kind()) {
+        // SQLite: no external lock, same reasoning as an unnamed dialect. The
+        // comparison this arm replaces asked for `"sqlite"`, which is not the
+        // name `Dialect.sqlite` carries (`"sqlite3"`), so it matched nothing and
+        // SQLite fell through to the unnamed-dialect answer instead — the same
+        // `false`, but by accident rather than by intent.
+        .sqlite, .unknown => return false,
+        .postgres => {
+            var sql_buf: [128]u8 = undefined;
+            const sql = std.fmt.bufPrint(&sql_buf, "SELECT pg_try_advisory_lock({d})", .{advisory_lock_key}) catch return false;
+            const poll_ms: u32 = 25;
+            var waited: u32 = 0;
+            while (true) {
+                var rows = drv.query(sql, &.{}) catch |err| {
+                    zent_log.warn("zent migrations: pg advisory lock unavailable ({s}); continuing without lock", .{@errorName(err)});
+                    return false;
+                };
+                defer rows.deinit();
+                const acquired = if (rows.next()) |row| (row.getBool(0) orelse false) else false;
+                if (acquired) return true;
+                if (waited >= timeout_ms) return error.MigrationLockTimeout;
+                const step = @min(poll_ms, timeout_ms - waited);
+                sleepMs(step);
+                waited += step;
+            }
+        },
+        .mysql => {
+            var sql_buf: [160]u8 = undefined;
+            // GET_LOCK timeouts are whole seconds; a sub-second request rounds up
+            // to 1 so a small test timeout does not become "wait forever".
+            const secs: u32 = @max(1, timeout_ms / 1000);
+            const sql = std.fmt.bufPrint(&sql_buf, "SELECT GET_LOCK('{s}', {d})", .{ mysql_lock_name, secs }) catch return false;
             var rows = drv.query(sql, &.{}) catch |err| {
-                zent_log.warn("zent migrations: pg advisory lock unavailable ({s}); continuing without lock", .{@errorName(err)});
+                zent_log.warn("zent migrations: MySQL GET_LOCK unavailable ({s}); continuing without lock", .{@errorName(err)});
                 return false;
             };
             defer rows.deinit();
-            const acquired = if (rows.next()) |row| (row.getBool(0) orelse false) else false;
-            if (acquired) return true;
-            if (waited >= timeout_ms) return error.MigrationLockTimeout;
-            const step = @min(poll_ms, timeout_ms - waited);
-            sleepMs(step);
-            waited += step;
-        }
-    }
-
-    if (std.mem.eql(u8, name, "mysql")) {
-        var sql_buf: [160]u8 = undefined;
-        // GET_LOCK timeouts are whole seconds; a sub-second request rounds up
-        // to 1 so a small test timeout does not become "wait forever".
-        const secs: u32 = @max(1, timeout_ms / 1000);
-        const sql = std.fmt.bufPrint(&sql_buf, "SELECT GET_LOCK('{s}', {d})", .{ mysql_lock_name, secs }) catch return false;
-        var rows = drv.query(sql, &.{}) catch |err| {
-            zent_log.warn("zent migrations: MySQL GET_LOCK unavailable ({s}); continuing without lock", .{@errorName(err)});
+            const row = rows.next() orelse return false;
+            if (row.getInt(0)) |v| {
+                if (v == 1) return true;
+                if (v == 0) return error.MigrationLockTimeout;
+            }
+            zent_log.warn("zent migrations: MySQL GET_LOCK returned NULL; continuing without lock", .{});
             return false;
-        };
-        defer rows.deinit();
-        const row = rows.next() orelse return false;
-        if (row.getInt(0)) |v| {
-            if (v == 1) return true;
-            if (v == 0) return error.MigrationLockTimeout;
-        }
-        zent_log.warn("zent migrations: MySQL GET_LOCK returned NULL; continuing without lock", .{});
-        return false;
+        },
     }
-
-    // Unknown dialect: no external lock (same reasoning as SQLite).
-    return false;
 }
 
 /// Best-effort release of the lock taken by `lockMigration`.
 fn unlockMigration(drv: sql_driver.Driver) void {
-    const name = drv.dialect().name;
-    if (std.mem.eql(u8, name, "postgres")) {
-        var sql_buf: [128]u8 = undefined;
-        const sql = std.fmt.bufPrint(&sql_buf, "SELECT pg_advisory_unlock({d})", .{advisory_lock_key}) catch return;
-        _ = drv.exec(sql, &.{}) catch |err| {
-            zent_log.warn("zent migrations: pg advisory unlock failed ({s})", .{@errorName(err)});
-        };
-    } else if (std.mem.eql(u8, name, "mysql")) {
-        var sql_buf: [160]u8 = undefined;
-        const sql = std.fmt.bufPrint(&sql_buf, "SELECT RELEASE_LOCK('{s}')", .{mysql_lock_name}) catch return;
-        _ = drv.exec(sql, &.{}) catch |err| {
-            zent_log.warn("zent migrations: MySQL RELEASE_LOCK failed ({s})", .{@errorName(err)});
-        };
+    switch (drv.dialect().kind()) {
+        .postgres => {
+            var sql_buf: [128]u8 = undefined;
+            const sql = std.fmt.bufPrint(&sql_buf, "SELECT pg_advisory_unlock({d})", .{advisory_lock_key}) catch return;
+            _ = drv.exec(sql, &.{}) catch |err| {
+                zent_log.warn("zent migrations: pg advisory unlock failed ({s})", .{@errorName(err)});
+            };
+        },
+        .mysql => {
+            var sql_buf: [160]u8 = undefined;
+            const sql = std.fmt.bufPrint(&sql_buf, "SELECT RELEASE_LOCK('{s}')", .{mysql_lock_name}) catch return;
+            _ = drv.exec(sql, &.{}) catch |err| {
+                zent_log.warn("zent migrations: MySQL RELEASE_LOCK failed ({s})", .{@errorName(err)});
+            };
+        },
+        // SQLite took no lock, and an unnamed dialect has none to release.
+        .sqlite, .unknown => {},
     }
 }
 
@@ -1864,9 +1869,13 @@ fn auditTimestampDefault(column: ColumnDef, dialect: Dialect) ?[]const u8 {
     if (column.default_value != null) return null;
     if (column.logical_type == null or column.logical_type.? != .time) return null;
     if (!std.mem.eql(u8, column.name, "created_at") and !std.mem.eql(u8, column.name, "updated_at")) return null;
-    if (std.mem.eql(u8, dialect.name, "postgres")) return "(EXTRACT(EPOCH FROM now())::bigint)";
-    if (std.mem.eql(u8, dialect.name, "mysql")) return "(UNIX_TIMESTAMP())";
-    return "(unixepoch())";
+    return switch (dialect.kind()) {
+        .postgres => "(EXTRACT(EPOCH FROM now())::bigint)",
+        .mysql => "(UNIX_TIMESTAMP())",
+        // SQLite's unixepoch(), and the fallback an unnamed dialect has always
+        // taken.
+        .sqlite, .unknown => "(unixepoch())",
+    };
 }
 
 /// Normalize a SQL type name for dialect-agnostic comparison by:
@@ -2089,7 +2098,7 @@ pub fn createTableSQLAlloc(allocator: std.mem.Allocator, table: TableDef, dialec
         // PostgreSQL: a bare `INTEGER PRIMARY KEY` has no default, so an
         // INSERT without an explicit id fails NOT NULL on RETURNING. Map
         // auto-increment ids to SERIAL/BIGSERIAL (which own a sequence).
-        if (col.auto_increment and std.mem.eql(u8, dialect.name, "postgres")) {
+        if (col.auto_increment and dialect.kind() == .postgres) {
             sql_type = if (std.ascii.eqlIgnoreCase(sql_type, "BIGINT")) "BIGSERIAL" else "SERIAL";
         }
         if (i > 0) try buf.appendSlice(",\n");
@@ -2110,7 +2119,7 @@ pub fn createTableSQLAlloc(allocator: std.mem.Allocator, table: TableDef, dialec
         } else if (col.primary_key) {
             try buf.appendSlice(" PRIMARY KEY");
             if (col.auto_increment and
-                std.mem.eql(u8, dialect.name, "mysql") and
+                dialect.kind() == .mysql and
                 isMySqlAutoIncrementType(sql_type))
             {
                 try buf.appendSlice(" AUTO_INCREMENT");
@@ -2185,7 +2194,7 @@ pub fn createIndexSQLAlloc(allocator: std.mem.Allocator, index: IndexDef, table_
 
     try buf.appendSlice("CREATE ");
     if (index.unique) try buf.appendSlice("UNIQUE ");
-    if (std.mem.eql(u8, dialect.name, "mysql")) {
+    if (dialect.kind() == .mysql) {
         try buf.appendSlice("INDEX ");
     } else {
         try buf.appendSlice("INDEX IF NOT EXISTS ");
@@ -2249,7 +2258,10 @@ pub fn createViewSQLAlloc(allocator: std.mem.Allocator, comptime info: TypeInfo,
     var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
     defer buf.deinit();
 
-    if (std.mem.eql(u8, dialect.name, "sqlite3")) {
+    // PostgreSQL has no `CREATE VIEW IF NOT EXISTS` (42601) and SQLite no
+    // `CREATE OR REPLACE VIEW` (near `OR`), so SQLite alone takes IF NOT
+    // EXISTS; an unnamed dialect keeps the OR REPLACE it has always taken.
+    if (dialect.kind() == .sqlite) {
         try buf.appendSlice("CREATE VIEW IF NOT EXISTS ");
     } else {
         try buf.appendSlice("CREATE OR REPLACE VIEW ");
@@ -2359,7 +2371,7 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
         if (info.is_view or info.indexes.len == 0) continue;
 
         var existing_mysql_indexes: ?std.array_list.Managed(ExistingIndex) = null;
-        if (std.mem.eql(u8, dialect.name, "mysql")) {
+        if (dialect.kind() == .mysql) {
             existing_mysql_indexes = getExistingIndexes(allocator, driver_drv, info.table_name) catch |err| switch (err) {
                 error.UnsupportedDialect => unreachable, // The dialect was checked immediately above.
                 error.InvalidTableName => unreachable, // SQLite-only, and the dialect was checked immediately above.
@@ -2570,7 +2582,7 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
 }
 
 fn quoteIdentToBuffer(dialect: Dialect, buf: *std.array_list.Managed(u8), name: []const u8) !void {
-    const quote: u8 = if (std.mem.eql(u8, dialect.name, "mysql")) '`' else '"';
+    const quote: u8 = if (dialect.kind() == .mysql) '`' else '"';
     try buf.append(quote);
     for (name) |c| {
         try buf.append(c);
@@ -2582,7 +2594,7 @@ fn quoteIdentToBuffer(dialect: Dialect, buf: *std.array_list.Managed(u8), name: 
 }
 
 fn isSQLiteDialect(dialect: Dialect) bool {
-    return std.mem.eql(u8, dialect.name, "sqlite3");
+    return dialect.kind() == .sqlite;
 }
 
 fn defaultValueStr(comptime f: FieldInfo) ?[]const u8 {
@@ -2695,10 +2707,10 @@ pub fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.D
     var result = std.array_list.Managed(ExistingColumn).init(allocator);
     errdefer freeExistingColumns(allocator, &result);
 
-    const dialect = driver_drv.dialect();
-    const is_sqlite = std.mem.eql(u8, dialect.name, "sqlite3");
-    const is_postgres = std.mem.eql(u8, dialect.name, "postgres");
-    const is_mysql = std.mem.eql(u8, dialect.name, "mysql");
+    const kind = driver_drv.dialect().kind();
+    const is_sqlite = kind == .sqlite;
+    const is_postgres = kind == .postgres;
+    const is_mysql = kind == .mysql;
 
     if (is_sqlite and !sqlitePragmaNameUsable(table_name)) {
         reportUnusableSqliteName("table_info", table_name);
@@ -2764,11 +2776,14 @@ pub fn freeExistingColumns(allocator: std.mem.Allocator, columns: *std.array_lis
 /// `columns_comparable = false` (see `ExistingIndex`), which is the signal a
 /// caller must honour instead of guessing.
 pub fn getExistingIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
-    const dialect = driver_drv.dialect();
-    if (std.mem.eql(u8, dialect.name, "sqlite3")) return getSQLiteIndexes(allocator, driver_drv, table_name);
-    if (std.mem.eql(u8, dialect.name, "postgres")) return getPostgresIndexes(allocator, driver_drv, table_name);
-    if (std.mem.eql(u8, dialect.name, "mysql")) return getMySQLIndexes(allocator, driver_drv, table_name);
-    return error.UnsupportedDialect;
+    return switch (driver_drv.dialect().kind()) {
+        .sqlite => getSQLiteIndexes(allocator, driver_drv, table_name),
+        .postgres => getPostgresIndexes(allocator, driver_drv, table_name),
+        .mysql => getMySQLIndexes(allocator, driver_drv, table_name),
+        // An unnamed dialect has no catalog query of its own; it was the
+        // fallthrough before, and it still is.
+        .unknown => error.UnsupportedDialect,
+    };
 }
 
 /// Hand the accumulated key columns to the index at `current` and reset the
@@ -3106,11 +3121,12 @@ pub const ExistingForeignKey = struct {
 /// "no table at all" are different answers, and only the caller knows which
 /// question it asked.
 pub fn getExistingForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingForeignKey) {
-    const dialect = driver_drv.dialect();
-    if (std.mem.eql(u8, dialect.name, "sqlite3")) return getSQLiteForeignKeys(allocator, driver_drv, table_name);
-    if (std.mem.eql(u8, dialect.name, "postgres")) return getPostgresForeignKeys(allocator, driver_drv, table_name);
-    if (std.mem.eql(u8, dialect.name, "mysql")) return getMySQLForeignKeys(allocator, driver_drv, table_name);
-    return error.UnsupportedDialect;
+    return switch (driver_drv.dialect().kind()) {
+        .sqlite => getSQLiteForeignKeys(allocator, driver_drv, table_name),
+        .postgres => getPostgresForeignKeys(allocator, driver_drv, table_name),
+        .mysql => getMySQLForeignKeys(allocator, driver_drv, table_name),
+        .unknown => error.UnsupportedDialect,
+    };
 }
 
 /// Hand the accumulated columns to the foreign key at `current` and reset the
@@ -3412,11 +3428,12 @@ pub const ExistingView = struct {
 /// with an empty `definition`, because the view's *existence* is the answer this
 /// call also carries.
 pub fn getExistingViews(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, view_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingView) {
-    const dialect = driver_drv.dialect();
-    if (std.mem.eql(u8, dialect.name, "sqlite3")) return getSQLiteViews(allocator, driver_drv, view_name);
-    if (std.mem.eql(u8, dialect.name, "postgres")) return getPostgresViews(allocator, driver_drv, view_name);
-    if (std.mem.eql(u8, dialect.name, "mysql")) return getMySQLViews(allocator, driver_drv, view_name);
-    return error.UnsupportedDialect;
+    return switch (driver_drv.dialect().kind()) {
+        .sqlite => getSQLiteViews(allocator, driver_drv, view_name),
+        .postgres => getPostgresViews(allocator, driver_drv, view_name),
+        .mysql => getMySQLViews(allocator, driver_drv, view_name),
+        .unknown => error.UnsupportedDialect,
+    };
 }
 
 /// The body the three dialect wrappers share: one catalog row per view, two
