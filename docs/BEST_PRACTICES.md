@@ -60,7 +60,9 @@ frees with the *client's* allocator and is for rows the client produced
 (`All()`, `First()`, `Create().Save()`); mixing the two is a mismatched free —
 an arena's bookkeeping corrupted, or "free of invalid memory" taking the process
 down. The name `getOwned` is the reminder; the release call states the
-allocator out loud.
+allocator out loud. A JSON column's document is no exception: the copy carries
+its own arena (`json_arena`), so the same release call frees the strings and the
+payload — nothing the copy points at belongs to the row `getOwned` released.
 
 **Rule of thumb**: typed builders cover single-table + aggregates. Anything
 that references two tables, computes a `CASE`, or needs a correlated subquery
