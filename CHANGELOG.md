@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.79.0] - 2026-09-27
+
 ### Added
 - **`Dialect.kind()`, and dispatch that the compiler checks.** Dialect branching
   was 66 `std.mem.eql(u8, dialect.name, "…")` comparisons across `src/`. A string
