@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`Dialect.kind()`, and dispatch that the compiler checks.** Dialect branching
+  was 66 `std.mem.eql(u8, dialect.name, "…")` comparisons across `src/`. A string
+  comparison cannot be checked, and one was wrong: `maxBindParams` asked for
+  `"sqlite"` while `Dialect.sqlite.name` is `"sqlite3"`, so SQLite bulk-insert
+  chunks were sized from the 65535-parameter cap instead of its 999 — a large
+  batch hit `SQLITE_MAX_VARIABLE_NUMBER` instead of being split, which is the
+  failure the function exists to prevent (invisible locally because modern SQLite
+  tolerates 32766). Every one of those sites is now a `switch` over
+  `Dialect.Kind { sqlite, postgres, mysql, unknown }`, which is exhaustive: a
+  dialect added later is a compile error at each site that has to think about it.
+  `Dialect.name` is unchanged and stays what is logged and used for driver
+  selection.
+
+### Changed
+- **An unrecognised dialect name is refused, not guessed.** `.unknown` is a
+  `Dialect` a consumer can build by hand (`Dialect{ .name = "cockroach" }`); the
+  ALTER builders used to dispatch on the *first character* of the name, so
+  `"sqlserver"` took the SQLite arm and produced SQLite's `DROP COLUMN` for a
+  server this library has never spoken to. They now answer
+  `error.UnsupportedDialect` for it, while SQLite, PostgreSQL and MySQL produce
+  exactly the statements they did. Two migration gates that skipped SQLite by
+  first letter (`name[0] != 's'`) now ask `kind() != .sqlite` and let the builder
+  below refuse an unknown dialect by name instead of skipping it silently.
+
+### Fixed
+- **34 tests were testing the unknown fallback while claiming to test SQLite.**
+  They built `Dialect{ .name = "sqlite" }` — not a name this library defines — so
+  every one of them exercised `.unknown`, which happens to behave like SQLite
+  today for placeholders and identifier quoting. They now use `Dialect.sqlite`,
+  which is what they meant, so a future difference between the two paths cannot
+  pass unnoticed.
+
 ## [0.78.1] - 2026-09-27
 
 ## [0.78.0] - 2026-09-24

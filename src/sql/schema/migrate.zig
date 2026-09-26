@@ -3677,11 +3677,14 @@ fn dropColumnSQL(
     column_name: []const u8,
     dialect: Dialect,
 ) ![]const u8 {
-    return switch (dialect.name[0]) {
-        's' => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\"", .{ table_name, column_name }),
-        'p' => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\" CASCADE", .{ table_name, column_name }),
-        'm' => std.fmt.allocPrint(allocator, "ALTER TABLE `{s}` DROP COLUMN `{s}`", .{ table_name, column_name }),
-        else => error.UnsupportedDialect,
+    // The first-character dispatch this replaces treated any name starting with
+    // 's' as SQLite (`"sqlserver"` got SQLite's DROP COLUMN and would have been
+    // sent to the server verbatim); an unrecognised name is refused instead.
+    return switch (dialect.kind()) {
+        .sqlite => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\"", .{ table_name, column_name }),
+        .postgres => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\" CASCADE", .{ table_name, column_name }),
+        .mysql => std.fmt.allocPrint(allocator, "ALTER TABLE `{s}` DROP COLUMN `{s}`", .{ table_name, column_name }),
+        .unknown => error.UnsupportedDialect,
     };
 }
 
@@ -3738,11 +3741,10 @@ fn alterColumnTypeSQL(
     new_type: []const u8,
     dialect: Dialect,
 ) ![]const u8 {
-    return switch (dialect.name[0]) {
-        's' => error.UnsupportedDialect,
-        'p' => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE {s} USING \"{s}\"::{s}", .{ table_name, column_name, new_type, column_name, new_type }),
-        'm' => error.MySQLTypeChangeUnsafe,
-        else => error.UnsupportedDialect,
+    return switch (dialect.kind()) {
+        .sqlite, .unknown => error.UnsupportedDialect,
+        .postgres => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE {s} USING \"{s}\"::{s}", .{ table_name, column_name, new_type, column_name, new_type }),
+        .mysql => error.MySQLTypeChangeUnsafe,
     };
 }
 
@@ -3768,14 +3770,14 @@ fn alterColumnNullabilitySQL(
     not_null: bool,
     dialect: Dialect,
 ) ![]const u8 {
-    return switch (dialect.name[0]) {
-        'p' => std.fmt.allocPrint(
+    return switch (dialect.kind()) {
+        .postgres => std.fmt.allocPrint(
             allocator,
             "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" {s} NOT NULL",
             .{ table_name, column_name, if (not_null) "SET" else "DROP" },
         ),
-        'm' => error.MySQLNullabilityChangeUnsafe,
-        else => error.UnsupportedDialect,
+        .mysql => error.MySQLNullabilityChangeUnsafe,
+        .sqlite, .unknown => error.UnsupportedDialect,
     };
 }
 
@@ -4106,8 +4108,11 @@ pub fn planMigrateStatements(
                     const db_norm = try normalizeSqlType(existing_col.sql_type, &db_buf);
 
                     if (!std.mem.eql(u8, db_norm, schema_norm)) {
-                        // Skip ALTER TYPE on SQLite (unsupported natively).
-                        if (dialect.name[0] != 's') {
+                        // Skip ALTER TYPE on SQLite, which has no such statement
+                        // (`alterColumnTypeSQL` refuses it); an unrecognised dialect
+                        // is passed through so that function refuses it *by name*
+                        // rather than being skipped silently here.
+                        if (dialect.kind() != .sqlite) {
                             const version = computeMigrationVersion(info.table_name, "alter_type", col.name);
                             if (!versionContains(applied, version)) {
                                 try appendPlanned(
@@ -4127,7 +4132,7 @@ pub fn planMigrateStatements(
         // drift `checkNullability` reports. Gated like drop_columns /
         // allow_data_loss because SET NOT NULL fails on rows already holding
         // a NULL. SQLite is skipped: it has no ALTER COLUMN at all.
-        if (opts.allow_nullability_change and dialect.name[0] != 's') {
+        if (opts.allow_nullability_change and dialect.kind() != .sqlite) {
             inline for (table.columns) |col| {
                 if (getExistingColumnByName(existing_cols.items, col.name)) |existing_col| {
                     if (db_nullableOf(existing_col) != !col.not_null) {
@@ -7130,4 +7135,32 @@ test "checkSchema names a junction table whose name is a declared entity's table
         try std.testing.expect(d.kind != .missing_column);
         try std.testing.expect(d.kind != .junction_pair_uniqueness);
     }
+}
+
+test "the ALTER builders refuse a dialect name they do not know" {
+    // The dispatch used to be on `dialect.name[0]`, so a hand-built name like
+    // `"sqlserver"` took the SQLite arm and got SQLite's DROP COLUMN — SQL the
+    // library cannot vouch for, sent to a server it has never spoken to. The
+    // three named dialects still produce their own statement, and anything else
+    // is refused by name.
+    const allocator = std.testing.allocator;
+    const sqlserver = Dialect{ .name = "sqlserver" };
+
+    try std.testing.expectError(error.UnsupportedDialect, dropColumnSQL(allocator, "t", "c", sqlserver));
+    try std.testing.expectError(error.UnsupportedDialect, alterColumnTypeSQL(allocator, "t", "c", "TEXT", sqlserver));
+    try std.testing.expectError(error.UnsupportedDialect, alterColumnNullabilitySQL(allocator, "t", "c", true, sqlserver));
+
+    // The dialects themselves are unchanged.
+    const pg = try dropColumnSQL(allocator, "t", "c", Dialect.postgres);
+    defer allocator.free(pg);
+    try std.testing.expectEqualStrings("ALTER TABLE \"t\" DROP COLUMN \"c\" CASCADE", pg);
+    const my = try dropColumnSQL(allocator, "t", "c", Dialect.mysql);
+    defer allocator.free(my);
+    try std.testing.expectEqualStrings("ALTER TABLE `t` DROP COLUMN `c`", my);
+    const sq = try dropColumnSQL(allocator, "t", "c", Dialect.sqlite);
+    defer allocator.free(sq);
+    try std.testing.expectEqualStrings("ALTER TABLE \"t\" DROP COLUMN \"c\"", sq);
+    // SQLite has no ALTER COLUMN, and MySQL's is the unsafe one — unchanged.
+    try std.testing.expectError(error.UnsupportedDialect, alterColumnTypeSQL(allocator, "t", "c", "TEXT", Dialect.sqlite));
+    try std.testing.expectError(error.MySQLTypeChangeUnsafe, alterColumnTypeSQL(allocator, "t", "c", "TEXT", Dialect.mysql));
 }

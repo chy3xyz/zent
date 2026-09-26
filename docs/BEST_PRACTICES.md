@@ -1326,6 +1326,14 @@ later. Use this template:
 
 ## 10. Style
 
+- **Dialect branching goes through `Dialect.kind()`.** `switch (dialect.kind())`
+  is exhaustive, so a dialect added later is a compile error at every site that
+  has to think about it; `std.mem.eql(u8, dialect.name, "mysql")` is a string
+  comparison that silently answers "no" when it is misspelt (one did, and cost a
+  dead branch on SQLite's parameter cap). Use the constants
+  (`Dialect.sqlite`, `.postgres`, `.mysql`) — `Dialect{ .name = "sqlite" }` is a
+  *different* dialect (`"sqlite3"` is the SQLite one) and lands in `.unknown`.
+
 - Dupe strings with the **method's** allocator param (not a global) so the
   result's lifetime matches the caller's expectation.
 - Free zent results with `deinitEntity`/`deinitRows`/`Rows.deinit()` — never

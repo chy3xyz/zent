@@ -18,6 +18,7 @@
 //!   // client.doc.Query() ... - scope predicate auto-injected.
 
 const std = @import("std");
+const Dialect = @import("../sql/dialect.zig").Dialect;
 const sql = @import("../sql/builder.zig");
 const privacy = @import("policy.zig");
 const rtp = @import("../runtime/privacy.zig");
@@ -207,7 +208,7 @@ test "DataScopeFilter .all injects no predicate" {
 
 test "DataScopeFilter .self_ builds owner predicate" {
     var f = DataScopeFilter.init("dept_id", "owner_id", .self_, .{ .user_id = 7 });
-    var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(std.testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try f.predicate().?.appendTo(&b);
     const out = b.query();
@@ -220,7 +221,7 @@ test "DataScopeFilter .self_ builds owner predicate" {
 test "DataScopeFilter .dept_custom builds IN predicate" {
     const ids = [_]i64{ 3, 4, 9 };
     var f = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &ids });
-    var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(std.testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try f.predicate().?.appendTo(&b);
     const out = b.query();
@@ -231,7 +232,7 @@ test "DataScopeFilter .dept_custom builds IN predicate" {
 
 test "DataScopeFilter .dept_only builds dept predicate" {
     var f = DataScopeFilter.init("dept_id", "owner_id", .dept_only, .{ .self_dept_id = 3 });
-    var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(std.testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try f.predicate().?.appendTo(&b);
     const out = b.query();
@@ -359,7 +360,7 @@ test "DataScopeFilter over-long dept list fails closed, not open" {
     for (&many, 0..) |*d, i| d.* = @intCast(i + 1);
 
     var wide = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &many });
-    var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(std.testing.allocator, Dialect.sqlite);
     defer b.deinit();
     const pred = wide.predicate() orelse return error.ScopeDropped;
     try pred.appendTo(&b);
@@ -371,7 +372,7 @@ test "DataScopeFilter over-long dept list fails closed, not open" {
     var fits: [max_dept_ids]i64 = undefined;
     for (&fits, 0..) |*d, i| d.* = @intCast(i + 1);
     var ok = DataScopeFilter.init("dept_id", "owner_id", .dept_custom, .{ .dept_ids = &fits });
-    var b2 = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+    var b2 = sql.Builder.init(std.testing.allocator, Dialect.sqlite);
     defer b2.deinit();
     try ok.predicate().?.appendTo(&b2);
     const out2 = b2.query();
@@ -415,7 +416,7 @@ test "DataScopeFilter empty dept list fails closed, not open" {
     inline for (.{ .dept_custom, .dept_and_child }) |scope| {
         LogCapture.reset();
         var f = DataScopeFilter.init("dept_id", "owner_id", scope, .{ .dept_ids = &.{} });
-        var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+        var b = sql.Builder.init(std.testing.allocator, Dialect.sqlite);
         defer b.deinit();
         const pred = f.predicate() orelse return error.ScopeDropped;
         try pred.appendTo(&b);
@@ -451,7 +452,7 @@ test "DataScopeFilter empty-list deny leaves .all and non-empty lists alone" {
     const ids = [_]i64{ 3, 4 };
     inline for (.{ .dept_custom, .dept_and_child }) |scope| {
         var f = DataScopeFilter.init("dept_id", "owner_id", scope, .{ .dept_ids = &ids });
-        var b = sql.Builder.init(std.testing.allocator, .{ .name = "sqlite" });
+        var b = sql.Builder.init(std.testing.allocator, Dialect.sqlite);
         defer b.deinit();
         try f.predicate().?.appendTo(&b);
         const out = b.query();

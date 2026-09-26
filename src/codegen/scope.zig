@@ -275,7 +275,7 @@ test "scope.forTable renders the tenant and soft-delete contract" {
 
     // Unaliased: bare columns, one placeholder each, in contract order.
     {
-        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{});
+        var fragment = try forTable(infos, "scope_order", testing.allocator, Dialect.sqlite, null, &chain, .{});
         defer fragment.deinit();
         try testing.expectEqualStrings("(\"deleted_at\" IS NULL AND \"app_id\" = ?)", fragment.sql);
         try testing.expectEqual(@as(usize, 1), fragment.args.len);
@@ -293,14 +293,14 @@ test "scope.forTable renders the tenant and soft-delete contract" {
 
     // The entity name resolves as well as the table name.
     {
-        var fragment = try forTable(infos, "ScopeOrder", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{});
+        var fragment = try forTable(infos, "ScopeOrder", testing.allocator, Dialect.sqlite, null, &chain, .{});
         defer fragment.deinit();
         try testing.expectEqualStrings("(\"deleted_at\" IS NULL AND \"app_id\" = ?)", fragment.sql);
     }
 
     // `WithTrashed` drops the soft-delete half, like the fluent path.
     {
-        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{ .with_trashed = true });
+        var fragment = try forTable(infos, "scope_order", testing.allocator, Dialect.sqlite, null, &chain, .{ .with_trashed = true });
         defer fragment.deinit();
         try testing.expectEqualStrings("(\"app_id\" = ?)", fragment.sql);
     }
@@ -339,7 +339,7 @@ test "scope.forTable renders the tenant and soft-delete contract" {
     // `arg_index` is a no-op on a `?` dialect, where placeholders carry no
     // number at all.
     {
-        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{ .arg_index = 7 });
+        var fragment = try forTable(infos, "scope_order", testing.allocator, Dialect.sqlite, null, &chain, .{ .arg_index = 7 });
         defer fragment.deinit();
         try testing.expectEqualStrings("(\"deleted_at\" IS NULL AND \"app_id\" = ?)", fragment.sql);
     }
@@ -355,7 +355,7 @@ test "scope.forTable renders the tenant and soft-delete contract" {
     // No chain, no policy, not soft-deletable in this configuration: an empty
     // fragment, and `writeClause` then writes nothing at all.
     {
-        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, null, .{ .with_trashed = true });
+        var fragment = try forTable(infos, "scope_order", testing.allocator, Dialect.sqlite, null, null, .{ .with_trashed = true });
         defer fragment.deinit();
         try testing.expectEqualStrings("", fragment.sql);
         try testing.expect(isEmpty(fragment));
@@ -372,7 +372,7 @@ test "scope.forTable renders the tenant and soft-delete contract" {
     // doc claims `std.Io.Writer` qualifies, so exercise a real one instead of
     // only the test double.
     {
-        var frag = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{});
+        var frag = try forTable(infos, "scope_order", testing.allocator, Dialect.sqlite, null, &chain, .{});
         defer frag.deinit();
 
         var buf: [256]u8 = undefined;
@@ -386,7 +386,7 @@ test "scope.forTable renders the tenant and soft-delete contract" {
 
     // `writeClause` picks WHERE or AND, so the call site does not have to.
     {
-        var fragment = try forTable(infos, "scope_order", testing.allocator, .{ .name = "sqlite" }, null, &chain, .{});
+        var fragment = try forTable(infos, "scope_order", testing.allocator, Dialect.sqlite, null, &chain, .{});
         defer fragment.deinit();
 
         var buf = std.array_list.Managed(u8).init(testing.allocator);
@@ -423,14 +423,14 @@ test "scope.forTable is fail-closed for a policy-bearing table" {
     // returning an unscoped fragment.
     try testing.expectError(
         error.PrivacyDenied,
-        forTable(infos, "scope_secret", testing.allocator, .{ .name = "sqlite" }, null, null, .{}),
+        forTable(infos, "scope_secret", testing.allocator, Dialect.sqlite, null, null, .{}),
     );
 
     // With a context the policy decides; here it denies the operation
     // outright, which must not degrade into "no fragment".
     try testing.expectError(
         error.PrivacyDenied,
-        forTable(infos, "scope_secret", testing.allocator, .{ .name = "sqlite" }, privacy.PrivacyContext{ .user_id = 1 }, null, .{}),
+        forTable(infos, "scope_secret", testing.allocator, Dialect.sqlite, privacy.PrivacyContext{ .user_id = 1 }, null, .{}),
     );
 }
 
@@ -446,7 +446,7 @@ test "scope.forTable passes a policy filter through" {
         infos,
         "scope_doc",
         testing.allocator,
-        .{ .name = "sqlite" },
+        Dialect.sqlite,
         privacy.PrivacyContext{ .user_id = 42 },
         null,
         .{ .alias = "d" },

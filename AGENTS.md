@@ -11,7 +11,7 @@
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (491 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (494 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -51,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 491, integration 234 passed + 3 skipped
+`baseline` counts move with this: unit 494, integration 234 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -97,6 +97,7 @@ be set up at all on one server, create it only there and say why in a comment.
 | query rows | `All()` returns `std.array_list.Managed(Entity)`: `deinitEntity` per item, then `users.deinit()` (never pair a per-item free with a slice free) |
 | `std.array_list.Managed` (204 sites) | **Not** deprecated in 0.17 — it is the owning-list wrapper, while `std.ArrayList` is the unmanaged shape. Do not mass-migrate for style |
 | `std.time.Instant` / `std.time.timestamp()` | Gone in 0.17 (clocks live under `std.Io.Clock`). The clock sources are libc (`std.c.clock_gettime` / `gettimeofday`) with a documented fallback in `sql/driver.zig` and `sql/logger.zig` — not a defect to "fix" into `std.time` |
+| dialect dispatch | Branch on `dialect.kind()` (`Dialect.Kind`), never on `dialect.name`: a string comparison cannot be checked, and one asked for `"sqlite"` while `Dialect.sqlite.name` is `"sqlite3"`, so the branch never ran. `Dialect{ .name = "sqlite" }` is *not* `Dialect.sqlite` — tests that want SQLite must use the constant |
 | allocation-failure coverage | `src/test/allocation_failures*.zig` fail every allocation in turn and hold the byte ledger (0.17's `std.testing.checkAllAllocationFailures`). Add a path there when you add an assembly routine — they have found fourteen leaks so far, none visible in a non-OOM run |
 | diagnostics | Library code emits through `zent.runtime.log` (`src/runtime/log.zig`), which forwards to `std.log` byte-for-byte unless a sink is installed. Do not call `std.log` directly; `sql/logger.zig`'s per-query `Logger` keeps its own contract |
 

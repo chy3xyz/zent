@@ -1,4 +1,5 @@
 const std = @import("std");
+const Dialect = @import("../sql/dialect.zig").Dialect;
 const sql = @import("../sql/builder.zig");
 const Step = @import("step.zig").Step;
 
@@ -422,7 +423,7 @@ pub fn appendEdgeCount(b: *sql.Builder, step: Step) !void {
 const testing = std.testing;
 
 fn runSQL(allocator: std.mem.Allocator, comptime f: anytype, step: Step, extra: anytype) !sql.QueryResult {
-    var b = sql.Builder.init(allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(allocator, Dialect.sqlite);
     defer b.deinit();
     if (@typeInfo(@TypeOf(extra)) == .@"struct" and @typeInfo(@TypeOf(extra)).@"struct".fields.len > 0) {
         try @call(.auto, f, .{ &b, step } ++ extra);
@@ -444,7 +445,7 @@ test "appendSetNeighbors O2M" {
         .inverse = false,
     };
     const ids = &[_]sql.Value{ .{ .int = 1 }, .{ .int = 2 } };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendSetNeighbors(&b, step, ids);
     const result = b.query();
@@ -468,7 +469,7 @@ test "appendSetNeighbors M2M" {
         .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }});
     const result = b.query();
@@ -489,7 +490,7 @@ test "appendSetNeighbors M2O" {
         .edge_columns = &[_][]const u8{"owner_id"},
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }});
     const result = b.query();
@@ -512,7 +513,7 @@ test "appendSetNeighbors order + per-parent limit uses window function" {
         .desc = true,
         .limit = 2,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }});
     const result = b.query();
@@ -595,7 +596,7 @@ test "appendSetNeighborsFiltered applies extra predicates before the window rank
         .desc = true,
         .limit = 2,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     const extra = [_]sql.Predicate{sql.IsNull("deleted_at")};
     try appendSetNeighborsFiltered(&b, step, &[_]sql.Value{.{ .int = 1 }}, &extra);
@@ -631,7 +632,7 @@ test "appendSetNeighbors chunks parent ids and repeats the column predicate" {
     defer allocator.free(ids);
     for (ids, 0..) |*v, i| v.* = .{ .int = @intCast(i + 1) };
 
-    var b = sql.Builder.init(allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(allocator, Dialect.sqlite);
     defer b.deinit();
     try appendSetNeighbors(&b, step, ids);
     const result = b.query();
@@ -660,7 +661,7 @@ test "appendSetNeighbors rejects an empty parent id list" {
         .edge_columns = &[_][]const u8{"owner_id"},
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
 
     // No parents means "no neighbors", and the clause this function writes
@@ -686,7 +687,7 @@ test "appendSetNeighbors rejects limit on m2m" {
         .inverse = false,
         .limit = 2,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try testing.expectError(error.UnsupportedEdgeLimit, appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }}));
 }
@@ -703,7 +704,7 @@ test "appendSetNeighbors applies filter fragment with args" {
         .inverse = false,
         .filter = .{ .sql = "\"status\" = ?", .args = &.{.{ .string = "visible" }} },
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendSetNeighbors(&b, step, &[_]sql.Value{.{ .int = 1 }});
     const result = b.query();
@@ -723,7 +724,7 @@ test "appendHasNeighbors O2M" {
         .edge_columns = &[_][]const u8{"owner_id"},
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendHasNeighbors(&b, step, false);
     const result = b.query();
@@ -743,7 +744,7 @@ test "appendHasNeighbors M2M" {
         .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendHasNeighbors(&b, step, false);
     const result = b.query();
@@ -763,7 +764,7 @@ test "appendHasNeighborsWith M2M" {
         .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     const pred = sql.EQ("group.name", .{ .string = "admins" });
     try appendHasNeighborsWith(&b, step, &.{pred}, false);
@@ -786,7 +787,7 @@ test "appendEdgeCount O2M" {
         .edge_columns = &[_][]const u8{"owner_id"},
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendEdgeCount(&b, step);
     const result = b.query();
@@ -806,7 +807,7 @@ test "appendEdgeCount M2M" {
         .edge_columns = &[_][]const u8{ "group_id", "user_id" },
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendEdgeCount(&b, step);
     const result = b.query();
@@ -826,7 +827,7 @@ test "appendEdgeCount M2O" {
         .edge_columns = &[_][]const u8{"owner_id"},
         .inverse = false,
     };
-    var b = sql.Builder.init(testing.allocator, .{ .name = "sqlite" });
+    var b = sql.Builder.init(testing.allocator, Dialect.sqlite);
     defer b.deinit();
     try appendEdgeCount(&b, step);
     const result = b.query();

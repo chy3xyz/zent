@@ -111,7 +111,7 @@ pub const Builder = struct {
     }
 
     pub fn ident(b: *Builder, name: []const u8) !void {
-        const quote: u8 = switch (dialect_mod.kind(b.dialect)) {
+        const quote: u8 = switch ((b.dialect).kind()) {
             .mysql => '`',
             // SQLite and PostgreSQL both quote with `"`; an unknown dialect
             // has always been treated the same way.
@@ -369,7 +369,7 @@ pub const Predicate = union(enum) {
                 // pre-escaped allocation needed.
                 // MySQL: use '!' as escape character because '\' would
                 // escape the closing quote in string literals.
-                const escape: u8 = switch (dialect_mod.kind(b.dialect)) {
+                const escape: u8 = switch ((b.dialect).kind()) {
                     .mysql => '!',
                     .sqlite, .postgres, .unknown => p.escape,
                 };
@@ -933,7 +933,7 @@ pub const CTE = struct {
 /// Append a SQL string, rebasing PostgreSQL $N placeholders by `offset`.
 /// For non-PostgreSQL dialects or offset == 0, this is a direct copy.
 fn appendRebasedSql(b: *Builder, sql: []const u8, offset: usize) !void {
-    if (dialect_mod.kind(b.dialect) != .postgres or offset == 0) {
+    if ((b.dialect).kind() != .postgres or offset == 0) {
         return b.writeString(sql);
     }
     var i: usize = 0;
@@ -1114,12 +1114,12 @@ pub const Selector = struct {
             return;
         }
         if (s.for_update_of) |of| {
-            if (dialect_mod.kind(s.b.dialect) == .postgres) {
+            if ((s.b.dialect).kind() == .postgres) {
                 try s.b.writeString(" OF ");
                 try s.b.ident(of);
             }
         }
-        if (dialect_mod.kind(s.b.dialect) != .sqlite) {
+        if ((s.b.dialect).kind() != .sqlite) {
             if (s.skip_locked) try s.b.writeString(" SKIP LOCKED");
             if (s.nowait) try s.b.writeString(" NOWAIT");
         }
@@ -1377,7 +1377,7 @@ pub const InsertBuilder = struct {
         if (i.or_replace) {
             try i.b.writeString("INSERT OR REPLACE INTO ");
         } else if (i.or_ignore) {
-            try i.b.writeString(switch (dialect_mod.kind(i.b.dialect)) {
+            try i.b.writeString(switch ((i.b.dialect).kind()) {
                 .mysql => "INSERT IGNORE INTO ",
                 .sqlite => "INSERT OR IGNORE INTO ",
                 // PostgreSQL and an unknown dialect both have no IGNORE
@@ -2586,7 +2586,7 @@ test "InChunked splits large IN lists" {
     defer allocator.free(preds);
     try std.testing.expectEqual(@as(usize, 3), preds.len);
 
-    var b = Builder.init(allocator, .{ .name = "sqlite" });
+    var b = Builder.init(allocator, Dialect.sqlite);
     defer b.deinit();
     for (preds, 0..) |p, i| {
         if (i > 0) try b.writeString(" OR ");
