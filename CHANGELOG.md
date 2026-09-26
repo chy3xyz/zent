@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-09-27
+
 ### Fixed
 
 - **PostgreSQL: a cached prepared statement is released server-side.** Evicting
