@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.79.1] - 2026-09-27
+
 ### Changed
 - **`@FieldType(T, "field")` where the code used to fabricate a value to ask its
   type.** Eight sites asked `@TypeOf(@field(@as(ParentEntity, undefined)…))` or
