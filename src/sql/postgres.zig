@@ -67,7 +67,7 @@ pub const PostgresDriver = struct {
     allocator: std.mem.Allocator,
     /// Optional prepared-statement cache. When set, exec() reuses named
     /// prepared statements via PQprepare / PQexecPrepared.
-    cache: ?PreparedCache(16, *c.PGresult) = null,
+    cache: ?PreparedCache(16, *PgStmt) = null,
     /// SSL/TLS mode for connections.
     ssl_mode: SslMode = .prefer,
     /// Set once libpq reports the connection is gone, so the pool can discard it
@@ -92,6 +92,32 @@ pub const PostgresDriver = struct {
     current_statement_timeout_ms: ?u32 = null,
 
     pub const SslMode = enum { disable, require, prefer, verify_full };
+
+    /// A prepared statement this driver owns: the server-side name
+    /// `PQexecPrepared` takes it by, and the `PGresult` `PQprepare` returned
+    /// for it.
+    ///
+    /// The name travels with the handle because the cache's release hook is
+    /// handed the handle alone — no SQL, no name — and releasing an entry has
+    /// to `DEALLOCATE` the statement that name identifies. Without that, the
+    /// statement outlives its cache slot: the next `PQprepare` under the same
+    /// (content-hash) name fails with SQLSTATE 42P05, and after a DDL the kept
+    /// plan cannot be executed either when a `SELECT *`-shaped statement's
+    /// result type changed (0A000 `cached plan must not change result type`).
+    pub const PgStmt = struct {
+        /// `p_` plus the SQL's hex content hash, NUL-terminated: `bufPrint`
+        /// writes only the name, and the zeroed byte after it is the `\x00`.
+        name_buf: [20]u8,
+        name_len: u8,
+        /// As returned by `PQprepare` (status `PGRES_COMMAND_OK`); released
+        /// with `PQclear`.
+        prep: *c.PGresult,
+
+        /// The NUL-terminated name `PQprepare` / `PQexecPrepared` want.
+        pub fn name(self: *const PgStmt) [*:0]const u8 {
+            return @ptrCast(self.name_buf[0..self.name_len :0].ptr);
+        }
+    };
 
     /// Fail fast on a connection that is already known to be gone: every
     /// operation would fail anyway, and the caller (the pool) is about to
@@ -145,12 +171,7 @@ pub const PostgresDriver = struct {
 
     pub fn close(self: *PostgresDriver) void {
         if (self.cache) |*cch| {
-            cch.evictAll(self, struct {
-                fn f(ctx: anytype, h: *c.PGresult) void {
-                    _ = ctx;
-                    c.PQclear(h);
-                }
-            }.f);
+            cch.evictAll(self, releaseStmt);
         }
         c.PQfinish(self.conn);
     }
@@ -251,11 +272,19 @@ pub const PostgresDriver = struct {
         paramFormats: *std.ArrayListUnmanaged(c_int),
         owned_lens: *std.ArrayListUnmanaged(?usize),
     ) !void {
-        try paramValues.resize(allocator, args.len);
-        try paramLengths.resize(allocator, args.len);
-        try paramFormats.resize(allocator, args.len);
+        // `paramValues` and `owned_lens` are the pair `freeParams` walks —
+        // `paramValues` holds the pointer, `owned_lens` the length to free it
+        // with — so both are sized *and cleared* before any other list can be
+        // populated. Sizing `owned_lens` last left it empty whenever a resize in
+        // between failed, and the `defer` in exec()/query() then indexed past
+        // its end; leaving either uncleared would be the same walk over
+        // undefined memory.
         try owned_lens.resize(allocator, args.len);
         @memset(owned_lens.items, null);
+        try paramValues.resize(allocator, args.len);
+        @memset(paramValues.items, null);
+        try paramLengths.resize(allocator, args.len);
+        try paramFormats.resize(allocator, args.len);
 
         for (args, 0..) |arg, i| {
             switch (arg) {
@@ -386,62 +415,66 @@ pub const PostgresDriver = struct {
         // DDL invalidates every cached prepared statement.
         if (self.cache) |*cch| {
             if (cache_mod.isDDL(sql)) {
-                cch.evictAll(self, struct {
-                    fn f(ctx: anytype, h: *c.PGresult) void {
-                        _ = ctx;
-                        c.PQclear(h);
-                    }
-                }.f);
+                cch.evictAll(self, releaseStmt);
             }
         }
 
         // Use named prepared statements when cache is enabled and we have args.
         if (self.cache != null and args.len > 0) {
             const cch = &self.cache.?;
-            const hash = std.hash.Wyhash.hash(0, sql);
-            var name_buf: [20]u8 = std.mem.zeroes([20]u8);
-            const name_str = std.fmt.bufPrint(&name_buf, "p_{x}", .{hash}) catch {
-                zent_log.err("postgres: bufPrint for prepared name failed", .{});
-                return error.DriverFailed;
-            };
-            const name_z: [*:0]const u8 = @ptrCast(name_str.ptr);
 
             const PrepareCtx = struct {
                 conn: *c.PGconn,
-                name: [*:0]const u8,
+                allocator: std.mem.Allocator,
                 sql: [*:0]const u8,
                 nParams: c_int,
+                /// Content hash of the SQL: the name is `p_<hash>`, so the same
+                /// SQL prepared again after a `DEALLOCATE` reuses its name.
+                hash: u64,
             };
             const pctx = PrepareCtx{
                 .conn = self.conn,
-                .name = name_z,
+                .allocator = self.allocator,
                 .sql = sql_z.ptr,
                 .nParams = @intCast(args.len),
+                .hash = std.hash.Wyhash.hash(0, sql),
             };
 
-            _ = cch.getOrPrepare(sql, pctx, struct {
-                fn f(ctx: PrepareCtx, s: []const u8) !*c.PGresult {
+            const prepared = cch.getOrPrepare(sql, pctx, struct {
+                fn f(ctx: PrepareCtx, s: []const u8) !*PgStmt {
                     _ = s;
-                    const res = c.PQprepare(ctx.conn, ctx.name, ctx.sql, ctx.nParams, null) orelse {
+                    const stmt = try ctx.allocator.create(PgStmt);
+                    errdefer ctx.allocator.destroy(stmt);
+                    stmt.name_buf = std.mem.zeroes([20]u8);
+                    const name_str = std.fmt.bufPrint(&stmt.name_buf, "p_{x}", .{ctx.hash}) catch {
+                        zent_log.err("postgres: bufPrint for prepared name failed", .{});
+                        return error.DriverFailed;
+                    };
+                    stmt.name_len = @intCast(name_str.len);
+                    const res = c.PQprepare(ctx.conn, stmt.name(), ctx.sql, ctx.nParams, null) orelse {
                         logPgError(ctx.conn, "PQprepare");
                         return error.DriverFailed;
                     };
                     if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
                         logPgError(ctx.conn, "PQprepare");
-                        return sqlstateToError(res);
+                        const err = sqlstateToError(res);
+                        c.PQclear(res);
+                        return err;
                     }
-                    return res;
+                    stmt.prep = res;
+                    return stmt;
                 }
-            }.f, self, struct {
-                fn f(ctx: anytype, h: *c.PGresult) void {
-                    _ = ctx;
-                    c.PQclear(h);
-                }
-            }.f) catch |err| return self.noteError(if (err == error.OutOfMemory) error.OutOfMemory else error.DriverFailed);
+            }.f, self, releaseStmt) catch |err| return self.noteError(if (err == error.OutOfMemory) error.OutOfMemory else error.DriverFailed);
+
+            // The cache keeps the handle only when it had room for it. A
+            // statement it could not keep is ours to release after the call —
+            // otherwise the server-side statement outlives it, and the next
+            // `PQprepare` under that name is the 42P05 failure.
+            defer if (!prepared.cached) releaseStmt(self, prepared.stmt);
 
             const res = c.PQexecPrepared(
                 self.conn,
-                name_z,
+                prepared.stmt.name(),
                 @intCast(args.len),
                 paramValues.items.ptr,
                 paramLengths.items.ptr,
@@ -799,6 +832,29 @@ pub const PostgresDriver = struct {
     };
 };
 
+/// Release a cached statement: drop the server-side prepared statement, then
+/// the `PGresult` and the handle that carries the name.
+///
+/// `DEALLOCATE` (not `PQclosePrepared`, which needs libpq 17) is what makes the
+/// content-hash name reusable — see `PgStmt`. A failure is expected on teardown
+/// and after a lost connection, so it is a warning: the local resources are
+/// released either way, and one of them leaking would be worse than a noisy
+/// log.
+fn releaseStmt(ctx: *PostgresDriver, s: *PostgresDriver.PgStmt) void {
+    // Zeroed (there is no `bufPrintZ` in this std) so the byte after the
+    // command is the NUL `PQexec` reads to: the command is at most 31 bytes.
+    var cmd_buf: [40]u8 = std.mem.zeroes([40]u8);
+    if (std.fmt.bufPrint(&cmd_buf, "DEALLOCATE \"{s}\"", .{s.name()})) |cmd| {
+        const res = c.PQexec(ctx.conn, cmd.ptr);
+        if (res) |r| {
+            if (c.PQresultStatus(r) != c.PGRES_COMMAND_OK) PostgresDriver.logPgError(ctx.conn, "DEALLOCATE");
+            c.PQclear(r);
+        } else PostgresDriver.logPgError(ctx.conn, "DEALLOCATE");
+    } else |_| {}
+    c.PQclear(s.prep);
+    ctx.allocator.destroy(s);
+}
+
 fn execSavepointStmt(d: *PostgresDriver, stmt: []const u8, name: []const u8) !void {
     const sql = try std.fmt.allocPrint(d.allocator, "{s} \"{s}\"", .{ stmt, name });
     defer d.allocator.free(sql);
@@ -989,30 +1045,35 @@ test "PostgresDriver cache field is optional" {
     var drv: PostgresDriver = .{ .conn = undefined, .allocator = undefined };
     try std.testing.expect(drv.cache == null);
 
-    drv.cache = PreparedCache(16, *c.PGresult){};
+    drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
     try std.testing.expect(drv.cache != null);
 }
 
 test "PostgresDriver cache DDL eviction" {
     // DDL SQL should be detected and trigger cache eviction.
-    var cch: PreparedCache(4, *c.PGresult) = .{};
+    var cch: PreparedCache(4, *PostgresDriver.PgStmt) = .{};
     try std.testing.expectEqual(@as(usize, 0), cch.len);
 
     // Manually insert an entry (simulate a prepared statement).
-    // We use getOrPrepare with a no-op prepare that returns a dummy pointer.
-    const dummy: *c.PGresult = @ptrFromInt(0x1);
+    // We use getOrPrepare with a no-op prepare that returns the dummy handle.
+    var dummy_stmt = PostgresDriver.PgStmt{
+        .name_buf = std.mem.zeroes([20]u8),
+        .name_len = 0,
+        .prep = @ptrFromInt(0x1),
+    };
+    const dummy: *PostgresDriver.PgStmt = &dummy_stmt;
     _ = cch.getOrPrepare(
         "SELECT 1",
         dummy,
         struct {
-            fn f(ctx: *c.PGresult, sql: []const u8) !*c.PGresult {
+            fn f(ctx: *PostgresDriver.PgStmt, sql: []const u8) !*PostgresDriver.PgStmt {
                 _ = sql;
                 return ctx;
             }
         }.f,
         dummy,
         struct {
-            fn f(ctx: *c.PGresult, h: *c.PGresult) void {
+            fn f(ctx: *PostgresDriver.PgStmt, h: *PostgresDriver.PgStmt) void {
                 _ = ctx;
                 _ = h;
             }
@@ -1027,7 +1088,7 @@ test "PostgresDriver cache DDL eviction" {
     try std.testing.expect(!cache_mod.isDDL("INSERT INTO foo VALUES (1)"));
 
     cch.evictAll(dummy, struct {
-        fn f(ctx: *c.PGresult, h: *c.PGresult) void {
+        fn f(ctx: *PostgresDriver.PgStmt, h: *PostgresDriver.PgStmt) void {
             _ = ctx;
             _ = h;
         }
@@ -1036,22 +1097,30 @@ test "PostgresDriver cache DDL eviction" {
 }
 
 test "PostgresDriver cache getOrPrepare hit" {
-    var cch: PreparedCache(4, *c.PGresult) = .{};
+    var cch: PreparedCache(4, *PostgresDriver.PgStmt) = .{};
     var prepare_count: usize = 0;
 
+    // The cache stores the handle, it never dereferences it, so a stack dummy
+    // stands in for a prepared statement here.
+    var dummy_stmt = PostgresDriver.PgStmt{
+        .name_buf = std.mem.zeroes([20]u8),
+        .name_len = 0,
+        .prep = @ptrFromInt(0x1),
+    };
     const Ctx = struct {
         count: *usize,
+        stmt: *PostgresDriver.PgStmt,
     };
-    var ctx = Ctx{ .count = &prepare_count };
+    var ctx = Ctx{ .count = &prepare_count, .stmt = &dummy_stmt };
 
     const h1 = try cch.getOrPrepare("SELECT 1", &ctx, struct {
-        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+        fn f(ctx_: *Ctx, sql: []const u8) !*PostgresDriver.PgStmt {
             _ = sql;
             ctx_.count.* += 1;
-            return @ptrFromInt(ctx_.count.*);
+            return ctx_.stmt;
         }
     }.f, &ctx, struct {
-        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+        fn f(ctx_: *Ctx, h: *PostgresDriver.PgStmt) void {
             _ = ctx_;
             _ = h;
         }
@@ -1059,13 +1128,13 @@ test "PostgresDriver cache getOrPrepare hit" {
     try std.testing.expectEqual(@as(usize, 1), prepare_count);
 
     const h2 = try cch.getOrPrepare("SELECT 1", &ctx, struct {
-        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+        fn f(ctx_: *Ctx, sql: []const u8) !*PostgresDriver.PgStmt {
             _ = sql;
             ctx_.count.* += 1;
-            return @ptrFromInt(ctx_.count.*);
+            return ctx_.stmt;
         }
     }.f, &ctx, struct {
-        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+        fn f(ctx_: *Ctx, h: *PostgresDriver.PgStmt) void {
             _ = ctx_;
             _ = h;
         }
@@ -1076,40 +1145,76 @@ test "PostgresDriver cache getOrPrepare hit" {
 }
 
 test "PostgresDriver cache different SQL different entries" {
-    var cch: PreparedCache(4, *c.PGresult) = .{};
+    var cch: PreparedCache(4, *PostgresDriver.PgStmt) = .{};
     var prepare_count: usize = 0;
 
+    var dummy_stmt = PostgresDriver.PgStmt{
+        .name_buf = std.mem.zeroes([20]u8),
+        .name_len = 0,
+        .prep = @ptrFromInt(0x1),
+    };
     const Ctx = struct {
         count: *usize,
+        stmt: *PostgresDriver.PgStmt,
     };
-    var ctx = Ctx{ .count = &prepare_count };
+    var ctx = Ctx{ .count = &prepare_count, .stmt = &dummy_stmt };
 
     _ = try cch.getOrPrepare("SELECT 1", &ctx, struct {
-        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+        fn f(ctx_: *Ctx, sql: []const u8) !*PostgresDriver.PgStmt {
             _ = sql;
             ctx_.count.* += 1;
-            return @ptrFromInt(ctx_.count.*);
+            return ctx_.stmt;
         }
     }.f, &ctx, struct {
-        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+        fn f(ctx_: *Ctx, h: *PostgresDriver.PgStmt) void {
             _ = ctx_;
             _ = h;
         }
     }.f);
     _ = try cch.getOrPrepare("SELECT 2", &ctx, struct {
-        fn f(ctx_: *Ctx, sql: []const u8) !*c.PGresult {
+        fn f(ctx_: *Ctx, sql: []const u8) !*PostgresDriver.PgStmt {
             _ = sql;
             ctx_.count.* += 1;
-            return @ptrFromInt(ctx_.count.*);
+            return ctx_.stmt;
         }
     }.f, &ctx, struct {
-        fn f(ctx_: *Ctx, h: *c.PGresult) void {
+        fn f(ctx_: *Ctx, h: *PostgresDriver.PgStmt) void {
             _ = ctx_;
             _ = h;
         }
     }.f);
     try std.testing.expectEqual(@as(usize, 2), prepare_count);
     try std.testing.expectEqual(@as(usize, 2), cch.len);
+}
+
+test "Postgres: a failed bind leaves the parameter lists a consistent pair" {
+    // `bindParams` sizes four lists, and `freeParams` walks two of them as a
+    // pair — `paramValues` supplies the pointer, `owned_lens` the length to
+    // free it with. A resize that fails part way through therefore must not
+    // leave `paramValues` longer than `owned_lens`: the `defer` in
+    // `exec` / `query` then indexes past the end of `owned_lens` (ReleaseSafe:
+    // panic; ReleaseFast: out-of-bounds read).
+    const args = [_]Value{
+        .{ .string = "a" },
+        .{ .int = 7 },
+        .{ .bytes = "xyz" },
+        .{ .bool = true },
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, values: []const Value) !void {
+            var paramValues: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+            var paramLengths: std.ArrayListUnmanaged(c_int) = .empty;
+            var paramFormats: std.ArrayListUnmanaged(c_int) = .empty;
+            var owned_lens: std.ArrayListUnmanaged(?usize) = .empty;
+            defer {
+                PostgresDriver.freeParams(allocator, paramValues, &owned_lens);
+                paramValues.deinit(allocator);
+                paramLengths.deinit(allocator);
+                paramFormats.deinit(allocator);
+            }
+            try PostgresDriver.bindParams(allocator, values, &paramValues, &paramLengths, &paramFormats, &owned_lens);
+        }
+    }.run, .{@as([]const Value, &args)});
 }
 
 test "Postgres: only a reported decimal command tag counts as a known row count" {

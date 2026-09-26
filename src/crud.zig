@@ -95,7 +95,7 @@ pub fn CrudService(
                 }
                 found.deinit();
             }
-            return if (found.items.len > 0) try ownedCopy(allocator, found.items[0]) else null;
+            return if (found.items.len > 0) try ownedCopy(info, allocator, found.items[0]) else null;
         }
 
         /// Create from a scalar-field entity; publishes CrudEvent.created.
@@ -182,13 +182,20 @@ pub fn CrudService(
         /// on SQLite/PostgreSQL, one statement per row on MySQL, which has no
         /// `RETURNING`. Caller deinits the returned id list. Emits one
         /// CrudEvent.created per row.
-        pub fn insertMany(self: *Self, entities: []const Entity) !std.array_list.Managed(i64) {
+        ///
+        /// `tenant_id` is a **parameter** and is the value written to
+        /// `tenant_col`, exactly as `create` does: the entity's own tenant
+        /// field is skipped rather than copied, so a freshly built entity left
+        /// at the zero value does not write tenant `0`.
+        pub fn insertMany(self: *Self, entities: []const Entity, tenant_id: i64) !std.array_list.Managed(i64) {
             var b = try self.client.BulkInsert();
             defer b.deinit();
             for (entities) |e| {
+                _ = try b.setFieldValue(tenant_col, tenant_id);
                 inline for (info.fields) |f| {
-                    if (f.is_id) continue;
-                    _ = try b.setFieldValue(f.name, @field(e, f.name));
+                    if (!f.is_id and !std.mem.eql(u8, f.name, tenant_col)) {
+                        _ = try b.setFieldValue(f.name, @field(e, f.name));
+                    }
                 }
                 _ = try b.Next();
             }
@@ -206,12 +213,19 @@ pub fn CrudService(
         /// ids are the ones each row actually got. Caller deinits the returned
         /// id list. No CrudEvent is emitted (insert-vs-update is
         /// indistinguishable from the returned ids).
-        pub fn upsertMany(self: *Self, entities: []const Entity) !std.array_list.Managed(i64) {
+        ///
+        /// `tenant_id` is a **parameter** and is the value written to
+        /// `tenant_col`, as in `insertMany`: the entity's own tenant field is
+        /// skipped, not copied.
+        pub fn upsertMany(self: *Self, entities: []const Entity, tenant_id: i64) !std.array_list.Managed(i64) {
             var b = try self.client.BulkInsert();
             defer b.deinit();
             for (entities) |e| {
+                _ = try b.setFieldValue(tenant_col, tenant_id);
                 inline for (info.fields) |f| {
-                    _ = try b.setFieldValue(f.name, @field(e, f.name));
+                    if (!std.mem.eql(u8, f.name, tenant_col)) {
+                        _ = try b.setFieldValue(f.name, @field(e, f.name));
+                    }
                 }
                 _ = try b.Next();
             }
@@ -221,12 +235,20 @@ pub fn CrudService(
 }
 
 const zent_deinit = @import("codegen/entity.zig").deinitEntity;
+const dupeJsonInto = @import("codegen/entity.zig").dupeJsonInto;
 
-/// Owned copy of a scanned entity: struct fields are copied and string
-/// fields are duplicated into `allocator`. On error nothing is leaked and
-/// nothing is transferred: the copies made before the failing one are freed
-/// before the error is returned, so the caller owns nothing but the error.
-fn ownedCopy(allocator: std.mem.Allocator, src: anytype) !@TypeOf(src) {
+/// Owned copy of a scanned entity: struct fields are copied, string fields are
+/// duplicated into `allocator`, and JSON payloads are re-duped into a fresh
+/// arena (also created with `allocator`) attached as the copy's `json_arena`.
+/// Both halves then have the owner a later `deinitEntity(infos, info, &copy,
+/// allocator)` expects — strings freed with the allocator, JSON with the
+/// arena — so the source row can be released first (which is what `getOwned`
+/// does) without invalidating the copy.
+///
+/// On error nothing is leaked and nothing is transferred: the copies made
+/// before the failing one are freed before the error is returned, so the
+/// caller owns nothing but the error.
+fn ownedCopy(comptime info: graph_mod.TypeInfo, allocator: std.mem.Allocator, src: anytype) !@TypeOf(src) {
     const T = @TypeOf(src);
     var out: T = src;
     const fields = @typeInfo(T).@"struct".field_names;
@@ -255,26 +277,37 @@ fn ownedCopy(allocator: std.mem.Allocator, src: anytype) !@TypeOf(src) {
             }
         }
     }
+    // The scan row's JSON arena is owned by `getOwned` and released there, so
+    // the copy's payload must be re-homed before it is returned — a shallow
+    // `out = src` leaves it pointing at memory about to be freed.
+    _ = try dupeJsonInto(info, &out, allocator);
     return out;
 }
 
 test "ownedCopy releases the strings it already duplicated when a later dupe fails" {
-    const Row = struct {
-        id: i64,
-        a: []const u8,
-        b: []const u8,
-        opt: ?[]const u8,
-        c: []const u8,
-    };
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const entity_mod = @import("codegen/entity.zig");
+
+    const Row = Schema("OwnedCopyRow", .{ .fields = &.{
+        field.String("a"),
+        field.String("b"),
+        field.String("c"),
+        field.String("opt").Optional(),
+    } });
+    const info = comptime fromSchema(Row);
+    const infos = &[_]graph_mod.TypeInfo{info};
+    const RowEntity = entity_mod.Entity(infos, info);
     // Every string field non-empty, and the optional present, so the copy is
     // exactly four allocations and `fail_index = i` means "the first i dupes
     // landed, the (i+1)-th failed".
-    const src = Row{ .id = 7, .a = "alpha", .b = "bravo", .opt = "delta", .c = "charlie" };
+    const src = RowEntity{ .id = 7, .a = "alpha", .b = "bravo", .opt = "delta", .c = "charlie" };
 
     var i: usize = 0;
     while (i < 4) : (i += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
-        try std.testing.expectError(error.OutOfMemory, ownedCopy(failing.allocator(), src));
+        try std.testing.expectError(error.OutOfMemory, ownedCopy(info, failing.allocator(), src));
         // i dupes succeeded and all i must have been released again: without
         // the errdefer this is `deallocations == 0`, and the leaked slices are
         // also reported by `std.testing.allocator` at test exit.
@@ -401,6 +434,52 @@ test "CrudService get with mismatched allocator (arena copy)" {
     try std.testing.expect((try svc.getOwned(arena.allocator(), 0, id)) == null);
 }
 
+test "CrudService getOwned keeps a JSON payload whose source arena getOwned released" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+
+    const Settings = struct { theme: []const u8, retries: i64 };
+    const Widget = Schema("OwnedJsonWidget", .{ .fields = &.{
+        field.Int("tenant_id"),
+        field.String("name"),
+        field.JSON("settings", Settings),
+    } });
+    const info = comptime fromSchema(Widget);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const client = codegen.EntityClient(infos, info).init(allocator, driver.asDriver());
+    var svc = Service.init(allocator, client);
+
+    const id = try svc.create(.{
+        .id = 0,
+        .tenant_id = 0,
+        .name = "widget",
+        .settings = .{ .theme = "dark", .retries = 3 },
+        .json_arena = null,
+    }, 7);
+
+    var got = (try svc.getOwned(allocator, 7, id)).?;
+    // The scan row's JSON arena is released by getOwned before it returns, so
+    // the copy's payload has to be its own. Before the fix these read the freed
+    // source arena (garbage), and the `deinitEntity` below hit a double free.
+    try std.testing.expectEqualStrings("dark", got.settings.theme);
+    try std.testing.expectEqual(@as(i64, 3), got.settings.retries);
+    // One call frees both halves: string fields with the allocator, the JSON
+    // payload with the copy's own arena.
+    deinitEntity(infos, info, &got, allocator);
+}
+
 test "CrudService insertMany/upsertMany batch writes" {
     const allocator = std.testing.allocator;
     const field = @import("core/field.zig");
@@ -444,7 +523,7 @@ test "CrudService insertMany/upsertMany batch writes" {
         .{ .id = 0, .tenant_id = 1, .name = "a", .price_cents = 100 },
         .{ .id = 0, .tenant_id = 1, .name = "b", .price_cents = 200 },
         .{ .id = 0, .tenant_id = 1, .name = "c", .price_cents = 300 },
-    });
+    }, 1);
     defer ids.deinit();
     try std.testing.expectEqual(@as(usize, 3), ids.items.len);
     try std.testing.expectEqual(@as(usize, 3), Recorder.created);
@@ -457,13 +536,66 @@ test "CrudService insertMany/upsertMany batch writes" {
     const ups = try svc.upsertMany(&.{
         .{ .id = ids.items[0], .tenant_id = 1, .name = "a2", .price_cents = 150 },
         .{ .id = 0, .tenant_id = 1, .name = "d", .price_cents = 400 },
-    });
+    }, 1);
     defer ups.deinit();
     try std.testing.expectEqual(@as(usize, 2), ups.items.len);
 
     var page2 = try svc.list(1, 1, 10);
     defer page2.deinit();
     try std.testing.expectEqual(@as(i64, 4), page2.total);
+}
+
+test "CrudService insertMany/upsertMany write the tenant parameter, not the entity's zero value" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    const Product = Schema("BatchTenantProduct", .{ .fields = &.{
+        field.Int("tenant_id"),
+        field.String("name"),
+        field.Int("price_cents"),
+    } });
+    const info = comptime fromSchema(Product);
+    const TypeInfo = graph_mod.TypeInfo;
+    const infos = &[_]TypeInfo{info};
+    const Service = CrudService(infos, info, "tenant_id");
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    const client = codegen.EntityClient(infos, info).init(allocator, driver.asDriver());
+    var svc = Service.init(allocator, client);
+
+    // The entities carry the zero tenant (the default of a freshly built one);
+    // the parameter is what must be written, exactly as `create` already does.
+    const ids = try svc.insertMany(&.{
+        .{ .id = 0, .tenant_id = 0, .name = "x", .price_cents = 1 },
+        .{ .id = 0, .tenant_id = 0, .name = "y", .price_cents = 2 },
+    }, 7);
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+
+    var page7 = try svc.list(7, 1, 10);
+    defer page7.deinit();
+    try std.testing.expectEqual(@as(i64, 2), page7.total);
+    // Nothing landed in tenant 0, which is where the entity's own value put it.
+    var page0 = try svc.list(0, 1, 10);
+    defer page0.deinit();
+    try std.testing.expectEqual(@as(i64, 0), page0.total);
+
+    // The upsert path scopes the same way.
+    const ups = try svc.upsertMany(&.{
+        .{ .id = 0, .tenant_id = 0, .name = "z", .price_cents = 3 },
+    }, 9);
+    defer ups.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ups.items.len);
+    var page9 = try svc.list(9, 1, 10);
+    defer page9.deinit();
+    try std.testing.expectEqual(@as(i64, 1), page9.total);
 }
 
 test "CrudService handles optional string fields in create/get" {

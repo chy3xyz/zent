@@ -31,11 +31,15 @@ fn toDriverError(err: anyerror) driver.Error {
 }
 
 /// Errnos whose driver.Error carries caller-actionable meaning (constraint
-/// violations, timeouts, retryable transaction aborts) and must be propagated
-/// verbatim instead of collapsing into the generic MySQLExecFailed /
-/// MySQLStmtFailed.
+/// violations, timeouts, retryable transaction aborts, and a lost connection)
+/// and must be propagated verbatim instead of collapsing into the generic
+/// MySQLExecFailed / MySQLStmtFailed. `ConnectionFailed` belongs here because
+/// the pool has to tell "this connection is gone, discard it" from "this
+/// statement failed"; the PostgreSQL driver reports the same condition, so
+/// leaving it out also made the two dialects answer differently.
 fn isDistinctErrno(err: driver.Error) bool {
     return switch (err) {
+        error.ConnectionFailed,
         error.QueryTimeout,
         error.UniqueViolation,
         error.NotNullViolation,
@@ -114,6 +118,22 @@ pub const MySQLDriver = struct {
     /// Mark the connection dead after a lost-connection errno.
     fn markDead(self: *MySQLDriver, err: anyerror) void {
         if (err == error.ConnectionFailed) self.dead = true;
+    }
+
+    /// Record a failed C call on the driver and return the classification to
+    /// report, or `null` when the caller must collapse it into its generic
+    /// failure.
+    ///
+    /// Every collapse site funnels through here so a lost connection is always
+    /// flagged (`markDead`, so the pool discards the handle and nothing reads
+    /// from it again) and always reported as `ConnectionFailed` — the retryable
+    /// class callers switch on — rather than as `ExecFailed` / `QueryFailed`.
+    /// Timeouts and constraint violations keep their own classification for the
+    /// same reason; anything else returns `null`.
+    fn classifyFailure(self: *MySQLDriver, errno: c_uint) ?driver.Error {
+        const err = errnoToError(errno);
+        self.markDead(err);
+        return if (isDistinctErrno(err)) err else null;
     }
 
     /// MySQL SSL mode.
@@ -466,12 +486,7 @@ pub const MySQLDriver = struct {
                 // probe failure when applyServerTimeout tries
                 // max_execution_time against MariaDB — not a real error.
                 if (errno != 1193) logMySQLError(self, self.conn, "exec");
-                const err = errnoToError(errno);
-                self.markDead(err);
-                // Timeouts and constraint violations are distinct outcomes
-                // (callers rely on e.g. UniqueViolation for upsert fallbacks);
-                // everything else collapses to the generic exec failure.
-                if (isDistinctErrno(err)) return err;
+                if (self.classifyFailure(errno)) |err| return err;
                 return error.MySQLExecFailed;
             }
 
@@ -483,9 +498,7 @@ pub const MySQLDriver = struct {
             if (c.mysql_store_result(self.conn)) |res| {
                 c.mysql_free_result(res);
             } else if (c.mysql_errno(self.conn) != 0) {
-                const err = errnoToError(c.mysql_errno(self.conn));
-                self.markDead(err);
-                if (isDistinctErrno(err)) return err;
+                if (self.classifyFailure(c.mysql_errno(self.conn))) |err| return err;
                 return error.MySQLExecFailed;
             }
 
@@ -561,11 +574,7 @@ pub const MySQLDriver = struct {
         }
 
         if (c.mysql_stmt_execute(stmt) != 0) {
-            const err = errnoToError(c.mysql_errno(self.conn));
-            self.markDead(err);
-            // Statement timeouts and constraint violations are distinct
-            // outcomes; the rest collapse to the generic stmt failure.
-            if (isDistinctErrno(err)) return err;
+            if (self.classifyFailure(c.mysql_errno(self.conn))) |err| return err;
             logMySQLError(self, self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
@@ -648,11 +657,7 @@ pub const MySQLDriver = struct {
         }
 
         if (c.mysql_stmt_execute(stmt) != 0) {
-            const err = errnoToError(c.mysql_errno(self.conn));
-            self.markDead(err);
-            // Statement timeouts and constraint violations are distinct
-            // outcomes; the rest collapse to the generic stmt failure.
-            if (isDistinctErrno(err)) return err;
+            if (self.classifyFailure(c.mysql_errno(self.conn))) |err| return err;
             logMySQLError(self, self.conn, "stmt_execute");
             return error.MySQLStmtFailed;
         }
@@ -670,9 +675,10 @@ pub const MySQLDriver = struct {
 
         // Store result on client side
         if (c.mysql_stmt_store_result(stmt) != 0) {
-            const err = errnoToError(c.mysql_errno(self.conn));
-            // Statement timeouts are the intended outcome of withTimeout.
-            if (err == error.QueryTimeout) return err;
+            // Statement timeouts (the intended outcome of withTimeout) and a
+            // lost connection are both distinct; the latter also marks the
+            // handle dead so the pool discards it.
+            if (self.classifyFailure(c.mysql_errno(self.conn))) |err| return err;
             logMySQLError(self, self.conn, "stmt_store_result");
             return error.MySQLStmtFailed;
         }
@@ -914,10 +920,19 @@ const MySQLTx = struct {
     fn deinit(ptr: *anyopaque) void {
         const self: *MySQLTx = @ptrCast(@alignCast(ptr));
         if (self.state == .active) {
-            self.driver.in_tx = false;
-            _ = self.driver.exec("ROLLBACK", &.{}) catch |err| {
+            // Clear the flag only after the ROLLBACK actually succeeded. The
+            // pool reads `inTransaction()` to decide whether a returned
+            // connection still holds a transaction, so clearing it up front
+            // would let a connection whose rollback failed (for any reason
+            // other than a lost connection) go back into `available` while a
+            // server-side transaction is still open — the next borrower would
+            // then run inside it. ConnPool.release reasons the same way and
+            // drops a connection it could not clean.
+            if (self.driver.exec("ROLLBACK", &.{})) |_| {
+                self.driver.in_tx = false;
+            } else |err| {
                 zent_log.warn("mysql tx deinit: rollback failed ({s})", .{@errorName(err)});
-            };
+            }
         }
         self.driver.allocator.destroy(self);
     }
@@ -1227,6 +1242,7 @@ fn prepareMySQLStmt(drv: *MySQLDriver, sql: []const u8) !*c.MYSQL_STMT {
     defer drv.allocator.free(sql_z);
 
     if (c.mysql_stmt_prepare(stmt, sql_z.ptr, @intCast(sql_z.len)) != 0) {
+        if (drv.classifyFailure(c.mysql_errno(drv.conn))) |err| return err;
         MySQLDriver.logMySQLError(drv, drv.conn, "stmt_prepare");
         zent_log.debug("mysql stmt_prepare sql: {s}", .{sql});
         return error.MySQLStmtFailed;
@@ -1278,4 +1294,91 @@ test "MySQL toDriverError maps native errors to the unified set" {
     try std.testing.expectEqual(driver.Error.QueryTimeout, toDriverError(error.QueryTimeout));
     try std.testing.expectEqual(driver.Error.UniqueViolation, toDriverError(error.UniqueViolation));
     try std.testing.expectEqual(driver.Error.DriverFailed, toDriverError(error.Unexpected));
+}
+
+// ------------------------------------------------------------------
+// Lost-connection handling
+// ------------------------------------------------------------------
+
+test "MySQL: a lost connection keeps its classification instead of collapsing" {
+    // The collapse sites (`exec`, `query` and the prepared-statement failures)
+    // must keep a distinction the caller and the pool act on. `ConnectionFailed`
+    // used to be missing from the whitelist, so a lost connection came back as
+    // MySQLExecFailed / MySQLStmtFailed: the pool could not tell it should
+    // discard the handle, and a consumer switching on the error got a different
+    // answer than the PostgreSQL driver gives for the same condition.
+    try std.testing.expect(driver.isRetryable(error.ConnectionFailed));
+    try std.testing.expect(isDistinctErrno(errnoToError(2002))); // CR_CONN_HOST_ERROR
+    try std.testing.expect(isDistinctErrno(errnoToError(2003))); // CR_CONNECTION_ERROR
+    try std.testing.expect(isDistinctErrno(errnoToError(2006))); // CR_SERVER_GONE_ERROR
+    try std.testing.expect(isDistinctErrno(errnoToError(2013))); // CR_SERVER_LOST
+
+    // The exact decision every collapse site makes: propagate the lost
+    // connection (and remember the handle is unusable) instead of collapsing.
+    var drv: MySQLDriver = .{ .conn = undefined, .allocator = undefined };
+    try std.testing.expectEqual(driver.Error.ConnectionFailed, drv.classifyFailure(2006).?);
+    try std.testing.expect(drv.dead);
+
+    // ... but the whitelist did not become a catch-all: an ordinary exec
+    // failure still collapses to the caller's generic error, while a
+    // caller-actionable errno still survives.
+    var drv2: MySQLDriver = .{ .conn = undefined, .allocator = undefined };
+    try std.testing.expect(drv2.classifyFailure(1142) == null); // ER_TABLEACCESS_DENIED_ERROR -> ExecFailed
+    try std.testing.expect(!drv2.dead);
+    try std.testing.expectEqual(driver.Error.UniqueViolation, drv2.classifyFailure(1062).?); // ER_DUP_ENTRY
+}
+
+test "MySQL: prepare failure on a lost connection marks the driver dead and reports ConnectionFailed" {
+    // Defect C (path 1): `prepareMySQLStmt` used to return MySQLStmtFailed
+    // without calling markDead, so the pool would hand the lost handle to the
+    // next borrower and the error looked like a bad statement.
+    var drv = try disconnectedDriver();
+    defer drv.close();
+    try std.testing.expectError(error.ConnectionFailed, prepareMySQLStmt(&drv, "SELECT 1"));
+    try std.testing.expect(drv.dead);
+}
+
+test "MySQL: store_result failure on a lost connection marks the driver dead and reports ConnectionFailed" {
+    // Defect C (path 2), the `query` store_result branch. Without a server the
+    // statement can neither be prepared nor executed, so this asserts the
+    // decision the branch now shares with the prepare path above (which is
+    // exercised end to end) rather than the C call that cannot run here. Before
+    // the fix the branch neither marked the handle dead nor reported the lost
+    // connection — and it is the branch that runs after a result set is
+    // fetched, where a dropped connection is most likely.
+    var drv: MySQLDriver = .{ .conn = undefined, .allocator = undefined };
+    try std.testing.expectEqual(driver.Error.ConnectionFailed, drv.classifyFailure(2013).?);
+    try std.testing.expect(drv.dead);
+}
+
+test "MySQL: tx deinit keeps in_tx set when the rollback fails" {
+    // Defect E: deinit used to clear `in_tx` before issuing ROLLBACK, so a
+    // rollback that failed for a non-connection reason left the flag false
+    // while the server-side transaction stayed open — and ConnPool.release
+    // reads `inTransaction()` to decide whether it must clean the connection
+    // up before reuse. The failure is injected through the allocation `exec`
+    // does for the NUL-terminated SQL, so it is a non-connection failure
+    // (OutOfMemory) and the driver is not marked dead: the connection is one
+    // the pool would otherwise consider reusable.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var drv: MySQLDriver = .{
+        .conn = undefined,
+        .allocator = failing.allocator(),
+        .in_tx = true,
+    };
+    const tx = try std.testing.allocator.create(MySQLTx);
+    tx.* = .{ .driver = &drv, .state = .active };
+    MySQLTx.deinit(tx);
+    try std.testing.expect(!drv.dead);
+    try std.testing.expect(drv.inTransaction());
+}
+
+/// A real libmariadb handle that was never connected. Every C call on it fails
+/// with errno 2006 ("server has gone away") without a server, which is how the
+/// lost-connection paths are reached in these tests.
+fn disconnectedDriver() !MySQLDriver {
+    return .{
+        .conn = c.mysql_init(null) orelse return error.MySQLInitFailed,
+        .allocator = std.testing.allocator,
+    };
 }

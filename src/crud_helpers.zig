@@ -223,7 +223,12 @@ pub fn queryRows(
         list.deinit();
     }
     while (rows.next()) |row| {
-        try list.append(try mapRow(allocator, row));
+        const mapped = try mapRow(allocator, row);
+        // `mapped` owns strings the list does not know about yet; if the append
+        // fails it never reaches `list.items`, so the errdefer above cannot see
+        // it. Release this one row with the same allocator that built it.
+        errdefer freeOwnedStrings(allocator, T, mapped);
+        try list.append(mapped);
     }
     // `next()` answers null for a step failure exactly as it does for the end
     // of the result set, so without this check a query that broke halfway came
@@ -680,7 +685,9 @@ pub fn CursorResult(comptime Accessor: type) type {
 
 fn CursorPageResult(comptime Accessor: type) type {
     const CR = CursorResult(Accessor);
-    return (error{InvalidCursorColumn} || @typeInfo(AllResult(Accessor)).error_union.error_set)!CR;
+    // `NullableCursorColumn` is separate from `InvalidCursorColumn` on purpose:
+    // the column is a real, integer one, it just cannot carry a NULL cursor.
+    return (error{ InvalidCursorColumn, NullableCursorColumn } || @typeInfo(AllResult(Accessor)).error_union.error_set)!CR;
 }
 
 fn parseCursorOptions(opts: anytype) !CursorOptions {
@@ -731,17 +738,36 @@ fn getEntityCursorVal(comptime Entity: type, entity: *const Entity, col_name: []
     return null;
 }
 
-/// True when `field_name` is an entity field whose Zig type is an integer
-/// (an optional integer counts). The cursor value is bound as `Value.int`
-/// and compared with `<`/`>`, so a non-integer cursor column would silently
-/// filter nothing (`after=3` against a text column returns the whole table,
-/// with `has_more`/`next_cursor` contradicting each other); `cursorPage`
-/// rejects such a column up front instead.
+/// True when `field_name` is an entity field whose Zig type is a **plain**
+/// integer. An optional integer is deliberately excluded: SQL `NULL` has no
+/// representable cursor value, so the last page item would fold to
+/// `next_cursor = null` while `has_more` stayed true and a caller looping on
+/// `has_more` would re-query with no cursor and receive the first page again.
+/// `cursorPage` refuses that shape by name (`NullableCursorColumn`) rather than
+/// emit a cursor that re-reads page 1.
+///
+/// A non-integer cursor column is excluded too: the cursor binds as `Value.int`
+/// and compares with `<`/`>`, so `after=3` against a text column would filter
+/// nothing and return the whole table with `has_more`/`next_cursor`
+/// contradicting each other (`InvalidCursorColumn`).
 fn isIntegerCursorField(comptime Entity: type, field_name: []const u8) bool {
     inline for (@typeInfo(Entity).@"struct".field_names, @typeInfo(Entity).@"struct".field_types) |fname, FType| {
         if (std.mem.eql(u8, fname, field_name)) {
-            const T = if (@typeInfo(FType) == .optional) @typeInfo(FType).optional.child else FType;
-            return @typeInfo(T) == .int;
+            return @typeInfo(FType) == .int;
+        }
+    }
+    return false;
+}
+
+/// True when `field_name` is an entity field of optional integer type — the one
+/// rejected cursor shape a caller can act on, so `cursorPage` answers
+/// `error.NullableCursorColumn` for it instead of the generic
+/// `error.InvalidCursorColumn`.
+fn isNullableIntegerCursorField(comptime Entity: type, field_name: []const u8) bool {
+    inline for (@typeInfo(Entity).@"struct".field_names, @typeInfo(Entity).@"struct".field_types) |fname, FType| {
+        if (std.mem.eql(u8, fname, field_name)) {
+            if (@typeInfo(FType) != .optional) return false;
+            return @typeInfo(@typeInfo(FType).optional.child) == .int;
         }
     }
     return false;
@@ -750,8 +776,11 @@ fn isIntegerCursorField(comptime Entity: type, field_name: []const u8) bool {
 /// Keyset cursor-based pagination helper.
 /// Performs fast cursor pagination without OFFSET overhead.
 /// Whitelist-checks `options.cursor_col` against entity schema fields and
-/// requires it to be an integer field — the cursor binds as an integer, so
-/// anything else would fail open (see `isIntegerCursorField`).
+/// requires it to be a **plain** integer field — the cursor binds as an integer
+/// and is read back from the last row, so anything else would fail open (see
+/// `isIntegerCursorField`). A nullable integer column is refused with
+/// `error.NullableCursorColumn` before any query runs, because a NULL there
+/// would silently restart the caller at page 1 (see `isNullableIntegerCursorField`).
 pub fn cursorPage(
     accessor: anytype,
     predicates: anytype,
@@ -760,6 +789,11 @@ pub fn cursorPage(
 ) CursorPageResult(@TypeOf(accessor)) {
     const opts = try parseCursorOptions(options);
     const Entity = @typeInfo(CreateResult(@TypeOf(accessor))).error_union.payload;
+    // Checked before the integer/field check so a nullable column reports its
+    // own name rather than collapsing into the generic one.
+    if (isNullableIntegerCursorField(Entity, opts.cursor_col)) {
+        return error.NullableCursorColumn;
+    }
     if (!isValidField(@TypeOf(accessor).entity_info, opts.cursor_col) or
         !isIntegerCursorField(Entity, opts.cursor_col))
     {
@@ -840,7 +874,13 @@ pub fn batchCreate(
     }
 
     for (items) |item| {
-        const entity = try create(accessor, item);
+        var entity = try create(accessor, item);
+        // `entity`'s strings belong to the client allocator, not to `list`'s;
+        // until the append succeeds it is not in `list.items`, so the errdefer
+        // above cannot release it. Free it with the allocator that built it —
+        // `deinitRows(..., allocator)` would take the list's allocator and is an
+        // invalid free for this value.
+        errdefer deinitEntity(client_infos, client_info, &entity, client_alloc);
         try list.append(entity);
     }
     return list;
@@ -1850,15 +1890,139 @@ test "crud_helpers: cursorPage rejects a non-integer cursor column" {
     // choice, not the bound value, is what the comparison cannot support.
     try std.testing.expectError(error.InvalidCursorColumn, cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "title", .after = null }, 2));
 
-    // Integer and optional-integer columns stay legal.
+    // A plain integer column stays legal.
     var by_id = try cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "id", .after = 1 }, 2);
     defer by_id.deinit(infos, info, allocator);
     try std.testing.expectEqual(@as(usize, 2), by_id.items.items.len);
     try std.testing.expectEqual(@as(?i64, 3), by_id.next_cursor);
 
-    var by_seq = try cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "seq" }, 2);
-    defer by_seq.deinit(infos, info, allocator);
-    try std.testing.expectEqual(@as(usize, 2), by_seq.items.items.len);
+    // An optional integer used to be accepted here. It is refused now: a NULL
+    // cursor folds into `next_cursor = null` beside `has_more = true`, which
+    // restarts a `while (has_more)` caller at page 1 (`NullableCursorColumn`).
+    try std.testing.expectError(error.NullableCursorColumn, cursorPage(client.cursor_doc, .{}, .{ .cursor_col = "seq" }, 2));
+}
+
+// ── Allocation-failure fixtures for `batchCreate` / `queryRows` ──
+// `checkAllAllocationFailures` runs a function that cannot capture the test's
+// locals, so the schema and row type it needs live at file scope.
+
+const OomBatchItem = struct { name: []const u8 };
+
+const OomBatchSchema = @import("core/schema.zig").Schema("OomBatch", .{
+    .table_name = "crud_helpers_oom_batch",
+    .pk = "batch_id",
+    .fields = &.{
+        @import("core/field.zig").Int("batch_id"),
+        @import("core/field.zig").String("name"),
+    },
+});
+const oom_batch_info = @import("codegen/graph.zig").fromSchema(OomBatchSchema);
+const oom_batch_infos = &[_]graph_mod.TypeInfo{oom_batch_info};
+
+const OomRow = struct { id: i64, name: []const u8 };
+
+fn oomMapRow(allocator: std.mem.Allocator, row: sql_driver.Row) !OomRow {
+    return .{
+        .id = row.getInt(0) orelse 0,
+        .name = try allocator.dupe(u8, row.getText(1) orelse ""),
+    };
+}
+
+test "crud_helpers: batchCreate frees the created entity when the list append fails" {
+    const allocator = std.testing.allocator;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, oom_batch_infos);
+
+    // Both the entity (via the client's allocator) and the list use the
+    // injected allocator, so the sweep's byte ledger sees the dropped entity —
+    // the allocator mismatch that `batchCreate` documents is what made this
+    // leak invisible to a single-allocator check.
+    try std.testing.checkAllAllocationFailures(allocator, struct {
+        fn run(failing: std.mem.Allocator, drv_iface: sql_driver.Driver) !void {
+            const client = client_mod.makeClient(oom_batch_infos, failing, drv_iface);
+            var list = try batchCreate(client.oom_batch, failing, &[_]OomBatchItem{
+                .{ .name = "first" },
+                .{ .name = "second" },
+            });
+            for (list.items) |*e| deinitEntity(oom_batch_infos, oom_batch_info, e, failing);
+            list.deinit();
+        }
+    }.run, .{driver});
+}
+
+test "crud_helpers: queryRows frees the mapped row when the list append fails" {
+    const allocator = std.testing.allocator;
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    _ = try driver.exec("CREATE TABLE crud_helpers_oom_rows (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try driver.exec("INSERT INTO crud_helpers_oom_rows (id, name) VALUES (1, 'alpha')", &.{});
+    _ = try driver.exec("INSERT INTO crud_helpers_oom_rows (id, name) VALUES (2, 'beta')", &.{});
+
+    // `mapRow` and the list share the one allocator `queryRows` was given, so
+    // an append failure after the row was duped must release that row.
+    try std.testing.checkAllAllocationFailures(allocator, struct {
+        fn run(failing: std.mem.Allocator, drv_iface: sql_driver.Driver) !void {
+            var r = try queryRows(OomRow, drv_iface, "SELECT id, name FROM crud_helpers_oom_rows ORDER BY id", &.{}, failing, oomMapRow);
+            defer r.deinit();
+            try std.testing.expectEqual(@as(usize, 2), r.items.len);
+        }
+    }.run, .{driver});
+}
+
+test "crud_helpers: cursorPage rejects a nullable integer cursor column" {
+    const allocator = std.testing.allocator;
+    const field = @import("core/field.zig");
+    const Schema = @import("core/schema.zig").Schema;
+    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const migrate = @import("sql/schema/migrate.zig");
+    const sqlite_driver = @import("sql/sqlite.zig");
+
+    // An optional integer is a permitted schema shape, and `seq` below is
+    // NULL on the middle row. Folding that NULL into `next_cursor = null`
+    // while `has_more` stays true sends a `while (has_more)` caller back to
+    // page 1, so entering cursor mode on `seq` must fail by name instead.
+    const Doc = Schema("NullableCursorDoc", .{
+        .fields = &.{
+            field.String("title"),
+            field.Int("seq").Optional(),
+        },
+    });
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]graph_mod.TypeInfo{info};
+
+    var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const driver = drv.asDriver();
+    try migrate.migrateSchema(allocator, driver, infos);
+    const client = client_mod.makeClient(infos, allocator, driver);
+
+    inline for (0..3) |_| {
+        var null_seq = try create(client.nullable_cursor_doc, .{ .title = "mid", .seq = @as(?i64, null) });
+        deinitEntity(infos, info, &null_seq, allocator);
+    }
+
+    var result = cursorPage(client.nullable_cursor_doc, .{}, .{ .cursor_col = "seq" }, 2);
+    if (result) |*page| {
+        // Pre-fix: the call succeeds and reports the defect directly.
+        std.debug.print("nullable cursor accepted: next_cursor={?} has_more={}\n", .{ page.next_cursor, page.has_more });
+        page.deinit(infos, info, allocator);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqualStrings("NullableCursorColumn", @errorName(err));
+    }
+
+    // A plain integer column is still a legal cursor.
+    var by_id = try cursorPage(client.nullable_cursor_doc, .{}, .{ .cursor_col = "id" }, 2);
+    defer by_id.deinit(infos, info, allocator);
+    try std.testing.expectEqual(@as(usize, 2), by_id.items.items.len);
 }
 
 test "crud_helpers: updateWithVersion optimistic locking and batchSaveOrUpdate" {
