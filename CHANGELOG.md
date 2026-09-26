@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Keyword tables are `std.StaticStringMapWithEql(…, eqlAsciiIgnoreCase)`
+  instead of comparison chains.** Three sites scanned a word against a list at
+  runtime: the EntQL lexer's keywords (nine `std.ascii.eqlIgnoreCase` calls for
+  every word that is *not* a keyword — i.e. for every field name in every
+  expression), `sqlite.zig`'s seven "SQLite reports no change count for these"
+  verbs, and `cache.zig`'s `isDDL`. All three are comptime-built, allocation-free
+  tables now, and each is one place to add a word rather than an arm in the
+  middle of a loop or a chain. The case-insensitive comparison is the map's own
+  (`std.static_string_map.eqlAsciiIgnoreCase`), because the alternative — an
+  exact-match table — is a silent behaviour change: switching either table to
+  `std.StaticStringMap` fails six existing tests (the EntQL `IN`, `CONTAINS`,
+  `IS NULL`, `AND/OR` and `NOT` cases and `isDDL detection`), which is how the
+  case-insensitivity these callers depend on is pinned today. No new tests were
+  needed, and the count is unchanged.
+
 ## [0.80.0] - 2026-09-27
 
 ### Changed

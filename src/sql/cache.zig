@@ -186,14 +186,21 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
     };
 }
 
+/// The statement words that invalidate every cached prepared statement.
+/// Compared case-insensitively through `eqlAsciiIgnoreCase`: SQL arrives in
+/// either case, and the caller's cache coherence depends on this answer.
+const ddl_keywords = std.StaticStringMapWithEql(void, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{
+    .{ "create", {} },
+    .{ "alter", {} },
+    .{ "drop", {} },
+});
+
 /// Returns true if `sql` is a DDL statement (CREATE / ALTER / DROP).
 /// DDL invalidates all cached prepared statements.
 pub fn isDDL(sql: []const u8) bool {
     const s = ltrim(sql, " \t\n\r");
     const first_word = if (std.mem.indexOfAny(u8, s, " \t\n\r")) |idx| s[0..idx] else s;
-    return std.ascii.eqlIgnoreCase(first_word, "CREATE") or
-        std.ascii.eqlIgnoreCase(first_word, "ALTER") or
-        std.ascii.eqlIgnoreCase(first_word, "DROP");
+    return ddl_keywords.has(first_word);
 }
 
 fn ltrim(s: []const u8, chars: []const u8) []const u8 {

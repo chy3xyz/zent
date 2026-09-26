@@ -273,6 +273,18 @@ pub const SQLiteDriver = struct {
         return c.sqlite3_stmt_readonly(stmt) == 0 and !writesWithoutReportingChanges(sql);
     }
 
+    /// The statements SQLite performs without reporting a change count (DDL and
+    /// maintenance). Compared case-insensitively: SQL arrives in every case.
+    const not_dml_keywords = std.StaticStringMapWithEql(void, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{
+        .{ "create", {} },
+        .{ "alter", {} },
+        .{ "drop", {} },
+        .{ "analyze", {} },
+        .{ "vacuum", {} },
+        .{ "pragma", {} },
+        .{ "reindex", {} },
+    });
+
     /// The writable statements that are *not* INSERT / UPDATE / DELETE, and so
     /// never set `sqlite3_changes`.
     ///
@@ -299,11 +311,7 @@ pub const SQLiteDriver = struct {
     fn writesWithoutReportingChanges(sql: []const u8) bool {
         const rest = std.mem.trimStart(u8, sql, " \t\n\r\x0b\x0c");
         const first_word = rest[0 .. std.mem.indexOfAny(u8, rest, " \t\n\r\x0b\x0c(") orelse rest.len];
-        const not_dml = [_][]const u8{ "create", "alter", "drop", "analyze", "vacuum", "pragma", "reindex" };
-        for (not_dml) |kw| {
-            if (std.ascii.eqlIgnoreCase(first_word, kw)) return true;
-        }
-        return false;
+        return not_dml_keywords.has(first_word);
     }
 
     pub fn query(self: *SQLiteDriver, query_sql: []const u8, args: []const Value) !driver.Rows {

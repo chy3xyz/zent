@@ -31,6 +31,24 @@ const sql = @import("../sql/builder.zig");
 // Tokenizer
 // ------------------------------------------------------------------
 
+/// The lexer's keywords. Matched case-insensitively — `IS`/`NOT` and
+/// `and`/`has` are written both ways in practice — through `eqlAsciiIgnoreCase`,
+/// which is what makes the table usable as an exact-match map.
+///
+/// `is` does not consume its operand: the parser reads `IS NULL` and
+/// `IS NOT NULL` from the following tokens, so both forms work.
+const keywords = std.StaticStringMapWithEql(Token, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{
+    .{ "is", Token{ .kw_is = {} } },
+    .{ "not", Token{ .kw_not = {} } },
+    .{ "and", Token{ .kw_and = {} } },
+    .{ "or", Token{ .kw_or = {} } },
+    .{ "in", Token{ .kw_in = {} } },
+    .{ "null", Token{ .kw_null = {} } },
+    .{ "contains", Token{ .kw_contains = {} } },
+    .{ "has", Token{ .kw_has = {} } },
+    .{ "not_has", Token{ .kw_not_has = {} } },
+});
+
 const Token = union(enum) {
     eof,
     ident: []const u8,
@@ -181,21 +199,11 @@ const Lexer = struct {
             }
             const word = self.input[start..self.pos];
 
-            // Check for multi-word keywords (need to look ahead)
-            if (std.ascii.eqlIgnoreCase("IS", word)) {
-                // Don't consume trailing tokens; let the parser handle
-                // `IS NULL` and `IS NOT NULL` so both forms work.
-                return .kw_is;
-            }
-
-            if (std.ascii.eqlIgnoreCase("NOT", word)) return .kw_not;
-            if (std.ascii.eqlIgnoreCase("AND", word)) return .kw_and;
-            if (std.ascii.eqlIgnoreCase("OR", word)) return .kw_or;
-            if (std.ascii.eqlIgnoreCase("IN", word)) return .kw_in;
-            if (std.ascii.eqlIgnoreCase("NULL", word)) return .kw_null;
-            if (std.ascii.eqlIgnoreCase("CONTAINS", word)) return .kw_contains;
-            if (std.ascii.eqlIgnoreCase("has", word)) return .kw_has;
-            if (std.ascii.eqlIgnoreCase("not_has", word)) return .kw_not_has;
+            // One comptime-built, case-insensitive table instead of a chain: the
+            // chain was nine `eqlIgnoreCase` calls for every word that is *not* a
+            // keyword — i.e. for every field name in every expression — and adding
+            // a keyword meant adding an arm in the middle of the lexer.
+            if (keywords.get(word)) |tok| return tok;
 
             return Token{ .ident = word };
         }
