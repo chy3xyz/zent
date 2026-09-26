@@ -315,6 +315,21 @@ changed-vs-matched family (after `crud.update`, `crud_helpers.update` and
 `increment`), and the first one found by comparison rather than by report — which
 is the argument for the matrix existing.
 
+### Z39 — the report that was about the DDL, not the adjacency JOIN (v0.78.1)
+
+A consumer filed this as *"邻接 JOIN 表名短名推导: the adjacency JOIN writes the entity's short name instead of its declared `table_name`, SQLite only"*, with three L0 end-to-end cases suspended and a workaround (a short-name alias table) they had verified makes them pass.
+
+| | |
+|--|--|
+| **Verdict** | **The defect is real; the report's mechanism, location and dialect scope are not.** It is the migration/DDL layer's foreign-key derivation, it is dialect-independent, and it fails on the child's first **INSERT**, not on a join's prepare |
+| **Reproduced** | A minimal schema (`UploadFile` with `table_name = "xdaofood_upload_file"`; `OrderProduct` with `table_name = "xdaofood_order_product"` and `edge.From("file", UploadFile).Field("image_id")`) on SQLite in memory: both tables are created under their declared names and the child's INSERT fails with `no such table: main.upload_file` — the consumer's exact error. The DDL it was checked against: `FOREIGN KEY ("file_id") REFERENCES "upload_file" ("id")` |
+| **Two defects, one branch** | `src/sql/schema/migrate.zig`'s `tableFromTypeInfoCrossRef` From-edge branch (1) derived the referenced table as `toSnakeCase(e.target_name)`, while the same function's To-edge branch twenty lines below resolves `other_info.table_name`; and (2) named the injected FK column `<edge>_id` regardless of `e.field_name` — which `graph.getEdgeFKColumn` honours — so the constraint sat on a column nothing reads (`file_id`) and the column that holds the reference (`image_id`) had none |
+| **Why the workaround worked** | Adding `CREATE TABLE upload_file …` makes the *derived* name exist, so the dangling FK resolves. That is evidence that the SQL asked for the short name — not evidence about *which* SQL asked |
+| **Fix (v0.78.1)** | Both halves: the referenced table is the target's declared `table_name` when the entity is in the migrated graph (the derivation survives only for an out-of-graph target, where the FK dangles either way), and the FK column is the edge's `Field(…)` or `<edge>_id` otherwise. Regression test `codegen.client`'s *"an edge target's declared table_name is what the traversal names"* asserts the DDL (`REFERENCES "xdaofood_upload_file"`, `FOREIGN KEY ("image_id")`, no `"file_id"`) and then runs the inserts, the `QueryEdge` traversal and the `WithEdge` eager load end to end; falsified twice, once per half |
+| **What the consumer should do** | Rebuild that table (or add the missing constraint and drop the phantom column) — the DDL change is in `CHANGELOG.md` 0.78.1. Their three suspended cases then run without the alias table |
+
+Both of the report's hypotheses fail on the code in instructive ways: `edgeTargetInfo` **compile-errors** rather than synthesising a TypeInfo, so no query path can produce a short name, and `buildEdgeStep` reads `target_info.table_name`, so the adjacency SQL was never the place. "MySQL unaffected" is not a dialect fact either — their production tables predate the FK clause, so nothing was left to dangle at insert time. The recurring lesson: which layer produced a string is a question for the code, and a workaround that hides a symptom is evidence about the symptom only.
+
 ### Z37–Z38 — two user-approved semantics fixes (v0.70.0)
 
 Both were on the "needs a decision" list in `docs/OPEN_ITEMS.md`; the user
@@ -322,6 +337,7 @@ approved them, and both are now resolved.
 
 | # | Item | What it was | Fix |
 |---|---|---|---|
+| Z39 | A `From` edge's FK derived its table name instead of reading the declared one, and injected a phantom FK column | P1 | **Fixed** v0.78.1 — both halves, with a DDL+end-to-end regression test. The report's mechanism was wrong: it is the DDL, not the adjacency JOIN, and not dialect-specific |
 | Z37 | **The pool parks a borrower that has room to be served** | Found by the pool stress tests (v0.61.0): a health check failing on a *freshly opened* connection closed that connection — freeing room below `max_connections` — and the borrow then parked on the condition variable, where nothing could wake it (the only signal is another borrower's `release`), so the caller waited out `max_wait_ms` and got `PoolWaitTimeout` instead of the connection error | Waiting now happens **only while it can be served**: the pool at its ceiling with everything lent out. With room below the ceiling the borrow retries on the bounded `max_retries`/`retry_backoff_ms` path, and a call that only met failed health checks reports that error (`PingFailed`/`ConnectionFailed`) rather than `PoolExhausted` |
 | Z38 | **SQLite declares foreign keys but does not enforce them** | `zent` never issued `PRAGMA foreign_keys` and SQLite defaults it OFF, so FK clauses in the DDL accepted dangling references; `checkSchema` compares the DDL shape and cannot see the switch | `openWithOptions` issues the pragma on every handle and **verifies the read-back** (a no-op inside a transaction, so issuing it is not evidence), with an explicit `.enforce_foreign_keys = false` opt-out. Its cross-dialect case exposed a PostgreSQL bug: `sqlstateToError` read the condition at offset 2, so `23502`/`23503` both answered `UniqueViolation` — fixed at offset 3/4 |
 

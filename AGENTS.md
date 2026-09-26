@@ -11,7 +11,7 @@
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (490 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (491 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -51,7 +51,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 490, integration 234 passed + 3 skipped
+`baseline` counts move with this: unit 491, integration 234 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
