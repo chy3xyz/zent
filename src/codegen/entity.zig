@@ -515,6 +515,46 @@ pub fn dupeEntityTo(
     return dupeItem(infos, info, @TypeOf(self.*), self.*, arena);
 }
 
+/// Re-dupe an entity's JSON fields into a fresh arena created with
+/// `allocator`, and attach that arena to the entity's own `json_arena`.
+///
+/// This is the counterpart of `dupeEntityTo` for an entity that will be freed
+/// with `deinitEntity`: that helper puts *everything* (strings included) in
+/// the caller's arena and must not reach `deinitEntity`, while this one
+/// re-homes only the JSON payload and leaves the string fields alone, so the
+/// later `deinitEntity(infos, info, &copy, allocator)` frees the strings with
+/// the allocator and the JSON with the copy's own arena.
+///
+/// `crud.ownedCopy` needs exactly that: it starts from a shallow struct copy
+/// whose JSON fields still point into the scanned source row's arena, which
+/// `CrudService.getOwned` releases before it returns.
+///
+/// A no-op (`null`) when the entity has no `json_arena` member, or when that
+/// arena is already null (the row carried no JSON). Returns the attached
+/// arena, which `deinitEntity` then owns.
+pub fn dupeJsonInto(
+    comptime info: TypeInfo,
+    self: anytype,
+    allocator: std.mem.Allocator,
+) std.mem.Allocator.Error!?*std.heap.ArenaAllocator {
+    const T = @TypeOf(self.*);
+    if (comptime @hasField(T, "json_arena")) {
+        if (self.json_arena == null) return null;
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        inline for (info.fields) |f| {
+            if (f.field_type != .json) continue;
+            const field_type = if (f.optional) ?f.zig_type else f.zig_type;
+            @field(self, f.name) = try dupeDeep(field_type, @field(self, f.name), arena.allocator());
+        }
+        self.json_arena = arena;
+        return arena;
+    }
+    return null;
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
