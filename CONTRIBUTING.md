@@ -29,7 +29,7 @@
 
 ### 环境要求
 
-- Zig 0.17.0 或更高版本
+- Zig `0.17.0-dev.2151+2ec5523d5`（CI 固定的快照，也是 `build.zig.zon` 里 `minimum_zig_version` 的值）
 - SQLite3 开发库
 
 ### 克隆项目

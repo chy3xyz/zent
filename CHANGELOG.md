@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **The toolchain is pinned to one snapshot: `0.17.0-dev.2151+2ec5523d5`.**
+  CI installed `0.17.0-dev.1567+f0354179a` in all four jobs while the local
+  toolchain was 2151 — 584 dev builds apart — so "green in CI" and "green here"
+  were statements about different compilers, and the gap only grows. CI, this
+  repository's `minimum_zig_version`, the README prerequisite, `AGENTS.md` and
+  `CONTRIBUTING.md` now name the same snapshot and must be bumped together.
+  `minimum_zig_version = "0.17.0-dev.2151"` means an **older dev build is
+  refused up front** ("zig version … does not satisfy") instead of failing
+  somewhere inside the build; a newer dev build is still accepted, but it is not
+  what CI verifies. Checked before pinning: the whole gate set runs on 2151
+  locally (`zig build test` 494 tests, `test-integration`, `benchmark`, and the
+  dead-code gate with zmodu v0.15.32 built **by** 2151, since that job compiles
+  the checker with the same snapshot).
+
 ## [0.79.1] - 2026-09-27
 
 ### Changed

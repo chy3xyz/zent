@@ -19,7 +19,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1567+f0354179a
+          version: 0.17.0-dev.2151+2ec5523d5
 
       - name: Cache Zig
         uses: actions/cache@v4
@@ -108,7 +108,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1567+f0354179a
+          version: 0.17.0-dev.2151+2ec5523d5
 
       - name: Cache Zig
         uses: actions/cache@v4
@@ -134,7 +134,7 @@ jobs:
       - name: Install Zig (zigmodu toolchain)
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1567+f0354179a
+          version: 0.17.0-dev.2151+2ec5523d5
 
       - name: Build zmodu CLI from zigmodu (pinned v0.15.32)
         run: |
@@ -159,7 +159,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1567+f0354179a
+          version: 0.17.0-dev.2151+2ec5523d5
 
       - name: Install native database clients
         run: |

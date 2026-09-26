@@ -23,9 +23,11 @@ Current release: **v0.79.1** (package version synced to tags; see `scripts/relea
 
 ### Prerequisites
 
-- Zig 0.17-dev — CI pins `0.17.0-dev.1567+f0354179a`. Dev snapshots are not
-  ABI-stable; if a newer snapshot fails to build, use that exact commit
-  (check yours with `zig env`).
+- Zig `0.17.0-dev.2151+2ec5523d5` — the snapshot CI pins, and the one
+  `build.zig.zon`'s `minimum_zig_version` names, so an older dev build is
+  refused with a clear message instead of failing somewhere inside the build.
+  Dev snapshots are not ABI-stable: bump the pin (CI, this line,
+  `minimum_zig_version`) in one commit, and check yours with `zig env`.
 - SQLite3 development libraries
 
 ### Installation
