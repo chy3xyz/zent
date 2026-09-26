@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.80.0] - 2026-09-27
+
 ### Changed
 - **The toolchain is pinned to one snapshot: `0.17.0-dev.2151+2ec5523d5`.**
   CI installed `0.17.0-dev.1567+f0354179a` in all four jobs while the local
