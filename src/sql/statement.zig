@@ -226,10 +226,14 @@ const Classification = struct {
 /// label is read from the message and flagged as a heuristic; PostgreSQL and
 /// MySQL both hand back a structured code, and their labels are certain.
 fn classify(dialect: Dialect, diagnosis: StatementDiagnosis) Classification {
-    if (std.mem.eql(u8, dialect.name, "mysql")) return classifyMysql(diagnosis.native_code);
-    if (std.mem.eql(u8, dialect.name, "postgres")) return classifyPostgres(diagnosis.sqlstate orelse "");
-    if (std.mem.eql(u8, dialect.name, "sqlite3")) return classifySqlite(diagnosis.message orelse "");
-    return .{ .problem = .other };
+    return switch (dialect.kind()) {
+        .mysql => classifyMysql(diagnosis.native_code),
+        .postgres => classifyPostgres(diagnosis.sqlstate orelse ""),
+        .sqlite => classifySqlite(diagnosis.message orelse ""),
+        // A dialect this code does not know carries no code to read, so it
+        // stays undiagnosed rather than borrowing another server's numbering.
+        .unknown => .{ .problem = .other },
+    };
 }
 
 /// MySQL errno: 1064 ER_PARSE_ERROR, 1146 ER_NO_SUCH_TABLE, 1109

@@ -14,16 +14,14 @@ pub const ExplainResult = struct {
 
 pub fn explainSql(allocator: std.mem.Allocator, dialect: Dialect, raw_sql: []const u8, format: Format) !ExplainResult {
     const prefix: []const u8 = blk: {
-        if (std.mem.eql(u8, dialect.name, "sqlite3")) {
-            break :blk "EXPLAIN QUERY PLAN ";
+        switch (dialect.kind()) {
+            .sqlite => break :blk "EXPLAIN QUERY PLAN ",
+            .postgres => break :blk if (format == .json) "EXPLAIN (FORMAT JSON) " else "EXPLAIN ",
+            .mysql => break :blk if (format == .json) "EXPLAIN FORMAT=JSON " else "EXPLAIN ",
+            // Only the three built-ins have an EXPLAIN form to emit; a dialect
+            // with any other name is refused, as the old fall-through did.
+            .unknown => return error.UnsupportedDialect,
         }
-        if (std.mem.eql(u8, dialect.name, "postgres")) {
-            break :blk if (format == .json) "EXPLAIN (FORMAT JSON) " else "EXPLAIN ";
-        }
-        if (std.mem.eql(u8, dialect.name, "mysql")) {
-            break :blk if (format == .json) "EXPLAIN FORMAT=JSON " else "EXPLAIN ";
-        }
-        return error.UnsupportedDialect;
     };
     const sql = try allocator.alloc(u8, prefix.len + raw_sql.len);
     @memcpy(sql[0..prefix.len], prefix);
