@@ -1960,9 +1960,11 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
         for (info.edges) |e| {
             if (e.kind == .from and (e.relation == .o2m or e.relation == .m2o)) {
                 // O2M/M2O From edge: this entity has a foreign key column
-                // e.g., Car.owner -> User (owner_id column in car table)
-                // Column name is edge_name + "_id"
-                const fk_col_name = e.name ++ "_id";
+                // e.g., Car.owner -> User (owner_id column in car table), named
+                // by the edge (`Field("owner_id")`) when it says so and
+                // `<edge>_id` otherwise — `graph.getEdgeFKColumn`'s choice, so
+                // this DDL and the queries name the same column.
+                const fk_col_name = e.field_name orelse (e.name ++ "_id");
                 const col = ColumnDef{
                     .name = fk_col_name,
                     .sql_type = "INTEGER",
@@ -2410,6 +2412,29 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
 /// Like tableFromTypeInfo, but also adds FK columns from cross-referenced To edges.
 /// For example, if User has a To("cars", Car) O2M edge, this adds a "user_id" FK column
 /// to the Car table pointing back to User.
+/// The table a foreign key on this edge must reference: the **declared**
+/// `table_name` of the edge's target when that entity is in this graph, and the
+/// snake_case derivation of its schema name only when it is not (the historical
+/// spelling, kept for a caller that migrates a table whose target it did not
+/// pass — a foreign key to an entity outside the graph is dangling either way).
+///
+/// The derivation is *not* the same thing: an entity that declares
+/// `table_name = "xdaofood_upload_file"` is stored in that table, and an FK that
+/// names `upload_file` instead points at nothing. On SQLite, where foreign keys
+/// are enforced since v0.70, the child's first INSERT then fails with
+/// `no such table: main.upload_file` — the symptom a consumer reported as a
+/// "short name" defect. `tableFromTypeInfoCrossRef`'s To-edge half has always
+/// resolved this through `other_info.table_name`; the From-edge half derived the
+/// name instead, which is the inconsistency this closes.
+fn edgeRefTable(comptime e: EdgeInfo, comptime all_infos: []const TypeInfo) []const u8 {
+    comptime {
+        for (all_infos) |ti| {
+            if (std.mem.eql(u8, ti.name, e.target_name)) return ti.table_name;
+        }
+        return toSnakeCase(e.target_name);
+    }
+}
+
 fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
     comptime {
         var columns: []const ColumnDef = &.{};
@@ -2437,7 +2462,12 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
         // Own From edges generate FK columns in this table
         for (info.edges) |e| {
             if (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) {
-                const fk_col_name = e.name ++ "_id";
+                // The column the edge names (`Field("image_id")`) or `<edge>_id`
+                // without one — the same choice `graph.getEdgeFKColumn` makes for
+                // the query side. Deriving `<edge>_id` unconditionally put the FK
+                // on a column nothing reads, while the column the queries use held
+                // the reference with no constraint on it.
+                const fk_col_name = e.field_name orelse (e.name ++ "_id");
                 // Skip adding the column definition if it was already added via info.fields
                 // (e.g., from addEdgeFields), but still add the FK constraint.
                 var col_exists = false;
@@ -2459,7 +2489,7 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
 
                 const fk = ForeignKeyDef{
                     .columns = &[_][]const u8{fk_col_name},
-                    .ref_table = toSnakeCase(e.target_name),
+                    .ref_table = edgeRefTable(e, all_infos),
                     .ref_columns = &[_][]const u8{"id"},
                 };
                 foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};

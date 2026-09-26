@@ -1943,3 +1943,100 @@ const PartialRowsDriver = struct {
         return false;
     }
 };
+
+test "an edge target's declared table_name is what the traversal names" {
+    // A consumer report claimed that the adjacency SQL derives the target's
+    // table from the entity's *short* name (`UploadFile` → `upload_file`)
+    // instead of honouring the declared `table_name` (`xdaofood_upload_file`),
+    // and that only the SQLite dialect is affected. This is the smallest shape
+    // that can tell: an `edge.From` (m2o, the FK on the source row) whose target
+    // declares a table name that is not the snake_case of its schema name.
+    //
+    // If the claim held, the traversal below would prepare
+    // `... FROM "upload_file" ...` and fail with "no such table: upload_file" on
+    // SQLite — the name is absent from this database by construction, and the
+    // FK's own `REFERENCES` clause (enforced since SQLite's pragma is on, v0.70)
+    // would reject it at DDL time first.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const edge = @import("../core/edge.zig");
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const UploadFile = Schema("UploadFile", .{
+        .table_name = "xdaofood_upload_file",
+        .fields = &.{field.String("path")},
+    });
+    const OrderProduct = Schema("OrderProduct", .{
+        .table_name = "xdaofood_order_product",
+        .fields = &.{ field.Int("image_id"), field.String("title") },
+        .edges = &.{edge.From("file", UploadFile).Field("image_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ OrderProduct, UploadFile });
+    const infos = graph.types;
+    const product_info = comptime @import("graph.zig").fromSchema(OrderProduct);
+    const file_info = comptime @import("graph.zig").fromSchema(UploadFile);
+
+    // The declared names are the ones the metadata carries.
+    try std.testing.expectEqualStrings("xdaofood_upload_file", file_info.table_name);
+    try std.testing.expectEqualStrings("xdaofood_order_product", product_info.table_name);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+
+    // The DDL is where the defect lived: the child's foreign key named the
+    // *derived* table (`upload_file`) and sat on a column the queries never use
+    // (`<edge>_id`), while the reference itself is held in `image_id`.
+    {
+        var meta = try driver.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'xdaofood_order_product'",
+            &.{},
+        );
+        defer meta.deinit();
+        const row = meta.next() orelse return error.NoTableRow;
+        const ddl = row.getText(0).?;
+        try std.testing.expect(std.mem.indexOf(u8, ddl, "REFERENCES \"xdaofood_upload_file\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, ddl, "FOREIGN KEY (\"image_id\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, ddl, "\"file_id\"") == null);
+    }
+
+    const client = makeClient(infos, allocator, driver.asDriver());
+
+    const file_id = blk: {
+        var b = try client.upload_file.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("path", "/a.png");
+        var row = try b.Save();
+        defer deinitEntity(infos, file_info, &row, allocator);
+        break :blk row.id;
+    };
+    const product_id = blk: {
+        var b = try client.order_product.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("image_id", file_id);
+        _ = try b.setFieldValue("title", "p");
+        var row = try b.Save();
+        defer deinitEntity(infos, product_info, &row, allocator);
+        break :blk row.id;
+    };
+
+    // The m2o traversal: `SELECT ... FROM <target> t INNER JOIN <source> s ...`.
+    var targets = try client.order_product.QueryEdge("file", &.{product_id});
+    defer client.order_product.deinitEdgeRows("file", &targets);
+    try std.testing.expectEqual(@as(usize, 1), targets.items.len);
+    try std.testing.expectEqualStrings("/a.png", targets.items[0].path);
+
+    // And the eager-load path over the same edge, which builds its own SQL.
+    var q = client.order_product.Query();
+    defer q.deinit();
+    _ = try q.WithEdge("file");
+    var rows = try q.All();
+    defer client.order_product.deinitRows(&rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    const loaded = rows.items[0].edges.file.?;
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("/a.png", loaded[0].path);
+}
