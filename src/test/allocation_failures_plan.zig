@@ -4,7 +4,9 @@
 //!   - the CRUD copy path: `CrudService.getOwned` hands a scanned row to
 //!     `crud.ownedCopy`, which duplicates one string field at a time and has to
 //!     release the copies it already made when a later dupe fails — the
-//!     partial-teardown shape where a leak is one `errdefer` away;
+//!     partial-teardown shape where a leak is one `errdefer` away. A JSON
+//!     column adds `entity.dupeJsonInto`'s own arena to the same sweep: its
+//!     `create`, its buffers and the payload strings are each failable;
 //!   - the migration planner: `migrate.planMigrateStatements` builds an ordered
 //!     list of statements, each of them its own buffer, out of the same kind of
 //!     `allocPrint`/`dupe` chain.
@@ -102,6 +104,60 @@ test "an owned copy through the CRUD path unwinds cleanly when any single alloca
             defer deinitEntity(caaf_note_infos, caaf_note_info, &got, child);
             try std.testing.expectEqualStrings("body-bravo", got.body);
             try std.testing.expectEqualStrings("note-delta", got.note.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Copy.run, .{ &svc, id });
+}
+
+/// The same copy path with a JSON column: the payload is re-duped by
+/// `entity.dupeJsonInto` into a fresh arena (whose `create`, buffers and
+/// payload strings are all allocations of the swept allocator), so this sweep
+/// fails each of those too and holds the partial-teardown `errdefer`s — the
+/// arena's and `ownedCopy`'s string loop — to the byte ledger.
+const CaafJsonSettings = struct { theme: []const u8 };
+
+const CaafJsonNote = Schema("CaafJsonNote", .{
+    .table_name = "caaf_json_note",
+    .fields = &.{
+        field.Int("tenant_id"),
+        field.String("title"),
+        field.JSON("settings", CaafJsonSettings),
+    },
+});
+
+const caaf_json_note_info = graph_mod.fromSchema(CaafJsonNote);
+const caaf_json_note_infos: []const TypeInfo = &.{caaf_json_note_info};
+const CaafJsonNoteService = crud.CrudService(caaf_json_note_infos, caaf_json_note_info, "tenant_id");
+
+test "an owned copy with a JSON column unwinds cleanly when any single allocation fails" {
+    const allocator = std.testing.allocator;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+
+    var db = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer db.close();
+    try migrate.migrateSchema(allocator, db.asDriver(), caaf_json_note_infos);
+
+    const Client = codegen.EntityClient(caaf_json_note_infos, caaf_json_note_info);
+    const client = Client.init(allocator, db.asDriver());
+    var svc = CaafJsonNoteService.init(allocator, client);
+
+    const id = try svc.create(.{
+        .id = 0,
+        .tenant_id = 0,
+        .title = "title-alpha",
+        .settings = .{ .theme = "theme-delta" },
+        .json_arena = null,
+    }, 7);
+
+    const Copy = struct {
+        fn run(child: std.mem.Allocator, service: *CaafJsonNoteService, note_id: i64) !void {
+            var got = (try service.getOwned(child, 7, note_id)) orelse return error.TestUnexpectedResult;
+            // String field owned by `child`, JSON payload by the arena
+            // `dupeJsonInto` created with `child`: one `deinitEntity` frees both.
+            defer deinitEntity(caaf_json_note_infos, caaf_json_note_info, &got, child);
+            try std.testing.expectEqualStrings("title-alpha", got.title);
+            try std.testing.expectEqualStrings("theme-delta", got.settings.theme);
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Copy.run, .{ &svc, id });
