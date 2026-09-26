@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.78.1] - 2026-09-27
+
 ## [0.78.0] - 2026-09-24
 
 ### Breaking
