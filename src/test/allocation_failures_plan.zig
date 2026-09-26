@@ -163,6 +163,66 @@ test "an owned copy with a JSON column unwinds cleanly when any single allocatio
     try std.testing.checkAllAllocationFailures(allocator, Copy.run, .{ &svc, id });
 }
 
+/// The same copy path with an **untyped** `field.JSONValue` document: the
+/// payload is a tree of arena-owned nodes whose keys, strings, array backing
+/// and object backing are re-duped node-by-node by `entity.dupeJsonDeep`, so
+/// this sweep fails each of those allocations too — the recursive copy path the
+/// typed-struct sweep above cannot reach.
+const CaafJsonValueNote = Schema("CaafJsonValueNote", .{
+    .table_name = "caaf_json_value_note",
+    .fields = &.{
+        field.Int("tenant_id"),
+        field.String("title"),
+        field.JSONValue("payload"),
+    },
+});
+
+const caaf_json_value_note_info = graph_mod.fromSchema(CaafJsonValueNote);
+const caaf_json_value_note_infos: []const TypeInfo = &.{caaf_json_value_note_info};
+const CaafJsonValueNoteService = crud.CrudService(caaf_json_value_note_infos, caaf_json_value_note_info, "tenant_id");
+
+test "an owned copy with an untyped JSONValue document unwinds cleanly when any single allocation fails" {
+    const allocator = std.testing.allocator;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+
+    var db = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer db.close();
+    try migrate.migrateSchema(allocator, db.asDriver(), caaf_json_value_note_infos);
+
+    const Client = codegen.EntityClient(caaf_json_value_note_infos, caaf_json_value_note_info);
+    const client = Client.init(allocator, db.asDriver());
+    var svc = CaafJsonValueNoteService.init(allocator, client);
+
+    // A nested object + array, so the copied document is more than one node.
+    var payload_arena = std.heap.ArenaAllocator.init(allocator);
+    defer payload_arena.deinit();
+    const payload = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        payload_arena.allocator(),
+        "{\"theme\":\"theme-delta\",\"tags\":[\"alpha\",\"bravo\"]}",
+        .{},
+    );
+    const id = try svc.create(.{
+        .id = 0,
+        .tenant_id = 0,
+        .title = "title-alpha",
+        .payload = payload,
+        .json_arena = null,
+    }, 7);
+
+    const Copy = struct {
+        fn run(child: std.mem.Allocator, service: *CaafJsonValueNoteService, note_id: i64) !void {
+            var got = (try service.getOwned(child, 7, note_id)) orelse return error.TestUnexpectedResult;
+            defer deinitEntity(caaf_json_value_note_infos, caaf_json_value_note_info, &got, child);
+            try std.testing.expectEqualStrings("title-alpha", got.title);
+            try std.testing.expectEqualStrings("theme-delta", got.payload.object.get("theme").?.string);
+            try std.testing.expectEqual(@as(usize, 2), got.payload.object.get("tags").?.array.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Copy.run, .{ &svc, id });
+}
+
 // ------------------------------------------------------------------
 // (b) migration planning
 // ------------------------------------------------------------------

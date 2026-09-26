@@ -169,7 +169,12 @@ pub fn EdgeInterceptorSink(comptime tinfo: TypeInfo) type {
                 }
             }
             if (!found) return error.UnknownField;
-            try self.preds.append(self.allocator, sql.EQ(columnName(tinfo, field_name), value));
+            // Same dedupe rule as every other interceptor sink: the pair,
+            // never the column alone (see `sql.eqUnlessPresent`). Without it an
+            // interceptor chain that scopes twice emits the duplicated injected
+            // predicate that previously made an eager-loaded target query fail
+            // with "Column ... is ambiguous".
+            try sql.appendEqUnlessPresentUnmanaged(self.preds, self.allocator, columnName(tinfo, field_name), value);
         }
     };
 }
@@ -1804,6 +1809,39 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
+
+test "EdgeInterceptorSink.addEq dedupes the (column, value) pair" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Widget = schema("EdgeSinkWidget", .{
+        .fields = &.{ field.Int("app_id"), field.String("name") },
+    });
+    const graph = comptime buildGraph(&.{Widget});
+    const info = graph.types[0];
+
+    var preds: std.ArrayListUnmanaged(sql.Predicate) = .empty;
+    defer preds.deinit(allocator);
+
+    const Sink = EdgeInterceptorSink(info);
+    var sink = Sink{ .preds = &preds, .allocator = allocator };
+
+    // The same interceptor applied twice must collapse: before the fix this
+    // emitted `... AND app_id = ? AND app_id = ?` for an eager-loaded target
+    // query (the duplicated injected predicate that caused the ambiguity
+    // incident).
+    try Sink.addEq(&sink, "app_id", .{ .int = 1 });
+    try std.testing.expectEqual(@as(usize, 1), preds.items.len);
+    try Sink.addEq(&sink, "app_id", .{ .int = 1 });
+    try std.testing.expectEqual(@as(usize, 1), preds.items.len);
+
+    // Same column, different value: MUST be kept. Column-only dedupe would let
+    // a caller predicate suppress the interceptor-injected tenant value.
+    try Sink.addEq(&sink, "app_id", .{ .int = 2 });
+    try std.testing.expectEqual(@as(usize, 2), preds.items.len);
+}
 
 test "Query builder basic" {
     const field = @import("../core/field.zig");
