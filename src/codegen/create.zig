@@ -996,8 +996,15 @@ fn buildUpsertSuffix(
 /// Callers chunk rows so a large batch degrades into several statements
 /// instead of failing on the driver's limit.
 fn maxBindParams(dialect: Dialect) usize {
-    if (std.mem.eql(u8, dialect.name, "sqlite")) return 999;
-    return 65535;
+    return switch (dialect.kind()) {
+        // `Dialect.sqlite`'s name is "sqlite3"; the arm used to ask for
+        // "sqlite", which matched nothing and left SQLite sized for the 65535
+        // cap. `.unknown` takes the conservative cap too: a name this library
+        // does not know gets the value that cannot produce a statement a server
+        // refuses, at the cost of a smaller batch.
+        .sqlite, .unknown => 999,
+        .postgres, .mysql => 65535,
+    };
 }
 
 /// Generate a Bulk Insert builder for an entity.
@@ -2423,4 +2430,24 @@ test "create: the after-hook failure warning reaches an installed log sink" {
     try std.testing.expectEqual(@as(usize, 1), Capture.count);
     try std.testing.expectEqual(zent.runtime.log.Level.warn, Capture.level);
     try std.testing.expectEqualStrings("after-hook failed on table 'user' (create): HookFailed", Capture.last());
+}
+
+test "the bulk-insert chunk cap is SQLite's 999, not the PostgreSQL/MySQL 65535" {
+    // `maxBindParams` decides how many rows a bulk insert puts in one statement
+    // (`chunk_rows = maxBindParams / cols_per_row`). It asked for `"sqlite"`,
+    // which is not the name of `Dialect.sqlite` (`"sqlite3"`), so the SQLite arm
+    // never ran and a wide batch was sized for 65535 bound parameters — past
+    // SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (999 on builds before 3.32), which is
+    // the failure mode the function exists to prevent. The assertion is on the
+    // cap rather than on a statement count because the cap is what chunks are
+    // computed from.
+    const DialectKind = @import("../sql/dialect.zig").Dialect;
+    try std.testing.expectEqual(@as(usize, 999), maxBindParams(DialectKind.sqlite));
+    try std.testing.expectEqual(@as(usize, 65535), maxBindParams(DialectKind.postgres));
+    try std.testing.expectEqual(@as(usize, 65535), maxBindParams(DialectKind.mysql));
+    // A dialect nobody named is treated as SQLite here: the conservative cap is
+    // the one that cannot produce a statement a server rejects.
+    try std.testing.expectEqual(@as(usize, 999), maxBindParams(Dialect{ .name = "cockroach" }));
+    // The spelling mistake itself, pinned so it cannot come back as a literal.
+    try std.testing.expectEqual(@as(usize, 999), maxBindParams(Dialect{ .name = "sqlite" }));
 }
