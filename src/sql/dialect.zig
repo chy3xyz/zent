@@ -8,7 +8,7 @@ pub const Dialect = struct {
     pub const mysql = Dialect{ .name = "mysql" };
 
     pub fn placeholder(d: Dialect, buf: []u8, index: usize) ![]const u8 {
-        if (std.mem.eql(u8, d.name, "postgres")) {
+        if (kind(d) == .postgres) {
             return std.fmt.bufPrint(buf, "${d}", .{index});
         }
         return "?";
@@ -22,7 +22,7 @@ pub const Dialect = struct {
     /// `buf` must hold at least `2 * name.len + 2` bytes; a smaller buffer
     /// returns `error.NoSpaceLeft`.
     pub fn quoteIdent(d: Dialect, buf: []u8, name: []const u8) ![]const u8 {
-        const quote: u8 = if (std.mem.eql(u8, d.name, "mysql")) '`' else '"';
+        const quote: u8 = if (kind(d) == .mysql) '`' else '"';
 
         var i: usize = 0;
         if (buf.len < 2 * name.len + 2) return error.NoSpaceLeft;
@@ -42,6 +42,26 @@ pub const Dialect = struct {
         return buf[0..i];
     }
 };
+
+/// The dialect family a `Dialect` belongs to, for dispatch.
+///
+/// Branch on this, never on `name`: a string comparison cannot be checked, so
+/// a misspelt literal (`"sqlite"` for `"sqlite3"`) compares false and the
+/// branch silently never runs.
+///
+/// `.unknown` is a `Dialect` a consumer may build by hand
+/// (`Dialect{ .name = "cockroach" }`). It has always been treated as
+/// SQLite-ish — `?` placeholders, double-quoted identifiers — and naming it
+/// keeps that fallback visible at each call site instead of hiding in an
+/// `else`.
+pub const Kind = enum { sqlite, postgres, mysql, unknown };
+
+pub fn kind(d: Dialect) Kind {
+    if (std.mem.eql(u8, d.name, "sqlite3")) return .sqlite;
+    if (std.mem.eql(u8, d.name, "postgres")) return .postgres;
+    if (std.mem.eql(u8, d.name, "mysql")) return .mysql;
+    return .unknown;
+}
 
 test "quoteIdent doubles embedded quote characters" {
     var buf: [64]u8 = undefined;

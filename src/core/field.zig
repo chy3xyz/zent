@@ -1,4 +1,5 @@
 const std = @import("std");
+const dialect_mod = @import("../sql/dialect.zig");
 
 /// Field type category.
 pub const FieldType = enum {
@@ -264,7 +265,7 @@ pub fn Version(name: []const u8) Field {
 // SQL type mapping
 // ------------------------------------------------------------------
 
-pub const Dialect = @import("../sql/dialect.zig").Dialect;
+pub const Dialect = dialect_mod.Dialect;
 
 pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
     switch (field_type) {
@@ -279,12 +280,12 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
             // length ent uses — has none of those restrictions. A prefix index
             // (`name(255)`) is not the fix: for UNIQUE it would silently
             // constrain only the first 255 characters.
-            if (std.mem.eql(u8, dialect.name, "mysql")) return "VARCHAR(255)";
+            if (dialect_mod.kind(dialect) == .mysql) return "VARCHAR(255)";
             return "TEXT";
         },
         .text => return "TEXT",
         .bytes => {
-            if (std.mem.eql(u8, dialect.name, "postgres")) return "BYTEA";
+            if (dialect_mod.kind(dialect) == .postgres) return "BYTEA";
             return "BLOB";
         },
         .time => {
@@ -296,7 +297,7 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
             return "BIGINT";
         },
         .json => {
-            if (std.mem.eql(u8, dialect.name, "postgres")) return "JSONB";
+            if (dialect_mod.kind(dialect) == .postgres) return "JSONB";
             return "TEXT";
         },
         .enum_ => {
@@ -305,22 +306,22 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
             // fixed and finite, so VARCHAR(255) is the right width; MySQL's
             // native ENUM(...) would put the value list into the DDL and its
             // semantics differ between MySQL and MariaDB.
-            if (std.mem.eql(u8, dialect.name, "mysql")) return "VARCHAR(255)";
+            if (dialect_mod.kind(dialect) == .mysql) return "VARCHAR(255)";
             return "TEXT";
         },
         .uuid => {
-            if (std.mem.eql(u8, dialect.name, "postgres")) return "UUID";
+            if (dialect_mod.kind(dialect) == .postgres) return "UUID";
             // MySQL cannot index TEXT without a key length, so a UUID primary
             // key would fail CREATE TABLE (errno 1170). CHAR(36) holds the
             // canonical 8-4-4-4-12 form and is indexable.
-            if (std.mem.eql(u8, dialect.name, "mysql")) return "CHAR(36)";
+            if (dialect_mod.kind(dialect) == .mysql) return "CHAR(36)";
             return "TEXT";
         },
         .decimal => {
-            if (std.mem.eql(u8, dialect.name, "postgres")) return "NUMERIC";
+            if (dialect_mod.kind(dialect) == .postgres) return "NUMERIC";
             // MySQL DECIMAL without precision defaults to (10,0) and would
             // truncate fractional cents — pin an explicit precision instead.
-            if (std.mem.eql(u8, dialect.name, "mysql")) return "DECIMAL(38,10)";
+            if (dialect_mod.kind(dialect) == .mysql) return "DECIMAL(38,10)";
             // SQLite TEXT affinity keeps the literal bytes exact; NUMERIC
             // affinity would silently rewrite "1.10" to the REAL 1.1.
             return "TEXT";

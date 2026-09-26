@@ -1,5 +1,6 @@
 const std = @import("std");
-const Dialect = @import("dialect.zig").Dialect;
+const dialect_mod = @import("dialect.zig");
+const Dialect = dialect_mod.Dialect;
 const Step = @import("../graph/step.zig").Step;
 const value_mod = @import("value.zig");
 pub const Value = value_mod.Value;
@@ -110,7 +111,12 @@ pub const Builder = struct {
     }
 
     pub fn ident(b: *Builder, name: []const u8) !void {
-        const quote: u8 = if (std.mem.eql(u8, b.dialect.name, "mysql")) '`' else '"';
+        const quote: u8 = switch (dialect_mod.kind(b.dialect)) {
+            .mysql => '`',
+            // SQLite and PostgreSQL both quote with `"`; an unknown dialect
+            // has always been treated the same way.
+            .sqlite, .postgres, .unknown => '"',
+        };
 
         if (std.mem.indexOfScalar(u8, name, quote) == null) {
             // Pre-allocate once for quote+name+quote to avoid three separate
@@ -363,7 +369,10 @@ pub const Predicate = union(enum) {
                 // pre-escaped allocation needed.
                 // MySQL: use '!' as escape character because '\' would
                 // escape the closing quote in string literals.
-                const escape: u8 = if (std.mem.eql(u8, b.dialect.name, "mysql")) '!' else p.escape;
+                const escape: u8 = switch (dialect_mod.kind(b.dialect)) {
+                    .mysql => '!',
+                    .sqlite, .postgres, .unknown => p.escape,
+                };
                 if (p.fold) try b.writeString("LOWER(");
                 try b.qualifiedIdent(p.column);
                 if (p.fold) try b.writeByte(')');
@@ -924,7 +933,7 @@ pub const CTE = struct {
 /// Append a SQL string, rebasing PostgreSQL $N placeholders by `offset`.
 /// For non-PostgreSQL dialects or offset == 0, this is a direct copy.
 fn appendRebasedSql(b: *Builder, sql: []const u8, offset: usize) !void {
-    if (!std.mem.eql(u8, b.dialect.name, "postgres") or offset == 0) {
+    if (dialect_mod.kind(b.dialect) != .postgres or offset == 0) {
         return b.writeString(sql);
     }
     var i: usize = 0;
@@ -1104,14 +1113,13 @@ pub const Selector = struct {
         } else {
             return;
         }
-        const dname = s.b.dialect.name;
         if (s.for_update_of) |of| {
-            if (std.mem.eql(u8, dname, "postgres")) {
+            if (dialect_mod.kind(s.b.dialect) == .postgres) {
                 try s.b.writeString(" OF ");
                 try s.b.ident(of);
             }
         }
-        if (!std.mem.eql(u8, dname, "sqlite3")) {
+        if (dialect_mod.kind(s.b.dialect) != .sqlite) {
             if (s.skip_locked) try s.b.writeString(" SKIP LOCKED");
             if (s.nowait) try s.b.writeString(" NOWAIT");
         }
@@ -1369,13 +1377,13 @@ pub const InsertBuilder = struct {
         if (i.or_replace) {
             try i.b.writeString("INSERT OR REPLACE INTO ");
         } else if (i.or_ignore) {
-            if (std.mem.eql(u8, i.b.dialect.name, "mysql")) {
-                try i.b.writeString("INSERT IGNORE INTO ");
-            } else if (std.mem.eql(u8, i.b.dialect.name, "sqlite3")) {
-                try i.b.writeString("INSERT OR IGNORE INTO ");
-            } else {
-                try i.b.writeString("INSERT INTO ");
-            }
+            try i.b.writeString(switch (dialect_mod.kind(i.b.dialect)) {
+                .mysql => "INSERT IGNORE INTO ",
+                .sqlite => "INSERT OR IGNORE INTO ",
+                // PostgreSQL and an unknown dialect both have no IGNORE
+                // clause here and fall back to a plain INSERT.
+                .postgres, .unknown => "INSERT INTO ",
+            });
         } else {
             try i.b.writeString("INSERT INTO ");
         }
