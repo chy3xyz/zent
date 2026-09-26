@@ -300,42 +300,47 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             // so the claim is atomic without an explicit transaction.
             // PostgreSQL adds FOR UPDATE SKIP LOCKED so a concurrent claimer
             // skips locked rows instead of blocking.
-            if (std.mem.eql(u8, dialect.name, "postgres")) {
-                const q = comptime std.fmt.comptimePrint(
-                    "UPDATE \"{s}\" SET \"status\" = $1, \"claimed_at\" = $2 WHERE \"id\" IN (" ++
-                        "SELECT \"id\" FROM \"{s}\" WHERE \"status\" = $3 " ++
-                        "ORDER BY \"created_at\" ASC LIMIT $4 FOR UPDATE SKIP LOCKED" ++
-                        ") RETURNING \"id\", \"aggregate_type\", \"aggregate_id\", " ++
-                        "\"event_type\", \"payload\", \"attempts\", \"created_at\"",
-                    .{ table, table },
-                );
-                var rows = try d.query(q, &.{
-                    .{ .string = Status.processing },
-                    .{ .int = now },
-                    .{ .string = Status.pending },
-                    .{ .int = @intCast(limit) },
-                });
-                defer rows.deinit();
-                return try collectRows(allocator, rows);
-            }
-
-            if (std.mem.eql(u8, dialect.name, "sqlite3")) {
-                const q = comptime std.fmt.comptimePrint(
-                    "UPDATE \"{s}\" SET \"status\" = ?, \"claimed_at\" = ? WHERE \"id\" IN (" ++
-                        "SELECT \"id\" FROM \"{s}\" WHERE \"status\" = ? " ++
-                        "ORDER BY \"created_at\" ASC LIMIT ?" ++
-                        ") RETURNING \"id\", \"aggregate_type\", \"aggregate_id\", " ++
-                        "\"event_type\", \"payload\", \"attempts\", \"created_at\"",
-                    .{ table, table },
-                );
-                var rows = try d.query(q, &.{
-                    .{ .string = Status.processing },
-                    .{ .int = now },
-                    .{ .string = Status.pending },
-                    .{ .int = @intCast(limit) },
-                });
-                defer rows.deinit();
-                return try collectRows(allocator, rows);
+            switch (dialect.kind()) {
+                .postgres => {
+                    const q = comptime std.fmt.comptimePrint(
+                        "UPDATE \"{s}\" SET \"status\" = $1, \"claimed_at\" = $2 WHERE \"id\" IN (" ++
+                            "SELECT \"id\" FROM \"{s}\" WHERE \"status\" = $3 " ++
+                            "ORDER BY \"created_at\" ASC LIMIT $4 FOR UPDATE SKIP LOCKED" ++
+                            ") RETURNING \"id\", \"aggregate_type\", \"aggregate_id\", " ++
+                            "\"event_type\", \"payload\", \"attempts\", \"created_at\"",
+                        .{ table, table },
+                    );
+                    var rows = try d.query(q, &.{
+                        .{ .string = Status.processing },
+                        .{ .int = now },
+                        .{ .string = Status.pending },
+                        .{ .int = @intCast(limit) },
+                    });
+                    defer rows.deinit();
+                    return try collectRows(allocator, rows);
+                },
+                .sqlite => {
+                    const q = comptime std.fmt.comptimePrint(
+                        "UPDATE \"{s}\" SET \"status\" = ?, \"claimed_at\" = ? WHERE \"id\" IN (" ++
+                            "SELECT \"id\" FROM \"{s}\" WHERE \"status\" = ? " ++
+                            "ORDER BY \"created_at\" ASC LIMIT ?" ++
+                            ") RETURNING \"id\", \"aggregate_type\", \"aggregate_id\", " ++
+                            "\"event_type\", \"payload\", \"attempts\", \"created_at\"",
+                        .{ table, table },
+                    );
+                    var rows = try d.query(q, &.{
+                        .{ .string = Status.processing },
+                        .{ .int = now },
+                        .{ .string = Status.pending },
+                        .{ .int = @intCast(limit) },
+                    });
+                    defer rows.deinit();
+                    return try collectRows(allocator, rows);
+                },
+                // MySQL is the remaining built-in, and an unrecognised dialect
+                // lands with it exactly as the old `else` did: both take the
+                // reservation transaction below instead of a single statement.
+                .mysql, .unknown => {},
             }
 
             // MySQL has no UPDATE ... RETURNING, so reserve the rows inside a
