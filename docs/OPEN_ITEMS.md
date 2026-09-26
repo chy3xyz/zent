@@ -9,42 +9,31 @@ current instead.
 **Not a wish list.** Everything here was observed: a measurement, a reproduction,
 or source that says something the docs do not.
 
-- `docs/ISSUES_FROM_ZAPI.md` — consumer-reported items (Z1–Z35), with verdicts.
+- `docs/ISSUES_FROM_ZAPI.md` — consumer-reported items (Z1–Z39), with verdicts.
 - `docs/BEST_PRACTICES.md` §5h — what `checkSchema` does **not** compare.
 - `CHANGELOG.md` — history, including the negative audit results.
 
 ---
 
-_Resolved in v0.70.0: the pool no longer parks when it has room to serve, and
-SQLite now enforces foreign keys. Resolved in v0.71.0: the missing-uuid-key
-error is `MissingPrimaryKey` on every dialect (decided before the statement
-runs), the insert log sites report the rows the server wrote, and the pool
-records an `all.append` OOM as itself. Two items were examined and deliberately
-kept — now pinned in comments so they are not "fixed" into something worse:
-`borrowErrorFor` folding unknown driver errors into `PoolExhausted` (the
-bounded set `asDriver` needs; the unmapped name stays in the warn log) and
-`driverInTransaction` answering `false` on a failed borrow (the `beginTxCtx`
-preflight routes `false` to `beginTx`, whose own borrow surfaces the real
-error). Resolved in v0.78.0: a grouped `Count()` answers the number of groups (a derived
-table, so zero groups is `0` rather than `NotFound`), the seven single-value
-aggregates refuse a grouped query with `error.GroupByNotSupported` (their own
-error set, shared readers untouched), `SaveOne`/`ExecOne`/`ForceExecOne` answer
-`error.RowsAffectedUnknown` instead of `NotFound` when the driver never counted,
-and `AllOwned()` gives `All()`'s rows a one-call release. Resolved in v0.75.0: a junction name that is also a declared entity's table is
-reported as its own `junction_name_collision` drift (both surfaces named, and
-classified read-breaking, so a deploy gate stops on it) instead of surfacing as
-the shape symptoms, and `migrateSchema` warns at the moment it plans the
-junction's `CREATE TABLE IF NOT EXISTS`. Resolved in v0.73.0: `CrudService.getOwned` names the row's allocator and
-`deinitRowWith` is the release that matches it, a column-level `UNIQUE` is
-enforced on an existing table (the migration adds the unique index), and
-`Sum`/`Avg` answer `error.EmptyAggregate` for an empty set instead of the
-`error.TypeMismatch` a non-numeric value produces. Resolved in v0.72.0:
-`Restore` is scoped by the policy's filters and the
-interceptor chain, `queryTargets*`/`QueryEdge` report a mid-read failure instead
-of a short page, `IDs()` projects the primary key, the EntQL `has()`/`not_has()`
-lowerings and the `WithEdgeOptions` inner join carry the target's soft-delete
-scope, and an m2m existence predicate is qualified to the target table. This
-file is pruned as items land; history lives in `CHANGELOG.md`._
+_This file is pruned as items land; `CHANGELOG.md` is the history._
+
+**Recently resolved** (newest first; earlier releases are in the CHANGELOG):
+
+| Release | What left this file |
+|---|---|
+| v0.80.1 | keyword tables became comptime maps (`StaticStringMapWithEql(…, eqlAsciiIgnoreCase)`) instead of comparison chains |
+| v0.80.0 | the toolchain is pinned to `0.17.0-dev.2151+2ec5523d5` in CI, `minimum_zig_version` and the docs |
+| v0.79.1 | `@FieldType` for type probes; `toSnakeCase` has one definition (its fourth copy was dead code) |
+| v0.79.0 | `Dialect.Kind`; dispatch on `kind()`, not on strings — the misspelt `"sqlite"` branch had SQLite sized for the 65535-parameter cap instead of 999 |
+| v0.78.1 | a `From` edge's foreign key names the target's declared `table_name` and the edge's own column (Z39) |
+| v0.78.0 | grouped `Count()` answers the group count; the seven single-value aggregates refuse `GroupBy`; `RowsAffectedUnknown`; `AllOwned()` |
+
+**Examined and deliberately kept** — pinned in comments so they are not "fixed"
+into something worse: `borrowErrorFor` folding unknown driver errors into
+`PoolExhausted` (the bounded set `asDriver` needs; the unmapped name stays in the
+warn log), and `driverInTransaction` answering `false` on a failed borrow (the
+`beginTxCtx` preflight routes `false` to `beginTx`, whose own borrow surfaces the
+real error).
 
 **Negative results from the v0.72.0 audit** (recorded so the ground is known to
 be covered): `update_delete.zig`'s edge-write branches — `SetEdgeIDs`,
@@ -65,9 +54,6 @@ with no runtime failure shapes to audit.
 | **EntQL speaks physical column names, not field names** | `parseComparison` (`entql/parser.zig:433-440`) never maps an ident through `columnName`, so on a schema using `.StorageKey`, `WhereEntQL("name = …")` addresses the literal column `name`. v0.74.0 closed the dangerous half — an ident the entity in scope does not have is now `error.UnknownField` before any SQL is built, including inside `has(...)`, and **either** spelling of a field is accepted — so what is left is the naming question: map idents to `columnName` at lowering, or state in the EntQL docs that this expression language addresses physical columns. Decide | Mapping needs the whole parse tree lowered with the schema in hand (the codegen layer has it); documenting is a docs-only change but leaves the ambiguity for a schema that declares both columns |
 
 ## Open, with a known shape
-
-| Item | Evidence |
-|---|---|
 
 | Item | Evidence |
 |---|---|
@@ -95,4 +81,3 @@ with no runtime failure shapes to audit.
 | **The allocation-failure sweep still has known gaps** | `src/test/allocation_failures*.zig` use `std.testing.checkAllAllocationFailures` (Zig 0.17) to fail every allocation in turn and hold the byte ledger; they have found fifteen leak sites so far (three in `sql/builder.zig` at v0.76.1; at v0.77.0 five in the `sql/scan.zig` scanners and `queryAll`, three in `sql/schema/migrate.zig`'s planning and SQLite introspection, and four in the MySQL/PostgreSQL introspection, those last by inspection). They also found a *contract* defect: JSON parsing reported an out-of-memory as `TypeMismatch`, which the lenient scanners turned into the field's default (fixed v0.77.1). Covered today: fragment rendering, an assembled SELECT, the row scanners including the JSON/arena half (v0.77.1), `queryAll`, `planMigrateStatements`, `CrudService.getOwned`, and the neighbour fragments (clean). Uncovered, in the order they are most likely to hide something: (**a**) `Builder.init`, which *swallows* an induced OOM by design, so the sweep reports `SwallowedOutOfMemoryError` and skips it (`initCapacity` is swept instead); (**b**) the higher-level services that assemble several of these pieces (`outbox.zig`, `crud_helpers.zig`, `shard.zig`), none of which is swept yet; (**c**) `entity.zig`'s `deinitEntity` / `deinitEntityList`, which are release paths rather than assembly paths — a leak there needs a different instrument (a counter, not the ledger). The per-dialect catalog stubs landed in v0.77.2, so the index introspection is no longer on this list |
 | **MariaDB differences are still found after the tag is pushed** | The new `tests/integration/dialect_matrix.zig` now compares the dialects directly, which covers the semantic half. What it cannot cover is a difference neither harness knows to ask about, and this session's three escapes (`column_default` quoting, functional indexes, `BEGIN` through prepare) were all of that kind. The only root fix is a local MariaDB or a working container runtime |
 | **Modules the audit method has not reached** | `codegen/query.zig`'s full branches, `codegen/graph.zig` / `meta.zig`, `graph/step.zig`, `update_delete.zig`'s edge-write branches and `bench/` were audited in the v0.72.0 pass (5 defects, all fixed; the negative results are recorded above). Still unread: the drivers' dialect-specific edges (`sql/sqlite.zig`, `mysql.zig`, `postgres.zig` beyond the result-decoding paths), `crud.zig` / `helpers.zig` / `shard.zig`, `privacy/`'s rule evaluation, and `examples/` other than `check_sql` and `migrate`. The method's hit rate has stayed high — `catch {}` 20 sites → 1 defect, `catch null`/`catch 0` 10 → 2, the high-level modules → 4 including a privilege escalation, the unaudited modules → an EntQL fail-open, the v0.72.0 sweep → 5 (two of them scope bypasses) — so this is where a defect is most likely to be found rather than reported |
-| **Log text is not assertable** | This repository has no `logFn`, so warnings cannot be captured in tests. Several fixes in this series are therefore pinned only at the level below the message (the renderer, or the value a callback receives), and each one says so rather than claiming an end-to-end assertion |

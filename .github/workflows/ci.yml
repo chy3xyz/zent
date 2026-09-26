@@ -51,8 +51,30 @@ jobs:
       - name: Benchmark smoke (ReleaseFast)
         run: zig build benchmark -Doptimize=ReleaseFast --summary all
 
+      # Each example is a real end-to-end path (comptime codegen → SQL → SQLite),
+      # and `zig build` above only *compiles* them: running them is the only thing
+      # that executes what they assert. They are cheap, and a failure names the
+      # example rather than a batch.
       - name: Example smoke (start)
         run: zig build run-start --summary all
+
+      - name: Example smoke (complex e-commerce)
+        run: zig build run-complex --summary all
+
+      - name: Example smoke (pool)
+        run: zig build run-pool --summary all
+
+      - name: Example smoke (advanced patterns)
+        run: zig build run-advanced --summary all
+
+      - name: Example smoke (interceptor, multi-tenant)
+        run: zig build run-interceptor --summary all
+
+      - name: Example smoke (check_sql)
+        run: zig build run-check-sql --summary all
+
+      - name: Example smoke (migrate, file-based migrations)
+        run: zig build migrate --summary all
 
       - name: Version consistency
         run: bash scripts/check-version.sh

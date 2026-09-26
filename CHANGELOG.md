@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **CI now runs every example, not just `run-start`.** `zig build` compiles the
+  examples and nothing executed them, so the end-to-end paths they assert
+  (comptime codegen → SQL → SQLite, the pool's stats, the interceptor's
+  multi-tenant rewrite, the file-based migration runner) were only ever checked
+  by hand. Seven smoke steps, one per example, so a failure names the example.
+- **`README_CN.md` caught up with `README.md`**: it still named the old toolchain
+  pin (`0.17.0-dev.1567`) and had no build-cost section, i.e. the two things a
+  consumer on a small machine needs first. `docs/OPEN_ITEMS.md` was also
+  compacted — its accumulated "Resolved in …" prose (out of order, 2.4 KB) is now
+  a newest-first table, a duplicated table header is gone, the stale "log text is
+  not assertable" row (the v0.77.0 sink made it false) is removed, and its ledger
+  range reads Z1–Z39.
+
 ## [0.80.1] - 2026-09-27
 
 ### Changed

@@ -23,8 +23,11 @@ Zig 语言实现的实体框架（Entity Framework），复刻自 [ent](https://
 
 ### 环境要求
 
-- Zig 0.17-dev —— CI 锁定 `0.17.0-dev.1567+f0354179a`。dev 快照之间 ABI 不稳定，
-  若更新快照后编译失败，请使用该精确 commit（用 `zig env` 查看你的版本）。
+- Zig `0.17.0-dev.2151+2ec5523d5` —— CI 安装的正是这个快照，`build.zig.zon` 的
+  `minimum_zig_version` 也写上它，所以更旧的 dev 快照会在构建一开始就被拒绝
+  （“zig version … does not satisfy”），而不是编到一半报奇怪的错；更新的 dev 快照
+  仍可用，但那不是 CI 验证的版本。dev 快照之间 ABI 不稳定，要升级就一次性改
+  CI、`minimum_zig_version`、这份 README 与 `AGENTS.md`（用 `zig env` 查看你的版本）。
 - SQLite3 开发库
 
 ### 安装
@@ -236,6 +239,48 @@ mod.linkSystemLibrary("sqlite3", .{}); // 或 libpq / mariadb-connector-c
 ```bash
 zig fetch --save git+https://github.com/chy3xyz/zent.git#vX.Y.Z
 ```
+
+### 构建成本，以及在小机器上如何压缩
+
+消费者**首次**构建的大头不是 zent 的代码生成，而是对驱动头文件跑的 `translate-c`
+——每个驱动一个进程，而 zent 会为机器上装了头文件的每个驱动各跑一次。实测（80 实体的
+消费方项目、macOS/arm64、清空 `ZIG_GLOBAL_CACHE_DIR`）：
+
+| 步骤 | 墙钟 | 峰值内存 |
+|---|---|---|
+| `translate-c`，单个驱动（sqlite3、libpq 或 mariadb-connector-c） | ~26 s | ~590 MB |
+| 消费方自己的编译——zent 为 80 个实体做代码生成 | ~4 s | ~440 MB |
+
+全局缓存热时同一次构建约 13 s / 384 MB，而代码生成那半基本线性：**每实体约 +1.4 MB、
++0.1 s**（20 / 40 / 80 实体实测 7.8 s / 298 MB、9.0 s / 319 MB、12.6 s / 384 MB）。
+所以内存紧张的构建机上，真正被拖垮的是头文件翻译，不是 comptime。
+
+三个旋钮，按收益排序：
+
+1. **只翻译你要链接的驱动。** 每个启用的驱动是一个 `translate-c` 进程，且它们会并发，
+   所以三套头文件齐全的机器要同时承受三份峰值。通过依赖项把开关传进去：
+
+   ```zig
+   const zent = b.dependency("zent", .{
+       .target = target,
+       .optimize = optimize,
+       .sqlite = false, // 例如 PostgreSQL-only 部署
+       .mysql = false,
+   });
+   ```
+
+   默认行为不变（机器上有头文件就翻译）；把**你确实在用的**驱动关掉，会在首次使用时
+   报 `no module named 'pg_c'`（或 `sqlite3_c` / `mysql_c`），错误直接点名。
+
+2. **保留全局缓存。** 把 `ZIG_GLOBAL_CACHE_DIR` 放在持久卷上，翻译就从"每次构建"
+   变成"每台机器一次"（一套驱动约 75 MB）；无缓存时那 87 s 首次构建里约 60 s 是构建
+   系统自身的工作。
+
+3. **限制并发**：内存紧张时用 `zig build -j2`（或 `-j1`）。上面的峰值是**每进程**的，
+   小 VM 撑不住的是总和。慢一些，但能跑完。
+
+另一件顺带值得知道的事：本仓库自身的 `zig build test` 峰值约 **1 GB**（它一次编译所有
+测试根）。这属于 CI 的活，不要放在发布机器上。
 
 ## 贡献
 
