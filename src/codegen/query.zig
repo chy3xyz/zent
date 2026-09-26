@@ -270,7 +270,7 @@ fn loadEdgePath(
 
     // Support both integer and textual (uuid) primary keys: the neighbor map
     // and __fk read are selected at compile time.
-    const IdType = @TypeOf(@field(@as(ParentEntity, undefined), ParentInfo.pk_field));
+    const IdType = @FieldType(ParentEntity, ParentInfo.pk_field);
 
     inline for (ParentInfo.edges) |edge| {
         if (std.mem.eql(u8, edge.name, split.head)) {
@@ -278,7 +278,7 @@ fn loadEdgePath(
             // Target type mirrors the parent's edges field: LightEntity for
             // the first level (so nesting can continue), PlainFields for the
             // terminal level.
-            const EdgeFieldType = @TypeOf(@field(@as(ParentEntity, undefined).edges, edge.name));
+            const EdgeFieldType = @FieldType(@FieldType(ParentEntity, "edges"), edge.name);
             const TargetEntity = @typeInfo(@typeInfo(EdgeFieldType).optional.child).pointer.child;
             const step = comptime buildEdgeStep(edge, ParentInfo, target_info);
             const MapT = if (comptime IdType == i64)
@@ -1166,7 +1166,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             // coerces the text to a number (a leading-digit prefix, else 0)
             // and the other dialects would refuse outright, so a list of
             // integers that name no row is the one answer this must not give.
-            if (comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) != i64) {
+            if (comptime @FieldType(Entity, info.pk_field) != i64) {
                 @compileError("IDs() requires an i64 primary key; a textual key has no id to return");
             }
             const pol = try self.checkPolicy();

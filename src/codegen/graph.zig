@@ -335,7 +335,16 @@ fn generateIndexName(comptime type_name: []const u8, comptime columns: []const [
     }
 }
 
-fn toSnakeCase(name: []const u8) []const u8 {
+/// `OrderProduct` → `order_product`: the derivation this library uses for a
+/// table or column name it has to invent.
+///
+/// The single definition, deliberately. Four layers derive names from schema
+/// names — the graph metadata, the codegen, the DDL layer and the client — and
+/// they must agree: the From-edge defect of v0.78.1 was a derived name in the
+/// DDL disagreeing with the declared one the queries used. Copies of this
+/// function in three files were byte-identical, which only meant nobody had
+/// edited one of them yet.
+pub fn toSnakeCase(name: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(1000000);
         var result: []const u8 = "";

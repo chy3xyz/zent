@@ -2611,18 +2611,7 @@ fn defaultValueStr(comptime f: FieldInfo) ?[]const u8 {
     };
 }
 
-fn toSnakeCase(name: []const u8) []const u8 {
-    comptime {
-        var result: []const u8 = "";
-        for (name, 0..) |c, i| {
-            if (std.ascii.isUpper(c) and i > 0) {
-                result = result ++ "_";
-            }
-            result = result ++ &[_]u8{std.ascii.toLower(c)};
-        }
-        return result;
-    }
-}
+const toSnakeCase = @import("../../codegen/graph.zig").toSnakeCase;
 
 /// A column as the *database* reports it. Owned: `name` and `sql_type` are
 /// allocated, release the list with `freeExistingColumns`.

@@ -3,19 +3,6 @@ const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
 
-fn toSnakeCase(name: []const u8) []const u8 {
-    comptime {
-        var result: []const u8 = "";
-        for (name, 0..) |c, i| {
-            if (std.ascii.isUpper(c) and i > 0) {
-                result = result ++ "_";
-            }
-            result = result ++ &[_]u8{std.ascii.toLower(c)};
-        }
-        return result;
-    }
-}
-
 /// Generate a light entity struct (fields only, no edges) from TypeInfo.
 /// This breaks comptime recursion when edges reference each other.
 /// Pure scalar fields (no edges) - the terminal node of nested eager loads.

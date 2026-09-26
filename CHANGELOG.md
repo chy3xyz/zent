@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`@FieldType(T, "field")` where the code used to fabricate a value to ask its
+  type.** Eight sites asked `@TypeOf(@field(@as(ParentEntity, undefined)…))` or
+  built a zero-initialised entity purely to write `@TypeOf(@field(entity, …))` —
+  a value whose only purpose was to be the subject of a type query. `@FieldType`
+  is the builtin for exactly that question, so the fabricated values are gone and
+  the intent is written down.
+- **`graph.toSnakeCase` is the one definition of the name derivation.** It existed
+  in four files (`codegen/graph.zig`, `codegen/client.zig`, `codegen/entity.zig`,
+  `sql/schema/migrate.zig`), three of them byte-identical — and the fourth, in
+  `entity.zig`, was **dead code**: nothing had called it since it was copied.
+  Four layers derive names from schema names (graph metadata, codegen, the DDL
+  layer, the client) and they must agree: v0.78.1's From-edge defect was a
+  derived name in the DDL disagreeing with the declared one the queries used, so
+  copies that can drift are a defect class rather than untidiness. The function is
+  now `pub` in `graph.zig` — which every one of those files already imports — with
+  the other three aliasing it, so their call sites are unchanged.
+
 ## [0.79.0] - 2026-09-27
 
 ### Added

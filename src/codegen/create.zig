@@ -356,7 +356,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             defer if (mapped_conflict) |m| self.allocator.free(m);
             const pk_col = pkColumn(info);
             const upsert_conflict_cols: []const []const u8 = mapped_conflict orelse &[_][]const u8{pk_col};
-            const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
+            const pk_is_integer = comptime @FieldType(Entity, info.pk_field) == i64;
             const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, is_sqlite, is_mysql, columns.items, upsert_conflict_cols, pk_col, pk_is_integer, self.upsert_set_exprs, info.table_name);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 
@@ -378,7 +378,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 // NULL *after* the write. Answering `TypeMismatch` there would
                 // name a type error for what is actually a missing key, with
                 // the keyless row already on disk.
-                if (comptime @TypeOf(@field(entity, info.pk_field)) != i64) {
+                if (comptime @FieldType(Entity, info.pk_field) != i64) {
                     if (textPrimaryKeyFrom(self.values.items, info.pk_field) == null) return error.MissingPrimaryKey;
                 }
                 var builder = if (or_replace and is_sqlite and self.upsert_set_exprs == null)
@@ -417,7 +417,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 var returned_row = false;
                 if (rows.next()) |row| {
                     returned_row = true;
-                    if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
+                    if (comptime @FieldType(Entity, info.pk_field) == i64) {
                         @field(entity, info.pk_field) = @intCast(row.getInt(0) orelse return error.TypeMismatch);
                     } else {
                         // Textual primary key (uuid): RETURNING gives the value
@@ -477,7 +477,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 // would come back carrying `""`, which names no row while
                 // looking like a key that names one — the same shape as the
                 // `last_insert_id orelse 0` this path's integer branch refuses.
-                if (comptime @TypeOf(@field(entity, info.pk_field)) != i64) {
+                if (comptime @FieldType(Entity, info.pk_field) != i64) {
                     if (textPrimaryKeyFrom(self.values.items, info.pk_field) == null) return error.MissingPrimaryKey;
                 }
                 var builder = if (ignore_conflicts)
@@ -500,7 +500,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 const start = nowUs();
                 const res = try self.driver.execCtx(&self.execution_context, full_sql, q.args);
                 const duration_us: u64 = nowUs() - start;
-                if (comptime @TypeOf(@field(entity, info.pk_field)) == i64) {
+                if (comptime @FieldType(Entity, info.pk_field) == i64) {
                     // `last_insert_id` is `?i64` because a driver may have no
                     // id to give, and a `0` written here is indistinguishable
                     // from a real key — the entity would look like a row that
@@ -1312,7 +1312,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             defer if (mapped_conflict) |m| self.allocator.free(m);
             const pk_col = pkColumn(info);
             const upsert_conflict_cols: []const []const u8 = mapped_conflict orelse &[_][]const u8{pk_col};
-            const pk_is_integer = comptime @TypeOf(@field(@import("../sql/scan.zig").zeroInit(Entity), info.pk_field)) == i64;
+            const pk_is_integer = comptime @FieldType(Entity, info.pk_field) == i64;
             const upsert_suffix: []const u8 = try buildUpsertSuffix(self.allocator, or_replace, is_postgres, false, is_mysql, columns.items, upsert_conflict_cols, pk_col, pk_is_integer, null, info.table_name);
             defer if (upsert_suffix.len > 0) self.allocator.free(upsert_suffix);
 

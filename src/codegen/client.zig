@@ -290,18 +290,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
     };
 }
 
-fn toSnakeCase(name: []const u8) []const u8 {
-    comptime {
-        var result: []const u8 = "";
-        for (name, 0..) |c, i| {
-            if (std.ascii.isUpper(c) and i > 0) {
-                result = result ++ "_";
-            }
-            result = result ++ &[_]u8{std.ascii.toLower(c)};
-        }
-        return result;
-    }
-}
+const toSnakeCase = @import("graph.zig").toSnakeCase;
 
 fn structFieldName(comptime name: []const u8) [:0]const u8 {
     comptime {
