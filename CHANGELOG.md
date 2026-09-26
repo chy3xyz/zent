@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.80.2] - 2026-09-27
+
 ### Changed
 - **CI now runs every example, not just `run-start`.** `zig build` compiles the
   examples and nothing executed them, so the end-to-end paths they assert

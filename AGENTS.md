@@ -7,7 +7,7 @@
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.
-- Version: **v0.80.1** (package version synced to tags — see `docs/RELEASING.md`).
+- Version: **v0.80.2** (package version synced to tags — see `docs/RELEASING.md`).
 
 ## Commands
 
