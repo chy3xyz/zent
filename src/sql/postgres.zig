@@ -62,6 +62,58 @@ fn reportedRowsFromCommandTag(tag: []const u8) error{DriverFailed}!ReportedRows 
     return .{ .rows = rows, .known = true };
 }
 
+/// Keyword/value arrays for `PQconnectdbParams`, each terminated by a null
+/// entry, plus the NUL-terminated copies they point at.
+///
+/// `connectDb` cannot interpolate its arguments into a conninfo string: libpq's
+/// conninfo grammar is whitespace-separated `key=value`, so a value containing
+/// a space, a quote or a backslash must be quoted/escaped. A password with a
+/// space is silently truncated (and the tail read as a stray keyword), and
+/// because libpq honours the **last** occurrence of a keyword, a value shaped
+/// like `x sslmode=disable` can even override an earlier one. One array entry
+/// per keyword hands libpq each argument as exactly one intact value.
+const ConnectParams = struct {
+    keywords: [8][*c]const u8,
+    values: [8][*c]const u8,
+    /// The NUL-terminated values `values` points at, in array order (host,
+    /// port, dbname, user, password); freed by `deinit`.
+    owned: [5][:0]u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *const ConnectParams) void {
+        for (self.owned) |o| self.allocator.free(o);
+    }
+};
+
+/// Build the keyword/value arrays `connectDb` passes to `PQconnectdbParams`.
+/// Kept separate from the connect call so the encoding of each argument can be
+/// asserted without a live server. On error nothing is leaked: each value that
+/// was already allocated is released before the error is returned.
+fn buildConnectParams(allocator: std.mem.Allocator, host: []const u8, port: u16, dbname: []const u8, user: []const u8, password: []const u8) std.mem.Allocator.Error!ConnectParams {
+    var self: ConnectParams = .{
+        .keywords = .{ "host", "port", "dbname", "user", "password", "sslmode", "connect_timeout", null },
+        // sslmode=prefer and connect_timeout=10 are the defaults the previous
+        // conninfo string carried; keep them intact.
+        .values = .{ null, null, null, null, null, "prefer", "10", null },
+        .owned = undefined,
+        .allocator = allocator,
+    };
+    var n: usize = 0;
+    errdefer for (self.owned[0..n]) |o| allocator.free(o);
+    self.owned[n] = try allocator.dupeSentinel(u8, host, 0);
+    n += 1;
+    self.owned[n] = try allocator.printSentinel("{d}", .{port}, 0);
+    n += 1;
+    self.owned[n] = try allocator.dupeSentinel(u8, dbname, 0);
+    n += 1;
+    self.owned[n] = try allocator.dupeSentinel(u8, user, 0);
+    n += 1;
+    self.owned[n] = try allocator.dupeSentinel(u8, password, 0);
+    n += 1;
+    for (self.owned, 0..) |o, i| self.values[i] = o;
+    return self;
+}
+
 pub const PostgresDriver = struct {
     conn: *c.PGconn,
     allocator: std.mem.Allocator,
@@ -142,6 +194,15 @@ pub const PostgresDriver = struct {
         defer allocator.free(conninfo_z);
 
         const conn = c.PQconnectdb(conninfo_z.ptr) orelse return error.PostgresConnectFailed;
+        return adoptConnection(allocator, conn);
+    }
+
+    /// Take ownership of a connection libpq has just opened: reject it (and
+    /// free it) when libpq reports a failed connection, otherwise set the
+    /// client encoding and wrap it in a driver. Shared by `connect` (conninfo
+    /// string) and `connectDb` (keyword/value arrays) so both entry points
+    /// converge on the same error handling.
+    fn adoptConnection(allocator: std.mem.Allocator, conn: *c.PGconn) !PostgresDriver {
         if (c.PQstatus(conn) != c.CONNECTION_OK) {
             defer c.PQfinish(conn);
             const msg = c.PQerrorMessage(conn);
@@ -160,13 +221,10 @@ pub const PostgresDriver = struct {
     }
 
     pub fn connectDb(allocator: std.mem.Allocator, host: []const u8, port: u16, dbname: []const u8, user: []const u8, password: []const u8) !PostgresDriver {
-        const conninfo = try std.fmt.allocPrint(
-            allocator,
-            "host={s} port={d} dbname={s} user={s} password={s} sslmode=prefer connect_timeout=10",
-            .{ host, port, dbname, user, password },
-        );
-        defer allocator.free(conninfo);
-        return connect(allocator, conninfo);
+        var params = try buildConnectParams(allocator, host, port, dbname, user, password);
+        defer params.deinit();
+        const conn = c.PQconnectdbParams(&params.keywords, &params.values, 0) orelse return error.PostgresConnectFailed;
+        return adoptConnection(allocator, conn);
     }
 
     pub fn close(self: *PostgresDriver) void {
@@ -1286,4 +1344,41 @@ test "Postgres: the SQLSTATE of each constraint failure maps to its own error" {
     // condition to read.
     try std.testing.expectEqual(driver.Error.DriverFailed, PostgresDriver.sqlstateCodeToError("2"));
     try std.testing.expectEqual(driver.Error.ExecFailed, PostgresDriver.sqlstateCodeToError("235"));
+}
+
+test "connectDb passes each argument to libpq as one intact keyword value" {
+    const allocator = std.testing.allocator;
+    // Every character the conninfo grammar gives a meaning to: a space would
+    // end a value, and a single quote and a backslash need escaping. All three
+    // are legal in a password, which is why a public API that cannot carry them
+    // is a bug.
+    const password = "pa ss'w\\x";
+    var params = try buildConnectParams(allocator, "db.internal", 5432, "app", "svc", password);
+    defer params.deinit();
+
+    // Parallel keyword/value arrays, in the documented order.
+    const expected_keys = [_][]const u8{ "host", "port", "dbname", "user", "password", "sslmode", "connect_timeout" };
+    for (expected_keys, 0..) |key, i| {
+        try std.testing.expectEqualStrings(key, std.mem.span(@as([*:0]const u8, @ptrCast(params.keywords[i]))));
+    }
+    // The five dynamic values are the NUL-terminated copies the array points at.
+    for (params.owned, 0..) |o, i| {
+        try std.testing.expect(@intFromPtr(params.values[i]) == @intFromPtr(o.ptr));
+    }
+    // ... and the lists are null-terminated, as PQconnectdbParams requires.
+    try std.testing.expect(params.keywords[7] == null);
+    try std.testing.expect(params.values[7] == null);
+
+    // Each value is exactly what the caller passed. The password above all:
+    // the old conninfo interpolation cut it at the first space and read the
+    // tail as conninfo syntax.
+    try std.testing.expectEqualStrings("db.internal", params.owned[0]);
+    try std.testing.expectEqualStrings("5432", params.owned[1]);
+    try std.testing.expectEqualStrings("app", params.owned[2]);
+    try std.testing.expectEqualStrings("svc", params.owned[3]);
+    try std.testing.expectEqualStrings(password, params.owned[4]);
+
+    // The two defaults the previous conninfo string carried are intact.
+    try std.testing.expectEqualStrings("prefer", std.mem.span(@as([*:0]const u8, @ptrCast(params.values[5]))));
+    try std.testing.expectEqualStrings("10", std.mem.span(@as([*:0]const u8, @ptrCast(params.values[6]))));
 }

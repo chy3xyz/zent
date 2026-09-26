@@ -460,9 +460,51 @@ fn dupeDeep(comptime T: type, v: T, arena: std.mem.Allocator) std.mem.Allocator.
             for (v, 0..) |item, i| out[i] = try dupeDeep(a.child, item, arena);
             return out;
         },
-        // Tagged unions (e.g. untyped std.json.Value documents) are copied
-        // shallowly — their payloads stay in the source entity's json_arena.
-        else => return v,
+        // A `field.JSONValue` document (`std.json.Value`) is a tree of
+        // arena-owned nodes and needs the recursive copy below; every other
+        // tagged union is copied by value, which is correct for an inline
+        // union with no arena-owned payload.
+        else => {
+            if (T == std.json.Value) return try dupeJsonDeep(v, arena);
+            return v;
+        },
+    }
+}
+
+/// Deep-copy a `std.json.Value` document into `arena`.
+///
+/// `dupeDeep`'s generic tagged-union branch cannot cover this: the document's
+/// `.string` / `.number_string` bytes and every `.array` / `.object` container
+/// are allocated in the *source* entity's `json_arena`, so a shallow copy keeps
+/// pointers into memory the caller is about to free — which is exactly what
+/// `CrudService.getOwned` does before it returns the copy.
+///
+/// A failure part-way through leaves the partially built document in `arena`.
+/// That is deliberate and not a leak: the arena is freed as a unit, so the
+/// half-built tree is reclaimed along with everything else.
+fn dupeJsonDeep(v: std.json.Value, arena: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
+    switch (v) {
+        .null, .bool, .integer, .float => return v,
+        .number_string => |s| return .{ .number_string = try arena.dupe(u8, s) },
+        .string => |s| return .{ .string = try arena.dupe(u8, s) },
+        .array => |arr| {
+            var out = std.json.Array.init(arena);
+            try out.ensureTotalCapacity(arr.items.len);
+            for (arr.items) |item| out.appendAssumeCapacity(try dupeJsonDeep(item, arena));
+            return .{ .array = out };
+        },
+        .object => |obj| {
+            var out = std.json.ObjectMap.empty;
+            try out.ensureTotalCapacity(arena, obj.count());
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                out.putAssumeCapacity(
+                    try arena.dupe(u8, entry.key_ptr.*),
+                    try dupeJsonDeep(entry.value_ptr.*, arena),
+                );
+            }
+            return .{ .object = out };
+        },
     }
 }
 
@@ -500,7 +542,8 @@ fn dupeItem(
 }
 
 /// Deep-copy an entity (scalar fields, string/slice fields, typed JSON
-/// structs and up to two levels of eager-loaded edges) into `arena`.
+/// structs, untyped `field.JSONValue` documents and up to two levels of
+/// eager-loaded edges) into `arena`.
 ///
 /// The returned entity borrows everything from the arena: pass it to
 /// request-scoped code and free it all at once with `arena.deinit()`.
@@ -662,6 +705,60 @@ test "dupeEntityTo deep-copies strings, JSON payloads and edges into an arena" {
     try std.testing.expectEqualStrings("tech", copy.name);
     try std.testing.expectEqualStrings("draft", copy.note.?);
     try std.testing.expectEqualStrings("hello", copy.edges.posts.?[0].title);
+    // `copy` must NOT be deinitEntity'd — the arena owns it.
+}
+
+test "dupeEntityTo re-homes a JSONValue document out of the source arena" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Doc = Schema("DupeJsonValueDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.JSONValue("doc"),
+        },
+    });
+    const graph = comptime buildGraph(&.{Doc});
+    const infos = graph.types;
+    const info = infos[0];
+    const DocEntity = Entity(infos, info);
+
+    // A parsed document is a tree of arena-owned nodes: its object keys, its
+    // string payloads and its array backing all live in the source arena.
+    const src_arena = try allocator.create(std.heap.ArenaAllocator);
+    src_arena.* = std.heap.ArenaAllocator.init(allocator);
+    const json_text = "{\"outer\":{\"items\":[\"alpha\",\"日本語\"],\"n\":3}}";
+    var src = DocEntity{
+        .id = 1,
+        .name = "spec",
+        .doc = try std.json.parseFromSliceLeaky(std.json.Value, src_arena.allocator(), json_text, .{}),
+        .json_arena = src_arena,
+    };
+
+    var dst_state = std.heap.ArenaAllocator.init(allocator);
+    defer dst_state.deinit();
+    const copy = try dupeEntityTo(infos, info, &src, dst_state.allocator());
+
+    // Reads back the same document while both are alive.
+    try std.testing.expectEqual(@as(i64, 3), copy.doc.object.get("outer").?.object.get("n").?.integer);
+    const items = copy.doc.object.get("outer").?.object.get("items").?.array;
+    try std.testing.expectEqualStrings("alpha", items.items[0].string);
+    try std.testing.expectEqualStrings("日本語", items.items[1].string);
+
+    // Release the source arena — exactly what `CrudService.getOwned` does
+    // before it returns the copy.
+    src.json_arena = null;
+    src_arena.deinit();
+    allocator.destroy(src_arena);
+
+    // This second read is a dangling access before the fix: the copy's
+    // document still pointed into the freed source arena.
+    try std.testing.expectEqual(@as(i64, 3), copy.doc.object.get("outer").?.object.get("n").?.integer);
+    const items2 = copy.doc.object.get("outer").?.object.get("items").?.array;
+    try std.testing.expectEqualStrings("alpha", items2.items[0].string);
+    try std.testing.expectEqualStrings("日本語", items2.items[1].string);
     // `copy` must NOT be deinitEntity'd — the arena owns it.
 }
 

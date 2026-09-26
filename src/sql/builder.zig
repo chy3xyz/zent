@@ -556,22 +556,45 @@ pub fn LTE(column: []const u8, value: Value) Predicate {
     return .{ .lte = .{ .column = column, .value = value } };
 }
 
-/// Append `column = value` unless an identical EQ is already present.
+/// The dedupe rule shared by `appendEqUnlessPresent` and its unmanaged twin:
+/// is an identical EQ already in `items`?
 ///
 /// Dedupe is deliberately on the **(column, value) pair**, never on the column
 /// alone: skipping because the column is already constrained would let a
 /// caller-supplied predicate suppress an interceptor-injected tenant value,
 /// which would turn "add a predicate" into a way to escape tenant scoping.
-pub fn appendEqUnlessPresent(list: *std.array_list.Managed(Predicate), column: []const u8, value: Value) !void {
-    for (list.items) |p| {
+fn eqUnlessPresent(items: []const Predicate, column: []const u8, value: Value) bool {
+    for (items) |p| {
         switch (p) {
             .eq => |b| {
-                if (std.mem.eql(u8, b.column, column) and value_mod.eql(b.value, value)) return;
+                if (std.mem.eql(u8, b.column, column) and value_mod.eql(b.value, value)) return true;
             },
             else => {},
         }
     }
+    return false;
+}
+
+/// Append `column = value` unless an identical EQ is already present.
+/// See `eqUnlessPresent` for the dedupe rule.
+pub fn appendEqUnlessPresent(list: *std.array_list.Managed(Predicate), column: []const u8, value: Value) !void {
+    if (eqUnlessPresent(list.items, column, value)) return;
     try list.append(EQ(column, value));
+}
+
+/// The unmanaged twin of `appendEqUnlessPresent`, for a caller that collects
+/// predicates in a `std.ArrayListUnmanaged(Predicate)` and passes its allocator
+/// explicitly (the edge-target interceptor sink). Both entry points share the
+/// one dedupe rule in `eqUnlessPresent`, so no sink can drift into column-only
+/// dedupe — the rule that guards tenant scoping.
+pub fn appendEqUnlessPresentUnmanaged(
+    list: *std.ArrayListUnmanaged(Predicate),
+    allocator: std.mem.Allocator,
+    column: []const u8,
+    value: Value,
+) !void {
+    if (eqUnlessPresent(list.items, column, value)) return;
+    try list.append(allocator, EQ(column, value));
 }
 
 /// Append `predicates` to `list`, accepting **every** shape a call site may
