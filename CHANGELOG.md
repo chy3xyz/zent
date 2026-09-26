@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.80.1] - 2026-09-27
+
 ### Changed
 - **Keyword tables are `std.StaticStringMapWithEql(…, eqlAsciiIgnoreCase)`
   instead of comparison chains.** Three sites scanned a word against a list at
