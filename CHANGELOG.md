@@ -28,9 +28,13 @@ All notable changes to this project will be documented in this file.
   headers and libraries (`usr/include[/postgresql|/mariadb]`,
   `usr/lib/<multiarch>`, `lib/<multiarch>`, `usr/lib64`, `usr/lib`), and
   `ZENT_PG_INCLUDE_DIR`/`ZENT_PG_LIB_DIR` / `ZENT_MYSQL_INCLUDE_DIR`/
-  `ZENT_MYSQL_LIB_DIR` override one driver. There is deliberately no `-D` option
-  for these: a CLI `-D` is validated against the *root* package, so a dependency
-  cannot receive one (the attempt answers `invalid option`). Consumers stop
+  `ZENT_MYSQL_LIB_DIR` override one driver. A cross root reaches zent two ways,
+  and they cover different callers: `XCOMPILE_ROOT`/`ZENT_XROOT` from the
+  environment, or an `xroot` **option** the parent forwards —
+  `b.dependency("zent", .{ .target = target, .optimize = optimize, .xroot = root })`.
+  A CLI `-D` cannot carry it: it is validated against the *root* package, so a
+  dependency only ever sees what its parent passes (a forwarded `xroot` used to
+  answer `invalid option`). Consumers stop
   re-implementing the discovery by calling zent's own —
   `const zent_build = b.lazyImport(@This(), "zent").?;
   zent_build.linkDrivers(b, mod, target, .{})` — which is what keeps a build

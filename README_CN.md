@@ -259,8 +259,11 @@ XCOMPILE_ROOT=/path/to/sysroot zig build -Dtarget=aarch64-linux-gnu
 `usr/include[/mariadb]`，以及库 `usr/lib/<multiarch>`（`aarch64-linux-gnu`、
 `x86_64-linux-gnu` …）、`lib/<multiarch>`、`usr/lib64`、`usr/lib`。单个驱动可以用
 `ZENT_PG_INCLUDE_DIR` / `ZENT_PG_LIB_DIR`、`ZENT_MYSQL_INCLUDE_DIR` /
-`ZENT_MYSQL_LIB_DIR` 覆盖。这里**故意不提供** `-D` 选项：CLI 的 `-D` 只对**根包**
-声明的选项校验，依赖方拿不到（会得到 `invalid option`）。MySQL 的库名会在解析出的
+`ZENT_MYSQL_LIB_DIR` 覆盖。root 有两条通道：环境变量（`XCOMPILE_ROOT`、`ZENT_XROOT`），
+或父构建脚本转发过来的**选项** —— `b.dependency("zent", .{ .target = target,
+.optimize = optimize, .xroot = root })`；CLI 的 `-D` 到不了依赖方，因为它只对**根包**
+声明的选项校验，依赖只能收到父包传的值（转发 `xroot` 以前会得到 `invalid option`）。
+`linkDrivers` 用同一份 root：`.\{ .root = … \}`。MySQL 的库名会在解析出的
 lib 目录里探测 —— 先 `libmariadb` 再 `libmysqlclient` —— 所以 Debian sysroot 需要
 `libmariadb-dev`，而不是它的 `mysqlclient` 兼容包。
 

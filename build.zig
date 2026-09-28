@@ -387,10 +387,24 @@ fn isHostTarget(b: *std.Build, target: std.Build.ResolvedTarget) bool {
 }
 
 /// The **target's** root — a Debian/Ubuntu sysroot or a distro rootfs — or
-/// null when the caller named none. `ZENT_XROOT` is the prefixed spelling of
-/// the same variable; the unprefixed one is what cross builds in this
-/// ecosystem already set (see the sibling `db_link.zig`).
+/// null when the caller named none.
+///
+/// Two spellings, because there are two kinds of caller. `XCOMPILE_ROOT` (or
+/// `ZENT_XROOT`) is what a cross build in this ecosystem already exports, and it
+/// is the one that works from a shell. The `xroot` **option** is for a parent
+/// build script that already reads its own `-Dxroot=` (a CLI flag is validated
+/// against the root package, so a dependency can never see it directly — it has
+/// to arrive through `b.dependency("zent", .{ .xroot = … })`). The option wins
+/// when the parent forwards one, so a caller that sets both gets what it passed.
 fn crossRoot(b: *std.Build) ?[]const u8 {
+    const forwarded = b.option(
+        []const u8,
+        "xroot",
+        "cross-compile root: the target's headers and libraries (empty = $XCOMPILE_ROOT/$ZENT_XROOT, else probe the host when the target is the host)",
+    );
+    if (forwarded) |root| {
+        if (root.len > 0) return root;
+    }
     return envValue(b, "XCOMPILE_ROOT") orelse envValue(b, "ZENT_XROOT");
 }
 
@@ -728,11 +742,20 @@ const DriverLink = struct {
     }
 };
 
-/// Which of the three drivers a consumer links.
+/// Which of the three drivers a consumer links, and where the target's headers
+/// and libraries are.
 pub const Drivers = struct {
     sqlite: bool = true,
     pg: bool = true,
     mysql: bool = true,
+    /// The **target's** root, when the caller has one (its own `-Dxroot=`, an
+    /// env var it read, a sysroot it knows). Passed in rather than read from an
+    /// option here: this function runs inside the *consumer's* build script, and
+    /// `b.option` panics if the same name is declared twice on one builder — a
+    /// consumer with its own `xroot` option is the normal case, not an edge.
+    /// `null` falls back to `XCOMPILE_ROOT`/`ZENT_XROOT`, then to host probing
+    /// when the target is the host.
+    root: ?[]const u8 = null,
 };
 
 /// Link the driver libraries `mod` needs, with the same discovery this build
@@ -759,7 +782,7 @@ pub const Drivers = struct {
 /// finds no headers at all. (It still warns, once, that host discovery was
 /// skipped — see `warnCrossWithoutRoot`.)
 pub fn linkDrivers(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, drivers: Drivers) void {
-    const root = crossRoot(b);
+    const root = drivers.root orelse envValue(b, "XCOMPILE_ROOT") orelse envValue(b, "ZENT_XROOT");
     warnCrossWithoutRoot(b, target, root);
     const link = DriverLink{ .b = b, .target = target, .root = root };
     if (drivers.sqlite) link.sqlite(mod);

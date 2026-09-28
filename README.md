@@ -272,9 +272,14 @@ XCOMPILE_ROOT=/path/to/sysroot zig build -Dtarget=aarch64-linux-gnu
 `usr/lib/<multiarch>` (`aarch64-linux-gnu`, `x86_64-linux-gnu`, …),
 `lib/<multiarch>`, `usr/lib64` or `usr/lib`. One driver at a time can be
 overridden with `ZENT_PG_INCLUDE_DIR` / `ZENT_PG_LIB_DIR` and
-`ZENT_MYSQL_INCLUDE_DIR` / `ZENT_MYSQL_LIB_DIR`. There is deliberately no `-D`
-option for these: a CLI `-D` is validated against the **root** package, so a
-dependency cannot receive one (it would answer `invalid option`). The MySQL
+`ZENT_MYSQL_INCLUDE_DIR` / `ZENT_MYSQL_LIB_DIR`. A root reaches zent either
+through the environment (`XCOMPILE_ROOT`, `ZENT_XROOT`) or as an option the
+parent build script forwards —
+`b.dependency("zent", .{ .target = target, .optimize = optimize, .xroot = root })`;
+a CLI `-D` cannot carry it, because it is validated against the **root** package
+and a dependency only sees what its parent passes (before this, forwarding one
+answered `invalid option`). `linkDrivers` takes the same root as
+`.{ .root = … }`. The MySQL
 library name is probed in the resolved lib dir — `libmariadb` before
 `libmysqlclient` — so a Debian sysroot needs `libmariadb-dev` rather than its
 `mysqlclient` compat package.
