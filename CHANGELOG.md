@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.81.1] - 2026-09-28
+
 ### Fixed
 
 - **Driver discovery probed the build machine for a cross target.** `pg_config`,
