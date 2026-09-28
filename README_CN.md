@@ -229,9 +229,13 @@ zent/
 },
 
 // build.zig
-const zent = b.dependency("zent", .{ .target = target, .optimize = optimize });
-mod.addImport("zent", zent.module("zent"));
-mod.linkSystemLibrary("sqlite3", .{}); // 或 libpq / mariadb-connector-c
+const zent_dep = b.dependency("zent", .{ .target = target, .optimize = optimize });
+mod.addImport("zent", zent_dep.module("zent"));
+
+// 用 zent 自己的发现逻辑链接它翻译过的驱动 —— 包含下面的交叉编译规则，
+// 消费方不必再实现一遍（正是那份镜像副本把 macOS 归档塞进了 Linux 链接）：
+const zent_build = b.lazyImport(@This(), "zent").?;
+zent_build.linkDrivers(b, mod, target, .{}); // 只链 SQLite：.{ .pg = false }
 ```
 
 每次 zent 发版后需要刷新锁定 hash：
@@ -239,6 +243,30 @@ mod.linkSystemLibrary("sqlite3", .{}); // 或 libpq / mariadb-connector-c
 ```bash
 zig fetch --save git+https://github.com/chy3xyz/zent.git#vX.Y.Z
 ```
+
+### 交叉编译
+
+驱动发现问的是**目标**，永远不是构建机。`pg_config`、`pkg-config` 与 Homebrew
+前缀只在目标**就是**本机时才会被查询 —— 因为 Linux 链接行上的
+`-L /opt/homebrew/…` 就是一个交给 `ld` 的 Mach-O 归档（一条错路径换几百条 `ld`
+报错）。给交叉构建指向目标自己的 root：
+
+```bash
+XCOMPILE_ROOT=/path/to/sysroot zig build -Dtarget=aarch64-linux-gnu
+```
+
+`XCOMPILE_ROOT`（或 `ZENT_XROOT`）下会查找头文件 `usr/include[/postgresql]`、
+`usr/include[/mariadb]`，以及库 `usr/lib/<multiarch>`（`aarch64-linux-gnu`、
+`x86_64-linux-gnu` …）、`lib/<multiarch>`、`usr/lib64`、`usr/lib`。单个驱动可以用
+`ZENT_PG_INCLUDE_DIR` / `ZENT_PG_LIB_DIR`、`ZENT_MYSQL_INCLUDE_DIR` /
+`ZENT_MYSQL_LIB_DIR` 覆盖。这里**故意不提供** `-D` 选项：CLI 的 `-D` 只对**根包**
+声明的选项校验，依赖方拿不到（会得到 `invalid option`）。MySQL 的库名会在解析出的
+lib 目录里探测 —— 先 `libmariadb` 再 `libmysqlclient` —— 所以 Debian sysroot 需要
+`libmariadb-dev`，而不是它的 `mysqlclient` 兼容包。
+
+既没有 root 也没有覆盖项的交叉构建会警告一次"已跳过 host 发现"。找不到的驱动绑定
+随之缺失，表现为首次使用时的 `no module named sqlite3_c/pg_c/mysql_c` —— 这个错误
+本身就说清了问题。
 
 ### 构建成本，以及在小机器上如何压缩
 

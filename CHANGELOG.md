@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Driver discovery probed the build machine for a cross target.** `pg_config`,
+  `pkg-config` and the Homebrew prefixes were consulted without looking at
+  `target`, so `zig build -Dtarget=aarch64-linux-gnu` on a macOS/arm64 host
+  emitted `-isystem /opt/homebrew/include/postgresql@17 -L /opt/homebrew/…` —
+  the host's own archives handed to a Linux link, where a Mach-O `.a` is a few
+  hundred `ld` errors. Host probing now runs only when the target *is* the build
+  host (`isHostTarget`: resolved arch/os/abi, so an explicit
+  `-Dtarget=aarch64-macos` on an aarch64 Mac is still a host build), and
+  `grep -c homebrew` on that cross build's verbose output is `0` where it was
+  `18`. A consumer could not have worked around this from outside, which is why
+  a sibling project's mirrored copy of the same discovery produced the same
+  failure independently.
+
+### Added
+
+- **`build.zig` exports `linkDrivers`, and a cross build can be pointed at the
+  target's root.** `XCOMPILE_ROOT` (or `ZENT_XROOT`) supplies the target's
+  headers and libraries (`usr/include[/postgresql|/mariadb]`,
+  `usr/lib/<multiarch>`, `lib/<multiarch>`, `usr/lib64`, `usr/lib`), and
+  `ZENT_PG_INCLUDE_DIR`/`ZENT_PG_LIB_DIR` / `ZENT_MYSQL_INCLUDE_DIR`/
+  `ZENT_MYSQL_LIB_DIR` override one driver. There is deliberately no `-D` option
+  for these: a CLI `-D` is validated against the *root* package, so a dependency
+  cannot receive one (the attempt answers `invalid option`). Consumers stop
+  re-implementing the discovery by calling zent's own —
+  `const zent_build = b.lazyImport(@This(), "zent").?;
+  zent_build.linkDrivers(b, mod, target, .{})` — which is what keeps a build
+  script from handing the host's libraries to a foreign link. The MySQL library
+  name is probed in the resolved lib dir (`libmariadb` before `libmysqlclient`)
+  rather than assumed to be `mariadb`, and a cross build with neither a root nor
+  an override warns once that host discovery was skipped instead of failing with
+  a link error that names none of it. `README` §"Consumer wiring" has the
+  cross-compiling note.
+
 ## [0.81.0] - 2026-09-27
 
 ### Fixed

@@ -238,9 +238,15 @@ forces C linkage on consumers:
 },
 
 // build.zig
-const zent = b.dependency("zent", .{ .target = target, .optimize = optimize });
-mod.addImport("zent", zent.module("zent"));
-mod.linkSystemLibrary("sqlite3", .{}); // or libpq / mariadb-connector-c
+const zent_dep = b.dependency("zent", .{ .target = target, .optimize = optimize });
+mod.addImport("zent", zent_dep.module("zent"));
+
+// Link the same drivers zent translated, through zent's own discovery —
+// including the cross-compile rules below, so a consumer's build script never
+// has to re-implement them (a mirrored copy of that logic is what once put a
+// macOS archive on a Linux link line):
+const zent_build = b.lazyImport(@This(), "zent").?;
+zent_build.linkDrivers(b, mod, target, .{}); // .{ .pg = false } to narrow
 ```
 
 After every zent release the pinned hash must be refreshed:
@@ -248,6 +254,35 @@ After every zent release the pinned hash must be refreshed:
 ```bash
 zig fetch --save git+https://github.com/chy3xyz/zent.git#vX.Y.Z
 ```
+
+### Cross-compiling
+
+Driver discovery asks **the target**, never the build machine. `pg_config`,
+`pkg-config` and the Homebrew prefixes are consulted only when the target *is*
+the host, because `-L /opt/homebrew/…` on a Linux link line is a Mach-O archive
+handed to `ld` (one wrong path is a few hundred `ld` errors). Point a cross
+build at the target's own root:
+
+```bash
+XCOMPILE_ROOT=/path/to/sysroot zig build -Dtarget=aarch64-linux-gnu
+```
+
+`XCOMPILE_ROOT` (or `ZENT_XROOT`) is searched for the headers
+`usr/include[/postgresql]`, `usr/include[/mariadb]`, and the libraries under
+`usr/lib/<multiarch>` (`aarch64-linux-gnu`, `x86_64-linux-gnu`, …),
+`lib/<multiarch>`, `usr/lib64` or `usr/lib`. One driver at a time can be
+overridden with `ZENT_PG_INCLUDE_DIR` / `ZENT_PG_LIB_DIR` and
+`ZENT_MYSQL_INCLUDE_DIR` / `ZENT_MYSQL_LIB_DIR`. There is deliberately no `-D`
+option for these: a CLI `-D` is validated against the **root** package, so a
+dependency cannot receive one (it would answer `invalid option`). The MySQL
+library name is probed in the resolved lib dir — `libmariadb` before
+`libmysqlclient` — so a Debian sysroot needs `libmariadb-dev` rather than its
+`mysqlclient` compat package.
+
+A cross build with neither a root nor an override warns once that host discovery
+was skipped. The bindings for drivers it could not find are then absent, which
+surfaces as `no module named sqlite3_c/pg_c/mysql_c` at the first use — that
+error names the mistake.
 
 ### Build cost, and how to cut it on a small machine
 

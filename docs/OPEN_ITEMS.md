@@ -21,6 +21,7 @@ _This file is pruned as items land; `CHANGELOG.md` is the history._
 
 | Release | What left this file |
 |---|---|
+| v0.81.1 | driver discovery is target-aware — host probing is gated on `isHostTarget`, the target's paths come from `XCOMPILE_ROOT` or the per-driver overrides, and `build.zig` exports `linkDrivers` so a consumer's build script stops mirroring it (a cross build no longer hands the host's `-I`/`-L` to a foreign link) |
 | v0.81.0 | the audit lanes' defects, thirteen in all: a cached PostgreSQL statement is `DEALLOCATE`d when evicted (42P05, and 0A000 after a DDL), `bindParams` keeps its parameter lists paired, MySQL reports a lost connection as `ConnectionFailed` and keeps `in_tx` honest, `getOwned`'s copy owns its JSON arena, a `field.JSONValue` document is deep-copied instead of shared, the batch writes take `tenant_id`, two `append`-failure leaks, a nullable integer cursor column is refused by name, the edge-target sink dedupes, and libpq gets each argument as one intact value |
 | v0.80.1 | keyword tables became comptime maps (`StaticStringMapWithEql(…, eqlAsciiIgnoreCase)`) instead of comparison chains |
 | v0.80.0 | the toolchain is pinned to `0.17.0-dev.2151+2ec5523d5` in CI, `minimum_zig_version` and the docs |
