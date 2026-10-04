@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-10-04
+
 ### Changed
 
 - **The toolchain pin moved from the `0.17.0-dev.2151+2ec5523d5` snapshot to the
