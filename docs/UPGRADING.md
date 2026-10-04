@@ -121,10 +121,10 @@ use `field.JSON(name, T)`; untyped documents use `field.JSONValue(name)`
 
 ## 8. Build & toolchain
 
-- The toolchain is pinned to `0.17.0-dev.2151+2ec5523d5`: CI installs exactly
-  that snapshot and `build.zig.zon`'s `minimum_zig_version` names it, so an older
-  dev build fails immediately with "zig version … does not satisfy" rather than
-  somewhere inside the build. A newer dev build is accepted, but it is not what
+- The toolchain is pinned to `0.17.0` (stable): CI installs exactly
+  that release and `build.zig.zon`'s `minimum_zig_version` names it, so an older
+  build fails immediately with "zig version … does not satisfy" rather than
+  somewhere inside the build. A newer toolchain is accepted, but it is not what
   CI verifies — bump the pin in one commit (CI, `minimum_zig_version`, README,
   `AGENTS.md`) after a green local run.
 - `zig build test` compiles without libpq/libmariadb headers; PG/MySQL

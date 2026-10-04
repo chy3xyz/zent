@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The toolchain pin moved from the `0.17.0-dev.2151+2ec5523d5` snapshot to the
+  `0.17.0` stable release.** CI installs 0.17.0, `build.zig.zon`'s
+  `minimum_zig_version` is `"0.17.0"`, and the READMEs / `CONTRIBUTING.md` /
+  `AGENTS.md` / `docs/UPGRADING.md` name it. Because a pre-release sorts before
+  the release, the old dev snapshots no longer satisfy `minimum_zig_version` —
+  consumers on `0.17.0-dev.*` must move to 0.17.0 stable (or newer). No source
+  changes were needed: the full suite (511 unit tests, 236 integration tests +
+  3 skipped across SQLite/PostgreSQL/MySQL) passes unchanged on the release
+  compiler.
+
 ## [0.81.2] - 2026-09-28
 
 ## [0.81.1] - 2026-09-28

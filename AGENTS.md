@@ -3,7 +3,7 @@
 ## Project
 
 - Zig port of [ent](https://entgo.io/) (Go ORM). Toolchain pinned to
-  `0.17.0-dev.2151+2ec5523d5` (CI, `build.zig.zon`'s `minimum_zig_version`, README) — bump all of them together, never one.
+  `0.17.0` stable (CI, `build.zig.zon`'s `minimum_zig_version`, README) — bump all of them together, never one.
 - Remote: `https://github.com/chy3xyz/zent.git`
 - Default branch: `main`
 - Build is driven by `build.zig`; CI lives at `.github/workflows/ci.yml`.

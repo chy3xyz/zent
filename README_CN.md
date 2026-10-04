@@ -23,10 +23,10 @@ Zig 语言实现的实体框架（Entity Framework），复刻自 [ent](https://
 
 ### 环境要求
 
-- Zig `0.17.0-dev.2151+2ec5523d5` —— CI 安装的正是这个快照，`build.zig.zon` 的
-  `minimum_zig_version` 也写上它，所以更旧的 dev 快照会在构建一开始就被拒绝
-  （“zig version … does not satisfy”），而不是编到一半报奇怪的错；更新的 dev 快照
-  仍可用，但那不是 CI 验证的版本。dev 快照之间 ABI 不稳定，要升级就一次性改
+- Zig `0.17.0`（正式版）或更新 —— CI 安装的正是一个 0.17.0 工具链，`build.zig.zon` 的
+  `minimum_zig_version` 也写上它，所以更旧的构建会在构建一开始就被拒绝
+  （“zig version … does not satisfy”），而不是编到一半报奇怪的错；0.17.0
+  之前的 dev 快照之间 ABI 不稳定，要升级就一次性改
   CI、`minimum_zig_version`、这份 README 与 `AGENTS.md`（用 `zig env` 查看你的版本）。
 - SQLite3 开发库
 
