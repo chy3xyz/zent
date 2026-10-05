@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.83.0] - 2026-10-05
+
 ### Fixed
 
 - **`id.uuidv4` was neither random nor thread-safe.** The CSPRNG was seeded
