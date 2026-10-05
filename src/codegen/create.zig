@@ -395,7 +395,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
                 // Build the full SQL: q.sql + ignore suffix + PG/SQLite UPSERT suffix + RETURNING.
                 // MySQL never reaches this branch because it does not support RETURNING.
-                const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{pk_col});
+                const ret_suffix = try self.allocator.print(" RETURNING \"{s}\"", .{pk_col});
                 defer self.allocator.free(ret_suffix);
 
                 const full_sql_len = q.sql.len + ignore_suffix.len + upsert_suffix.len + ret_suffix.len;
@@ -1350,7 +1350,7 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                     defer query.deinit();
 
                     // SQLite / PostgreSQL: append RETURNING clause and query.
-                    const ret_suffix = try std.fmt.allocPrint(self.allocator, " RETURNING \"{s}\"", .{pk_col});
+                    const ret_suffix = try self.allocator.print(" RETURNING \"{s}\"", .{pk_col});
                     defer self.allocator.free(ret_suffix);
                     const full_sql = try self.allocator.alloc(u8, query.sql.len + upsert_suffix.len + ret_suffix.len);
                     defer self.allocator.free(full_sql);

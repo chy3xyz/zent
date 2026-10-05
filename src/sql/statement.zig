@@ -202,9 +202,9 @@ pub fn checkStatement(
             diagnosis.problem = .parameter_mismatch;
             if (diagnosis.message == null) {
                 diagnosis.message = if (diagnosis.param_count) |n|
-                    try std.fmt.allocPrint(allocator, "the statement takes {d} parameter(s), {d} were supplied", .{ n, args.len })
+                    try allocator.print("the statement takes {d} parameter(s), {d} were supplied", .{ n, args.len })
                 else
-                    try std.fmt.allocPrint(allocator, "the statement does not take the {d} supplied parameter(s)", .{args.len});
+                    try allocator.print("the statement does not take the {d} supplied parameter(s)", .{args.len});
             }
         },
         .unsupported => {

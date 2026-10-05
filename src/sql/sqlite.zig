@@ -385,13 +385,13 @@ pub const SQLiteDriver = struct {
     pub fn beginTx(self: *SQLiteDriver) !driver.Tx {
         self.mutex.lock();
         errdefer self.mutex.unlock();
-        _ = try self.execInner(null, "BEGIN", &.{});
         const tx_ptr = try self.allocator.create(SQLiteTx);
         errdefer self.allocator.destroy(tx_ptr);
         tx_ptr.* = SQLiteTx{
             .driver = self,
             .state = .active,
         };
+        _ = try self.execInner(null, "BEGIN", &.{});
         return driver.Tx{
             .inner = self.asDriver(),
             .commitFn = struct {
@@ -600,7 +600,7 @@ fn sqliteErrnoToDriver(db: *c.sqlite3, fallback: driver.Error) driver.Error {
 }
 
 fn execSavepointStmt(d: *SQLiteDriver, stmt: []const u8, name: []const u8) !void {
-    const sql = try std.fmt.allocPrint(d.allocator, "{s} \"{s}\"", .{ stmt, name });
+    const sql = try d.allocator.print("{s} \"{s}\"", .{ stmt, name });
     defer d.allocator.free(sql);
     _ = try d.exec(sql, &.{});
 }

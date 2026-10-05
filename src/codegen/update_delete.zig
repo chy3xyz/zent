@@ -148,7 +148,7 @@ fn buildM2MAddQuery(
     var q = try ib.takeQuery();
     errdefer q.deinit();
     if (dialect.kind() == .postgres) {
-        const full = try std.fmt.allocPrint(allocator, "{s} ON CONFLICT DO NOTHING", .{q.sql});
+        const full = try allocator.print("{s} ON CONFLICT DO NOTHING", .{q.sql});
         allocator.free(q.sql);
         q.sql = full;
     }

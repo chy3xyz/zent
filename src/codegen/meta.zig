@@ -11,6 +11,7 @@ pub fn Meta(comptime info: TypeInfo) type {
 
         // Physical SQL column names array.
         pub const Columns = blk: {
+            @setEvalBranchQuota(1000000);
             var cols: [info.fields.len][]const u8 = undefined;
             for (info.fields, 0..) |f, i| cols[i] = f.column_name;
             break :blk cols;
@@ -18,6 +19,7 @@ pub fn Meta(comptime info: TypeInfo) type {
 
         // Edge name constants
         pub const Edges = blk: {
+            @setEvalBranchQuota(1000000);
             var edges: [info.edges.len][]const u8 = undefined;
             for (info.edges, 0..) |e, i| edges[i] = e.name;
             break :blk &edges;

@@ -286,7 +286,7 @@ pub const PostgresDriver = struct {
         if (self.current_statement_timeout_ms == desired) return;
 
         const sql = if (desired) |ms|
-            try std.fmt.allocPrint(self.allocator, "SET statement_timeout = '{d}ms'", .{ms})
+            try self.allocator.print("SET statement_timeout = '{d}ms'", .{ms})
         else
             try self.allocator.dupe(u8, "SET statement_timeout = DEFAULT");
         defer self.allocator.free(sql);
@@ -358,14 +358,14 @@ pub const PostgresDriver = struct {
                     paramFormats.items[i] = 0;
                 },
                 .int => |v| {
-                    const s = try std.fmt.allocPrintSentinel(allocator, "{d}\x00", .{v}, 0);
+                    const s = try allocator.printSentinel("{d}\x00", .{v}, 0);
                     paramValues.items[i] = s.ptr;
                     paramLengths.items[i] = @intCast(s.len - 1); // libpq reads by len, no NUL
                     paramFormats.items[i] = 0;
                     owned_lens.items[i] = s.len + 1;
                 },
                 .float => |v| {
-                    const s = try std.fmt.allocPrintSentinel(allocator, "{d}\x00", .{v}, 0);
+                    const s = try allocator.printSentinel("{d}\x00", .{v}, 0);
                     paramValues.items[i] = s.ptr;
                     paramLengths.items[i] = @intCast(s.len - 1);
                     paramFormats.items[i] = 0;
@@ -750,7 +750,6 @@ pub const PostgresDriver = struct {
 
     pub fn beginTx(self: *PostgresDriver) !driver.Tx {
         try self.ensureAlive();
-        _ = try self.exec("BEGIN", &.{});
 
         const tx_ptr = try self.allocator.create(PostgresTx);
         errdefer self.allocator.destroy(tx_ptr);
@@ -758,6 +757,8 @@ pub const PostgresDriver = struct {
             .driver = self,
             .state = .active,
         };
+
+        _ = try self.exec("BEGIN", &.{});
 
         return driver.Tx{
             .inner = self.asDriver(),
@@ -914,7 +915,7 @@ fn releaseStmt(ctx: *PostgresDriver, s: *PostgresDriver.PgStmt) void {
 }
 
 fn execSavepointStmt(d: *PostgresDriver, stmt: []const u8, name: []const u8) !void {
-    const sql = try std.fmt.allocPrint(d.allocator, "{s} \"{s}\"", .{ stmt, name });
+    const sql = try d.allocator.print("{s} \"{s}\"", .{ stmt, name });
     defer d.allocator.free(sql);
     _ = try d.exec(sql, &.{});
 }
@@ -1016,8 +1017,19 @@ const PostgresRows = struct {
         .isNull = isNull,
     };
 
-    fn currentRow(self: *PostgresRows) c_int {
+    inline fn currentRow(self: *PostgresRows) c_int {
         return self.row_index - 1;
+    }
+
+    /// The column's text value, or null when the cell is NULL (or libpq has
+    /// no value for it). getInt/getFloat/getText/getBool parse from this one
+    /// copy; getBlob cannot share it — it slices by `PQgetlength`, not by the
+    /// span, so its length source stays its own.
+    fn textOf(self: *PostgresRows, index: usize) ?[]const u8 {
+        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
+        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
+        if (val == null) return null;
+        return std.mem.span(val);
     }
 
     fn columnCount(ptr: *anyopaque) usize {
@@ -1033,26 +1045,19 @@ const PostgresRows = struct {
 
     fn getInt(ptr: *anyopaque, index: usize) ?i64 {
         const self: *PostgresRows = @ptrCast(@alignCast(ptr));
-        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
-        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
-        if (val == null) return null;
-        return std.fmt.parseInt(i64, std.mem.span(val), 10) catch null;
+        const text = self.textOf(index) orelse return null;
+        return std.fmt.parseInt(i64, text, 10) catch null;
     }
 
     fn getFloat(ptr: *anyopaque, index: usize) ?f64 {
         const self: *PostgresRows = @ptrCast(@alignCast(ptr));
-        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
-        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
-        if (val == null) return null;
-        return std.fmt.parseFloat(f64, std.mem.span(val)) catch null;
+        const text = self.textOf(index) orelse return null;
+        return std.fmt.parseFloat(f64, text) catch null;
     }
 
     fn getText(ptr: *anyopaque, index: usize) ?[]const u8 {
         const self: *PostgresRows = @ptrCast(@alignCast(ptr));
-        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
-        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
-        if (val == null) return null;
-        return std.mem.span(val);
+        return self.textOf(index);
     }
 
     fn getBlob(ptr: *anyopaque, index: usize) ?[]const u8 {
@@ -1068,10 +1073,10 @@ const PostgresRows = struct {
 
     fn getBool(ptr: *anyopaque, index: usize) ?bool {
         const self: *PostgresRows = @ptrCast(@alignCast(ptr));
-        if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
-        const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
-        if (val == null) return null;
-        return val[0] == 't';
+        const text = self.textOf(index) orelse return null;
+        // An empty text answers false, as the raw `val[0]` read of the NUL
+        // terminator did; the length guard keeps the slice access in bounds.
+        return text.len != 0 and text[0] == 't';
     }
 
     fn isNull(ptr: *anyopaque, index: usize) bool {

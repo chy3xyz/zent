@@ -112,11 +112,14 @@ pub const MySQLDriver = struct {
     /// Fail fast when the connection has been lost (avoids segfault on the
     /// stale libmysqlclient handle).
     fn ensureAlive(self: *MySQLDriver) driver.Error!void {
-        if (self.dead) return error.ConnectionFailed;
+        if (self.dead) {
+            @branchHint(.cold);
+            return error.ConnectionFailed;
+        }
     }
 
     /// Mark the connection dead after a lost-connection errno.
-    fn markDead(self: *MySQLDriver, err: anyerror) void {
+    inline fn markDead(self: *MySQLDriver, err: anyerror) void {
         if (err == error.ConnectionFailed) self.dead = true;
     }
 
@@ -194,6 +197,7 @@ pub const MySQLDriver = struct {
     pub fn connectOptsSslSocket(allocator: std.mem.Allocator, host: [:0]const u8, port: u32, user: [:0]const u8, passwd: [:0]const u8, dbname: [:0]const u8, cfg: SslConfig, unix_socket: ?[:0]const u8) !MySQLDriver {
         const conn = c.mysql_init(null);
         if (conn == null) return error.MySQLInitFailed;
+        errdefer c.mysql_close(conn);
 
         // Set connect timeout (10s) and read/write timeouts (30s).
         const default_read_timeout: c_uint = 30;
@@ -249,7 +253,6 @@ pub const MySQLDriver = struct {
         const sock_ptr: ?[*:0]const u8 = if (unix_socket) |s| s.ptr else null;
         const ret = c.mysql_real_connect(conn, host.ptr, user.ptr, passwd.ptr, dbname.ptr, @intCast(port), sock_ptr, 0);
         if (ret == null) {
-            defer c.mysql_close(conn);
             const msg = c.mysql_error(conn);
             // warn (not err): a refused connection is an expected, recoverable
             // outcome (server not running / integration-test skip path), and
@@ -395,7 +398,7 @@ pub const MySQLDriver = struct {
         }
 
         const ms = desired.?;
-        const sql = try std.fmt.allocPrint(self.allocator, "SET SESSION max_execution_time = {d}", .{ms});
+        const sql = try self.allocator.print("SET SESSION max_execution_time = {d}", .{ms});
         defer self.allocator.free(sql);
         if (self.exec(sql, &.{})) |_| {
             self.current_server_timeout_ms = desired;
@@ -406,7 +409,7 @@ pub const MySQLDriver = struct {
             // query will run without a server-side timeout — log it rather
             // than hanging silently.
             const sec: u32 = if (ms == 0) 1 else @intCast((ms + 999) / 1000);
-            const sql2 = try std.fmt.allocPrint(self.allocator, "SET SESSION max_statement_time = {d}", .{sec});
+            const sql2 = try self.allocator.print("SET SESSION max_statement_time = {d}", .{sec});
             defer self.allocator.free(sql2);
             if (self.exec(sql2, &.{})) |_| {
                 self.current_server_timeout_ms = desired;
@@ -719,9 +722,6 @@ pub const MySQLDriver = struct {
 
     pub fn beginTx(self: *MySQLDriver) !driver.Tx {
         try self.ensureAlive();
-        // MySQL autocommit is on by default, so BEGIN disables it within the tx
-        _ = try self.exec("BEGIN", &.{});
-        self.in_tx = true;
 
         const tx_ptr = try self.allocator.create(MySQLTx);
         errdefer self.allocator.destroy(tx_ptr);
@@ -729,6 +729,10 @@ pub const MySQLDriver = struct {
             .driver = self,
             .state = .active,
         };
+
+        // MySQL autocommit is on by default, so BEGIN disables it within the tx
+        _ = try self.exec("BEGIN", &.{});
+        self.in_tx = true;
 
         return driver.Tx{
             .inner = self.asDriver(),
@@ -866,7 +870,7 @@ pub const MySQLDriver = struct {
 };
 
 fn execSavepointStmt(d: *MySQLDriver, stmt: []const u8, name: []const u8) !void {
-    const sql = try std.fmt.allocPrint(d.allocator, "{s} `{s}`", .{ stmt, name });
+    const sql = try d.allocator.print("{s} `{s}`", .{ stmt, name });
     defer d.allocator.free(sql);
     _ = try d.exec(sql, &.{});
 }
@@ -1165,52 +1169,43 @@ pub const MySQLRows = struct {
         return std.mem.span(self.fields[@intCast(index)].name);
     }
 
-    fn getBool(ptr: *anyopaque, index: usize) ?bool {
-        const self: *MySQLRows = @ptrCast(@alignCast(ptr));
+    /// The column's text as bound by the last fetch, or null when the cell is
+    /// NULL. getBool/getInt/getFloat parse from this one copy; isNull cannot
+    /// share it (it reads `null_indicators`, not the row bind).
+    fn textOf(self: *MySQLRows, index: usize) ?[]const u8 {
         const binds = self.row_bind orelse return null;
         if (binds[index].is_null.* != 0) return null;
         const sb = self.string_buffers.?;
         const len = self.lengths.?;
-        const text = sb.items[index][0..len.items[index]];
+        return sb.items[index][0..len.items[index]];
+    }
+
+    fn getBool(ptr: *anyopaque, index: usize) ?bool {
+        const self: *MySQLRows = @ptrCast(@alignCast(ptr));
+        const text = self.textOf(index) orelse return null;
         return !std.mem.eql(u8, text, "0") and !std.ascii.eqlIgnoreCase(text, "false");
     }
 
     fn getInt(ptr: *anyopaque, index: usize) ?i64 {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
-        const binds = self.row_bind orelse return null;
-        if (binds[index].is_null.* != 0) return null;
-        const sb = self.string_buffers.?;
-        const len = self.lengths.?;
-        const text = sb.items[index][0..len.items[index]];
+        const text = self.textOf(index) orelse return null;
         return std.fmt.parseInt(i64, text, 10) catch null;
     }
 
     fn getFloat(ptr: *anyopaque, index: usize) ?f64 {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
-        const binds = self.row_bind orelse return null;
-        if (binds[index].is_null.* != 0) return null;
-        const sb = self.string_buffers.?;
-        const len = self.lengths.?;
-        const text = sb.items[index][0..len.items[index]];
+        const text = self.textOf(index) orelse return null;
         return std.fmt.parseFloat(f64, text) catch null;
     }
 
     fn getText(ptr: *anyopaque, index: usize) ?[]const u8 {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
-        const binds = self.row_bind orelse return null;
-        if (binds[index].is_null.* != 0) return null;
-        const sb = self.string_buffers.?;
-        const len = self.lengths.?;
-        return sb.items[index][0..len.items[index]];
+        return self.textOf(index);
     }
 
     fn getBlob(ptr: *anyopaque, index: usize) ?[]const u8 {
         const self: *MySQLRows = @ptrCast(@alignCast(ptr));
-        const binds = self.row_bind orelse return null;
-        if (binds[index].is_null.* != 0) return null;
-        const sb = self.string_buffers.?;
-        const len = self.lengths.?;
-        return sb.items[index][0..len.items[index]];
+        return self.textOf(index);
     }
 
     fn isNull(ptr: *anyopaque, index: usize) bool {

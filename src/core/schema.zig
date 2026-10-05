@@ -8,6 +8,10 @@ pub const Annotation = struct {
 /// Merge field arrays from mixins into a single array.
 fn mergeMixinFields(comptime base: []const @import("field.zig").Field, comptime mixins: []const type) []const @import("field.zig").Field {
     comptime {
+        // Every `Schema()` call merges its mixins; a many-mixin/many-field
+        // schema must not depend on the default 1000 quota of whatever
+        // comptime scope evaluates it.
+        @setEvalBranchQuota(10_000);
         var result: []const @import("field.zig").Field = base;
         for (mixins) |M| {
             if (@hasDecl(M, "fields")) {
@@ -20,6 +24,8 @@ fn mergeMixinFields(comptime base: []const @import("field.zig").Field, comptime 
 
 fn mergeMixinEdges(comptime base: []const @import("edge.zig").Edge, comptime mixins: []const type) []const @import("edge.zig").Edge {
     comptime {
+        // See mergeMixinFields.
+        @setEvalBranchQuota(10_000);
         var result: []const @import("edge.zig").Edge = base;
         for (mixins) |M| {
             if (@hasDecl(M, "edges")) {
@@ -32,6 +38,8 @@ fn mergeMixinEdges(comptime base: []const @import("edge.zig").Edge, comptime mix
 
 fn mergeMixinIndexes(comptime base: []const @import("index.zig").Index, comptime mixins: []const type) []const @import("index.zig").Index {
     comptime {
+        // See mergeMixinFields.
+        @setEvalBranchQuota(10_000);
         var result: []const @import("index.zig").Index = base;
         for (mixins) |M| {
             if (@hasDecl(M, "indexes")) {
@@ -44,6 +52,8 @@ fn mergeMixinIndexes(comptime base: []const @import("index.zig").Index, comptime
 
 fn mergeMixinPolicies(comptime base: ?@import("../privacy/policy.zig").Policy, comptime mixins: []const type) ?@import("../privacy/policy.zig").Policy {
     comptime {
+        // See mergeMixinFields.
+        @setEvalBranchQuota(10_000);
         var result = base;
         for (mixins) |M| {
             if (@hasDecl(M, "policy")) {

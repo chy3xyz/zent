@@ -2,7 +2,7 @@
 //! something owned out of several allocations.
 //!
 //! The repository's whole ownership story is errdefer chains: a fragment, a
-//! query, a plan — each assembled from a handful of `allocPrint`/`dupe`/
+//! query, a plan — each assembled from a handful of `Allocator.print`/`dupe`/
 //! `append` calls, each of which can fail with `OutOfMemory` while the earlier
 //! ones have already succeeded. Where the chain is wrong the result is a leak,
 //! a double free, or an OOM that is swallowed into a value; all three are

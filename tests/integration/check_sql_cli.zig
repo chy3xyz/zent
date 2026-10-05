@@ -64,7 +64,7 @@ fn lineContaining(haystack: []const u8, needle: []const u8) ?[]const u8 {
 /// Write `source` into the test's temp directory and hand back the path, which
 /// is relative to the build root (the cwd of a test run).
 fn writeSqlFile(allocator: std.mem.Allocator, tmp: *testing.TmpDir, name: []const u8, source: []const u8) ![]u8 {
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+    const path = try allocator.print(".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
     errdefer allocator.free(path);
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = source });
     return path;
@@ -144,9 +144,9 @@ test "check_sql: a file with a clean and a broken statement exits non-zero, one 
     try testing.expectEqual(cli.exit_statements_failed, result.code);
 
     const report = result.out();
-    const clean_marker = try std.fmt.allocPrint(allocator, "{s}:2: ok", .{path});
+    const clean_marker = try allocator.print("{s}:2: ok", .{path});
     defer allocator.free(clean_marker);
-    const broken_marker = try std.fmt.allocPrint(allocator, "{s}:3: failed problem=syntax", .{path});
+    const broken_marker = try allocator.print("{s}:3: failed problem=syntax", .{path});
     defer allocator.free(broken_marker);
 
     const clean_line = lineContaining(report, clean_marker) orelse return error.NoCleanLine;
@@ -205,7 +205,7 @@ test "check_sql: a statement that would write writes nothing" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/target.db", .{tmp.sub_path});
+    const db_path = try allocator.print(".zig-cache/tmp/{s}/target.db", .{tmp.sub_path});
     defer allocator.free(db_path);
 
     {
@@ -214,7 +214,7 @@ test "check_sql: a statement that would write writes nothing" {
         _ = try drv.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", &.{});
     }
 
-    const dsn = try std.fmt.allocPrint(allocator, "sqlite:{s}", .{db_path});
+    const dsn = try allocator.print("sqlite:{s}", .{db_path});
     defer allocator.free(dsn);
     const result = try runCli(allocator, &.{
         "check_sql",
@@ -240,7 +240,7 @@ test "check_sql: the DSN comes from --dsn first, then $ZENT_DSN, then SQLite in 
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/env.db", .{tmp.sub_path});
+    const db_path = try allocator.print(".zig-cache/tmp/{s}/env.db", .{tmp.sub_path});
     defer allocator.free(db_path);
 
     {
@@ -251,9 +251,9 @@ test "check_sql: the DSN comes from --dsn first, then $ZENT_DSN, then SQLite in 
         _ = try drv.exec("CREATE TABLE env_marker (id INTEGER PRIMARY KEY)", &.{});
     }
 
-    const env_dsn = try std.fmt.allocPrint(allocator, "sqlite:{s}", .{db_path});
+    const env_dsn = try allocator.print("sqlite:{s}", .{db_path});
     defer allocator.free(env_dsn);
-    const missing = try std.fmt.allocPrint(allocator, "sqlite:.zig-cache/tmp/{s}/does_not_exist.db", .{tmp.sub_path});
+    const missing = try allocator.print("sqlite:.zig-cache/tmp/{s}/does_not_exist.db", .{tmp.sub_path});
     defer allocator.free(missing);
 
     // The env DSN applies when --dsn is absent...

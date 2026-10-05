@@ -46,26 +46,38 @@ pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row
     switch (info) {
         .int => |int| {
             if (int.bits <= 64 and int.signedness == .signed) {
-                const v = row.getInt(0) orelse return error.TypeMismatch;
+                const v = row.getInt(0) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
                 return @intCast(v);
             }
             @compileError("Unsupported integer type for scanning: " ++ @typeName(T));
         },
         .float => |float| {
             if (float.bits <= 64) {
-                const v = row.getFloat(0) orelse return error.TypeMismatch;
+                const v = row.getFloat(0) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
                 if (T == f32) return @floatCast(v);
                 return v;
             }
             @compileError("Unsupported float type for scanning: " ++ @typeName(T));
         },
         .bool => {
-            const v = row.getInt(0) orelse return error.TypeMismatch;
+            const v = row.getInt(0) orelse {
+                @branchHint(.cold);
+                return error.TypeMismatch;
+            };
             return v != 0;
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                const text = row.getText(0) orelse return error.TypeMismatch;
+                const text = row.getText(0) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
                 return try allocator.dupe(u8, text);
             }
             @compileError("Unsupported pointer type for scanning: " ++ @typeName(T));
@@ -296,7 +308,7 @@ fn freeScannedFields(comptime T: type, allocator: std.mem.Allocator, value: *con
 /// `getInt`/`isNull` call. `index` is the first column the scan reads, so
 /// `scanRowOffset` counts from its own offset; extra trailing columns are
 /// allowed (`target.*` projections append a computed `__fk`).
-fn requireColumns(row: Row, index: usize, need: usize) error{ColumnCountMismatch}!void {
+inline fn requireColumns(row: Row, index: usize, need: usize) error{ColumnCountMismatch}!void {
     if (row.columnCount() < index + need) return error.ColumnCountMismatch;
 }
 
@@ -583,26 +595,38 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
     switch (info) {
         .int => |int| {
             if (int.bits <= 64 and int.signedness == .signed) {
-                const v = row.getInt(index) orelse return error.TypeMismatch;
+                const v = row.getInt(index) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
                 return @intCast(v);
             }
             @compileError("Unsupported integer type for scanning: " ++ @typeName(T));
         },
         .float => |float| {
             if (float.bits <= 64) {
-                const v = row.getFloat(index) orelse return error.TypeMismatch;
+                const v = row.getFloat(index) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
                 if (T == f32) return @floatCast(v);
                 return v;
             }
             @compileError("Unsupported float type for scanning: " ++ @typeName(T));
         },
         .bool => {
-            const v = row.getBool(index) orelse return error.TypeMismatch;
+            const v = row.getBool(index) orelse {
+                @branchHint(.cold);
+                return error.TypeMismatch;
+            };
             return v;
         },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
-                const text = row.getText(index) orelse return error.TypeMismatch;
+                const text = row.getText(index) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
                 return try allocator.dupe(u8, text);
             }
             @compileError("Unsupported pointer type for scanning: " ++ @typeName(T));
@@ -612,7 +636,10 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
             return try scanColumn(opt.child, allocator, row, index, json_arena);
         },
         .@"struct" => {
-            const text = row.getText(index) orelse return error.TypeMismatch;
+            const text = row.getText(index) orelse {
+                @branchHint(.cold);
+                return error.TypeMismatch;
+            };
             // Entity scans pass a per-entity arena so deinitEntity frees the
             // parsed JSON in one shot; bare scans (json_arena == null) fall
             // back to the caller's allocator, so those strings stay
@@ -633,7 +660,10 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
             // untyped JSON document.
             if (T != std.json.Value)
                 @compileError("Unsupported union type for scanning: " ++ @typeName(T));
-            const text = row.getText(index) orelse return error.TypeMismatch;
+            const text = row.getText(index) orelse {
+                @branchHint(.cold);
+                return error.TypeMismatch;
+            };
             const a = if (json_arena) |arena| arena.allocator() else allocator;
             // As above: an OOM while parsing is an OOM, not a bad value.
             return std.json.parseFromSliceLeaky(std.json.Value, a, text, json_parse_options) catch |err| switch (err) {
@@ -643,11 +673,17 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
         },
         .@"enum" => {
             if (row.getInt(index)) |v| {
-                const int_val = std.math.cast(@typeInfo(T).@"enum".tag_type, v) orelse return error.TypeMismatch;
+                const int_val = std.math.cast(@typeInfo(T).@"enum".tag_type, v) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
                 return @fromBackingInt(@intCast(int_val));
             }
             if (row.getText(index)) |text| {
-                return std.meta.stringToEnum(T, text) orelse return error.TypeMismatch;
+                return std.meta.stringToEnum(T, text) orelse {
+                    @branchHint(.cold);
+                    return error.TypeMismatch;
+                };
             }
             return error.TypeMismatch;
         },

@@ -60,6 +60,7 @@ pub const InterceptorChain = struct {
 
     pub fn deinit(self: *InterceptorChain) void {
         self.interceptors.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Append an interceptor to the chain.

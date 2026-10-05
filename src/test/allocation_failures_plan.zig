@@ -9,7 +9,7 @@
 //!     `create`, its buffers and the payload strings are each failable;
 //!   - the migration planner: `migrate.planMigrateStatements` builds an ordered
 //!     list of statements, each of them its own buffer, out of the same kind of
-//!     `allocPrint`/`dupe` chain.
+//!     `Allocator.print`/`dupe` chain.
 //!
 //! The method is the sibling file's: `checkAllAllocationFailures` runs the
 //! function once to count the allocations, then fails each one in turn and

@@ -181,7 +181,9 @@ pub fn ConnPool(comptime D: type) type {
         wait_tickets: std.ArrayListUnmanaged(u64) = .empty,
         owned_io: ?*std.Io.Threaded = null,
         /// Total borrows that gave up, for a dashboard: the number that says
-        /// "the pool is too small" or "the database is gone".
+        /// "the pool is too small" or "the database is gone". Incremented under
+        /// the mutex (see `borrow`'s failure tail), which is also where `stats`
+        /// reads it.
         exhausted_total: u64 = 0,
         /// Why the most recent borrow attempt produced nothing. `tryBorrowNoLock`
         /// can fail for reasons that are *not* exhaustion — a refused connection,
@@ -769,11 +771,18 @@ pub fn ConnPool(comptime D: type) type {
             // that ran out is the third case and wins over a reason recorded
             // earlier in the call: "I gave up after my budget" is the answer to
             // why this call has no connection, whatever it ran into on the way.
+            // Both writes are O(1) bookkeeping that belongs under the mutex:
+            // `stats()` reads `exhausted_total` while holding it, and
+            // `last_attempt_error` is documented as written and read under it —
+            // two concurrent failed borrows would otherwise race the counter
+            // and the reason.
+            self.mutex.lockUncancelable(io);
             self.exhausted_total += 1;
             const reason: anyerror = if (timed_out)
                 error.PoolWaitTimeout
             else
                 self.last_attempt_error orelse error.PoolExhausted;
+            self.mutex.unlock(io);
             if (self.options.metrics.onError) |cb| cb(self.options.metrics.context, reason);
             // Silent exhaustion was the other half of that report: the pool had
             // no log line at all.

@@ -1352,7 +1352,7 @@ test "outbox stress: concurrent dispatchers on separate connections never double
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/outbox_stress.db", .{tmp.sub_path});
+    const path = try allocator.print(".zig-cache/tmp/{s}/outbox_stress.db", .{tmp.sub_path});
     defer allocator.free(path);
 
     var drv = try stress_sqlite.SQLiteDriver.open(allocator, path);

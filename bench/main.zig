@@ -37,8 +37,13 @@ pub fn runForCtx(
 }
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(gpa.deinit() == .ok);
+    // 0.17.0 replaced DebugAllocator with SafeAllocator (release notes):
+    // deinit reports every leak (logging each one) and frees all backing
+    // memory, returning the leak count, and any allocator misuse panics.
+    // Backing is page_allocator — DebugAllocator's default — so leak
+    // detection at deinit stays the point of running the suite on it.
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer std.debug.assert(gpa.deinit() == 0);
     const allocator = gpa.allocator();
 
     const io = std.Io.Threaded.global_single_threaded.io();

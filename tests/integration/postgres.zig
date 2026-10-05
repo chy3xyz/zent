@@ -31,7 +31,7 @@ fn connect(allocator: std.mem.Allocator) !PostgresDriver {
     if (std.process.Environ.getPosix(std.testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     const dsn = std.process.Environ.getPosix(std.testing.environ, "PG_DSN") orelse {
         const user = std.process.Environ.getPosix(std.testing.environ, "USER") orelse "n0x";
-        const conninfo = try std.fmt.allocPrint(allocator, "host=localhost dbname=zent_test user={s}", .{user});
+        const conninfo = try allocator.print("host=localhost dbname=zent_test user={s}", .{user});
         defer allocator.free(conninfo);
         return PostgresDriver.connect(allocator, conninfo);
     };
@@ -499,7 +499,7 @@ test "Postgres: connection pool basic operations" {
                     return PostgresDriver.connect(a, dsn);
                 }
                 const user = std.process.Environ.getPosix(std.testing.environ, "USER") orelse "n0x";
-                const conninfo = try std.fmt.allocPrint(a, "host=localhost dbname=zent_test user={s}", .{user});
+                const conninfo = try a.print("host=localhost dbname=zent_test user={s}", .{user});
                 defer a.free(conninfo);
                 return PostgresDriver.connect(a, conninfo);
             }
@@ -1889,7 +1889,7 @@ test "Postgres: stream iterator avoids loading all rows" {
     for (0..50) |i| {
         var b = try client.pg_stream_entity.Create();
         defer b.deinit();
-        const name = try std.fmt.allocPrint(allocator, "entity_{d}", .{i});
+        const name = try allocator.print("entity_{d}", .{i});
         defer allocator.free(name);
         _ = try b.setFieldValue("name", name);
         _ = try b.setFieldValue("idx", @as(i64, @intCast(i)));
@@ -1907,7 +1907,7 @@ test "Postgres: stream iterator avoids loading all rows" {
 
         var count: usize = 0;
         while (try iter.next()) |entity| {
-            const expected_name = try std.fmt.allocPrint(allocator, "entity_{d}", .{count});
+            const expected_name = try allocator.print("entity_{d}", .{count});
             defer allocator.free(expected_name);
             try testing.expectEqualStrings(expected_name, entity.name);
             try testing.expectEqual(@as(i64, @intCast(count)), entity.idx);

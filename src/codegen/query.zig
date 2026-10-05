@@ -1761,7 +1761,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             // accept too. The wrapper binds no argument of its own, so the
             // inner statement's list is the outer's list in the same order —
             // copied, because `inner` owns the original.
-            const text = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM ({s}) AS __zent_groups", .{inner.sql});
+            const text = try self.allocator.print("SELECT COUNT(*) FROM ({s}) AS __zent_groups", .{inner.sql});
             errdefer self.allocator.free(text);
             return .{
                 .sql = text,
@@ -3162,7 +3162,7 @@ test "an m2m has() predicate is qualified to the target table" {
     // column belonged to. (Before the qualification fix this answered a
     // filtered-by-accident row set with no error at all.)
     {
-        const entql_sql = try std.fmt.allocPrint(allocator, "has(groups, user_id = {d})", .{user_ids[0]});
+        const entql_sql = try allocator.print("has(groups, user_id = {d})", .{user_ids[0]});
         defer allocator.free(entql_sql);
         var q = root.d5_qual_user.Query();
         defer q.deinit();
@@ -3278,7 +3278,7 @@ test "AllOwned answers the same rows as All under one release" {
     for (0..3) |i| {
         var b = try root.user.Create();
         defer b.deinit();
-        const name = try std.fmt.allocPrint(allocator, "u{d}", .{i});
+        const name = try allocator.print("u{d}", .{i});
         defer allocator.free(name);
         _ = try b.setFieldValue("name", name);
         _ = try b.setFieldValue("age", 30);
@@ -3334,7 +3334,7 @@ test "OwnedRows deinit twice is a no-op, not a double free" {
     for (0..2) |i| {
         var b = try root.user.Create();
         defer b.deinit();
-        const name = try std.fmt.allocPrint(allocator, "u{d}", .{i});
+        const name = try allocator.print("u{d}", .{i});
         defer allocator.free(name);
         _ = try b.setFieldValue("name", name);
         _ = try b.setFieldValue("age", 30);
@@ -3385,7 +3385,7 @@ test "an OwnedRows and a PagedResult release in either order" {
     for (0..3) |i| {
         var b = try root.user.Create();
         defer b.deinit();
-        const name = try std.fmt.allocPrint(allocator, "u{d}", .{i});
+        const name = try allocator.print("u{d}", .{i});
         defer allocator.free(name);
         _ = try b.setFieldValue("name", name);
         _ = try b.setFieldValue("age", 30);

@@ -327,11 +327,24 @@ fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8, comp
 fn generateIndexName(comptime type_name: []const u8, comptime columns: []const []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(1000000);
-        var result: []const u8 = type_name;
+        // Fixed-buffer write instead of the per-column `++` accumulation:
+        // byte-identical output (pinned against the concat reference in the
+        // tests below) without the O(n²) comptime string building.
+        var total: usize = type_name.len;
+        for (columns) |col| total += 1 + col.len;
+        var buf: [total]u8 = undefined;
+        @memcpy(buf[0..type_name.len], type_name);
+        var len: usize = type_name.len;
         for (columns) |col| {
-            result = result ++ "_" ++ col;
+            buf[len] = '_';
+            len += 1;
+            @memcpy(buf[len .. len + col.len], col);
+            len += col.len;
         }
-        return result;
+        // Const copy so the escaped slice is comptime constant data, not a
+        // reference to comptime var storage (same as toSnakeCase above).
+        const out = buf;
+        return out[0..len];
     }
 }
 
@@ -347,14 +360,26 @@ fn generateIndexName(comptime type_name: []const u8, comptime columns: []const [
 pub fn toSnakeCase(name: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(1000000);
-        var result: []const u8 = "";
+        // Fixed-buffer write instead of the per-character `++` accumulation:
+        // worst case grows one `_` per interior capital, so `name.len * 2`
+        // always fits. Byte-identical output (pinned against the concat
+        // reference in the tests below) without the O(n²) comptime string
+        // building.
+        var buf: [name.len * 2]u8 = undefined;
+        var len: usize = 0;
         for (name, 0..) |c, i| {
             if (std.ascii.isUpper(c) and i > 0) {
-                result = result ++ "_";
+                buf[len] = '_';
+                len += 1;
             }
-            result = result ++ &[_]u8{std.ascii.toLower(c)};
+            buf[len] = std.ascii.toLower(c);
+            len += 1;
         }
-        return result;
+        // The const copy is what makes the result a comptime constant: a
+        // slice into a comptime *var* may not reach runtime, and callers do
+        // embed the derived name into runtime SQL strings.
+        const out = buf;
+        return out[0..len];
     }
 }
 
@@ -380,10 +405,13 @@ fn makeEdgeForResolve(kind: edge_mod.EdgeKind, unique: bool) edge_mod.Edge {
 pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
     comptime {
         @setEvalBranchQuota(1000000);
-        var result: []const TypeInfo = &.{};
-        for (infos) |info| {
-            var resolved_edges: []const EdgeInfo = &.{};
-            for (info.edges) |e| {
+        // Both accumulators below used `list = list ++ &[_]T{item}` per item
+        // — O(n²) copying over the whole edge-resolution walk. The lengths
+        // are comptime-known, so write by index instead.
+        var result: [infos.len]TypeInfo = undefined;
+        for (infos, 0..) |info, i| {
+            var resolved_edges: [info.edges.len]EdgeInfo = undefined;
+            for (info.edges, 0..) |e, j| {
                 var re = e;
                 // Find target info by name
                 for (infos) |target_info| {
@@ -424,23 +452,28 @@ pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
                         }
                     }
                 }
-                resolved_edges = resolved_edges ++ &[_]EdgeInfo{re};
+                resolved_edges[j] = re;
             }
-            result = result ++ &[_]TypeInfo{TypeInfo{
+            // Const copies lift the arrays into comptime constant storage —
+            // a slice into comptime *var* memory may not reach runtime, and
+            // TypeInfo slices do (drivers iterate `info.fields`/`.edges`).
+            const edges_const = resolved_edges;
+            result[i] = TypeInfo{
                 .name = info.name,
                 .table_name = info.table_name,
                 .pk_field = info.pk_field,
                 .fields = info.fields,
-                .edges = resolved_edges,
+                .edges = &edges_const,
                 .indexes = info.indexes,
                 .policy = info.policy,
                 .is_view = info.is_view,
                 .view_sql = info.view_sql,
                 .soft_delete = info.soft_delete,
                 .annotations = info.annotations,
-            }};
+            };
         }
-        return result;
+        const result_const = result;
+        return &result_const;
     }
 }
 
@@ -457,17 +490,37 @@ const IncomingEdge = struct { source: TypeInfo, edge: EdgeInfo };
 /// edge sets; 30-table stress schema goes from ~900 to ~30 inner steps).
 fn buildIncomingTable(comptime infos: []const TypeInfo) [infos.len][]const IncomingEdge {
     comptime {
+        // Two passes per entity over every entity's edges: O(n²·edges) by
+        // design (see the comment on the struct) — 400 entities already
+        // pass 1M branches, so this carries its own large quota instead of
+        // inheriting the caller's.
+        @setEvalBranchQuota(10000000);
         var table: [infos.len][]const IncomingEdge = undefined;
         for (infos, 0..) |info, i| {
-            var list: []const IncomingEdge = &.{};
+            // Two passes (count, then fill) size the exact array instead of
+            // the former `list = list ++ …` accumulation — O(n²) comptime
+            // copying per entity. The count is comptime-known, so the second
+            // pass is cheap.
+            var count: usize = 0;
+            for (infos) |other| {
+                for (other.edges) |e| {
+                    if (e.kind == .to and std.mem.eql(u8, e.target_name, info.name)) count += 1;
+                }
+            }
+            var list: [count]IncomingEdge = undefined;
+            var n: usize = 0;
             for (infos) |other| {
                 for (other.edges) |e| {
                     if (e.kind == .to and std.mem.eql(u8, e.target_name, info.name)) {
-                        list = list ++ &[_]IncomingEdge{.{ .source = other, .edge = e }};
+                        list[n] = .{ .source = other, .edge = e };
+                        n += 1;
                     }
                 }
             }
-            table[i] = list;
+            // Const copy lifts the array into comptime constant storage (a
+            // slice into comptime var memory may not reach runtime).
+            const list_const = list;
+            table[i] = &list_const;
         }
         return table;
     }
@@ -475,7 +528,13 @@ fn buildIncomingTable(comptime infos: []const TypeInfo) [infos.len][]const Incom
 
 fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdge) TypeInfo {
     comptime {
-        @setEvalBranchQuota(1000000);
+        // A hub entity (every other entity To-edges it) runs the incoming loop
+        // once per incoming edge over a field list that grows with each
+        // injection — O(incoming²/2) duplicate-FK scans plus the `fields ++`
+        // appends. That sits just over 1M branches for a 300-node hub (the
+        // 300 hub-and-spoke stress test below failed at 1M), so this subtree
+        // carries its own larger quota instead of relying on the caller's.
+        @setEvalBranchQuota(10000000);
         var fields: []const FieldInfo = info.fields;
 
         // Own From edges generate FK columns in this table.
@@ -583,30 +642,34 @@ fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
     comptime {
         @setEvalBranchQuota(1000000);
         const incoming = buildIncomingTable(infos);
-        var result: []const TypeInfo = &.{};
+        var result: [infos.len]TypeInfo = undefined;
         for (infos, 0..) |info, i| {
-            result = result ++ &[_]TypeInfo{addEdgeFields(info, incoming[i])};
+            result[i] = addEdgeFields(info, incoming[i]);
         }
-        return result;
+        const result_const = result;
+        return &result_const;
     }
 }
 
 /// Resolve the foreign-key column name for a non-M2M edge.
 fn getEdgeFKColumn(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) []const u8 {
-    if (edge.field_name) |fn_| return fn_;
-    if (edge.kind == .to) {
-        for (target_info.edges) |target_edge| {
-            if (target_edge.kind == .from) {
-                if (target_edge.ref) |ref| {
-                    if (std.mem.eql(u8, ref, edge.name)) {
-                        return target_edge.name ++ "_id";
+    comptime {
+        @setEvalBranchQuota(1000000);
+        if (edge.field_name) |fn_| return fn_;
+        if (edge.kind == .to) {
+            for (target_info.edges) |target_edge| {
+                if (target_edge.kind == .from) {
+                    if (target_edge.ref) |ref| {
+                        if (std.mem.eql(u8, ref, edge.name)) {
+                            return target_edge.name ++ "_id";
+                        }
                     }
                 }
             }
+            return toSnakeCase(source_info.name) ++ "_id";
+        } else {
+            return edge.name ++ "_id";
         }
-        return toSnakeCase(source_info.name) ++ "_id";
-    } else {
-        return edge.name ++ "_id";
     }
 }
 
@@ -624,6 +687,7 @@ fn getJunctionTable(comptime edge: EdgeInfo, comptime source_table: []const u8, 
 /// drift.
 fn fieldColumns(comptime info: TypeInfo) []const []const u8 {
     comptime {
+        @setEvalBranchQuota(1000000);
         var cols: []const []const u8 = &.{};
         for (info.fields) |f| cols = cols ++ &[_][]const u8{f.column_name};
         return cols;
@@ -631,46 +695,52 @@ fn fieldColumns(comptime info: TypeInfo) []const []const u8 {
 }
 
 pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) graph_step.Step {
-    const source_table = source_info.table_name;
-    const target_table = target_info.table_name;
+    comptime {
+        // Called both from quota-raised contexts (buildGraph, makePredicates)
+        // and bare (predicate lowerHasEdge, DDL): the per-edge concatenations
+        // below must not depend on the caller's quota.
+        @setEvalBranchQuota(1000000);
+        const source_table = source_info.table_name;
+        const target_table = target_info.table_name;
 
-    if (edge.relation == .m2m) {
-        const junction = getJunctionTable(edge, source_table, target_table);
-        const source_col = source_table ++ "_id";
-        const target_col = target_table ++ "_id";
-        return graph_step.Step{
-            .from_table = source_table,
-            .from_column = pkColumn(source_info),
-            .to_table = target_table,
-            .to_column = pkColumn(target_info),
-            .to_columns = fieldColumns(target_info),
-            .edge_rel = .m2m,
-            .edge_table = junction,
-            .edge_columns = &[_][]const u8{ target_col, source_col },
-            .inverse = edge.kind == .from,
-            .order_by = edge.order_by,
-            .desc = edge.desc,
-            .limit = edge.limit,
-            .filter = edge.filter,
-        };
-    } else {
-        const fk_col = getEdgeFKColumn(edge, source_info, target_info);
-        const is_to = edge.kind == .to;
-        return graph_step.Step{
-            .from_table = source_table,
-            .from_column = pkColumn(source_info),
-            .to_table = target_table,
-            .to_column = pkColumn(target_info),
-            .to_columns = fieldColumns(target_info),
-            .edge_rel = if (is_to) .o2m else .m2o,
-            .edge_table = if (is_to) target_table else source_table,
-            .edge_columns = &[_][]const u8{fk_col},
-            .inverse = !is_to,
-            .order_by = edge.order_by,
-            .desc = edge.desc,
-            .limit = edge.limit,
-            .filter = edge.filter,
-        };
+        if (edge.relation == .m2m) {
+            const junction = getJunctionTable(edge, source_table, target_table);
+            const source_col = source_table ++ "_id";
+            const target_col = target_table ++ "_id";
+            return graph_step.Step{
+                .from_table = source_table,
+                .from_column = pkColumn(source_info),
+                .to_table = target_table,
+                .to_column = pkColumn(target_info),
+                .to_columns = fieldColumns(target_info),
+                .edge_rel = .m2m,
+                .edge_table = junction,
+                .edge_columns = &[_][]const u8{ target_col, source_col },
+                .inverse = edge.kind == .from,
+                .order_by = edge.order_by,
+                .desc = edge.desc,
+                .limit = edge.limit,
+                .filter = edge.filter,
+            };
+        } else {
+            const fk_col = getEdgeFKColumn(edge, source_info, target_info);
+            const is_to = edge.kind == .to;
+            return graph_step.Step{
+                .from_table = source_table,
+                .from_column = pkColumn(source_info),
+                .to_table = target_table,
+                .to_column = pkColumn(target_info),
+                .to_columns = fieldColumns(target_info),
+                .edge_rel = if (is_to) .o2m else .m2o,
+                .edge_table = if (is_to) target_table else source_table,
+                .edge_columns = &[_][]const u8{fk_col},
+                .inverse = !is_to,
+                .order_by = edge.order_by,
+                .desc = edge.desc,
+                .limit = edge.limit,
+                .filter = edge.filter,
+            };
+        }
     }
 }
 
@@ -682,11 +752,13 @@ pub const Graph = struct {
 pub fn buildGraph(comptime schemas: []const type) Graph {
     comptime {
         @setEvalBranchQuota(1000000);
-        var types: []const TypeInfo = &.{};
-        for (schemas) |S| {
-            types = types ++ &[_]TypeInfo{fromSchema(S)};
+        // Exact-size array + index write: `types = types ++ …` per schema was
+        // O(n²) comptime copying on top of fromSchema's own work.
+        var types: [schemas.len]TypeInfo = undefined;
+        for (schemas, 0..) |S, i| {
+            types[i] = fromSchema(S);
         }
-        const resolved = resolveGraphEdges(types);
+        const resolved = resolveGraphEdges(&types);
         const with_fields = addEdgeFieldsToAll(resolved);
         return Graph{ .types = with_fields };
     }
@@ -901,6 +973,29 @@ const StressGen = struct {
         }
         return arr;
     }
+
+    /// Same hub-and-spoke shape over the *minimal* two-field schemas: the
+    /// Client stress test below wants the per-entity cost (entity struct,
+    /// five builders, predicates, order terms, meta) times hundreds of
+    /// entities, without the 8-field predicate fan-out of `listEdged`
+    /// swamping the measurement.
+    fn listEdgedMinimal(comptime N: usize) [N]type {
+        @setEvalBranchQuota(1000000);
+        const edge = @import("../core/edge.zig");
+        const Hub = make(0);
+        var arr: [N]type = undefined;
+        arr[0] = Hub;
+        for (1..N) |i| {
+            const Base = make(i);
+            arr[i] = struct {
+                pub const schema_name = Base.schema_name;
+                pub const fields = Base.fields;
+                pub const edges = &.{edge.To("hub", Hub)};
+                pub const indexes = Base.indexes;
+            };
+        }
+        return arr;
+    }
 };
 
 test "Graph stress: 400 minimal schemas build within the default quota" {
@@ -926,4 +1021,129 @@ test "Graph stress: 300 hub-and-spoke edged schemas build within the default quo
     // Every spoke resolves its To edge to the hub.
     try std.testing.expectEqual(@as(usize, 1), graph.types[100].edges.len);
     try std.testing.expectEqualStrings("Rich0", graph.types[100].edges[0].target_name);
+}
+
+test "Graph stress: 300-entity graph instantiates Client, Entity and predicates" {
+    // The heaviest consumer in the codegen: per entity the root Client
+    // generates the Entity struct, five builders, the predicate namespace,
+    // edge-order terms and meta — once per graph entry. Every spoke also
+    // resolves one To edge through buildEdgeStep (edge predicates + order
+    // terms + the injected FK column on the hub), so medium graphs randomly
+    // hit "quota exceeded" unless every one of those comptime stacks carries
+    // its own quota. The schemas are the minimal two-field ones: the cost
+    // under test is the per-entity client stack times the entity count, not
+    // one entity's field fan-out.
+    const schemas = comptime StressGen.listEdgedMinimal(300);
+    const graph = comptime buildGraph(&schemas);
+    const infos = graph.types;
+
+    const RootClient = comptime @import("client.zig").Client(infos);
+    // 5 root fields (allocator, driver, logger, interceptors,
+    // owns_interceptors) + one sub-client per entity.
+    try std.testing.expectEqual(@as(usize, 305), @typeInfo(RootClient).@"struct".field_names.len);
+    comptime {
+        if (!@hasField(RootClient, "stress0")) @compileError("Client is missing the hub sub-client");
+        if (!@hasField(RootClient, "stress299")) @compileError("Client is missing the last spoke sub-client");
+    }
+
+    // One entity's full Entity type, generated from the same resolved graph.
+    const StressEntity = comptime @import("entity.zig").Entity(infos, infos[200]);
+    try std.testing.expect(@hasField(StressEntity, "value"));
+    try std.testing.expect(@hasField(StressEntity, "edges"));
+
+    // One predicate-namespace generation, including the edge predicates that
+    // lower through buildEdgeStep.
+    const preds = comptime @import("predicate.zig").makePredicates(infos, infos[200]);
+    try std.testing.expect(preds.HasHub() == .exists_fn);
+    try std.testing.expect(preds.valueEQ(.{ .string = "x" }) == .eq);
+}
+
+// ------------------------------------------------------------------
+// Name-derivation references: the original concat implementations,
+// kept byte-for-byte as the semantic definition the fixed-buffer
+// rewrites of toSnakeCase / generateIndexName are tested against.
+// ------------------------------------------------------------------
+
+fn toSnakeCaseConcat(name: []const u8) []const u8 {
+    comptime {
+        var result: []const u8 = "";
+        for (name, 0..) |c, i| {
+            if (std.ascii.isUpper(c) and i > 0) {
+                result = result ++ "_";
+            }
+            result = result ++ &[_]u8{std.ascii.toLower(c)};
+        }
+        return result;
+    }
+}
+
+fn generateIndexNameConcat(comptime type_name: []const u8, comptime columns: []const []const u8) []const u8 {
+    comptime {
+        var result: []const u8 = type_name;
+        for (columns) |col| {
+            result = result ++ "_" ++ col;
+        }
+        return result;
+    }
+}
+
+test "toSnakeCase fixed-buffer rewrite matches the concat reference byte-for-byte" {
+    // Uppercase acronyms, consecutive capitals, digits, underscores, the
+    // empty string and single characters — every shape the old O(n²)
+    // character-by-character `++` handled.
+    const inputs = [_][]const u8{
+        "",
+        "a",
+        "A",
+        "id",
+        "ID",
+        "OrderProduct",
+        "HTTPServer",
+        "URLParser",
+        "ABC",
+        "ABCDef",
+        "Order2Go",
+        "Line2",
+        "v2",
+        "already_snake",
+        "Mixed_CaseName",
+        "xdaofood_upload_file",
+        "Rich0",
+        "HomePush",
+        "aBcDe",
+    };
+    comptime {
+        for (inputs) |input| {
+            if (!std.mem.eql(u8, toSnakeCaseConcat(input), toSnakeCase(input)))
+                @compileError("toSnakeCase rewrite diverged from the concat reference for input: " ++ input);
+        }
+    }
+    // Exact expectations pin the derivation itself, not just self-consistency
+    // (the four layers that share this derivation rely on these bytes).
+    try std.testing.expectEqualStrings("order_product", comptime toSnakeCase("OrderProduct"));
+    try std.testing.expectEqualStrings("h_t_t_p_server", comptime toSnakeCase("HTTPServer"));
+    try std.testing.expectEqualStrings("a_b_c_def", comptime toSnakeCase("ABCDef"));
+    try std.testing.expectEqualStrings("already_snake", comptime toSnakeCase("already_snake"));
+    try std.testing.expectEqualStrings("", comptime toSnakeCase(""));
+}
+
+test "generateIndexName fixed-buffer rewrite matches the concat reference byte-for-byte" {
+    const cases = [_]struct {
+        type_name: []const u8,
+        columns: []const []const u8,
+    }{
+        .{ .type_name = "Rich0", .columns = &.{"name"} },
+        .{ .type_name = "OrderProduct", .columns = &.{ "order", "product" } },
+        .{ .type_name = "t", .columns = &.{} },
+        .{ .type_name = "", .columns = &.{"c"} },
+        .{ .type_name = "User", .columns = &.{ "email", "tenant_id", "created_at" } },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectEqualStrings(
+            comptime generateIndexNameConcat(case.type_name, case.columns),
+            comptime generateIndexName(case.type_name, case.columns),
+        );
+    }
+    try std.testing.expectEqualStrings("Rich0_name", comptime generateIndexName("Rich0", &.{"name"}));
+    try std.testing.expectEqualStrings("t", comptime generateIndexName("t", &.{}));
 }

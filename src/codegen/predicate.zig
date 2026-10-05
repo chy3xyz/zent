@@ -6,8 +6,10 @@ const buildEdgeStep = @import("graph.zig").buildEdgeStep;
 const sql = @import("../sql/builder.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
 
-fn fieldName(comptime base: []const u8, comptime suffix: []const u8) [:0]const u8 {
+fn fieldName(comptime entity_name: []const u8, comptime base: []const u8, comptime suffix: []const u8) [:0]const u8 {
     comptime {
+        if (base.len + suffix.len > 255)
+            @compileError("zent: predicate name '" ++ base ++ suffix ++ "' for field '" ++ base ++ "' on entity '" ++ entity_name ++ "' exceeds the 255-byte comptime name buffer; shorten the field name");
         var buf: [256:0]u8 = undefined;
         @memcpy(buf[0..base.len], base);
         @memcpy(buf[base.len .. base.len + suffix.len], suffix);
@@ -16,9 +18,15 @@ fn fieldName(comptime base: []const u8, comptime suffix: []const u8) [:0]const u
     }
 }
 
-fn edgePredName(comptime prefix: []const u8, comptime edge_name: []const u8) [:0]const u8 {
+fn edgePredName(comptime entity_name: []const u8, comptime prefix: []const u8, comptime edge_name: []const u8) [:0]const u8 {
     comptime {
         // Prepend prefix, then capitalize edge name, e.g. "Has" + "cars" → "HasCars"
+        // An empty edge name reads past the buffer below; fail naming the
+        // entity and prefix instead of a comptime out-of-bounds panic.
+        if (edge_name.len == 0)
+            @compileError("zent: edge with an empty name on entity '" ++ entity_name ++ "' cannot derive its '" ++ prefix ++ "<Edge>' predicate");
+        if (prefix.len + edge_name.len > 255)
+            @compileError("zent: predicate name '" ++ prefix ++ edge_name ++ "' for edge '" ++ edge_name ++ "' on entity '" ++ entity_name ++ "' exceeds the 255-byte comptime name buffer; shorten the edge name");
         var buf: [256:0]u8 = undefined;
         @memcpy(buf[0..prefix.len], prefix);
         buf[prefix.len] = std.ascii.toUpper(edge_name[0]);
@@ -62,12 +70,12 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
         const NoArgPredFn = *const fn () sql.Predicate;
 
         for (info.fields) |f| {
-            const eq_name = fieldName(f.name, "EQ");
-            const ne_name = fieldName(f.name, "NE");
-            const gt_name = fieldName(f.name, "GT");
-            const gte_name = fieldName(f.name, "GTE");
-            const lt_name = fieldName(f.name, "LT");
-            const lte_name = fieldName(f.name, "LTE");
+            const eq_name = fieldName(info.name, f.name, "EQ");
+            const ne_name = fieldName(info.name, f.name, "NE");
+            const gt_name = fieldName(info.name, f.name, "GT");
+            const gte_name = fieldName(info.name, f.name, "GTE");
+            const lt_name = fieldName(info.name, f.name, "LT");
+            const lte_name = fieldName(info.name, f.name, "LTE");
 
             for ([_][:0]const u8{ eq_name, ne_name, gt_name, gte_name, lt_name, lte_name }) |name| {
                 field_names[idx] = name;
@@ -76,8 +84,8 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
                 idx += 1;
             }
 
-            const in_name = fieldName(f.name, "In");
-            const not_in_name = fieldName(f.name, "NotIn");
+            const in_name = fieldName(info.name, f.name, "In");
+            const not_in_name = fieldName(info.name, f.name, "NotIn");
             for ([_][:0]const u8{ in_name, not_in_name }) |name| {
                 field_names[idx] = name;
                 field_types[idx] = ListPredFn;
@@ -85,8 +93,8 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
                 idx += 1;
             }
 
-            const is_null_name = fieldName(f.name, "IsNull");
-            const not_nil_name = fieldName(f.name, "NotNil");
+            const is_null_name = fieldName(info.name, f.name, "IsNull");
+            const not_nil_name = fieldName(info.name, f.name, "NotNil");
             for ([_][:0]const u8{ is_null_name, not_nil_name }) |name| {
                 field_names[idx] = name;
                 field_types[idx] = NoArgPredFn;
@@ -95,7 +103,7 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
             }
 
             if (f.field_type == .string or f.field_type == .text) {
-                const contains_name = fieldName(f.name, "Contains");
+                const contains_name = fieldName(info.name, f.name, "Contains");
                 field_names[idx] = contains_name;
                 field_types[idx] = StringPredFn;
                 field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(StringPredFn) };
@@ -106,22 +114,22 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
                 // the wildcards — a trap that has bitten at least one consumer
                 // and one doc. New code should use `Like`; `Contains` stays as
                 // the historical alias (renaming it is a breaking change).
-                const like_name = fieldName(f.name, "Like");
+                const like_name = fieldName(info.name, f.name, "Like");
                 field_names[idx] = like_name;
                 field_types[idx] = StringPredFn;
                 field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(StringPredFn) };
                 idx += 1;
-                const contains_esc_name = fieldName(f.name, "ContainsEscaped");
+                const contains_esc_name = fieldName(info.name, f.name, "ContainsEscaped");
                 field_names[idx] = contains_esc_name;
                 field_types[idx] = StringPredFn;
                 field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(StringPredFn) };
                 idx += 1;
 
                 const str_names = [_][:0]const u8{
-                    fieldName(f.name, "HasPrefix"),
-                    fieldName(f.name, "HasSuffix"),
-                    fieldName(f.name, "ContainsFold"),
-                    fieldName(f.name, "EQFold"),
+                    fieldName(info.name, f.name, "HasPrefix"),
+                    fieldName(info.name, f.name, "HasSuffix"),
+                    fieldName(info.name, f.name, "ContainsFold"),
+                    fieldName(info.name, f.name, "EQFold"),
                 };
                 for (str_names) |name| {
                     field_names[idx] = name;
@@ -135,19 +143,19 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
         // Edge-based predicates: Has{Edge}(), Has{Edge}With(preds), NotHas{Edge}()
         const PredWithFn = *const fn ([]const sql.Predicate) sql.Predicate;
         for (info.edges) |edge| {
-            const has_name = edgePredName("Has", edge.name);
+            const has_name = edgePredName(info.name, "Has", edge.name);
             field_names[idx] = has_name;
             field_types[idx] = NoArgPredFn;
             field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(NoArgPredFn) };
             idx += 1;
 
-            const has_with_name = fieldName(edgePredName("Has", edge.name), "With");
+            const has_with_name = fieldName(info.name, edgePredName(info.name, "Has", edge.name), "With");
             field_names[idx] = has_with_name;
             field_types[idx] = PredWithFn;
             field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(PredWithFn) };
             idx += 1;
 
-            const not_has_name = edgePredName("NotHas", edge.name);
+            const not_has_name = edgePredName(info.name, "NotHas", edge.name);
             field_names[idx] = not_has_name;
             field_types[idx] = NoArgPredFn;
             field_attrs[idx] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(NoArgPredFn) };
@@ -270,7 +278,7 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
             // tenant predicate through `Has{Edge}With(…)` explicitly.
             const target_soft_delete = target_info.soft_delete;
 
-            const has_name = edgePredName("Has", edge.name);
+            const has_name = edgePredName(info.name, "Has", edge.name);
             @field(result, has_name) = struct {
                 fn hasFn() sql.Predicate {
                     return .{ .exists_fn = &struct {
@@ -281,7 +289,7 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
                 }
             }.hasFn;
 
-            const has_with_name = fieldName(edgePredName("Has", edge.name), "With");
+            const has_with_name = fieldName(info.name, edgePredName(info.name, "Has", edge.name), "With");
             @field(result, has_with_name) = struct {
                 fn hasWithFn(preds: []const sql.Predicate) sql.Predicate {
                     return .{ .has_neighbors_with = .{
@@ -292,7 +300,7 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
                 }
             }.hasWithFn;
 
-            const not_has_name = edgePredName("NotHas", edge.name);
+            const not_has_name = edgePredName(info.name, "NotHas", edge.name);
             @field(result, not_has_name) = struct {
                 fn notHasFn() sql.Predicate {
                     return .{ .not_exists_fn = &struct {
@@ -323,25 +331,30 @@ pub fn lowerHasEdge(
     allocator: std.mem.Allocator,
     pred: *sql.Predicate,
 ) error{ UnknownEdge, OutOfMemory }!void {
+    // Comptime edge-name -> Step table (Step values are runtime readable),
+    // matched by the runtime edge_name string. Built once, above the switch:
+    // the has_edge and not_has_edge branches consume the same table, and
+    // comptime blocks in a function body are evaluated on every analysis of
+    // the instantiation regardless of which branch runs — two copies here
+    // doubled the O(edges) buildEdgeStep work per entity on every graph.
+    const edge_steps = comptime blk: {
+        @setEvalBranchQuota(1000000);
+        var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step, soft_delete: bool } = undefined;
+        for (info.edges, 0..) |e, i| {
+            const target_info = edgeTargetInfo(infos, info, e);
+            // The lowered predicate is an EXISTS over the *target* table, so
+            // it carries the target's soft-delete scope exactly as the typed
+            // `Has{Edge}()` / `NotHas{Edge}()` predicates above do — a
+            // trashed row cannot satisfy an existence filter. Dropping it
+            // here made `has(...)` pass for a parent whose rows are all
+            // trashed, and `not_has(...)` fail, both disagreeing with the
+            // typed predicates.
+            steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info), .soft_delete = target_info.soft_delete };
+        }
+        break :blk steps;
+    };
     switch (pred.*) {
         .has_edge => |*h| {
-            // Comptime edge-name -> Step table (Step values are runtime
-            // readable), matched by the runtime edge_name string.
-            const edge_steps = comptime blk: {
-                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step, soft_delete: bool } = undefined;
-                for (info.edges, 0..) |e, i| {
-                    const target_info = edgeTargetInfo(infos, info, e);
-                    // The lowered predicate is an EXISTS over the *target*
-                    // table, so it carries the target's soft-delete scope
-                    // exactly as the typed `Has{Edge}()` / `NotHas{Edge}()`
-                    // predicates above do — a trashed row cannot satisfy an
-                    // existence filter. Dropping it here made `has(...)` pass
-                    // for a parent whose rows are all trashed, and `not_has(...)`
-                    // fail, both disagreeing with the typed predicates.
-                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info), .soft_delete = target_info.soft_delete };
-                }
-                break :blk steps;
-            };
             var lowered = false;
             for (edge_steps) |es| {
                 if (std.mem.eql(u8, es.name, h.edge_name)) {
@@ -361,21 +374,6 @@ pub fn lowerHasEdge(
             if (!lowered) return error.UnknownEdge;
         },
         .not_has_edge => |*h| {
-            const edge_steps = comptime blk: {
-                var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step, soft_delete: bool } = undefined;
-                for (info.edges, 0..) |e, i| {
-                    const target_info = edgeTargetInfo(infos, info, e);
-                    // The lowered predicate is an EXISTS over the *target*
-                    // table, so it carries the target's soft-delete scope
-                    // exactly as the typed `Has{Edge}()` / `NotHas{Edge}()`
-                    // predicates above do — a trashed row cannot satisfy an
-                    // existence filter. Dropping it here made `has(...)` pass
-                    // for a parent whose rows are all trashed, and `not_has(...)`
-                    // fail, both disagreeing with the typed predicates.
-                    steps[i] = .{ .name = e.name, .step = buildEdgeStep(e, info, target_info), .soft_delete = target_info.soft_delete };
-                }
-                break :blk steps;
-            };
             var lowered = false;
             for (edge_steps) |es| {
                 if (std.mem.eql(u8, es.name, h.edge_name)) {

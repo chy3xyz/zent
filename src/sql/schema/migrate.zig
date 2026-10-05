@@ -1938,6 +1938,10 @@ pub const TableDef = struct {
 /// Generate a TableDef from a TypeInfo at comptime.
 pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
     comptime {
+        // 字段/外键循环在 `inline for (infos)` 的迁移入口下按表×字段展开，
+        // 15+ 表的应用 schema 就会击穿默认 5000 分支限额(如 zenaipa);与
+        // defaultValueStr 同量级提升配额，避免 "exceeded backwards branches"。
+        @setEvalBranchQuota(50_000);
         var columns: []const ColumnDef = &.{};
 
         // Generate columns from fields. DDL uses the physical column name
@@ -2449,6 +2453,11 @@ fn edgeRefTable(comptime e: EdgeInfo, comptime all_infos: []const TypeInfo) []co
 
 fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
     comptime {
+        // 字段/外键/交叉引用循环在 `inline for (infos)` 的迁移入口下按
+        // 表×字段展开，15+ 表的应用 schema 就会击穿默认 5000 分支限额
+        // (如 zenaipa);与 defaultValueStr 同量级提升配额，避免
+        // "exceeded backwards branches"。
+        @setEvalBranchQuota(50_000);
         var columns: []const ColumnDef = &.{};
         var foreign_keys: []const ForeignKeyDef = &.{};
 
@@ -2707,7 +2716,7 @@ pub fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.D
     }
 
     const sql_text = if (is_sqlite)
-        try std.fmt.allocPrint(allocator, "PRAGMA table_info(\"{s}\")", .{table_name})
+        try allocator.print("PRAGMA table_info(\"{s}\")", .{table_name})
     else if (is_postgres)
         try allocator.dupe(u8, "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()")
     else if (is_mysql)
@@ -2985,7 +2994,7 @@ fn getSQLiteIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver,
     }
 
     {
-        const list_sql = try std.fmt.allocPrint(allocator, "PRAGMA index_list(\"{s}\")", .{table_name});
+        const list_sql = try allocator.print("PRAGMA index_list(\"{s}\")", .{table_name});
         defer allocator.free(list_sql);
         var rows = try driver_drv.query(list_sql, &.{});
         defer rows.deinit();
@@ -3020,7 +3029,7 @@ fn getSQLiteIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver,
         var quoted = std.array_list.Managed(u8).init(allocator);
         defer quoted.deinit();
         try quoteIdentToBuffer(dialect, &quoted, idx.name);
-        const info_sql = try std.fmt.allocPrint(allocator, "PRAGMA index_info({s})", .{quoted.items});
+        const info_sql = try allocator.print("PRAGMA index_info({s})", .{quoted.items});
         defer allocator.free(info_sql);
 
         var rows = try driver_drv.query(info_sql, &.{});
@@ -3306,7 +3315,7 @@ fn getSQLiteForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Dri
         return error.InvalidTableName;
     }
 
-    const sql_text = try std.fmt.allocPrint(allocator, "PRAGMA foreign_key_list(\"{s}\")", .{table_name});
+    const sql_text = try allocator.print("PRAGMA foreign_key_list(\"{s}\")", .{table_name});
     defer allocator.free(sql_text);
 
     var rows = try driver_drv.query(sql_text, &.{});
@@ -3670,9 +3679,9 @@ fn dropColumnSQL(
     // 's' as SQLite (`"sqlserver"` got SQLite's DROP COLUMN and would have been
     // sent to the server verbatim); an unrecognised name is refused instead.
     return switch (dialect.kind()) {
-        .sqlite => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\"", .{ table_name, column_name }),
-        .postgres => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" DROP COLUMN \"{s}\" CASCADE", .{ table_name, column_name }),
-        .mysql => std.fmt.allocPrint(allocator, "ALTER TABLE `{s}` DROP COLUMN `{s}`", .{ table_name, column_name }),
+        .sqlite => allocator.print("ALTER TABLE \"{s}\" DROP COLUMN \"{s}\"", .{ table_name, column_name }),
+        .postgres => allocator.print("ALTER TABLE \"{s}\" DROP COLUMN \"{s}\" CASCADE", .{ table_name, column_name }),
+        .mysql => allocator.print("ALTER TABLE `{s}` DROP COLUMN `{s}`", .{ table_name, column_name }),
         .unknown => error.UnsupportedDialect,
     };
 }
@@ -3732,7 +3741,7 @@ fn alterColumnTypeSQL(
 ) ![]const u8 {
     return switch (dialect.kind()) {
         .sqlite, .unknown => error.UnsupportedDialect,
-        .postgres => std.fmt.allocPrint(allocator, "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE {s} USING \"{s}\"::{s}", .{ table_name, column_name, new_type, column_name, new_type }),
+        .postgres => allocator.print("ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" TYPE {s} USING \"{s}\"::{s}", .{ table_name, column_name, new_type, column_name, new_type }),
         .mysql => error.MySQLTypeChangeUnsafe,
     };
 }
@@ -3760,8 +3769,7 @@ fn alterColumnNullabilitySQL(
     dialect: Dialect,
 ) ![]const u8 {
     return switch (dialect.kind()) {
-        .postgres => std.fmt.allocPrint(
-            allocator,
+        .postgres => allocator.print(
             "ALTER TABLE \"{s}\" ALTER COLUMN \"{s}\" {s} NOT NULL",
             .{ table_name, column_name, if (not_null) "SET" else "DROP" },
         ),
@@ -4397,7 +4405,7 @@ pub const MigrateFilesError = sql_driver.Error || std.Io.Dir.OpenError || std.Io
 /// requested direction (e.g. `.up.sql`). Filenames must begin with a positive
 /// integer version, optionally followed by an underscore and a description.
 fn parseMigrationFilename(name: []const u8, direction: []const u8) !?i64 {
-    const suffix = try std.fmt.allocPrint(std.heap.page_allocator, ".{s}.sql", .{direction});
+    const suffix = try std.heap.page_allocator.print(".{s}.sql", .{direction});
     defer std.heap.page_allocator.free(suffix);
     if (!std.mem.endsWith(u8, name, suffix)) return null;
 
@@ -4419,7 +4427,7 @@ fn fileChecksum(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]c
         std.hash.crc.Crc32.hash(data)
     else
         std.hash.crc.@"CRC-32/ISO-HDLC".hash(data);
-    return try std.fmt.allocPrint(allocator, "{x:0>8}", .{crc});
+    return try allocator.print("{x:0>8}", .{crc});
 }
 
 /// Split a SQL script into individual statements on unquoted `;` terminators.
@@ -4498,7 +4506,7 @@ fn readSingleMigrationFile(io: std.Io, allocator: std.mem.Allocator, dir_path: [
     errdefer allocator.free(checksum);
 
     const stem = name[0 .. name.len - ".up.sql".len];
-    const down_name = try std.fmt.allocPrint(allocator, "{s}.down.sql", .{stem});
+    const down_name = try allocator.print("{s}.down.sql", .{stem});
     defer allocator.free(down_name);
     const down_path = try std.fs.path.join(allocator, &.{ dir_path, down_name });
     defer allocator.free(down_path);

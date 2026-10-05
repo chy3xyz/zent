@@ -12,7 +12,7 @@
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (511 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (515 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -52,7 +52,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 511, integration 236 passed + 3 skipped
+`baseline` counts move with this: unit 515, integration 236 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -90,6 +90,8 @@ be set up at all on one server, create it only there and say why in a comment.
 | Pattern | Do this |
 |---|---|
 | `std.ArrayList(T).init(alloc)` / `.append(x)` | `.empty` + explicit allocator arg |
+| `std.fmt.allocPrint(a, …)` / `allocPrintSentinel` | `a.print(…)` / `a.printSentinel(…)` — deprecated wrappers in 0.17.0; migrated wholesale in v0.83.0 |
+| `@branchHint` placement | Only valid as the **first statement of a function body or a conditional branch** (`if`/`else`/`orelse`/`catch` prong) — a bare statement mid-function or inside a labeled block is a compile error (`error: must appear as the first statement…`). To hint a loop's exit tail, extract it into a helper fn or put the hint on a conditional prong |
 | `std.mem.trimRight/trimLeft` | `std.mem.trimEnd/trimStart` |
 | `@typeInfo(T).fields` | `.field_names` / `.field_types` / `.field_attrs` + `attrs.defaultValue(ft)` |
 | `std.meta.hasDecl` | builtin `@hasDecl` |

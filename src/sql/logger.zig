@@ -1,5 +1,6 @@
 const std = @import("std");
 const Value = @import("builder.zig").Value;
+const driver = @import("driver.zig");
 
 pub const LogContext = struct {
     sql: []const u8,
@@ -67,12 +68,19 @@ pub fn debugLogger() Logger {
     };
 }
 
-/// Returns current time as microseconds since an arbitrary epoch.
-/// Suitable for measuring elapsed durations.
+/// Current time in microseconds from the **monotonic** clock, not the wall
+/// clock. The call sites only ever take durations (`nowUs() - start`), and a
+/// wall clock is the wrong source for that: an NTP step or a manual clock set
+/// moves the wall clock under the measurement, so the difference goes
+/// negative and wraps into a huge u64 in the log line. Monotonic microseconds
+/// are therefore **only for measuring elapsed durations** — they carry no
+/// relation to the Unix epoch and must never be stored as a timestamp.
+///
+/// Shares `driver.monotonicNs`'s clock and its documented fallback chain
+/// (wall clock, then 0) rather than keeping a second copy that can drift
+/// from it.
 pub fn nowUs() u64 {
-    var tv: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&tv, null);
-    return @as(u64, @intCast(tv.sec)) * std.time.us_per_s + @as(u64, @intCast(tv.usec));
+    return @intCast(@divTrunc(driver.monotonicNs(), std.time.ns_per_us));
 }
 
 test "an unknown row count is not rendered as zero" {

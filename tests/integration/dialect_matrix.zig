@@ -364,7 +364,7 @@ fn observeMysql(a: std.mem.Allocator, allocator: std.mem.Allocator, c: Case, obs
 fn attempt(a: std.mem.Allocator, c: Case, drv: Driver) ![]const u8 {
     return c.run(a, drv) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => std.fmt.allocPrint(a, "err:{s}", .{@errorName(err)}) catch "err:OutOfMemory",
+        else => a.print("err:{s}", .{@errorName(err)}) catch "err:OutOfMemory",
     };
 }
 
@@ -376,7 +376,7 @@ fn pgConninfo(allocator: std.mem.Allocator) ![]u8 {
     if (std.process.Environ.getPosix(testing.environ, "SKIP_PG") != null) return error.SkipZigTest;
     if (std.process.Environ.getPosix(testing.environ, "PG_DSN")) |dsn| return allocator.dupe(u8, dsn);
     const user = std.process.Environ.getPosix(testing.environ, "USER") orelse "n0x";
-    return std.fmt.allocPrint(allocator, "host=localhost dbname=zent_test user={s}", .{user});
+    return allocator.print("host=localhost dbname=zent_test user={s}", .{user});
 }
 
 const MyEnv = struct {
@@ -516,7 +516,7 @@ fn caseCrudServiceIdempotentPut(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     const other_tenant = try svc.update(changed, 2);
     const missing = try svc.update(changed, id + 100_000);
 
-    return std.fmt.allocPrint(a, "idempotent={}|changed={}|other_tenant={}|missing={}", .{
+    return a.print("idempotent={}|changed={}|other_tenant={}|missing={}", .{
         idempotent, real_change, other_tenant, missing,
     });
 }
@@ -553,7 +553,7 @@ fn caseCrudHelpersUpdateCountsMatched(a: std.mem.Allocator, drv: Driver) ![]cons
         client.dm_upd_coupon.predicates.idEQ(.{ .int = created.id + 100_000 }),
     });
 
-    return std.fmt.allocPrint(a, "changed={d}|idempotent={d}|missing={d}", .{ changed, idempotent, missing });
+    return a.print("changed={d}|idempotent={d}|missing={d}", .{ changed, idempotent, missing });
 }
 
 /// `SET hits = hits + 0` changes nothing anywhere, but only MySQL reports it as
@@ -586,7 +586,7 @@ fn caseCrudHelpersIncrementZeroDelta(a: std.mem.Allocator, drv: Driver) ![]const
         client.dm_hits.predicates.idEQ(.{ .int = created.id + 100_000 }),
     });
 
-    return std.fmt.allocPrint(a, "plus={d}|zero={d}|missing={d}", .{ plus, zero, missing });
+    return a.print("plus={d}|zero={d}|missing={d}", .{ plus, zero, missing });
 }
 
 /// A row that is already in the trash is not deleted a second time. The count is
@@ -675,13 +675,13 @@ fn caseGroupedCountTotals(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     defer empty.deinit();
     _ = try empty.GroupBy(&.{"grp"});
     _ = try empty.Where(.{client.dm_count_row.predicates.grpEQ(.{ .string = "zzz" })});
-    const none = empty.Count() catch |err| return std.fmt.allocPrint(a, "empty=err:{s}", .{@errorName(err)});
+    const none = empty.Count() catch |err| return a.print("empty=err:{s}", .{@errorName(err)});
 
     var plain = client.dm_count_row.Query();
     defer plain.deinit();
     const all = try plain.Count();
 
-    return std.fmt.allocPrint(a, "groups={d}|empty={d}|ungrouped={d}", .{ groups, none, all });
+    return a.print("groups={d}|empty={d}|ungrouped={d}", .{ groups, none, all });
 }
 
 fn caseUniqueIndexAddedToExistingTable(a: std.mem.Allocator, drv: Driver) ![]const u8 {
@@ -730,7 +730,7 @@ fn caseUniqueIndexAddedToExistingTable(a: std.mem.Allocator, drv: Driver) ![]con
     // table can differ from the schema in ways that have nothing to do with the
     // declaration under test (an auto-increment column's default, say), and
     // those differences belong to other cases.
-    return std.fmt.allocPrint(a, "unique_drift_before={s}|unique_drift_after={s}|duplicate={s}", .{
+    return a.print("unique_drift_before={s}|unique_drift_after={s}|duplicate={s}", .{
         if (hasUniqueConstraintDrift(before)) "yes" else "no",
         if (hasUniqueConstraintDrift(after)) "yes" else "no",
         if (std.mem.eql(u8, duplicate, "ok")) "accepted" else "refused",
@@ -786,7 +786,7 @@ fn caseRepeatSoftDelete(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     defer live.deinit();
     const visible = try live.Count();
 
-    return std.fmt.allocPrint(a, "first={d}|second={d}|deleted_at={s}|visible={d}", .{
+    return a.print("first={d}|second={d}|deleted_at={s}|visible={d}", .{
         first_count, second_count, stamp, visible,
     });
 }
@@ -835,7 +835,7 @@ fn caseBatchSaveOrUpdateCounts(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     const first = try zent.crud_helpers.batchSaveOrUpdate(client.dm_batch_doc, items, "doc_code");
     const second = try zent.crud_helpers.batchSaveOrUpdate(client.dm_batch_doc, items, "doc_code");
 
-    return std.fmt.allocPrint(a, "first={d}/{d}|second={d}/{d}", .{
+    return a.print("first={d}/{d}|second={d}/{d}", .{
         first.created_count, first.updated_count, second.created_count, second.updated_count,
     });
 }
@@ -889,7 +889,7 @@ fn caseBulkDeleteWithoutPredicate(a: std.mem.Allocator, drv: Driver) ![]const u8
     defer sq.deinit();
     const soft_live = try sq.Count();
 
-    return std.fmt.allocPrint(a, "hard={s}|soft={s}|hard_live={d}|soft_live={d}", .{
+    return a.print("hard={s}|soft={s}|hard_live={d}|soft_live={d}", .{
         hard_result, soft_result, hard_live, soft_live,
     });
 }
@@ -984,7 +984,7 @@ fn caseEagerLoadedTargetColumnOrder(a: std.mem.Allocator, drv: Driver) ![]const 
     const loaded = rows.items[0].edges.thing orelse return error.NoEdge;
     if (loaded.len != 1) return error.NoEdge;
 
-    return std.fmt.allocPrint(a, "order={s}|app_id={d}|label={s}|qty={d}", .{
+    return a.print("order={s}|app_id={d}|label={s}|qty={d}", .{
         order, loaded[0].app_id, loaded[0].label, loaded[0].qty,
     });
 }
@@ -998,7 +998,7 @@ fn physicalColumns(a: std.mem.Allocator, drv: Driver, table: []const u8) ![][]co
     const is_sqlite = std.mem.eql(u8, drv.dialect().name, "sqlite3");
     const is_pg = std.mem.eql(u8, drv.dialect().name, "postgres");
     const stmt = if (is_sqlite)
-        try std.fmt.allocPrint(a, "PRAGMA table_info({s})", .{table})
+        try a.print("PRAGMA table_info({s})", .{table})
     else if (is_pg)
         try a.dupe(u8, "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position")
     else
@@ -1103,7 +1103,7 @@ fn caseForeignKeyEnforcement(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     defer remaining.deinit();
     const after_parent_delete = try remaining.Count();
 
-    return std.fmt.allocPrint(a, "dangling={s}|orphans={d}|linked={s}|after_parent_delete={d}", .{
+    return a.print("dangling={s}|orphans={d}|linked={s}|after_parent_delete={d}", .{
         dangling, orphans_stored, linked, after_parent_delete,
     });
 }
@@ -1165,7 +1165,7 @@ fn caseBulkWriteIdsNameTheirRows(a: std.mem.Allocator, drv: Driver) ![]const u8 
     defer upsert_ids.deinit();
     const upsert_names = try namesForIds(a, client, upsert_ids.items);
 
-    return std.fmt.allocPrint(a, "insert_n={d}|insert={s}|upsert_n={d}|upsert={s}", .{
+    return a.print("insert_n={d}|insert={s}|upsert_n={d}|upsert={s}", .{
         insert_ids.items.len, insert_names, upsert_ids.items.len, upsert_names,
     });
 }
@@ -1226,7 +1226,7 @@ fn caseScanRowColumnCountGuard(a: std.mem.Allocator, drv: Driver) ![]const u8 {
     else |err|
         @errorName(err);
 
-    return std.fmt.allocPrint(a, "narrow={s}|exact={s}", .{ narrow, exact });
+    return a.print("narrow={s}|exact={s}", .{ narrow, exact });
 }
 
 /// A statement and its argument list that disagree is the caller's own bug: the
@@ -1291,19 +1291,19 @@ fn caseWrongLengthBindingListIsRefused(a: std.mem.Allocator, drv: Driver) ![]con
     const after = resultName(drv.exec(insert, &.{ .{ .string = "bob" }, .{ .int = 2 } }));
     const written = try countRows(a, drv, "dm_param_row");
 
-    return std.fmt.allocPrint(a, "exact={s}|short_refused={s}|long_refused={s}|after={s}|rows={s}", .{
+    return a.print("exact={s}|short_refused={s}|long_refused={s}|after={s}|rows={s}", .{
         exact, short_refused, long_refused, after, written,
     });
 }
 
 /// The row count read back, or the name of the error the read failed with.
 fn countRows(a: std.mem.Allocator, drv: Driver, table: []const u8) ![]const u8 {
-    const stmt = try std.fmt.allocPrint(a, "SELECT COUNT(*) FROM {s}", .{table});
+    const stmt = try a.print("SELECT COUNT(*) FROM {s}", .{table});
     var rows = drv.query(stmt, &.{}) catch |err| return @errorName(err);
     defer rows.deinit();
     const row = rows.next() orelse return "no-row";
     const n = row.getInt(0) orelse return "no-value";
-    return std.fmt.allocPrint(a, "{d}", .{n});
+    return a.print("{d}", .{n});
 }
 
 /// `Restore` is documented as "true when a row was restored", and its statement
@@ -1355,7 +1355,7 @@ fn caseRestoreLiveRow(a: std.mem.Allocator, drv: Driver) ![]const u8 {
         break :blk try db.Restore(created.id + 100_000);
     };
 
-    return std.fmt.allocPrint(a, "live={}|trashed={}|missing={}", .{ live, trashed, missing });
+    return a.print("live={}|trashed={}|missing={}", .{ live, trashed, missing });
 }
 
 // ------------------------------------------------------------------

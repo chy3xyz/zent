@@ -45,6 +45,7 @@ fn capitalize(comptime s: []const u8) []const u8 {
 fn EdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     _ = infos;
     comptime {
+        @setEvalBranchQuota(1000000);
         const edge_count = info.edges.len;
         var field_names: [edge_count][:0]const u8 = undefined;
         var field_types: [edge_count]type = undefined;
@@ -53,7 +54,7 @@ fn EdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
         const OrderFn = *const fn (bool) sql.Order;
 
         for (info.edges, 0..) |edge, i| {
-            field_names[i] = byEdgeName(edge.name);
+            field_names[i] = byEdgeName(info.name, edge.name);
             field_types[i] = OrderFn;
             field_attrs[i] = .{ .default_value_ptr = null, .@"comptime" = false, .@"align" = @alignOf(OrderFn) };
         }
@@ -62,16 +63,24 @@ fn EdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
     }
 }
 
-fn byEdgeName(comptime edge_name: []const u8) [:0]const u8 {
+fn byEdgeName(comptime entity_name: []const u8, comptime edge_name: []const u8) [:0]const u8 {
     comptime {
-        var buf: [256:0]u8 = undefined;
+        // An empty edge name reads past the buffer below; fail with the entity
+        // and edge named instead of a comptime out-of-bounds panic.
+        if (edge_name.len == 0)
+            @compileError("zent: edge with an empty name on entity '" ++ entity_name ++ "' cannot derive its 'by<Edge>Count' order-term name");
         const prefix = "by";
         const suffix = "Count";
+        const len = prefix.len + edge_name.len + suffix.len;
+        // The fixed buffer holds 255 bytes + the NUL; reject the overflow with
+        // a message that names the entity and edge, not an array-index panic.
+        if (len > 255)
+            @compileError("zent: order-term name 'by" ++ edge_name ++ "Count' for edge '" ++ edge_name ++ "' on entity '" ++ entity_name ++ "' exceeds the 255-byte comptime name buffer; shorten the edge name");
+        var buf: [256:0]u8 = undefined;
         @memcpy(buf[0..prefix.len], prefix);
         buf[prefix.len] = std.ascii.toUpper(edge_name[0]);
         @memcpy(buf[prefix.len + 1 .. prefix.len + 1 + edge_name.len - 1], edge_name[1..]);
-        @memcpy(buf[prefix.len + 1 + edge_name.len - 1 .. prefix.len + 1 + edge_name.len - 1 + suffix.len], suffix);
-        const len = prefix.len + 1 + edge_name.len - 1 + suffix.len;
+        @memcpy(buf[prefix.len + 1 + edge_name.len - 1 .. len], suffix);
         buf[len] = 0;
         return buf[0..len :0];
     }
@@ -80,12 +89,13 @@ fn byEdgeName(comptime edge_name: []const u8) [:0]const u8 {
 /// Instantiate edge order terms.
 fn makeEdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) EdgeOrderTerms(infos, info) {
     comptime {
+        @setEvalBranchQuota(1000000);
         var result: EdgeOrderTerms(infos, info) = undefined;
         for (info.edges) |edge| {
             const target_info = edgeTargetInfo(infos, info, edge);
             const step = buildEdgeStep(edge, info, target_info);
 
-            const name = byEdgeName(edge.name);
+            const name = byEdgeName(info.name, edge.name);
 
             @field(result, name) = struct {
                 fn orderFn(desc: bool) sql.Order {
@@ -103,6 +113,11 @@ fn makeEdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo)
 
 /// Client for a single entity type.
 pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
+    // The per-entity type fan-out below (Entity + five builders + predicates +
+    // edge orders + meta) is O(fields + edges) comptime work per entity, and
+    // the root Client instantiates it once per graph entry — the default 1000
+    // branch quota breaks on medium graphs before this raises it.
+    @setEvalBranchQuota(1000000);
     const Entity = EntityGen(infos, info);
     const CreateBuilder = CreateGen(infos, info, Entity);
     const BulkInsertBuilder = BulkInsertGen(infos, info, Entity);
@@ -294,6 +309,17 @@ const toSnakeCase = @import("graph.zig").toSnakeCase;
 
 fn structFieldName(comptime name: []const u8) [:0]const u8 {
     comptime {
+        // Snake-casing can grow the name (one `_` per interior capital), so
+        // measure the derived length before writing the fixed buffer — a
+        // name that fits 255 but grows past it must fail naming the entity,
+        // not panic with a comptime out-of-bounds.
+        var derived_len: usize = 0;
+        for (name, 0..) |c, i| {
+            if (std.ascii.isUpper(c) and i > 0) derived_len += 1;
+            derived_len += 1;
+        }
+        if (derived_len > 255)
+            @compileError("zent: entity name '" ++ name ++ "' derives a client field name longer than the 255-byte comptime name buffer; shorten the entity name");
         var buf: [256:0]u8 = undefined;
         var len: usize = 0;
         for (name, 0..) |c, i| {
@@ -389,6 +415,10 @@ pub fn TxClient(comptime infos: []const TypeInfo) type {
 /// value may be passed to `DeinitClient`. Copies made afterwards borrow.
 pub fn Client(comptime infos: []const TypeInfo) type {
     comptime {
+        // One EntityClient instantiation per graph entry plus the @Struct
+        // assembly below: O(entities) comptime work that blows the default
+        // 1000 branch quota on medium graphs.
+        @setEvalBranchQuota(1000000);
         const total_fields = 5 + infos.len; // allocator, driver, logger, interceptors, owns_interceptors, + one per entity
         var field_names: [total_fields][:0]const u8 = undefined;
         var field_types: [total_fields]type = undefined;

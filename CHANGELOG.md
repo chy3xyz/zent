@@ -4,6 +4,90 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`id.uuidv4` was neither random nor thread-safe.** The CSPRNG was seeded
+  from three ASLR addresses plus a constant (reproducible where ASLR is off or
+  addresses are guessable), and the generator itself was one unsynchronized
+  static — two threads calling `uuidv4`/`uuidv7` raced its state (UB). Each
+  thread now gets a `threadlocal` ChaCha instance seeded from OS entropy
+  (`getentropy` on macOS, `getrandom` — libc or raw syscall — on Linux,
+  `/dev/urandom` as the last resort; entropy failure is a loud `@panic`,
+  signatures unchanged). Concurrent-smoke test included; compile-checked for
+  glibc ≥2.25, older glibc (raw-syscall path) and musl.
+- **`pool.borrow` raced its own failure bookkeeping.** `exhausted_total += 1`
+  and the `last_attempt_error` read ran *after* the mutex was dropped, so two
+  concurrent failed borrows raced the counter (`stats()` reads it under the
+  lock) and the reason, contradicting the field docs. Both writes now happen
+  inside the same O(1) critical section; ordering of the tail unchanged.
+- **The global hook registry published its pointer with `.monotonic`.**
+  `registerGlobal` builds the `HookChain` on the calling thread and hands the
+  pointer out; `.monotonic` gives readers no happens-before, so on weakly
+  ordered targets a reader could observe a partially built chain. Publish is
+  now `.release`, consume `.acquire` (the `cmpxchgWeak` in `unregisterGlobal`
+  gains the matching success order).
+- **MySQL `connectOptsSslSocket` leaked the `MYSQL` handle** when one of the
+  SSL option requirements (`sslmode=required`/`verify_ca`) failed after
+  `mysql_init` — the retry loop in a pool would leak one handle per attempt.
+  One `errdefer mysql_close` now covers every failure after init (including
+  the `real_connect` branch, which drops its now-redundant `defer`).
+- **`beginTx` could strand an open transaction on OOM** (all three drivers):
+  `BEGIN` ran before the `Tx` allocation, so an OOM left the connection in a
+  transaction nobody held a handle to. The allocation now happens first; after
+  `BEGIN` there is no failure path left.
+- **`logger.nowUs` measured durations on the wall clock** — an NTP step turned
+  `nowUs() - start` negative and wrapped the `u64` logs. It now reads
+  `CLOCK_MONOTONIC` (via `driver.monotonicNs`, one definition); the eight
+  duration call sites are unchanged.
+- **`examples/advanced` passed seconds where the outbox wants milliseconds**,
+  putting `created_at` ~55 years in the past and making `requeueStale`
+  instantly re-claim rows. The example now reads wall-clock milliseconds the
+  same way `outbox.nowMs` does.
+
+### Changed
+
+- **comptime quota hardening.** The `@Struct` constructors in `codegen`
+  (`PlainFields`/`EdgesType*`/`LightEntity`/`EntityFields`/`Entity`), the
+  `Client`/`EntityClient` entry points, `lowerHasEdge`'s blocks,
+  `buildEdgeStep`/`fieldColumns`/`getEdgeFKColumn`, the migrate
+  `tableFromTypeInfo*` pair and the `core/schema.zig` mixin merges all ran on
+  the default 1000-branch budget while doing O(entities × edges) byte
+  comparisons — mid-sized graphs could hit a random "quota exceeded". They now
+  size their budgets explicitly (same order as `buildGraph`'s existing pins),
+  `lowerHasEdge` builds its edge→step table once instead of twice, and a new
+  stress test instantiates `Client` + `Entity` + predicates over a 300-entity
+  graph (which drove out two more budget gaps in `addEdgeFields` and
+  `buildIncomingTable`).
+- **Derived names fail by name.** The four `[256:0]u8` comptime name buffers
+  (predicate/edge-predicate/by-edge/struct-field names) now `@compileError`
+  with the offending entity/field/edge on empty or overlong input, instead of
+  an out-of-bounds panic deep in the buffer write; `toSnakeCase` and
+  `generateIndexName` write into fixed buffers instead of per-character `++`
+  (byte-for-byte parity pinned by table tests), and the O(n²) `list ++ item`
+  accumulations in `buildGraph`/`resolveGraphEdges`/`buildIncomingTable`/
+  `addEdgeFieldsToAll` became exact-size array writes.
+- **Driver accessor cleanup.** MySQL and PostgreSQL row accessors share one
+  `textOf` helper (behaviour byte-identical; PG `getBool` additionally guards
+  an empty text before indexing it, matching what the old NUL-read did).
+- **`@branchHint`/`inline fn` on measured hot paths.** Cache hit/miss and
+  taken-entry scans, pool failure paths and SQLite/PG/MySQL scan mismatches
+  get cold/likely hints (0.17 only allows them as the first statement of a
+  function or conditional branch — see the gotchas table); small per-row
+  helpers (`currentRow`, `markDead`, `requireColumns`, `sqlEql`, `cacheable`,
+  `ltrim`) are `inline fn`. `bash scripts/bench-compare.sh` stays within its
+  canary; `cache/hit`, `upsert/*` and `scan/*` sit at or under baseline.
+- **`deinit` poisons more owners** (`self.* = undefined`): the seven
+  `sql/builder.zig` builders, `HookChain`, `InterceptorChain` and `TestEnv`.
+  `StoreEnv` deliberately keeps its move-out guard un-poisoned (a second
+  `deinit` must stay a well-defined no-op there).
+- **`bench` uses `std.heap.SafeAllocator`** (0.17.0's replacement for the
+  deprecated `DebugAllocator`); `deinit` asserts zero leaks as before.
+  Absolute ns/op can shift with the stronger checking — comparisons are
+  relative via `scripts/bench-compare.sh`.
+- **`std.fmt.allocPrint`/`allocPrintSentinel` migrated to
+  `Allocator.print`/`printSentinel`** (76 sites; both wrappers are deprecated
+  in 0.17.0).
+
 ## [0.82.0] - 2026-10-04
 
 ### Changed

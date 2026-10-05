@@ -84,6 +84,7 @@ pub const HookChain = struct {
 
     pub fn deinit(self: *HookChain) void {
         self.hooks.deinit(self.allocator);
+        self.* = undefined;
     }
 
     /// Add a hook to the chain.
@@ -131,14 +132,17 @@ pub const HookChain = struct {
 var global_registry: std.atomic.Value(?*HookChain) = std.atomic.Value(?*HookChain).init(null);
 
 /// Register a global hook chain that fires for every table/operation.
-/// Safe to call at any time (atomic store); the typical pattern is a single
+/// Safe to call at any time (release store); the typical pattern is a single
 /// registration during startup.
 ///
 /// Lifetime contract: the registry borrows `chain`, so the caller must keep
 /// it alive while registered and call `unregisterGlobal` before releasing it —
 /// otherwise `globalBefore`/`globalAfter` would run hooks out of freed memory.
 pub fn registerGlobal(chain: *HookChain) void {
-    global_registry.store(chain, .monotonic);
+    // Release pairs with the acquire loads in globalBefore/globalAfter: the
+    // chain is built on the calling thread, and a monotonic store would let a
+    // concurrent reader observe a half-initialized chain.
+    global_registry.store(chain, .release);
 }
 
 /// Clear the global chain, but only when `chain` is the one currently
@@ -149,8 +153,9 @@ pub fn unregisterGlobal(chain: *HookChain) void {
     var expected: ?*HookChain = chain;
     while (true) {
         // cmpxchgWeak returns `?T` where T is already `?*HookChain`, so the
-        // unwrapped payload is the value that was actually stored.
-        if (global_registry.cmpxchgWeak(expected, null, .monotonic, .monotonic)) |actual| {
+        // unwrapped payload is the value that was actually stored. The
+        // success order is release to keep the publish/acquire contract.
+        if (global_registry.cmpxchgWeak(expected, null, .release, .monotonic)) |actual| {
             if (actual != chain) return; // a different chain is registered now
             expected = actual;
         } else return; // swapped out
@@ -159,14 +164,14 @@ pub fn unregisterGlobal(chain: *HookChain) void {
 
 /// Execute all global before-hooks. Called by codegen before per-table hooks.
 pub fn globalBefore(ctx: *HookContext) HookError!void {
-    if (global_registry.load(.monotonic)) |c| {
+    if (global_registry.load(.acquire)) |c| {
         try c.executeBefore(ctx);
     }
 }
 
 /// Execute all global after-hooks. Called by codegen after per-table hooks.
 pub fn globalAfter(ctx: *HookContext) void {
-    if (global_registry.load(.monotonic)) |c| {
+    if (global_registry.load(.acquire)) |c| {
         c.executeAfter(ctx);
     }
 }

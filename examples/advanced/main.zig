@@ -43,7 +43,7 @@ pub fn main() !void {
             _ = try b.setFieldValue("user_email", email);
             _ = try b.setFieldValue("code", code);
             _ = try b.setFieldValue("amount", 100);
-            const api_key = try std.fmt.allocPrint(alloc2, "sk-{s}", .{code});
+            const api_key = try alloc2.print("sk-{s}", .{code});
             defer alloc2.free(api_key);
             _ = try b.setFieldValue("api_key", api_key);
             var saved = try b.Save();
@@ -85,7 +85,15 @@ pub fn main() !void {
         const Outbox = zent.outbox.Outbox(infos, zent.outbox.info);
         var tx = try zent.codegen.beginTx(infos, client);
         defer tx.deinit();
-        const now: i64 = @intCast(@divFloor(zent.sql_logger.nowUs(), std.time.us_per_s));
+        // Outbox stamps (`created_at` / `claimed_at`) are wall-clock epoch
+        // **milliseconds** — the `now_ms` domain outbox.zig documents. Its own
+        // `nowMs()` is not exported, so read the same wall clock the same way
+        // here. `sql_logger.nowUs` would be wrong for this: it is monotonic
+        // duration time and carries no relation to the epoch.
+        var tv: std.c.timeval = undefined;
+        if (std.c.gettimeofday(&tv, null) != 0) return error.ClockUnavailable;
+        const now: i64 = @as(i64, @intCast(tv.sec)) * std.time.ms_per_s +
+            @divTrunc(@as(i64, @intCast(tv.usec)), std.time.us_per_ms);
         _ = try Outbox.enqueue(tx.client, now, .{
             .aggregate_type = "adv_order",
             .aggregate_id = 1,

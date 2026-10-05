@@ -43,11 +43,11 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
         /// LRU order: index 0 is MRU, index len-1 is LRU.
         order: [capacity]usize = undefined,
 
-        fn sqlEql(e: *const Entry, sql: []const u8) bool {
+        inline fn sqlEql(e: *const Entry, sql: []const u8) bool {
             return e.sql_len == sql.len and std.mem.eql(u8, e.sql_buf[0..e.sql_len], sql);
         }
 
-        fn cacheable(sql: []const u8) bool {
+        inline fn cacheable(sql: []const u8) bool {
             return sql.len <= max_sql_len;
         }
 
@@ -63,7 +63,13 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
             // Linear scan (small capacity; fine for ≤ ~64 entries). The length
             // check short-circuits almost all byte compares.
             for (self.entries[0..self.len], 0..) |*e, i| {
-                if (!e.taken and sqlEql(e, sql)) return i;
+                if (e.taken) {
+                    // Checked-out entries are rare: at most one per in-flight
+                    // Rows iterator.
+                    @branchHint(.cold);
+                    continue;
+                }
+                if (sqlEql(e, sql)) return i;
             }
             return null;
         }
@@ -112,15 +118,17 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
             deinitFn: anytype,
         ) !Prepared {
             if (self.findEntry(sql)) |i| {
+                @branchHint(.likely);
                 self.moveToFront(i);
                 return .{ .stmt = self.entries[i].stmt, .cached = true };
+            } else {
+                @branchHint(.cold);
+                // Cache miss — prepare.
+                const stmt = try prepareFn(prepareCtx, sql);
+                if (!cacheable(sql)) return .{ .stmt = stmt, .cached = false };
+                const inserted = self.insert(sql, stmt, deinitCtx, deinitFn);
+                return .{ .stmt = stmt, .cached = inserted };
             }
-
-            // Cache miss — prepare.
-            const stmt = try prepareFn(prepareCtx, sql);
-            if (!cacheable(sql)) return .{ .stmt = stmt, .cached = false };
-            const inserted = self.insert(sql, stmt, deinitCtx, deinitFn);
-            return .{ .stmt = stmt, .cached = inserted };
         }
 
         /// Take a cached statement for exclusive use or prepare a new one.
@@ -134,10 +142,13 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
             prepareFn: anytype,
         ) !Taken {
             if (self.findEntry(sql)) |i| {
+                @branchHint(.likely);
                 self.entries[i].taken = true;
                 return .{ .stmt = self.entries[i].stmt, .slot = i };
+            } else {
+                @branchHint(.cold);
+                return .{ .stmt = try prepareFn(ctx, sql), .slot = null };
             }
-            return .{ .stmt = try prepareFn(ctx, sql), .slot = null };
         }
 
         /// Return a statement taken via `takeOrPrepare`, making its slot
@@ -203,7 +214,7 @@ pub fn isDDL(sql: []const u8) bool {
     return ddl_keywords.has(first_word);
 }
 
-fn ltrim(s: []const u8, chars: []const u8) []const u8 {
+inline fn ltrim(s: []const u8, chars: []const u8) []const u8 {
     var i: usize = 0;
     while (i < s.len and std.mem.indexOfScalar(u8, chars, s[i]) != null) : (i += 1) {}
     return s[i..];

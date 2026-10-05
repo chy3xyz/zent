@@ -175,7 +175,7 @@ pub fn run(
         if (try checkText(gpa, drv, path, text, params.items, out, err, &stats) == .aborted) return exit_unusable;
     }
     for (sqls.items, 1..) |text, index| {
-        const label = try std.fmt.allocPrint(gpa, "--sql#{d}", .{index});
+        const label = try gpa.print("--sql#{d}", .{index});
         defer gpa.free(label);
         if (try checkText(gpa, drv, label, text, params.items, out, err, &stats) == .aborted) return exit_unusable;
     }

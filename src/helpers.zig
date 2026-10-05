@@ -77,6 +77,9 @@ pub fn StoreEnv(comptime Driver: type, comptime Infos: anytype) type {
                 self.allocator.destroy(self.driver_ptr);
                 self.owns_driver = false;
             }
+            // Deliberately no `self.* = undefined` poison: the `owns_driver`
+            // flag is a move-out guard that keeps a second deinit a defined
+            // no-op, so the struct stays readable after release.
         }
 
         /// Raw driver access (ad-hoc SQL, migrations, testing).
@@ -119,6 +122,7 @@ pub fn TestEnv(comptime schemas: anytype) type {
 
         pub fn deinit(self: *Self) void {
             self.store.deinit();
+            self.* = undefined;
         }
     };
 }
@@ -346,7 +350,7 @@ test "PooledEnv opens, migrates and serves queries via the pool driver" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pool.db", .{tmp.sub_path});
+    const path = try allocator.print(".zig-cache/tmp/{s}/pool.db", .{tmp.sub_path});
     defer allocator.free(path);
 
     var env = try PooledEnv(sql_sqlite.SQLiteDriver, TestInfos).open(allocator, path, .{
@@ -378,9 +382,9 @@ test "ShardedEnv routes tenants and rebalances idempotently" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path_a = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/shard_a.db", .{tmp.sub_path});
+    const path_a = try allocator.print(".zig-cache/tmp/{s}/shard_a.db", .{tmp.sub_path});
     defer allocator.free(path_a);
-    const path_b = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/shard_b.db", .{tmp.sub_path});
+    const path_b = try allocator.print(".zig-cache/tmp/{s}/shard_b.db", .{tmp.sub_path});
     defer allocator.free(path_b);
 
     var env = try ShardedEnv(sql_sqlite.SQLiteDriver, TestInfos).open(allocator, &.{ path_a, path_b });
@@ -453,9 +457,9 @@ test "ShardedEnv.open cleans up earlier shards when a later shard fails to open"
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path_a = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/flaky_a.db", .{tmp.sub_path});
+    const path_a = try allocator.print(".zig-cache/tmp/{s}/flaky_a.db", .{tmp.sub_path});
     defer allocator.free(path_a);
-    const path_b = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/flaky_b.db", .{tmp.sub_path});
+    const path_b = try allocator.print(".zig-cache/tmp/{s}/flaky_b.db", .{tmp.sub_path});
     defer allocator.free(path_b);
 
     // First shard opens for real; the second fails inside Driver.open.

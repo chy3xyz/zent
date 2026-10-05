@@ -17,7 +17,7 @@
 //! var scope = try zent.scope.forClient(infos, "order", &client.order, .{ .alias = "o" });
 //! defer scope.deinit();
 //!
-//! var buf = std.ArrayList(u8).init(allocator);
+//! var buf = std.array_list.Managed(u8).init(allocator);
 //! try buf.appendSlice("SELECT o.id FROM order o WHERE o.amount > ?");
 //! try scope.write(buf.writer(testing.allocator), true);  // safe to call unconditionally
 //! ```
@@ -211,7 +211,7 @@ pub fn writeClause(fragment: sql.OwnedQuery, writer: anytype, has_where: bool) !
 /// the failure mode this API exists to remove.
 pub fn withClause(fragment: sql.OwnedQuery, allocator: std.mem.Allocator, head: []const u8, has_where: bool) ![]u8 {
     if (fragment.sql.len == 0) return allocator.dupe(u8, head);
-    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+    return allocator.print("{s}{s}{s}", .{
         head,
         if (has_where) " AND " else " WHERE ",
         fragment.sql,

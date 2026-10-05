@@ -539,7 +539,7 @@ fn parseComparison(ctx: *ParserContext) ParseError!sql.Predicate {
                 .string => |s| s,
                 else => return ParseError.MismatchedTypes,
             };
-            const wrapped = try std.fmt.allocPrint(ctx.allocator, "%{s}%", .{s});
+            const wrapped = try ctx.allocator.print("%{s}%", .{s});
             return sql.Like(field, .{ .string = wrapped });
         },
         .kw_is => {
