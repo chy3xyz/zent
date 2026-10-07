@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.83.1] - 2026-10-07
+
 ### Changed
 
 - **`std.builtin.*` spellings migrated to `std.lang.*`** (0.17.0 deprecates the
