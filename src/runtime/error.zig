@@ -47,7 +47,7 @@ pub fn formatError(err: anyerror) []const u8 {
 }
 
 /// Wrapper that logs and returns the error.
-pub fn logAndReturn(comptime src: std.builtin.SourceLocation, err: anyerror) anyerror {
+pub fn logAndReturn(comptime src: std.lang.SourceLocation, err: anyerror) anyerror {
     zent_log.err("zent error at {s}:{d}: {s}", .{ src.file, src.line, @errorName(err) });
     return err;
 }

@@ -257,7 +257,7 @@ pub fn scanRowLenientWithArena(comptime T: type, allocator: std.mem.Allocator, r
 
 /// Number of result-set columns a positional scan of `T` consumes: the struct
 /// fields minus the two synthetic ones (`edges`, `json_arena`).
-fn dataFieldCount(comptime s: std.builtin.Type.Struct) usize {
+fn dataFieldCount(comptime s: std.lang.Type.Struct) usize {
     var n: usize = 0;
     for (s.field_names) |fname| {
         if (std.mem.eql(u8, fname, "edges")) continue;

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`std.builtin.*` spellings migrated to `std.lang.*`** (0.17.0 deprecates the
+  former, removal slated for 0.18): the ten `std.builtin.Type.Struct.FieldAttributes`
+  annotations in the codegen/scan layer, `std.builtin.SourceLocation` in
+  `runtime/error.zig`, and `builtin.os.tag` in `core/id.zig` (the deprecated
+  top-level `os` constant) now use `std.lang` / `builtin.target.os`. The types
+  are identical — rename only, no behaviour change.
+
 ## [0.83.0] - 2026-10-05
 
 ### Fixed

@@ -14,7 +14,7 @@ fn PlainFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
         // arena-based JSON ownership contract as full entities.
         var field_names: [info.fields.len + 1][:0]const u8 = undefined;
         var field_types: [info.fields.len + 1]type = undefined;
-        var field_attrs: [info.fields.len + 1]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var field_attrs: [info.fields.len + 1]std.lang.Type.Struct.FieldAttributes = undefined;
         for (info.fields, 0..) |f, i| {
             const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
             field_names[i] = (f.name)[0..f.name.len :0];
@@ -51,7 +51,7 @@ fn EdgesTypeShallow(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         }
         var field_names: [info.edges.len][:0]const u8 = undefined;
         var field_types: [info.edges.len]type = undefined;
-        var field_attrs: [info.edges.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var field_attrs: [info.edges.len]std.lang.Type.Struct.FieldAttributes = undefined;
         for (info.edges, 0..) |e, i| {
             const target_info = edgeTargetInfo(infos, info, e);
             const TargetEntity = PlainFields(infos, target_info);
@@ -80,7 +80,7 @@ pub fn LightEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo) ty
         const fields_info = @typeInfo(Plain).@"struct";
         var field_names: [fields_info.field_names.len + 1][:0]const u8 = undefined;
         var field_types: [fields_info.field_names.len + 1]type = undefined;
-        var field_attrs: [fields_info.field_names.len + 1]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var field_attrs: [fields_info.field_names.len + 1]std.lang.Type.Struct.FieldAttributes = undefined;
         for (fields_info.field_names, fields_info.field_types, 0..) |fname, ftype, i| {
             field_names[i] = fname;
             field_types[i] = ftype;
@@ -114,7 +114,7 @@ fn EdgesType(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
         }
         var field_names: [info.edges.len][:0]const u8 = undefined;
         var field_types: [info.edges.len]type = undefined;
-        var field_attrs: [info.edges.len]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var field_attrs: [info.edges.len]std.lang.Type.Struct.FieldAttributes = undefined;
         for (info.edges, 0..) |e, i| {
             const target_info = edgeTargetInfo(infos, info, e);
             const TargetEntity = LightEntity(infos, target_info);
@@ -139,7 +139,7 @@ fn EntityFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type 
         const edges_default: ET = .{};
         var field_names: [info.fields.len + 1][:0]const u8 = undefined;
         var field_types: [info.fields.len + 1]type = undefined;
-        var field_attrs: [info.fields.len + 1]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var field_attrs: [info.fields.len + 1]std.lang.Type.Struct.FieldAttributes = undefined;
         for (info.fields, 0..) |f, i| {
             const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
             field_names[i] = (f.name)[0..f.name.len :0];
@@ -202,7 +202,7 @@ pub fn Entity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
         const extra_count = 1 + @as(usize, @intFromBool(needs_arena));
         var field_names: [info.fields.len + extra_count][:0]const u8 = undefined;
         var field_types: [info.fields.len + extra_count]type = undefined;
-        var field_attrs: [info.fields.len + extra_count]std.builtin.Type.Struct.FieldAttributes = undefined;
+        var field_attrs: [info.fields.len + extra_count]std.lang.Type.Struct.FieldAttributes = undefined;
         for (info.fields, 0..) |f, i| {
             const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
             field_names[i] = (f.name)[0..f.name.len :0];

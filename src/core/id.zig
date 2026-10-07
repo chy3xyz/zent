@@ -36,9 +36,9 @@ fn getRandom() std.Random {
 /// Fills `buf` with OS entropy and panics if every source fails — a UUID
 /// generator must never silently fall back to a predictable seed.
 fn fillEntropy(buf: []u8) void {
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         if (getentropy(buf.ptr, buf.len) == 0) return;
-    } else if (builtin.os.tag == .linux and fillWithGetrandom(buf)) {
+    } else if (builtin.target.os.tag == .linux and fillWithGetrandom(buf)) {
         return;
     }
     fillWithUrandom(buf) catch @panic("OS entropy unavailable");
