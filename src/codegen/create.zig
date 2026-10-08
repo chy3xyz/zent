@@ -691,6 +691,18 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
 pub fn validateSqlValue(comptime field: FieldInfo, value: sql.Value) !void {
     if (value == .null) return; // null is valid for optional fields
+    // A declared `VarChar(n)` is the column's ceiling as well as its DDL
+    // width (`VARCHAR(n)` on MySQL). Enforce it on the write path so an
+    // over-long string is a named error here instead of a server-side
+    // failure (strict mode) or a silent truncation (permissive mode).
+    if (field.max_length) |max| {
+        if (field.field_type == .string) {
+            switch (value) {
+                .string => |s| if (s.len > max) return error.ValidationFailed,
+                else => {},
+            }
+        }
+    }
     for (field.validators) |v| {
         switch (v) {
             .positive => {
@@ -1666,6 +1678,45 @@ test "custom validator uses wildcard matching" {
     try validateSqlValue(info.fields[2], .{ .string = "AB9X" });
     try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[2], .{ .string = "AB99X" }));
     try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[2], .{ .string = "A9X" }));
+}
+
+test "validateSqlValue enforces a declared VarChar ceiling" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Profile = Schema("ProfileVarChar", .{
+        .fields = &.{
+            field.String("bio").VarChar(120),
+            field.String("nick"),
+        },
+    });
+    const info = comptime fromSchema(Profile);
+    try std.testing.expectEqual(@as(?usize, 120), info.fields[1].max_length);
+
+    // At the ceiling: accepted. Over it: the named validation error — the
+    // same failure a validator reports, no new error member.
+    const at_limit: [120]u8 = @splat('x');
+    const over_limit: [121]u8 = @splat('x');
+    try validateSqlValue(info.fields[1], .{ .string = &at_limit });
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(info.fields[1], .{ .string = &over_limit }));
+
+    // An undeclared field is not length-checked: whatever length passes.
+    try validateSqlValue(info.fields[2], .{ .string = &over_limit });
+
+    // NULL stays valid for the optional case, ceiling or not.
+    try validateSqlValue(info.fields[1], .null);
+
+    // A declared ceiling coexists with validators: both must pass.
+    const Capped = Schema("Capped", .{
+        .fields = &.{
+            field.String("slug").VarChar(10).NotEmpty(),
+        },
+    });
+    const capped_info = comptime fromSchema(Capped);
+    try validateSqlValue(capped_info.fields[1], .{ .string = "abc" });
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(capped_info.fields[1], .{ .string = "" }));
+    try std.testing.expectError(error.ValidationFailed, validateSqlValue(capped_info.fields[1], .{ .string = "0123456789A" }));
 }
 
 test "create with edges schema setFieldValue compiles" {

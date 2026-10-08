@@ -1885,6 +1885,14 @@ pub const ColumnDef = struct {
     /// Logical schema type. When present, migration SQL resolves it through the
     /// active dialect instead of reusing the SQLite-oriented `sql_type` value.
     logical_type: ?field_mod.FieldType = null,
+    /// DDL spelling for a string column that declared `VarChar(n)` —
+    /// comptime-formatted (`"VARCHAR(120)"`), because `columnSQLType` is a
+    /// runtime fn returning a borrowed slice it cannot print into.
+    /// `columnSQLType` uses it only for a MySQL dialect (replacing the
+    /// default `VARCHAR(255)`); PostgreSQL and SQLite keep the `TEXT` the
+    /// `.string` family already resolves to there. null for every column
+    /// that declared no length.
+    varchar_sql: ?[]const u8 = null,
     primary_key: bool = false,
     not_null: bool = false,
     unique: bool = false,
@@ -1894,6 +1902,14 @@ pub const ColumnDef = struct {
 
 fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
     if (column.logical_type) |logical_type| {
+        // A declared `VarChar(n)` replaces the default VARCHAR(255) on MySQL
+        // only; every other dialect — and every undeclared column — resolves
+        // through `sqlType` byte-for-byte unchanged.
+        if (logical_type == .string) {
+            if (column.varchar_sql) |varchar| {
+                if (dialect.kind() == .mysql) return varchar;
+            }
+        }
         return switch (logical_type) {
             inline else => |field_type| field_mod.sqlType(field_type, dialect),
         };
@@ -2011,6 +2027,7 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 .name = f.column_name,
                 .sql_type = f.sql_type,
                 .logical_type = f.field_type,
+                .varchar_sql = if (f.max_length) |n| field_mod.varCharSQL(n) else null,
                 .primary_key = f.is_id,
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
@@ -2558,6 +2575,7 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
                 .name = f.column_name,
                 .sql_type = f.sql_type,
                 .logical_type = f.field_type,
+                .varchar_sql = if (f.max_length) |n| field_mod.varCharSQL(n) else null,
                 .primary_key = f.is_id,
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
@@ -3715,6 +3733,7 @@ fn alterTableAddColumnSQL(
         .name = col.name,
         .sql_type = col.sql_type,
         .logical_type = col.logical_type,
+        .varchar_sql = col.varchar_sql,
         .not_null = col.not_null,
         .default_value = col.default_value,
     };
@@ -4607,14 +4626,27 @@ fn splitSqlStatements(allocator: std.mem.Allocator, sql: []const u8) ![]const []
         } else if (c == ';') {
             const stmt = std.mem.trim(u8, sql[start..i], " \t\r\n");
             if (stmt.len > 0) {
-                try statements.append(try allocator.dupe(u8, stmt));
+                // Copy first, then append — not `append(try dupe(...))`. An
+                // `append` OOM after a successful `dupe` would leak the copy,
+                // because the errdefer above frees only what is already in
+                // the list. The inline errdefer covers exactly that window;
+                // on success it is discarded, and the top errdefer then owns
+                // the copy like every other list item (no double free: a
+                // failed append never inserted it).
+                const copy = try allocator.dupe(u8, stmt);
+                errdefer allocator.free(copy);
+                try statements.append(copy);
             }
             start = i + 1;
         }
     }
     const last = std.mem.trim(u8, sql[start..], " \t\r\n");
     if (last.len > 0) {
-        try statements.append(try allocator.dupe(u8, last));
+        // Same shape as the `;`-terminated branch above: the top errdefer
+        // owns the copy only once `append` succeeds.
+        const copy = try allocator.dupe(u8, last);
+        errdefer allocator.free(copy);
+        try statements.append(copy);
     }
     return statements.toOwnedSlice();
 }
@@ -4885,6 +4917,93 @@ test "TableDef from TypeInfo" {
     try std.testing.expectEqualStrings("TEXT", table.columns[1].sql_type);
     try std.testing.expectEqualStrings("age", table.columns[2].name);
     try std.testing.expectEqualStrings("INTEGER", table.columns[2].sql_type);
+}
+
+test "columnSQLType resolves a declared VarChar width per dialect" {
+    const declared = ColumnDef{ .name = "bio", .sql_type = "TEXT", .logical_type = .string, .varchar_sql = field_mod.varCharSQL(120) };
+    // MySQL: the declared width replaces the default.
+    try std.testing.expectEqualStrings("VARCHAR(120)", columnSQLType(declared, Dialect.mysql));
+    // PG/SQLite: the dialect split `.string` already had, unchanged.
+    try std.testing.expectEqualStrings("TEXT", columnSQLType(declared, Dialect.postgres));
+    try std.testing.expectEqualStrings("TEXT", columnSQLType(declared, Dialect.sqlite));
+
+    // Undeclared: byte-for-byte the old resolution everywhere.
+    const plain = ColumnDef{ .name = "nick", .sql_type = "TEXT", .logical_type = .string };
+    try std.testing.expectEqualStrings("VARCHAR(255)", columnSQLType(plain, Dialect.mysql));
+    try std.testing.expectEqualStrings("TEXT", columnSQLType(plain, Dialect.postgres));
+    try std.testing.expectEqualStrings("TEXT", columnSQLType(plain, Dialect.sqlite));
+
+    // A width is consumed only by the `.string` family (`VarChar` refuses to
+    // declare one elsewhere; this guards hand-built ColumnDef values).
+    const mismatched = ColumnDef{ .name = "body", .sql_type = "TEXT", .logical_type = .text, .varchar_sql = field_mod.varCharSQL(120) };
+    try std.testing.expectEqualStrings("TEXT", columnSQLType(mismatched, Dialect.mysql));
+}
+
+test "a schema-declared VarChar width reaches the DDL on MySQL only" {
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const graph = @import("../../codegen/graph.zig");
+
+    const Profile = schema("MigrateProfile", .{
+        .fields = &.{
+            field.String("bio").VarChar(120),
+            field.String("nick"),
+        },
+    });
+
+    // MySQL build: the declared width in the statement, the undeclared field
+    // still the default VARCHAR(255).
+    const mysql_info = comptime graph.fromSchemaDialect(Profile, Dialect.mysql);
+    const mysql_table = comptime tableFromTypeInfo(mysql_info);
+    const mysql_sql = try createTableSQL(mysql_table, Dialect.mysql);
+    defer std.heap.page_allocator.free(mysql_sql);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`bio` VARCHAR(120)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`nick` VARCHAR(255)") != null);
+
+    // PG/SQLite: both columns stay TEXT, no VARCHAR anywhere — the dialect
+    // split the undeclared default already had.
+    const pg_info = comptime graph.fromSchemaDialect(Profile, Dialect.postgres);
+    const pg_table = comptime tableFromTypeInfo(pg_info);
+    const pg_sql = try createTableSQL(pg_table, Dialect.postgres);
+    defer std.heap.page_allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"bio\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "VARCHAR") == null);
+
+    const sqlite_info = comptime graph.fromSchemaDialect(Profile, Dialect.sqlite);
+    const sqlite_table = comptime tableFromTypeInfo(sqlite_info);
+    const sqlite_sql = try createTableSQL(sqlite_table, Dialect.sqlite);
+    defer std.heap.page_allocator.free(sqlite_sql);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "\"bio\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "VARCHAR") == null);
+}
+
+test "a declared VarChar width compares drift-free against the database's varchar" {
+    // checkSchema compares `normalizeTypeForCompare(columnSQLType(col))`
+    // against `normalizeTypeForCompare(db answer)`. MySQL's
+    // information_schema.columns.data_type answers `varchar` — the storage
+    // name, without the length — so the declared width must vanish in
+    // normalization. It does, by the same parenthesis-stripping that made the
+    // old VARCHAR(255) compare clean; bare `varchar` is already the canonical
+    // form (`character varying` maps onto it), so no alias entry is needed
+    // and none is added.
+    var schema_buf: [128]u8 = undefined;
+    var db_buf: [128]u8 = undefined;
+
+    const schema_declared = try normalizeSqlType(field_mod.varCharSQL(120), &schema_buf, Dialect.mysql);
+    try std.testing.expectEqualStrings("varchar", schema_declared);
+
+    const schema_legacy = try normalizeSqlType("VARCHAR(255)", &db_buf, Dialect.mysql);
+    try std.testing.expectEqualStrings(schema_declared, schema_legacy);
+
+    var db_buf2: [128]u8 = undefined;
+    const db_answer = try normalizeSqlType("varchar", &db_buf2, Dialect.mysql);
+    try std.testing.expectEqualStrings(schema_declared, db_answer);
+
+    // PG/SQLite: the declared spelling stays TEXT on both sides of the same
+    // comparison.
+    var pg_buf: [128]u8 = undefined;
+    const pg_schema = try normalizeSqlType("TEXT", &pg_buf, Dialect.postgres);
+    try std.testing.expectEqualStrings("text", pg_schema);
 }
 
 test "Create table SQL" {

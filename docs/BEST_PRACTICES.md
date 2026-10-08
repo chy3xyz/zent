@@ -94,6 +94,17 @@ unique or defaulted. Existing MySQL tables created before v0.57.0 hold `TEXT`
 where the schema now says `VARCHAR(255)`; see `UPGRADING.md` §12 for the
 conversion and the length check to run first.
 
+**Since v0.86.0 `String` can declare the cap itself**: `field.String("sku").VarChar(120)`
+emits `VARCHAR(120)` on MySQL (still `TEXT` on PostgreSQL/SQLite — the width is
+MySQL's problem to solve) and makes the write path reject a longer value with
+`error.ValidationFailed` on **every** dialect, so the trap surfaces at the call
+site instead of at MySQL. Without `.VarChar`, behaviour is exactly as before
+(`VARCHAR(255)`, no check). `.VarChar` on anything but `field.String` is a
+compile error, and `checkSchema` compares widths the same way it always has
+(lengths never participate, so a `120` schema over a `255` column stays
+drift-free — fix the column with the `UPGRADING.md` §12 recipe if you want the
+width enforced server-side).
+
 ## 2. Memory contract (the one thing to get right)
 
 zent results are **owned**; the caller frees exactly once. Three ownership

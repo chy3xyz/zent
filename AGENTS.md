@@ -92,6 +92,7 @@ be set up at all on one server, create it only there and say why in a comment.
 | `std.ArrayList(T).init(alloc)` / `.append(x)` | `.empty` + explicit allocator arg |
 | `std.fmt.allocPrint(a, …)` / `allocPrintSentinel` | `a.print(…)` / `a.printSentinel(…)` — deprecated wrappers in 0.17.0; migrated wholesale in v0.83.0 |
 | `std.builtin.X` / `builtin.os` | `std.lang.X` / `builtin.target.os` — 0.17.0 deprecates the `std.builtin` spellings (removal slated for 0.18); types are identical, rename only. Migrated in v0.83.1 |
+| `"x" ** n` (string/array repetition) | **Gone in 0.17.0** — the `**` operator was removed; unspaced `**` parses as two derefs. Repeat with an explicit loop, `[n]u8 = @splat(x)`, or `std.mem.concat`/`writer.writeByteNTimes` |
 | `@branchHint` placement | Only valid as the **first statement of a function body or a conditional branch** (`if`/`else`/`orelse`/`catch` prong) — a bare statement mid-function or inside a labeled block is a compile error (`error: must appear as the first statement…`). To hint a loop's exit tail, extract it into a helper fn or put the hint on a conditional prong |
 | `std.mem.trimRight/trimLeft` | `std.mem.trimEnd/trimStart` |
 | `@typeInfo(T).fields` | `.field_names` / `.field_types` / `.field_attrs` + `attrs.defaultValue(ft)` |

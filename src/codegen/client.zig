@@ -270,6 +270,40 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
             deinitEntityList(infos, info, self.allocator, rows);
         }
 
+        /// The set the query builder's `AllOwned` answers (`QueryError` there
+        /// is private to the builder), restated so a drift on either side
+        /// fails the compile below instead of silently widening the entry.
+        const AllOwnedError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
+
+        /// Fetch every matching row with the page and its list under one
+        /// owner — the client-side form of `Query().AllOwned()`, for a call
+        /// site that holds only the client and no live builder to pair a
+        /// `deinitRows(&rows)` with:
+        ///
+        /// ```zig
+        /// var owned = try client.user.AllOwned(allocator);
+        /// defer owned.deinit();
+        /// ```
+        ///
+        /// `allocator` is the scan allocator the rows are read into (usually
+        /// the client's own); `OwnedRows.deinit` releases into that same one
+        /// and is safe to call twice. The query runs with this client's
+        /// privacy context, interceptor chain and logger — the contract
+        /// `Query()` sets up — and answers the same error set as the
+        /// builder's `AllOwned`.
+        pub fn AllOwned(self: Self, allocator: std.mem.Allocator) AllOwnedError!QueryBuilder.OwnedRows {
+            comptime {
+                const builder_set = @typeInfo(@typeInfo(@TypeOf(QueryBuilder.AllOwned)).@"fn".return_type.?).error_union.error_set;
+                if (builder_set != AllOwnedError)
+                    @compileError("EntityClient.AllOwned error set drifted from QueryBuilder.AllOwned (QueryError)");
+            }
+            var qb = QueryBuilder.init(allocator, self.driver, self.privacy_ctx);
+            defer qb.deinit();
+            qb.logger = self.logger;
+            qb.interceptors = self.interceptors;
+            return qb.AllOwned();
+        }
+
         /// Free rows returned by `QueryEdge(edge_name, …)`. They are the
         /// *target* entity, not this client's, so they need the target's
         /// `TypeInfo` — resolved here from the same graph through the same
@@ -1745,6 +1779,53 @@ test "deinitRow / deinitRows / deinitEdgeRows free a page in one call" {
         client.dr_user.deinitEdgeRows("cars", &rows);
         try std.testing.expectEqual(@as(usize, 0), rows.items.len);
     }
+}
+
+test "client AllOwned owns rows and list; deinit twice is a no-op" {
+    // The client-side form of `Query().AllOwned()`: no live builder to pair a
+    // `deinitRows` with, one `deinit` releases rows and list — which
+    // `std.testing.allocator` proves by failing the run on any leak or double
+    // free.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Item = Schema("OwnPageItem", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+    const graph = comptime buildGraph(&.{Item});
+    const infos = graph.types;
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const client = makeClient(infos, allocator, driver.asDriver());
+
+    for ([_][]const u8{ "first", "second" }) |name| {
+        var b = try client.own_page_item.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", name);
+        _ = try b.setFieldValue("age", 30);
+        var row = try b.Save();
+        defer client.own_page_item.deinitRow(&row);
+    }
+
+    var owned = try client.own_page_item.AllOwned(allocator);
+    try std.testing.expectEqual(@as(usize, 2), owned.items.items.len);
+    // No ORDER BY, so assert membership rather than position.
+    var names = std.StringHashMap(void).init(allocator);
+    defer names.deinit();
+    for (owned.items.items) |*e| try names.put(e.name, {});
+    try std.testing.expect(names.contains("first"));
+    try std.testing.expect(names.contains("second"));
+
+    owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owned.items.items.len);
+    // Safe twice: the second call finds an empty list, not a double free.
+    owned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owned.items.items.len);
 }
 
 test "UseInterceptor heap-allocates once and DeinitClient frees it" {

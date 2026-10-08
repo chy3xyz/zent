@@ -376,12 +376,10 @@ fn parseSortOptions(opts: anytype) !SortOptions {
     if (@typeInfo(T) == .@"struct") {
         var res = SortOptions{};
         if (@hasField(T, "sort_col")) {
-            const val = @field(opts, "sort_col");
-            if (@typeInfo(@TypeOf(val)) == .optional) {
-                res.sort_col = val;
-            } else {
-                res.sort_col = val;
-            }
+            // Was written `if (@typeInfo(@TypeOf(val)) == .optional) A else A`; both
+            // arms were the same assignment — a bare value coerces into the optional
+            // field just as an optional one does — see OPEN_ITEMS.
+            res.sort_col = @field(opts, "sort_col");
         }
         if (@hasField(T, "desc")) {
             res.desc = @field(opts, "desc");
@@ -700,20 +698,15 @@ fn parseCursorOptions(opts: anytype) !CursorOptions {
             res.cursor_col = @field(opts, "cursor_col");
         }
         if (@hasField(T, "after")) {
-            const val = @field(opts, "after");
-            if (@typeInfo(@TypeOf(val)) == .optional) {
-                res.after = val;
-            } else {
-                res.after = val;
-            }
+            // Was written `if (@typeInfo(@TypeOf(val)) == .optional) A else A`; both
+            // arms were the same assignment (a bare i64 coerces into `?i64`) —
+            // see OPEN_ITEMS.
+            res.after = @field(opts, "after");
         }
         if (@hasField(T, "before")) {
-            const val = @field(opts, "before");
-            if (@typeInfo(@TypeOf(val)) == .optional) {
-                res.before = val;
-            } else {
-                res.before = val;
-            }
+            // Same dead branch `after` carried: both arms assigned the same
+            // expression — see OPEN_ITEMS.
+            res.before = @field(opts, "before");
         }
         if (@hasField(T, "desc")) {
             res.desc = @field(opts, "desc");

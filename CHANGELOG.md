@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`field.String("…").VarChar(n)`** — the additive answer to `String`'s
+  unexpressed `VARCHAR(255)` cap. On MySQL the DDL emits `VARCHAR(n)`; on
+  PostgreSQL and SQLite the column stays `TEXT` (the width is MySQL's problem
+  to solve). The write path — `Save` and every `Update` — rejects a longer
+  value with `error.ValidationFailed` on **every** dialect when a width is
+  declared, so the strict-`sql_mode` failure surfaces at the call site instead
+  of at MySQL. No `.VarChar`, no change: the DDL is the old `VARCHAR(255)` and
+  nothing is checked. `.VarChar` on anything but `field.String` is a compile
+  error. Type comparison is unaffected (lengths never participate in
+  `checkSchema`), so adopting a width over an existing `VARCHAR(255)` column
+  is drift-free; resizing the column is the `UPGRADING.md` §12 recipe.
+- **`client.<entity>.AllOwned(allocator)`** — the one-call page release for
+  consumers holding a client without a live builder: same `OwnedRows` the
+  query builder's `AllOwned()` returns (frees rows and list, safe to call
+  twice), with a comptime guard that keeps its error set identical to the
+  builder version.
+
+### Fixed
+
+- **A `SELECT` run through MySQL's prepared `exec` now reports its row
+  count.** The prepared path never drained the result set, so
+  `rows_affected_known` was `false` where the unprepared path answered — a
+  divergence documented since v0.63.0. Statements with result-set metadata are
+  now stored and freed inside `exec`; plain DML keeps the zero-cost path.
+  Diffs also unified across the integration suite.
+- **`splitSqlStatements` leaked a statement copy when an `append` failed**
+  (the same copy-then-append shape the FK and index readers went through).
+- **`parseSortOptions`/`parseCursorOptions` dead conditionals removed** —
+  three `if (optional) A else A` sites whose arms were literally identical;
+  behaviour unchanged, the misleading conditionals gone.
+
 ## [0.85.0] - 2026-10-08
 
 ### Fixed

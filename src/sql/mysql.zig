@@ -593,10 +593,27 @@ pub const MySQLDriver = struct {
 
         // `mysql_stmt_affected_rows` answers `(my_ulonglong)-1` — not 0 — while
         // it has no count: on error, and for a statement whose result set has
-        // not been consumed, which is every SELECT issued through this
-        // parameterized path (measured with a zero error code, so it is live).
+        // not been consumed (measured with a zero error code, so it is live).
         // `@intCast`ing that to `usize` used to store 18446744073709551615.
-        const raw = c.mysql_stmt_affected_rows(stmt);
+        // A result-set statement — a SELECT routed through exec — therefore
+        // stores its set first, the same drain the simple path's
+        // `mysql_store_result` above and the query path's
+        // `mysql_stmt_store_result` both do, so the count reads back as the
+        // row count and `rows_affected_known` agrees across exec shapes (this
+        // closes the v0.63.0 divergence). The common DML path has no result
+        // set: no store, no materialization, zero change.
+        const raw = blk: {
+            if (c.mysql_stmt_result_metadata(stmt) == null)
+                break :blk c.mysql_stmt_affected_rows(stmt);
+            if (c.mysql_stmt_store_result(stmt) != 0) {
+                if (self.classifyFailure(c.mysql_errno(self.conn))) |err| return err;
+                logMySQLError(self, self.conn, "stmt_store_result");
+                return error.MySQLStmtFailed;
+            }
+            const count = c.mysql_stmt_affected_rows(stmt);
+            _ = c.mysql_stmt_free_result(stmt);
+            break :blk count;
+        };
         // Same "0 is no id" rule as the simple path above: the C API documents
         // `mysql_stmt_insert_id()` as answering 0 when the statement produced
         // no AUTO_INCREMENT value. `ON DUPLICATE KEY UPDATE` reports the

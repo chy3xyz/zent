@@ -4419,7 +4419,7 @@ test "MySQL: a statement the prepared protocol rejects is not_checkable, not fai
     }
 }
 
-test "MySQL: exec maps the client's missing count to unknown, not to 18446744073709551615" {
+test "MySQL: exec counts DML exactly and a prepared SELECT reports its row count" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
     defer drv.close();
@@ -4451,16 +4451,17 @@ test "MySQL: exec maps the client's missing count to unknown, not to 18446744073
     try testing.expectEqual(@as(usize, 0), deleted_none.rows_affected);
     try testing.expect(deleted_none.rows_affected_known);
 
-    // A SELECT through the parameterized path is the reachable sentinel case,
-    // and it is a *client-library* value, not a server one: the connector
-    // reports `(my_ulonglong)-1` for as long as the statement has no affected
-    // count, which is until its result set is consumed — and this path never
-    // consumes it. (Measured against MySQL 9.3 through MariaDB Connector/C
-    // 3.4.5 with a zero error code, so the sentinel is not an error path.) The
-    // naive `@intCast` stored 18446744073709551615 as a row count.
+    // A SELECT through the parameterized path used to be the sentinel case:
+    // the connector reports `(my_ulonglong)-1` for as long as the statement
+    // has no affected count, which was forever here — this path never
+    // consumed its result set, so `rows_affected_known` answered false while
+    // the no-arg path (real_query + store_result) reported the row count. The
+    // prepared path now stores the set before reading the count, so both exec
+    // shapes agree (and the naive `@intCast` can no longer store
+    // 18446744073709551615): ids 1-4 remain, so the count is 4.
     const selected = try d.exec("SELECT * FROM my_rowcount WHERE id > ?", &.{.{ .int = 0 }});
-    try testing.expectEqual(@as(usize, 0), selected.rows_affected);
-    try testing.expect(!selected.rows_affected_known);
+    try testing.expectEqual(@as(usize, 4), selected.rows_affected);
+    try testing.expect(selected.rows_affected_known);
 }
 
 test "MySQL: bulk upsert ids name the rows that were written, collisions included" {

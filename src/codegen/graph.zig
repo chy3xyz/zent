@@ -34,9 +34,14 @@ pub const FieldInfo = struct {
     is_id: bool,
     is_version: bool = false,
     sensitive: bool = false,
+    /// Declared maximum string length (`field.VarChar(n)`), null when the
+    /// schema declared none. Consumed by `create.validateSqlValue` as the
+    /// write-path ceiling and by the DDL resolution below (`VARCHAR(n)` on
+    /// MySQL instead of the default `VARCHAR(255)`).
+    max_length: ?usize = null,
 
     pub fn sqlType(comptime self: FieldInfo, dialect: Dialect) []const u8 {
-        return field_mod.sqlType(self.field_type, dialect);
+        return field_mod.sqlTypeMax(self.field_type, self.max_length, dialect);
     }
 };
 
@@ -208,7 +213,7 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, co
             .column_name = f.storage_key orelse f.name,
             .field_type = f.field_type,
             .zig_type = field_mod.zigType(f.field_type, f.zig_type),
-            .sql_type = field_mod.sqlType(f.field_type, dialect),
+            .sql_type = field_mod.sqlTypeMax(f.field_type, f.max_length, dialect),
             .optional = f.optional,
             .nillable = f.nillable,
             .unique = f.unique,
@@ -219,6 +224,7 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, co
             .is_id = is_id,
             .is_version = f.is_version,
             .sensitive = f.sensitive,
+            .max_length = f.max_length,
         };
     }
 }
@@ -887,6 +893,35 @@ test "Version field is marked as is_version" {
     });
     const info = comptime fromSchema(User);
     try std.testing.expect(info.fields[1].is_version);
+}
+
+test "VarChar carries the declared length into FieldInfo and its DDL types" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+
+    const Profile = schema("Profile", .{
+        .fields = &.{
+            field.String("bio").VarChar(120),
+            field.String("nick"),
+        },
+    });
+
+    // MySQL build: the declared width reaches sql_type; the undeclared
+    // field keeps the default VARCHAR(255).
+    const mysql_info = comptime fromSchemaDialect(Profile, Dialect{ .name = "mysql" });
+    try std.testing.expectEqual(@as(?usize, 120), mysql_info.fields[1].max_length);
+    try std.testing.expectEqualStrings("VARCHAR(120)", mysql_info.fields[1].sql_type);
+    try std.testing.expectEqualStrings("VARCHAR(120)", mysql_info.fields[1].sqlType(Dialect{ .name = "mysql" }));
+    try std.testing.expectEqual(@as(?usize, null), mysql_info.fields[2].max_length);
+    try std.testing.expectEqualStrings("VARCHAR(255)", mysql_info.fields[2].sql_type);
+
+    // SQLite build (the fromSchema default): sql_type keeps the TEXT split,
+    // while the dialect-resolving method follows each field's declaration.
+    const info = comptime fromSchema(Profile);
+    try std.testing.expectEqual(@as(?usize, 120), info.fields[1].max_length);
+    try std.testing.expectEqualStrings("TEXT", info.fields[1].sql_type);
+    try std.testing.expectEqualStrings("VARCHAR(120)", info.fields[1].sqlType(Dialect{ .name = "mysql" }));
+    try std.testing.expectEqualStrings("VARCHAR(255)", info.fields[2].sqlType(Dialect{ .name = "mysql" }));
 }
 
 test "From edge with explicit FK field does not duplicate declared columns" {

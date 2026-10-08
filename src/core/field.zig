@@ -59,6 +59,13 @@ pub const Field = struct {
     /// Set it to map a Zig field onto a differently-named column in an
     /// existing table (ent's `StorageKey`).
     storage_key: ?[]const u8 = null,
+    /// Declared maximum string length (`VarChar(n)`). Only ever non-null on
+    /// a `.string` field — the modifier refuses every other type. Drives the
+    /// MySQL column width (`VARCHAR(n)` instead of `VARCHAR(255)`, see
+    /// `sqlTypeMax`) and the write-path ceiling (`validateSqlValue`); a
+    /// field that does not declare a length keeps today's behaviour
+    /// byte-for-byte on every dialect.
+    max_length: ?usize = null,
 
     // Builder methods
     /// Map this field onto a differently-named SQL column. User-facing APIs
@@ -192,6 +199,26 @@ pub const Field = struct {
     pub fn Phone(self: Field) Field {
         var f = self;
         f.validators = f.validators ++ &[_]Validator{.phone};
+        return f;
+    }
+
+    /// Declare a maximum length for the column's string values. On MySQL the
+    /// column becomes `VARCHAR(n)` instead of the default `VARCHAR(255)`;
+    /// PostgreSQL and SQLite keep `TEXT` — the dialect split `.string`
+    /// already has, unchanged. The write path rejects a value longer than
+    /// `n` with `error.ValidationFailed`, so an over-long string fails as a
+    /// named error before the server can (strict mode rejects it outright,
+    /// permissive mode silently truncates it).
+    ///
+    /// Compile-time checked: valid only on `field.String` fields.
+    /// `field.Text` is deliberately the unbounded type (see `sqlType`) and
+    /// `field.Enum` has a fixed value set, so neither takes a length; a
+    /// negative `n` cannot type-check against `usize`.
+    pub fn VarChar(self: Field, comptime n: usize) Field {
+        if (n == 0) @compileError("VarChar(n) requires n > 0 — a zero-length column could hold no value at all");
+        if (self.field_type != .string) @compileError("VarChar(n) is only valid on field.String fields: field.Text is deliberately unbounded and field.Enum has a fixed value set");
+        var f = self;
+        f.max_length = n;
         return f;
     }
 };
@@ -330,6 +357,26 @@ pub fn sqlType(comptime field_type: FieldType, dialect: Dialect) []const u8 {
     }
 }
 
+/// The DDL spelling of a declared `VarChar(n)` limit. A comptime helper
+/// because the string is needed where nothing can format into it:
+/// `FieldInfo.sql_type` and `migrate.zig`'s `columnSQLType` (a runtime fn
+/// whose return value is borrowed, so it has no allocator to print into).
+pub fn varCharSQL(comptime n: usize) []const u8 {
+    return "VARCHAR(" ++ std.fmt.comptimePrint("{d}", .{n}) ++ ")";
+}
+
+/// `sqlType`, length-aware. A `.string` field that declared `VarChar(n)`
+/// emits `VARCHAR(n)` on MySQL instead of the default `VARCHAR(255)`;
+/// every other combination — the undeclared default included — resolves
+/// through `sqlType` byte-for-byte unchanged (PostgreSQL and SQLite keep
+/// `TEXT`, the dialect split `.string` already had).
+pub fn sqlTypeMax(comptime field_type: FieldType, comptime max_length: ?usize, dialect: Dialect) []const u8 {
+    if (max_length) |n| {
+        if (field_type == .string and dialect.kind() == .mysql) return varCharSQL(n);
+    }
+    return sqlType(field_type, dialect);
+}
+
 /// Map a FieldType to a Zig type for generated code.
 pub fn zigType(comptime field_type: FieldType, comptime custom_type: ?type) type {
     switch (field_type) {
@@ -426,4 +473,62 @@ test "MySQL CREATE TABLE emits an indexable, defaultable unique String column" {
     const pg_sql = try migrate.createTableSQL(table, Dialect{ .name = "postgres" });
     defer std.heap.page_allocator.free(pg_sql);
     try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"email\" TEXT NOT NULL UNIQUE") != null);
+}
+
+test "VarChar: declared width on MySQL, TEXT elsewhere, undeclared unchanged" {
+    const mysql = Dialect{ .name = "mysql" };
+    const postgres = Dialect{ .name = "postgres" };
+    const sqlite = Dialect{ .name = "sqlite3" };
+
+    const bio = comptime String("bio").VarChar(120);
+    try std.testing.expectEqual(@as(?usize, 120), bio.max_length);
+
+    // MySQL: the declared width replaces the default VARCHAR(255).
+    try std.testing.expectEqualStrings("VARCHAR(120)", sqlTypeMax(.string, bio.max_length, mysql));
+    // PG/SQLite keep TEXT — the dialect split is the existing behaviour.
+    try std.testing.expectEqualStrings("TEXT", sqlTypeMax(.string, bio.max_length, postgres));
+    try std.testing.expectEqualStrings("TEXT", sqlTypeMax(.string, bio.max_length, sqlite));
+
+    // Undeclared: byte-for-byte the old mapping on every dialect.
+    try std.testing.expectEqualStrings("VARCHAR(255)", sqlTypeMax(.string, null, mysql));
+    try std.testing.expectEqualStrings("TEXT", sqlTypeMax(.string, null, postgres));
+    try std.testing.expectEqualStrings("TEXT", sqlTypeMax(.string, null, sqlite));
+
+    // A length never reaches the mapping of a type it cannot be declared on
+    // (`VarChar` refuses those at comptime) — belt and braces for hand-built
+    // Field/FieldInfo values.
+    try std.testing.expectEqualStrings("TEXT", sqlTypeMax(.text, 120, mysql));
+    try std.testing.expectEqualStrings("INTEGER", sqlTypeMax(.int, 120, mysql));
+    try std.testing.expectEqualStrings("VARCHAR(255)", sqlTypeMax(.enum_, 120, mysql));
+}
+
+test "VarChar: MySQL CREATE TABLE emits the declared width, other dialects TEXT" {
+    const migrate = @import("../sql/schema/migrate.zig");
+
+    const table = migrate.TableDef{
+        .name = "profile",
+        .columns = &.{
+            .{ .name = "id", .sql_type = "INTEGER", .logical_type = .int, .primary_key = true },
+            // Declared: VARCHAR(120) on MySQL, TEXT elsewhere.
+            .{ .name = "bio", .sql_type = "TEXT", .logical_type = .string, .varchar_sql = varCharSQL(120) },
+            // Undeclared: the default VARCHAR(255) on MySQL, unchanged.
+            .{ .name = "nick", .sql_type = "TEXT", .logical_type = .string },
+        },
+        .primary_keys = &.{"id"},
+    };
+
+    const mysql_sql = try migrate.createTableSQL(table, Dialect{ .name = "mysql" });
+    defer std.heap.page_allocator.free(mysql_sql);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`bio` VARCHAR(120)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`nick` VARCHAR(255)") != null);
+
+    const pg_sql = try migrate.createTableSQL(table, Dialect{ .name = "postgres" });
+    defer std.heap.page_allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"bio\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "VARCHAR") == null);
+
+    const sqlite_sql = try migrate.createTableSQL(table, Dialect{ .name = "sqlite3" });
+    defer std.heap.page_allocator.free(sqlite_sql);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "\"bio\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "VARCHAR") == null);
 }
