@@ -506,10 +506,19 @@ pub const MySQLDriver = struct {
             }
 
             const raw = c.mysql_affected_rows(self.conn);
+            // `mysql_insert_id()` documents 0 as "no AUTO_INCREMENT value was
+            // set (and no rows were written)" — the C API's "no id", not a key
+            // of 0. Reporting `null` here is what makes a plain insert into a
+            // table without AUTO_INCREMENT surface as `MissingLastInsertId`
+            // instead of silently writing pk = 0. `ON DUPLICATE KEY UPDATE`
+            // keeps an id on both branches — the insert reports the new row's,
+            // the update branch the updated row's — so `null` never means "the
+            // row was already there".
+            const raw_id = c.mysql_insert_id(self.conn);
             return driver.Result{
                 .rows_affected = if (raw == no_affected_rows) 0 else @intCast(raw),
                 .rows_affected_known = raw != no_affected_rows,
-                .last_insert_id = @intCast(c.mysql_insert_id(self.conn)),
+                .last_insert_id = if (raw_id != 0) @as(?i64, @intCast(raw_id)) else null,
             };
         }
 
@@ -588,10 +597,17 @@ pub const MySQLDriver = struct {
         // parameterized path (measured with a zero error code, so it is live).
         // `@intCast`ing that to `usize` used to store 18446744073709551615.
         const raw = c.mysql_stmt_affected_rows(stmt);
+        // Same "0 is no id" rule as the simple path above: the C API documents
+        // `mysql_stmt_insert_id()` as answering 0 when the statement produced
+        // no AUTO_INCREMENT value. `ON DUPLICATE KEY UPDATE` reports the
+        // updated row's own id on its update branch (the emitted
+        // `id=LAST_INSERT_ID(id)` is what makes that so), so `null` here is
+        // exactly "the driver has no id".
+        const raw_id = c.mysql_stmt_insert_id(stmt);
         return driver.Result{
             .rows_affected = if (raw == no_affected_rows) 0 else @intCast(raw),
             .rows_affected_known = raw != no_affected_rows,
-            .last_insert_id = @intCast(c.mysql_stmt_insert_id(stmt)),
+            .last_insert_id = if (raw_id != 0) @as(?i64, @intCast(raw_id)) else null,
         };
     }
 
@@ -603,7 +619,22 @@ pub const MySQLDriver = struct {
             cache_slot = t.slot;
             break :blk t.stmt;
         } else try prepareMySQLStmt(self, query_sql);
-        errdefer _ = c.mysql_stmt_close(stmt);
+        // Failure before the Rows iterator takes ownership: a statement held
+        // on a taken slot goes back to the cache (reset first, the way
+        // `MySQLRows.deinit` returns it) instead of being closed beneath an
+        // entry that still points at it and keeps the slot reserved — that
+        // burned one slot per distinct SQL that hit and failed, until the
+        // connection's prepare cache never hit again. A caller-owned handle
+        // (cache miss) is closed.
+        errdefer {
+            if (self.cache) |*cached| {
+                _ = c.mysql_stmt_free_result(stmt);
+                _ = c.mysql_stmt_reset(stmt);
+                cached.releaseTaken(cache_slot, stmt, {}, closeStmt);
+            } else {
+                _ = c.mysql_stmt_close(stmt);
+            }
+        }
 
         // Reset before rebinding (needed when stmt came from cache).
         _ = c.mysql_stmt_free_result(stmt);

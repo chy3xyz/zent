@@ -165,6 +165,24 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
             }
         }
 
+        /// Failure-path twin of `returnStmt`: release a statement handed out
+        /// by `takeOrPrepare` when its consumer fails before a Rows iterator
+        /// takes ownership (a failed bind, an allocation failure). A taken
+        /// slot goes back through `returnStmt`, which also handles a slot
+        /// invalidated by `evictAll` while the statement was checked out; a
+        /// `null` slot was never cached (cache miss, oversized SQL), so the
+        /// caller-owned handle is released with `deinitFn` — the same shape
+        /// the exec path's `owns_stmt` cleanup implements. The caller resets
+        /// the statement first, mirroring what `Rows.deinit` does on the
+        /// success path.
+        pub fn releaseTaken(self: *Self, slot: ?usize, stmt: Handle, deinitCtx: anytype, deinitFn: anytype) void {
+            if (slot) |s| {
+                self.returnStmt(s, stmt, deinitCtx, deinitFn);
+            } else {
+                deinitFn(deinitCtx, stmt);
+            }
+        }
+
         /// Evict and deinitialize all cached statements. Taken entries belong
         /// to in-flight Rows iterators: their handles stay valid (owned by the
         /// iterator), but their slots are dropped — a later `returnStmt` sees
@@ -342,6 +360,47 @@ test "PreparedCache: take reserves slot, returnStmt releases it" {
     const t3 = try cch.takeOrPrepare("SELECT 1", &ctx, testPrepare);
     try std.testing.expectEqual(t1.stmt, t3.stmt);
     try std.testing.expectEqual(@as(usize, 2), ctx.prepare_count);
+}
+
+test "PreparedCache: releaseTaken puts a taken slot back on a failure path" {
+    // The shape the drivers hit when a consumer fails after `takeOrPrepare`
+    // but before a Rows iterator owns the statement (a failed bind): the
+    // handle is cache-owned, so releasing it must not finalize it and must
+    // not strand the reservation.
+    var cch: PreparedCache(4, *anyopaque) = .{};
+    var ctx = TestCtx{};
+
+    // The statement is already cached (the exec path put it there).
+    _ = try cch.getOrPrepare("SELECT 1", &ctx, testPrepare, &ctx, testDeinitCount);
+
+    const t = try cch.takeOrPrepare("SELECT 1", &ctx, testPrepare);
+    try std.testing.expect(t.slot != null);
+    cch.releaseTaken(t.slot, t.stmt, &ctx, testDeinitCount);
+
+    // Nothing was burned: same length, nothing finalized, nothing taken.
+    try std.testing.expectEqual(@as(usize, 1), cch.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.evict_count);
+    for (cch.entries[0..cch.len]) |e| try std.testing.expect(!e.taken);
+
+    // The same SQL is a hit again — the failed consumer prepared nothing.
+    const again = try cch.takeOrPrepare("SELECT 1", &ctx, testPrepare);
+    try std.testing.expectEqual(t.stmt, again.stmt);
+    try std.testing.expectEqual(@as(usize, 1), ctx.prepare_count);
+    cch.releaseTaken(again.slot, again.stmt, &ctx, testDeinitCount);
+}
+
+test "PreparedCache: releaseTaken finalizes a statement that was never cached" {
+    var cch: PreparedCache(4, *anyopaque) = .{};
+    var ctx = TestCtx{};
+
+    // A take that missed the cache answers slot == null and a handle the
+    // caller owns; the null arm releases it, the way the exec path's
+    // `owns_stmt` cleanup does.
+    const t = try cch.takeOrPrepare("SELECT 1", &ctx, testPrepare);
+    try std.testing.expect(t.slot == null);
+    cch.releaseTaken(t.slot, t.stmt, &ctx, testDeinitCount);
+    try std.testing.expectEqual(@as(usize, 1), ctx.evict_count);
+    try std.testing.expectEqual(@as(usize, 0), cch.len);
 }
 
 test "PreparedCache: eviction skips taken entries" {

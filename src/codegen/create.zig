@@ -476,7 +476,9 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 // `sql_mode`, a server error on a strict one) and the entity
                 // would come back carrying `""`, which names no row while
                 // looking like a key that names one — the same shape as the
-                // `last_insert_id orelse 0` this path's integer branch refuses.
+                // `last_insert_id orelse 0` this path's integer branch refuses
+                // for a plain insert (ignore mode's id 0 is the nothing-written
+                // convention below, not a key the branch made up).
                 if (comptime @FieldType(Entity, info.pk_field) != i64) {
                     if (textPrimaryKeyFrom(self.values.items, info.pk_field) == null) return error.MissingPrimaryKey;
                 }
@@ -505,9 +507,24 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                     // id to give, and a `0` written here is indistinguishable
                     // from a real key — the entity would look like a row that
                     // exists, with the caller's own insert hidden behind it.
-                    // (The in-tree MySQL driver always answers `Some`; a
-                    // wrapper or a custom driver need not.)
-                    @field(entity, info.pk_field) = @intCast(res.last_insert_id orelse return error.MissingLastInsertId);
+                    // (The in-tree MySQL driver answers `null` exactly when
+                    // the C API reports no AUTO_INCREMENT value — its 0 — and
+                    // an id otherwise; a wrapper or a custom driver need not.)
+                    //
+                    // ODKU (`SaveOrUpdate`) keeps an id on both branches: the
+                    // insert reports the new row's, the update branch the
+                    // updated row's — so `null` still means "no id at all",
+                    // never "the row was already there".
+                    //
+                    // Ignore mode keeps the RETURNING path's convention (the
+                    // missing-row branch above): nothing was written, so the
+                    // entity comes back with the id left at zero instead of
+                    // the error, and callers can query the existing row.
+                    @field(entity, info.pk_field) = @intCast(blk: {
+                        if (res.last_insert_id) |id| break :blk id;
+                        if (ignore_conflicts) break :blk 0;
+                        return error.MissingLastInsertId;
+                    });
                 } else {
                     // Textual primary key (uuid) on MySQL: no RETURNING — keep
                     // the caller-provided id from the values. Presence was
@@ -1675,9 +1692,10 @@ test "create with edges schema setFieldValue compiles" {
 /// A driver whose `exec` answers the ids in `script`, one call at a time, and
 /// `null` where it has none to give. `driver.Result.last_insert_id` is `?i64`
 /// *because* a driver may have nothing to report — the in-tree MySQL driver
-/// always answers `Some`, so only a driver that says "no id" on purpose can
-/// reach those branches, the same way `UncountedDriver` reaches the
-/// unknown-row-count one.
+/// answers `null` exactly when the C API reports no id (its 0), so both the
+/// plain-insert `MissingLastInsertId` guard and the ignore-mode zero
+/// convention are reachable through it, the same way `UncountedDriver` reaches
+/// the unknown-row-count one.
 const IdScriptDriver = struct {
     /// One entry per `exec` call; a `null` entry is a driver with no id.
     script: []const ?i64,
@@ -1918,6 +1936,52 @@ test "create: a driver that reports no last_insert_id is an error, not a key of 
     // missing, and `0` is not a report of it.
     try std.testing.expectError(error.MissingLastInsertId, b.Save());
     try std.testing.expectEqual(@as(usize, 1), drv.exec_calls);
+}
+
+test "create: SaveIgnore with a driver that reports no id answers the entity at id 0" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+    const deinitEntity = @import("entity.zig").deinitEntity;
+
+    const User = schema("User", .{
+        .fields = &.{ field.String("name"), field.Int("age") },
+    });
+
+    const info = comptime fromSchema(User);
+    const infos = &[_]TypeInfo{info};
+    const UserEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, UserEntity);
+
+    // The ignored-insert shape: the statement ran, nothing was written, and
+    // the MySQL C API answers 0 — which the driver now reports as no id at
+    // all. The convention is the RETURNING path's missing-row answer above:
+    // the entity with the id left at zero, not `MissingLastInsertId`, so the
+    // two dialects stay one answer for `SaveIgnore`.
+    var drv = IdScriptDriver{ .script = &.{null} };
+    defer drv.freeCapture();
+    var b = Builder.init(std.testing.allocator, drv.asDriver(), &.{}, null);
+    defer b.deinit();
+    _ = try b.setFieldValue("name", "alice");
+    _ = try b.setFieldValue("age", @as(i64, 30));
+
+    var entity = try b.SaveIgnore();
+    defer deinitEntity(infos, info, &entity, std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 0), entity.id);
+    try std.testing.expectEqual(@as(usize, 1), drv.exec_calls);
+
+    // ... while the same no-id driver on a plain `Save` (and on `SaveOrUpdate`,
+    // whose ODKU update branch reports the updated row's id, never 0) is
+    // still the error: the guard above is what keeps a missing id from
+    // looking like a key.
+    var strict = IdScriptDriver{ .script = &.{null} };
+    defer strict.freeCapture();
+    var b2 = Builder.init(std.testing.allocator, strict.asDriver(), &.{}, null);
+    defer b2.deinit();
+    _ = try b2.setFieldValue("name", "bob");
+    _ = try b2.setFieldValue("age", @as(i64, 25));
+    try std.testing.expectError(error.MissingLastInsertId, b2.SaveOrUpdate());
 }
 
 test "create: an integer key still comes from last_insert_id, unchanged" {

@@ -330,6 +330,18 @@ A consumer filed this as *"邻接 JOIN 表名短名推导: the adjacency JOIN wr
 
 Both of the report's hypotheses fail on the code in instructive ways: `edgeTargetInfo` **compile-errors** rather than synthesising a TypeInfo, so no query path can produce a short name, and `buildEdgeStep` reads `target_info.table_name`, so the adjacency SQL was never the place. "MySQL unaffected" is not a dialect fact either — their production tables predate the FK clause, so nothing was left to dangle at insert time. The recurring lesson: which layer produced a string is a question for the code, and a workaround that hides a symptom is evidence about the symptom only.
 
+### Z40 — the FK's referenced column was hardcoded `id` (v0.84.0)
+
+A consumer bisecting their still-hanging L0 `foreign key mismatch` (the Z39 shape, *after* the Z39 fix) produced this one. The verdict from the repro matrix: **real, and not old-DDL residue** — a brand-new database reproduces it.
+
+| | |
+|--|--|
+| **Problem** | Z39 fixed the referenced **table** name and the child's **FK column** name, but the **referenced column** — the parent side of `REFERENCES <table> (<col>)` — stayed hardcoded `{"id"}` in all three derivation sites (`migrate.zig`'s From-edge branch, the To-edge crossref branch, and the `pub` `tableFromTypeInfo`). The query side honours a target's `.pk` override and `StorageKey` (`graph.pkColumn`), so a target entity declaring `.pk = "fid"` or renaming `id` via `StorageKey` — both supported shapes — produces DDL referencing a column that does not exist. The failure surfaces on the child's **first INSERT** (`foreign key mismatch - "child" referencing "parent"`), after reads on the same schema all pass |
+| **Reproduced (fresh `:memory:` db, foreign_keys=ON)** | Variant A (Z39 shape, default `id` PK): inserts pass — Z39 is clean on new databases. Variant B (`.pk = "fid"`): DDL reads `REFERENCES "xdaofood_upload_file" ("id")` → `foreign key mismatch`. Variant C (`id` + `StorageKey("file_uid")`): same mismatch, referencing `("id")` while the physical PK is `file_uid`. Two residue shapes produce the *same* error text and remain the consumer's other possibility: an old child table (pre-Z39 DDL, FK → short name — but that errors as `no such table`, not mismatch), and **new child DDL against an old/hand-made parent whose `id` has no PRIMARY KEY/UNIQUE** |
+| **Discriminator** | `PRAGMA foreign_key_list(<child>)` + `sqlite_master.sql`: FK → short name = old child table (rebuild it); FK → declared table with `("id")` while the parent's PK is another column = this defect; FK → declared table with the right column = look at the parent's DDL for a missing PK |
+| **Fix (v0.84.0)** | `edgeRefTarget` returns the target's `TypeInfo` when it is in the migrated graph, and both branches derive `.ref_columns` through `graph.pkColumn(target)` — the same resolver the query side uses, so the DDL and the traversals can no longer disagree. The out-of-graph fallback keeps the short-name/`"id"` shape (the FK dangles either way). `pub tableFromTypeInfo` cannot resolve a target from one TypeInfo and keeps its shape with a TODO; the latent `junctionTableForEdge` short-name sibling is recorded in `OPEN_ITEMS.md` (unreachable today). Regression tests: `.pk` variant, `StorageKey` variant, and the To-edge crossref variant — each asserts the DDL *and* runs the inserts under `foreign_keys = ON` |
+
+
 ### Z37–Z38 — two user-approved semantics fixes (v0.70.0)
 
 Both were on the "needs a decision" list in `docs/OPEN_ITEMS.md`; the user
@@ -338,6 +350,7 @@ approved them, and both are now resolved.
 | # | Item | What it was | Fix |
 |---|---|---|---|
 | Z39 | A `From` edge's FK derived its table name instead of reading the declared one, and injected a phantom FK column | P1 | **Fixed** v0.78.1 — both halves, with a DDL+end-to-end regression test. The report's mechanism was wrong: it is the DDL, not the adjacency JOIN, and not dialect-specific |
+| Z40 | The FK's *referenced column* was hardcoded `id`, ignoring the target's `.pk`/`StorageKey` (Z39's un-fixed third half) | P1 | **Fixed** v0.84.0 — `edgeRefTarget` + `graph.pkColumn` on both branches, DDL+insert regression tests for all three variants |
 | Z37 | **The pool parks a borrower that has room to be served** | Found by the pool stress tests (v0.61.0): a health check failing on a *freshly opened* connection closed that connection — freeing room below `max_connections` — and the borrow then parked on the condition variable, where nothing could wake it (the only signal is another borrower's `release`), so the caller waited out `max_wait_ms` and got `PoolWaitTimeout` instead of the connection error | Waiting now happens **only while it can be served**: the pool at its ceiling with everything lent out. With room below the ceiling the borrow retries on the bounded `max_retries`/`retry_backoff_ms` path, and a call that only met failed health checks reports that error (`PingFailed`/`ConnectionFailed`) rather than `PoolExhausted` |
 | Z38 | **SQLite declares foreign keys but does not enforce them** | `zent` never issued `PRAGMA foreign_keys` and SQLite defaults it OFF, so FK clauses in the DDL accepted dangling references; `checkSchema` compares the DDL shape and cannot see the switch | `openWithOptions` issues the pragma on every handle and **verifies the read-back** (a no-op inside a transaction, so issuing it is not evidence), with an explicit `.enforce_foreign_keys = false` opt-out. Its cross-dialect case exposed a PostgreSQL bug: `sqlstateToError` read the condition at offset 2, so `23502`/`23503` both answered `UniqueViolation` — fixed at offset 3/4 |
 
@@ -358,7 +371,7 @@ approved them, and both are now resolved.
 | Z11 | Decimal field | P2 | **Fixed** v0.31.0 |
 | Z12 | Complex UPDATE expr | P2 | **Fixed** v0.31.0 |
 | Z13 | Docs alignment | P2 | **Fixed** v0.30.0 |
-| Z14 | `Contains` semantics vs name | P2 | **Partially fixed** — docs+test done, naming **Open** |
+| Z14 | `Contains` semantics vs name | P2 | **Partially fixed, rename declined** — docs+`Like` alias done; the rename itself is a deliberate won't-fix (zapi's whole project sits on `Contains`; `Like` is the documented spelling for new code) |
 | Z15 | Edge writes on `From` edges | P2 | **Fixed** v0.44.0 — FK written in the UPDATE's SET |
 | Z16 | Multi-graph first-class | P2 | **Stage 1 done** v0.39.0 (actionable error); stages 2/3 **Open** per ROI |
 | Z17 | Entity release shape | P2 | **Fixed** v0.40.0 — `deinitRow`/`deinitRows`/`deinitEdgeRows` |

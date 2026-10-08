@@ -4,6 +4,76 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `From`/`To` edge's foreign key always referenced `id`, ignoring the
+  target's `.pk`/`StorageKey` override** (Z40 — the third half Z39 left). The
+  query side resolves the target's key through `graph.pkColumn`; the DDL side
+  hardcoded `{"id"}` in all three derivation sites, so a target declaring
+  `.pk = "fid"` (or renaming `id` via `StorageKey` — both supported shapes)
+  produced `REFERENCES "<table>" ("id")` against a column that does not exist,
+  and the child's first INSERT failed with SQLite's `foreign key mismatch` on
+  a **brand-new** database. `edgeRefTarget` now returns the in-graph target's
+  `TypeInfo` and both branches derive `.ref_columns` through `graph.pkColumn`,
+  so the DDL and the traversals cannot disagree. DDL+insert regression tests
+  for the `.pk`, `StorageKey` and To-edge-crossref variants; the out-of-graph
+  fallback and the (today unreachable) `junctionTableForEdge` short-name shape
+  are recorded in `OPEN_ITEMS.md`.
+- **A `query()` that failed after taking a prepared-cache slot stranded the
+  slot forever.** The failure `errdefer` finalized/closed the statement
+  without returning it — the entry stayed `taken`, invisible to lookups and
+  eviction, so sixteen distinct "hit then fail" statements (a defensive
+  SELECT against a missing table, say) silently stopped the connection's
+  prepare cache. `cache.releaseTaken` is now the single failure-path return
+  (slot-aware: `returnStmt` for a cached handle, plain close for the
+  caller-owned one), wired into SQLite's and MySQL's prepared `query` paths,
+  with take→fail→re-hit tests.
+- **MySQL passed "no id" through as the row's id.** `mysql_insert_id()`
+  answers `0` when the statement set no `AUTO_INCREMENT` value, and the driver
+  handed that `Some(0)` to `Save` — a table without auto-increment got rows
+  with `pk = 0` and no error (the `MissingLastInsertId` guard existed but was
+  unreachable). The driver now maps `0` → `null`: a plain `Save` fails with
+  `MissingLastInsertId` (the honest answer), `SaveIgnore` that did not insert
+  keeps the cross-dialect `id = 0` convention, and `SaveOrUpdate` is
+  unaffected (ODKU's update branch reports the updated row's id, never `0`).
+  SQLite/PG read ids from `RETURNING` and keep their behaviour.
+- **`Has{Edge}With` accepted predicates naming columns the target does not
+  have.** On an m2m existence join, `appendQualifiedPred` rewrites only the
+  plain-name shapes, so a hand-built `gt`/`like`/raw-shaped predicate over a
+  junction-only column bound to the junction silently. The generated wrapper
+  now checks every incoming predicate's column against the target's fields and
+  columns (recursively, raw exempt) and fails with the named
+  `error.UnknownField` instead of answering with the wrong rows.
+
+### Changed
+
+- **EntQL addresses field names first (the `OPEN_ITEMS` decision, made).**
+  A `WhereEntQL` ident is resolved against the entity in scope at lowering:
+  field API name → rewritten to the physical column (`StorageKey`-aware, also
+  inside `has(...)` against the edge target); physical column name → kept;
+  neither → `error.UnknownField`. When a field's API name collides with
+  another field's column name, the field-name reading wins. This replaces
+  "EntQL speaks physical columns" — a `StorageKey` field addressed by its API
+  name used to fail at prepare time on a column that did not exist.
+- **PostgreSQL's `query()` uses the prepared-statement cache** when one is
+  attached (previously `exec` only): `getOrPrepare` + `PQexecPrepared`, with
+  the uncached `PQexecParams` fallback unchanged. PG's iterator holds the
+  result, not the statement, so no slot accounting is involved.
+
+### Documented
+
+- `BEST_PRACTICES`: a per-dialect matrix for `getInt` over DECIMAL text
+  (SQLite coerces silently — pinned by a driver test; PG/MySQL answer
+  `TypeMismatch`/default), the no-generated-key `Save` contract after the
+  MySQL fix, and the new field-name-first EntQL addressing rules.
+- `OPEN_ITEMS`: the two "needs a decision" rows (EntQL naming, MySQL
+  `last_insert_id`) are decided and closed; the cache-slot and PG-cache rows
+  are closed; new known-shape rows record the `tableFromTypeInfo`/
+  `junctionTableForEdge` short-name sibling (unreachable today) and the
+  deferred `field.VarChar(n)` plan. Z14 (`Contains` → `Like`) is closed as a
+  deliberate won't-fix in `ISSUES_FROM_ZAPI.md`, which also gains the Z40
+  write-up with the repro matrix and the consumer-side discriminator query.
+
 ## [0.83.1] - 2026-10-07
 
 ### Changed

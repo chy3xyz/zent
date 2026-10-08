@@ -1989,6 +1989,14 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 const fk = ForeignKeyDef{
                     .columns = &[_][]const u8{fk_col_name},
                     .ref_table = toSnakeCase(e.target_name),
+                    // TODO: the referenced column is hardcoded to "id", so a
+                    // target declaring `.pk` or a StorageKey-renamed `id` gets
+                    // an FK to a column it does not have. Resolving it needs
+                    // the target's TypeInfo, which this pub signature does not
+                    // carry — same legacy family as `junctionTableForEdge`'s
+                    // derived short names below. The migration paths are not
+                    // affected: they go through `tableFromTypeInfoCrossRef`,
+                    // which references `graph.pkColumn`.
                     .ref_columns = &[_][]const u8{"id"},
                 };
                 foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
@@ -2006,6 +2014,14 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 const fk = ForeignKeyDef{
                     .columns = &[_][]const u8{fk_col_name},
                     .ref_table = toSnakeCase(e.target_name),
+                    // TODO: the referenced column is hardcoded to "id", so a
+                    // target declaring `.pk` or a StorageKey-renamed `id` gets
+                    // an FK to a column it does not have. Resolving it needs
+                    // the target's TypeInfo, which this pub signature does not
+                    // carry — same legacy family as `junctionTableForEdge`'s
+                    // derived short names below. The migration paths are not
+                    // affected: they go through `tableFromTypeInfoCrossRef`,
+                    // which references `graph.pkColumn`.
                     .ref_columns = &[_][]const u8{"id"},
                 };
                 foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
@@ -2032,6 +2048,10 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
 /// Generate a junction table definition for M2M edges.
 /// Columns and table name are deterministically ordered alphabetically
 /// so that whichever edge triggers creation first produces the same schema.
+/// Known legacy, not fixed here: both sides derive from `toSnakeCase` short
+/// names and the FKs reference a literal "id" — a declared `table_name` or
+/// custom pk on either end is not honoured (no public API reaches this path
+/// with the ends' TypeInfos).
 pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeInfo) TableDef {
     comptime {
         const source_table = source_info.table_name;
@@ -2425,14 +2445,12 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
     }
 }
 
-/// Like tableFromTypeInfo, but also adds FK columns from cross-referenced To edges.
-/// For example, if User has a To("cars", Car) O2M edge, this adds a "user_id" FK column
-/// to the Car table pointing back to User.
-/// The table a foreign key on this edge must reference: the **declared**
-/// `table_name` of the edge's target when that entity is in this graph, and the
-/// snake_case derivation of its schema name only when it is not (the historical
-/// spelling, kept for a caller that migrates a table whose target it did not
-/// pass — a foreign key to an entity outside the graph is dangling either way).
+/// The table — and, when the edge's target is in this graph, the entity —
+/// an edge's foreign key must reference. The target's declared `table_name`
+/// wins when the target is in this graph, and the snake_case derivation of
+/// its schema name is the fallback when it is not (the historical spelling,
+/// kept for a caller that migrates a table whose target it did not pass — a
+/// foreign key to an entity outside the graph is dangling either way).
 ///
 /// The derivation is *not* the same thing: an entity that declares
 /// `table_name = "xdaofood_upload_file"` is stored in that table, and an FK that
@@ -2442,15 +2460,27 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
 /// "short name" defect. `tableFromTypeInfoCrossRef`'s To-edge half has always
 /// resolved this through `other_info.table_name`; the From-edge half derived the
 /// name instead, which is the inconsistency this closes.
-fn edgeRefTable(comptime e: EdgeInfo, comptime all_infos: []const TypeInfo) []const u8 {
+const EdgeRefTarget = struct {
+    table: []const u8,
+    /// The target entity when it is in this graph — the referenced column is
+    /// `graph.pkColumn` of it. `null` means the target is outside the graph
+    /// and there is no TypeInfo to ask.
+    info: ?TypeInfo,
+};
+
+fn edgeRefTarget(comptime e: EdgeInfo, comptime all_infos: []const TypeInfo) EdgeRefTarget {
     comptime {
         for (all_infos) |ti| {
-            if (std.mem.eql(u8, ti.name, e.target_name)) return ti.table_name;
+            if (std.mem.eql(u8, ti.name, e.target_name))
+                return .{ .table = ti.table_name, .info = ti };
         }
-        return toSnakeCase(e.target_name);
+        return .{ .table = toSnakeCase(e.target_name), .info = null };
     }
 }
 
+/// Like tableFromTypeInfo, but also adds FK columns from cross-referenced To edges.
+/// For example, if User has a To("cars", Car) O2M edge, this adds a "user_id" FK column
+/// to the Car table pointing back to User.
 fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
     comptime {
         // 字段/外键/交叉引用循环在 `inline for (infos)` 的迁移入口下按
@@ -2508,10 +2538,22 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
                     columns = columns ++ &[_]ColumnDef{col};
                 }
 
+                const ref = edgeRefTarget(e, all_infos);
                 const fk = ForeignKeyDef{
                     .columns = &[_][]const u8{fk_col_name},
-                    .ref_table = edgeRefTable(e, all_infos),
-                    .ref_columns = &[_][]const u8{"id"},
+                    .ref_table = ref.table,
+                    // The reference names the target's primary-key column
+                    // (`graph.pkColumn`): the query side has always resolved
+                    // it that way, while a literal "id" gave a target that
+                    // declares `.pk` (or stores `id` under a StorageKey) an FK
+                    // to a column it does not have — on SQLite the child's
+                    // first INSERT then fails with `foreign key mismatch`.
+                    // Out of the graph there is no TypeInfo to ask, and the
+                    // reference is dangling whichever column it names.
+                    .ref_columns = if (ref.info) |target|
+                        &[_][]const u8{pkColumn(target)}
+                    else
+                        &[_][]const u8{"id"},
                 };
                 foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
             }
@@ -2564,7 +2606,10 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
                             const fk = ForeignKeyDef{
                                 .columns = &[_][]const u8{fk_col_name},
                                 .ref_table = other_info.table_name,
-                                .ref_columns = &[_][]const u8{"id"},
+                                // Same rule as the From-edge half: reference
+                                // the target's primary-key column
+                                // (`graph.pkColumn`), not a literal "id".
+                                .ref_columns = &[_][]const u8{pkColumn(other_info)},
                             };
                             foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
                         }
@@ -2621,6 +2666,7 @@ fn defaultValueStr(comptime f: FieldInfo) ?[]const u8 {
 }
 
 const toSnakeCase = @import("../../codegen/graph.zig").toSnakeCase;
+const pkColumn = @import("../../codegen/graph.zig").pkColumn;
 
 /// A column as the *database* reports it. Owned: `name` and `sql_type` are
 /// allocated, release the list with `freeExistingColumns`.
@@ -7160,4 +7206,157 @@ test "the ALTER builders refuse a dialect name they do not know" {
     // SQLite has no ALTER COLUMN, and MySQL's is the unsafe one — unchanged.
     try std.testing.expectError(error.UnsupportedDialect, alterColumnTypeSQL(allocator, "t", "c", "TEXT", Dialect.sqlite));
     try std.testing.expectError(error.MySQLTypeChangeUnsafe, alterColumnTypeSQL(allocator, "t", "c", "TEXT", Dialect.mysql));
+}
+
+test "an edge FK references the target's declared primary key (SQLite)" {
+    // `tableFromTypeInfoCrossRef` hardcoded the referenced column to "id" on
+    // the From-edge half, while the query side resolved the same edge through
+    // `graph.pkColumn`. A target that declares `.pk = "fid"` — a supported
+    // shape (core/schema.zig's `pk`) — then got a fresh child table whose
+    // FOREIGN KEY names a column the parent does not have, and on SQLite,
+    // where foreign keys are enforced, the child's first INSERT fails with
+    // `foreign key mismatch - "child" referencing "parent"`.
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const UploadFile = schema("UploadFile", .{
+        .table_name = "xdaofood_upload_file",
+        .pk = "fid",
+        .fields = &.{ field.Int("fid"), field.String("path") },
+    });
+    const OrderProduct = schema("OrderProduct", .{
+        .table_name = "xdaofood_order_product",
+        .fields = &.{ field.Int("image_id"), field.String("title") },
+        .edges = &.{edge.From("file", UploadFile).Field("image_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ OrderProduct, UploadFile });
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The child's foreign key names the declared table and the declared pk.
+    var meta = try drv.query(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'xdaofood_order_product'",
+        &.{},
+    );
+    defer meta.deinit();
+    const row = meta.next() orelse return error.NoTableRow;
+    const ddl = row.getText(0).?;
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "REFERENCES \"xdaofood_upload_file\" (\"fid\")") != null);
+    // The parent has no `id` column at all, so the old literal was an FK to a
+    // column that does not exist; it must be gone, not merely joined by "fid".
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "(\"id\")") == null);
+
+    // End to end, foreign keys on (SQLiteDriver.open sets and verifies the
+    // pragma): a child row over a real parent row inserts, and a dangling
+    // parent id is rejected — the constraint fires, not a mismatch.
+    _ = try drv.exec("INSERT INTO \"xdaofood_upload_file\" (\"fid\", \"path\") VALUES (7, '/a.png')", &.{});
+    _ = try drv.exec("INSERT INTO \"xdaofood_order_product\" (\"image_id\", \"title\") VALUES (7, 'p')", &.{});
+    try std.testing.expectError(
+        error.ForeignKeyViolation,
+        drv.exec("INSERT INTO \"xdaofood_order_product\" (\"image_id\", \"title\") VALUES (999, 'p')", &.{}),
+    );
+}
+
+test "an edge FK references a StorageKey-renamed id column (SQLite)" {
+    // The second shape of the same defect: the target keeps the default pk
+    // *name* (`id`) but stores it under another column via `StorageKey`, so
+    // the physical primary key — the only column a foreign key can name — is
+    // `file_uid`, not "id".
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const UploadFile = schema("UploadFile", .{
+        .table_name = "xdaofood_upload_file",
+        .fields = &.{ field.Int("id").StorageKey("file_uid"), field.String("path") },
+    });
+    const OrderProduct = schema("OrderProduct", .{
+        .table_name = "xdaofood_order_product",
+        .fields = &.{ field.Int("image_id"), field.String("title") },
+        .edges = &.{edge.From("file", UploadFile).Field("image_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ OrderProduct, UploadFile });
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    var meta = try drv.query(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'xdaofood_order_product'",
+        &.{},
+    );
+    defer meta.deinit();
+    const row = meta.next() orelse return error.NoTableRow;
+    const ddl = row.getText(0).?;
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "REFERENCES \"xdaofood_upload_file\" (\"file_uid\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "(\"id\")") == null);
+
+    // The reference resolves: the parent over file_uid, the child over image_id.
+    _ = try drv.exec("INSERT INTO \"xdaofood_upload_file\" (\"file_uid\", \"path\") VALUES (1, '/a.png')", &.{});
+    _ = try drv.exec("INSERT INTO \"xdaofood_order_product\" (\"image_id\", \"title\") VALUES (1, 'p')", &.{});
+}
+
+test "a cross-referenced To edge FK references the target's pk too (SQLite)" {
+    // The other half of the same fix: when Owner declares To("files", UploadFile)
+    // and UploadFile has no inverse From edge, the FK column auto-added to the
+    // upload_file table referenced a literal "id" as well — wrong for a target
+    // with a custom pk, with the same first-INSERT failure on SQLite.
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+
+    const UploadFile = schema("UploadFile", .{
+        .table_name = "xdaofood_upload_file",
+        .fields = &.{field.String("path")}, // deliberately no inverse From edge
+    });
+    const Owner = schema("Owner", .{
+        .table_name = "xdaofood_owner",
+        .pk = "oid",
+        .fields = &.{ field.Int("oid"), field.String("label") },
+        .edges = &.{edge.To("files", UploadFile)},
+    });
+
+    // Raw per-entity infos, not buildGraph: buildGraph's addEdgeFieldsToAll
+    // injects the incoming To edge's FK column into upload_file's fields
+    // itself, and the cross-reference branch then finds the column already
+    // present and pairs no constraint with it. A hand-built `fromSchema` list
+    // is the shape where this branch owns both the column and its FK — the
+    // shape a caller migrating a raw TypeInfo list uses.
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const owner_info = comptime fromSchema(Owner);
+    const file_info = comptime fromSchema(UploadFile);
+    const infos = &[_]TypeInfo{ owner_info, file_info };
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    // Here the auto-added child column is upload_file.owner_id.
+    var meta = try drv.query(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'xdaofood_upload_file'",
+        &.{},
+    );
+    defer meta.deinit();
+    const row = meta.next() orelse return error.NoTableRow;
+    const ddl = row.getText(0).?;
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "REFERENCES \"xdaofood_owner\" (\"oid\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "(\"id\")") == null);
+
+    _ = try drv.exec("INSERT INTO \"xdaofood_owner\" (\"oid\", \"label\") VALUES (1, 'o')", &.{});
+    _ = try drv.exec("INSERT INTO \"xdaofood_upload_file\" (\"path\", \"owner_id\") VALUES ('/a.png', 1)", &.{});
 }

@@ -5,6 +5,7 @@ const FieldInfo = @import("graph.zig").FieldInfo;
 const buildEdgeStep = @import("graph.zig").buildEdgeStep;
 const sql = @import("../sql/builder.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
+const runtime_log = @import("../runtime/log.zig");
 
 fn fieldName(comptime entity_name: []const u8, comptime base: []const u8, comptime suffix: []const u8) [:0]const u8 {
     comptime {
@@ -292,6 +293,33 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
             const has_with_name = fieldName(info.name, edgePredName(info.name, "Has", edge.name), "With");
             @field(result, has_with_name) = struct {
                 fn hasWithFn(preds: []const sql.Predicate) sql.Predicate {
+                    // A hand-written `sql.Predicate` is schema-blind: inside
+                    // the EXISTS body, a bare column that only the *other*
+                    // side of the edge owns used to bind there — on an m2m
+                    // edge the junction `j`, whose columns are literally
+                    // `<table>_id` — and the query answered a
+                    // filtered-by-accident page with no error at all. Every
+                    // column-bearing predicate must address the target, so
+                    // the wrapper checks them (see `hasWithPredOffender`).
+                    if (hasWithPredsOffender(target_info, preds)) |offender| {
+                        runtime_log.warn(
+                            "zent: has-with edge predicate on \"{s}\": column \"{s}\" is not a field or column of the target \"{s}\"; the predicate fails with UnknownField when rendered",
+                            .{ info.name, offender, target_info.name },
+                        );
+                        // The generated signature is infallible — callers
+                        // compose it straight into `Where` — so the
+                        // rejection is a predicate that fails at render:
+                        // `Predicate.appendTo` answers `error.UnknownField`,
+                        // the same answer the EntQL path gives at parse
+                        // time. Through a QueryBuilder the build path
+                        // narrows it to `BuildFailed`, exactly as it narrows
+                        // an unlowered `.has_edge`.
+                        return .{ .exists_fn = &struct {
+                            fn unknownFieldGen(_: *sql.Builder) anyerror!void {
+                                return error.UnknownField;
+                            }
+                        }.unknownFieldGen };
+                    }
                     return .{ .has_neighbors_with = .{
                         .step = step,
                         .preds = preds,
@@ -314,6 +342,82 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
 
         return result;
     }
+}
+
+// ------------------------------------------------------------------
+// Has{Edge}With target-column validation
+// ------------------------------------------------------------------
+
+/// Whether `name` can address a column of the edge *target* inside a
+/// `Has{Edge}With` subquery: the target's API field name, its physical
+/// column name (`StorageKey`), or a caller-qualified `t.col` — a dotted name
+/// carries its own table, exactly as `sql.appendQualifiedPred` treats it, so
+/// it is not second-guessed here.
+fn targetColumnKnown(comptime target: TypeInfo, name: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, name, '.') != null) return true;
+    inline for (target.fields) |f| {
+        if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, f.column_name, name)) return true;
+    }
+    return false;
+}
+
+/// The first column identifier in `pred` that addresses nothing the target
+/// entity has, or `null` when every column-bearing predicate addresses it.
+/// The shapes checked and the shapes skipped mirror `validateEntqlFields`
+/// (codegen/query.zig): fragments carrying their own SQL (`raw`, `raw_args`,
+/// subqueries, function-generated EXISTS) are not second-guessed, a
+/// `.has_neighbors_with` addresses its *own* target one hop further — which
+/// this scope cannot see, so skipping it keeps a nested composition legal —
+/// and `.has_edge` / `.not_has_edge` are unlowered placeholders whose
+/// rendering already fails loudly.
+fn hasWithPredOffender(comptime target: TypeInfo, pred: sql.Predicate) ?[]const u8 {
+    switch (pred) {
+        .eq, .ne, .gt, .lt, .gte, .lte, .like, .eq_fold => |op| {
+            if (!targetColumnKnown(target, op.column)) return op.column;
+        },
+        .in, .not_in => |op| {
+            if (!targetColumnKnown(target, op.column)) return op.column;
+        },
+        .or_in => |op| {
+            if (!targetColumnKnown(target, op.column)) return op.column;
+        },
+        .like_escaped => |op| {
+            if (!targetColumnKnown(target, op.column)) return op.column;
+        },
+        .is_null, .is_not_null => |column| {
+            if (!targetColumnKnown(target, column)) return column;
+        },
+        .in_subquery => |op| {
+            if (!targetColumnKnown(target, op.column)) return op.column;
+        },
+        .and_ => |op| {
+            if (hasWithPredOffender(target, op.left.*)) |column| return column;
+            if (hasWithPredOffender(target, op.right.*)) |column| return column;
+        },
+        .or_ => |op| {
+            if (hasWithPredOffender(target, op.left.*)) |column| return column;
+            if (hasWithPredOffender(target, op.right.*)) |column| return column;
+        },
+        .not_ => |inner| return hasWithPredOffender(target, inner.*),
+        .not_has_edge,
+        .raw,
+        .raw_args,
+        .exists_subquery,
+        .exists_fn,
+        .not_exists_fn,
+        .has_neighbors_with,
+        .in_select,
+        .has_edge,
+        => {},
+    }
+    return null;
+}
+
+fn hasWithPredsOffender(comptime target: TypeInfo, preds: []const sql.Predicate) ?[]const u8 {
+    for (preds) |pred| {
+        if (hasWithPredOffender(target, pred)) |column| return column;
+    }
+    return null;
 }
 
 /// Lower schema-unaware `.has_edge` / `.not_has_edge` placeholders produced by
@@ -563,6 +667,78 @@ test "Predicates: Has{Edge}With accepts the target entity's typed predicates" {
     try std.testing.expect(std.mem.indexOf(u8, q.sql, "EXISTS (") != null);
     try std.testing.expect(std.mem.indexOf(u8, q.sql, "\"model\" =") != null);
     try std.testing.expect(std.mem.indexOf(u8, q.sql, "\"year\" >=") != null);
+}
+
+test "Predicates: Has{Edge}With rejects a column the target does not have" {
+    // A hand-written `sql.Predicate` is schema-blind. Inside the EXISTS body,
+    // a bare column that only the *other* side of the edge owns used to bind
+    // there silently — on an m2m edge the junction `j`, whose columns are
+    // literally `<table>_id`: `HasCarsWith(&.{sql.EQ("owner_id", …)})`
+    // filtered by accident instead of erroring. The generated wrapper checks
+    // every column-bearing predicate against the target (field API name or
+    // physical column) and an unknown one fails the render with
+    // `error.UnknownField`, the same answer the EntQL path gives.
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const Dialect = @import("../sql/dialect.zig").Dialect;
+
+    const Car = schema("Car", .{
+        .fields = &.{ field.String("model"), field.Int("year") },
+    });
+    const User = schema("User", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("cars", Car)},
+    });
+
+    const car_info = comptime fromSchema(Car);
+    const user_info = comptime fromSchema(User);
+    const infos = comptime &[_]TypeInfo{ user_info, car_info };
+    const resolved = comptime @import("graph.zig").resolveGraphEdges(infos);
+    const user_preds = comptime makePredicates(resolved, resolved[0]);
+
+    const allocator = std.testing.allocator;
+
+    // A non-eq shape over a real target column passes and renders.
+    {
+        const ok = user_preds.HasCarsWith(&.{sql.GT("year", .{ .int = 2020 })});
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try ok.appendTo(&b);
+        try std.testing.expect(std.mem.indexOf(u8, b.query().sql, "\"year\" >") != null);
+    }
+
+    // `owner_id` — the source-side foreign key, the `<table>_id` shape a
+    // junction carries — is neither a Car field nor a Car column. The
+    // constructor stays infallible (its signature is pinned by callers
+    // composing it into `Where`), so the rejection is a predicate that fails
+    // at render, naming the error.
+    {
+        const bad = user_preds.HasCarsWith(&.{sql.EQ("owner_id", .{ .int = 7 })});
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try std.testing.expectError(error.UnknownField, bad.appendTo(&b));
+    }
+
+    // The same check recurses through AND/OR/NOT.
+    {
+        const ok_half = sql.EQ("model", .{ .string = "Tesla" });
+        const bad_half = sql.EQ("owner_id", .{ .int = 7 });
+        const nested = user_preds.HasCarsWith(&.{sql.And(&ok_half, &bad_half)});
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try std.testing.expectError(error.UnknownField, nested.appendTo(&b));
+    }
+
+    // `raw` carries its own SQL by convention and is not second-guessed.
+    {
+        const passthrough = user_preds.HasCarsWith(&.{sql.Raw("\"year\" > 2020")});
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try passthrough.appendTo(&b);
+        try std.testing.expect(std.mem.indexOf(u8, b.query().sql, "\"year\" > 2020") != null);
+    }
 }
 
 test "Predicates: Contains binds the pattern, ContainsEscaped wraps it" {

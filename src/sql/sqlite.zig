@@ -356,7 +356,22 @@ pub const SQLiteDriver = struct {
             }
             break :blk out.?;
         };
-        errdefer _ = c.sqlite3_finalize(stmt);
+        // Failure before the Rows iterator takes ownership: a statement held
+        // on a taken slot goes back to the cache (reset first, the way
+        // `SQLiteRows.deinit` returns it) instead of being finalized beneath
+        // an entry that still points at it and keeps the slot reserved — that
+        // burned one slot per distinct SQL that hit and failed, until the
+        // connection's prepare cache stopped answering. A caller-owned handle
+        // (cache miss) is finalized.
+        errdefer {
+            if (self.cache) |*cached| {
+                _ = c.sqlite3_reset(stmt);
+                _ = c.sqlite3_clear_bindings(stmt);
+                cached.releaseTaken(cache_slot, stmt, {}, finalizeStmt);
+            } else {
+                _ = c.sqlite3_finalize(stmt);
+            }
+        }
 
         // Reset before rebinding (needed when stmt came from cache).
         _ = c.sqlite3_reset(stmt);
@@ -992,6 +1007,55 @@ test "SQLite refuses a binding list the statement's parameter count does not fit
     try std.testing.expectEqual(@as(i64, 1), rows.next().?.getInt(0).?);
 }
 
+test "SQLite: a failed bind returns the taken cache slot instead of stranding it" {
+    // The query path checks the cached statement out for the lifetime of the
+    // Rows iterator. A consumer that fails before any iterator exists (a bind
+    // failure here, an allocation failure in general) used to finalize the
+    // cache-owned handle and leave the slot marked taken: the entry stopped
+    // answering lookups while staying invisible to eviction, so every
+    // distinct SQL that hit the cache and failed burned one of the 16 slots
+    // until the connection's prepare cache never hit again.
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    drv.cache = cache.PreparedCache(16, *c.sqlite3_stmt){};
+
+    // Cache the statement through the exec path (`getOrPrepare` inserts it).
+    _ = try drv.exec("SELECT ? UNION SELECT ?", &.{ .{ .int = 1 }, .{ .int = 2 } });
+    try std.testing.expectEqual(@as(usize, 1), drv.cache.?.len);
+    const cached_handle = drv.cache.?.entries[0].stmt;
+
+    // A bind failure on the cached SQL: the take already happened.
+    try std.testing.expectError(
+        error.SqliteParamCountMismatch,
+        drv.query("SELECT ? UNION SELECT ?", &.{.{ .int = 1 }}),
+    );
+
+    // The slot is back: same length, no entry taken, handle not finalized.
+    try std.testing.expectEqual(@as(usize, 1), drv.cache.?.len);
+    for (drv.cache.?.entries[0..drv.cache.?.len]) |e| {
+        try std.testing.expect(!e.taken);
+    }
+    try std.testing.expect(drv.cache.?.entries[0].stmt == cached_handle);
+
+    // The next query for the same SQL is a hit again — it takes this very
+    // entry, answers from it, and gives the slot back through Rows.deinit.
+    {
+        var again = try drv.query("SELECT ? UNION SELECT ?", &.{ .{ .int = 3 }, .{ .int = 4 } });
+        defer again.deinit();
+        const row = again.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 3), row.getInt(0).?);
+        try std.testing.expect(again.next() != null); // UNION pairs 3 with 4
+        try std.testing.expect(again.next() == null);
+    }
+    // deinit returned the slot: same length, nothing taken, same handle.
+    try std.testing.expectEqual(@as(usize, 1), drv.cache.?.len);
+    for (drv.cache.?.entries[0..drv.cache.?.len]) |e| {
+        try std.testing.expect(!e.taken);
+    }
+    try std.testing.expect(drv.cache.?.entries[0].stmt == cached_handle);
+}
+
 test "SQLite statements that take no parameters still run with no bindings" {
     const allocator = std.testing.allocator;
     var drv = try SQLiteDriver.open(allocator, ":memory:");
@@ -1016,6 +1080,29 @@ test "SQLite statements that take no parameters still run with no bindings" {
     var count = try d.query("SELECT COUNT(*) FROM t", &.{});
     defer count.deinit();
     try std.testing.expectEqual(@as(i64, 1), count.next().?.getInt(0).?);
+}
+
+test "SQLite: a TEXT numeric value coerces silently in getInt — pinned contract" {
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    const d = drv.asDriver();
+
+    // `field.Decimal` maps to TEXT on SQLite (it does on PG/MySQL too, but
+    // those parse the text and answer null on a non-integer, which the scan
+    // layer turns into TypeMismatch or a lenient default). SQLite's C API
+    // coerces instead: getInt over the TEXT value "12.34" answers 12 with no
+    // error, in strict *and* lenient scans alike. This is documented
+    // behaviour (BEST_PRACTICES, "Raw driver / DTO scanning"), not a bug to
+    // "fix" casually — changing it to a precise parse would turn currently
+    // succeeding reads into errors across consumers. Pin it so a change is a
+    // deliberate, reviewable decision.
+    _ = try d.exec("CREATE TABLE t (amount TEXT)", &.{});
+    _ = try d.exec("INSERT INTO t (amount) VALUES ('12.34')", &.{});
+    var rows = try d.query("SELECT amount FROM t", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 12), rows.next().?.getInt(0).?);
+    try std.testing.expect(rows.next() == null);
 }
 
 test "SQLite counts a repeated name once and a gapped ?NNN by its number" {

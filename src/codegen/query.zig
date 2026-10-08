@@ -543,10 +543,12 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const lowerHasEdge = @import("predicate.zig").lowerHasEdge;
             var parsed = try entql.parse(self.allocator, input);
             errdefer entql.deinitPred(self.allocator, &parsed);
-            // Checked before lowering: that step rewrites `has(...)` into the
-            // tuple form, and the edge name — the only thing that says which
-            // entity a nested ident belongs to — is gone from it afterwards.
-            try validateEntqlFields(infos, info, parsed);
+            // Validated and rewritten before lowering: that step rewrites
+            // `has(...)` into the tuple form, and the edge name — the only
+            // thing that says which entity a nested ident belongs to — is
+            // gone from it afterwards. The rewrite here is also what maps an
+            // API-name ident onto its physical column (StorageKey).
+            try validateEntqlFields(infos, info, &parsed);
             try lowerHasEdge(infos, info, self.allocator, &parsed);
             try self.predicates.append(parsed);
             try self.entql_owned.append(parsed);
@@ -2274,63 +2276,72 @@ test "query contract tests" {
     }
 }
 
-/// Reject an EntQL expression that names a field the entity in scope does not
-/// have.
+/// Validate **and rewrite** an EntQL expression's idents against the entity
+/// in scope. The parser is schema-unaware, so an ident reaches the statement
+/// exactly as written; this pass is what gives the expression its addressing
+/// semantics. It runs before lowering — that step rewrites `has(...)` into the
+/// tuple form, and the edge name, the only thing that says which entity a
+/// nested ident belongs to, is gone from it afterwards.
 ///
-/// The parser is schema-unaware, so an ident reached the statement exactly as
-/// written. Two things followed. On a schema using `.StorageKey` the filter
-/// addressed the literal column rather than the declared one. And — the case
-/// that made this a defect — an ident naming a *junction* column inside
-/// `has(...)`, where the target does not have it, bound to the junction table,
-/// which already carries `j.<fk> = <outer>.id`: the filter degenerated into a
-/// condition on the outer row and answered with no error at all.
+/// One ident on a column-bearing predicate resolves by three rules:
 ///
-/// A name is accepted when it matches the field's API name **or** its physical
-/// column name, so both spellings keep working (EntQL has always addressed
-/// physical columns); anything else is `error.UnknownField`, the answer
-/// `QueryView.whereEq`'s sink gives for the same mistake. Edge names are
-/// validated as before, by `lowerHasEdge`'s own `error.UnknownEdge`.
-fn validateEntqlFields(comptime infos: []const TypeInfo, comptime scoped: TypeInfo, pred: sql.Predicate) error{UnknownField}!void {
-    switch (pred) {
-        .eq, .ne, .gt, .lt, .gte, .lte, .like, .eq_fold => |op| {
-            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+///   1. Matches a field's API name (`f.name`) → the predicate's column side
+///      is rewritten to the field's physical column (`f.column_name`), so a
+///      `.StorageKey` field addressed by its API name filters the declared
+///      column instead of failing prepare on one that does not exist.
+///   2. Matches a physical column name, but no field name → left as written;
+///      the physical spelling stays a working address.
+///   3. Neither → `error.UnknownField`, the answer `QueryView.whereEq`'s sink
+///      gives for the same mistake.
+///
+/// A name matching one field's API name *and* another field's column name
+/// resolves by rule 1: the API name wins, deterministically. Edge names are
+/// validated as before, by `lowerHasEdge`'s own `error.UnknownEdge`; the
+/// nested expression of `has(...)` is validated and rewritten against the
+/// *target* entity, the scope switching with the edge.
+fn validateEntqlFields(comptime infos: []const TypeInfo, comptime scoped: TypeInfo, pred: *sql.Predicate) error{UnknownField}!void {
+    switch (pred.*) {
+        .eq, .ne, .gt, .lt, .gte, .lte, .like, .eq_fold => |*op| {
+            op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
         },
-        .in, .not_in => |op| {
-            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        .in, .not_in => |*op| {
+            op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
         },
-        .or_in => |op| {
-            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        .or_in => |*op| {
+            op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
         },
-        .like_escaped => |op| {
-            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        .like_escaped => |*op| {
+            op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
         },
-        .is_null, .is_not_null => |column| {
-            if (!entqlFieldKnown(scoped, column)) return error.UnknownField;
+        .is_null, .is_not_null => |*column| {
+            column.* = entqlColumnFor(scoped, column.*) orelse return error.UnknownField;
         },
-        .in_subquery => |op| {
-            if (!entqlFieldKnown(scoped, op.column)) return error.UnknownField;
+        .in_subquery => |*op| {
+            op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
         },
-        .and_ => |op| {
-            try validateEntqlFields(infos, scoped, op.left.*);
-            try validateEntqlFields(infos, scoped, op.right.*);
+        .and_ => |*op| {
+            try validateEntqlFields(infos, scoped, @constCast(op.left));
+            try validateEntqlFields(infos, scoped, @constCast(op.right));
         },
-        .or_ => |op| {
-            try validateEntqlFields(infos, scoped, op.left.*);
-            try validateEntqlFields(infos, scoped, op.right.*);
+        .or_ => |*op| {
+            try validateEntqlFields(infos, scoped, @constCast(op.left));
+            try validateEntqlFields(infos, scoped, @constCast(op.right));
         },
-        .not_ => |inner| try validateEntqlFields(infos, scoped, inner.*),
+        .not_ => |*inner| try validateEntqlFields(infos, scoped, @constCast(inner.*)),
         // The nested expression addresses the *target* entity, so the scope
-        // switches with the edge — which is why this runs before lowering.
-        .has_edge => |h| {
+        // switches with the edge — which is why this runs before lowering. An
+        // unknown edge is not an error here: `lowerHasEdge` answers
+        // `error.UnknownEdge` for it, as before.
+        .has_edge => |*h| {
             if (h.pred) |nested| {
                 inline for (scoped.edges) |e| {
                     if (std.mem.eql(u8, e.name, h.edge_name)) {
-                        try validateEntqlFields(infos, edgeTargetInfo(infos, scoped, e), nested.*);
+                        try validateEntqlFields(infos, edgeTargetInfo(infos, scoped, e), @constCast(nested));
                     }
                 }
             }
         },
-        // Nothing to check: no column of ours, or a fragment the library did
+        // Nothing to address: no column of ours, or a fragment the library did
         // not build (`raw`, policy filters, subquery text).
         .not_has_edge,
         .raw,
@@ -2344,13 +2355,21 @@ fn validateEntqlFields(comptime infos: []const TypeInfo, comptime scoped: TypeIn
     }
 }
 
-/// Whether `name` addresses `scoped` — its API field name or its physical
-/// column name (`StorageKey`).
-fn entqlFieldKnown(comptime scoped: TypeInfo, name: []const u8) bool {
+/// The physical column an EntQL ident addresses under the entity in scope, or
+/// `null` when nothing does. The rewrite hands back the schema's own string,
+/// so nothing is allocated and nothing new needs freeing — the parser's
+/// idents are slices of the caller's input, and nothing frees columns.
+fn entqlColumnFor(comptime scoped: TypeInfo, name: []const u8) ?[]const u8 {
+    // Two loops, field names first: an ident matching one field's API name
+    // and another field's `StorageKey` resolves to the *field*, never to the
+    // coincidental column.
     inline for (scoped.fields) |f| {
-        if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, f.column_name, name)) return true;
+        if (std.mem.eql(u8, f.name, name)) return f.column_name;
     }
-    return false;
+    inline for (scoped.fields) |f| {
+        if (std.mem.eql(u8, f.column_name, name)) return name;
+    }
+    return null;
 }
 
 test "Query builder Explain prefixes SQL" {
@@ -3174,8 +3193,10 @@ test "WhereEntQL rejects a field the entity does not have" {
     // The parser is schema-unaware, so an ident used to reach the statement as
     // written: a typo failed at the server (loud, but late and per-dialect),
     // and inside `has(...)` an ident naming a junction column bound to the
-    // junction and answered without an error. The check runs on the parsed
-    // tree, before lowering, and accepts either spelling of a field.
+    // junction and answered without an error. The pass on the parsed tree,
+    // before lowering, now also fixes the addressing: an ident naming a field
+    // by its API name is rewritten to the field's physical column, the
+    // physical spelling passes through, and anything else is `UnknownField`.
     const allocator = std.testing.allocator;
     const field = @import("../core/field.zig");
     const edge = @import("../core/edge.zig");
@@ -3185,7 +3206,9 @@ test "WhereEntQL rejects a field the entity does not have" {
     const client_mod = @import("client.zig");
     const migrate = @import("../sql/schema/migrate.zig");
 
-    const Pet = Schema("VfPet", .{ .fields = &.{ field.String("nick"), field.Int("age") } });
+    const Pet = Schema("VfPet", .{
+        .fields = &.{ field.String("nick"), field.Int("age"), field.String("tag").StorageKey("pet_tag") },
+    });
     const OwnerBase = Schema("VfOwner", .{
         .fields = &.{ field.String("name"), field.String("display").StorageKey("full_name") },
     });
@@ -3195,8 +3218,17 @@ test "WhereEntQL rejects a field the entity does not have" {
         pub const edges = &.{edge.To("pets", Pet)};
         pub const indexes = OwnerBase.indexes;
     };
+    // Rule-1-vs-rule-2 collision: `display` is one field's API name and — via
+    // `StorageKey` — another field's physical column. The table is still
+    // creatable: the physical columns (`full_name`, `display`) are distinct.
+    const MarkedBase = Schema("VfMarked", .{
+        .fields = &.{
+            field.String("display").StorageKey("full_name"),
+            field.String("remark").StorageKey("display"),
+        },
+    });
 
-    const graph = comptime buildGraph(&.{ Owner, Pet });
+    const graph = comptime buildGraph(&.{ Owner, Pet, MarkedBase });
     const infos = graph.types;
 
     var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -3223,18 +3255,36 @@ test "WhereEntQL rejects a field the entity does not have" {
         try std.testing.expectError(error.UnknownField, q.WhereEntQL("has(pets, name = \"x\")"));
     }
 
-    // Both spellings of a field are accepted, `StorageKey` included: EntQL has
-    // always addressed physical columns, and mapping idents is a separate
-    // decision (docs/OPEN_ITEMS.md).
+    // Rule 1: a `StorageKey` field addressed by its API name is rewritten, so
+    // the SQL filters `full_name` — the literal API spelling, a column the
+    // `VfOwner` table does not have, is gone from the statement.
     {
         var q = root.vf_owner.Query();
         defer q.deinit();
         _ = try q.WhereEntQL("display = \"x\"");
+        var plan = try q.Explain(allocator, .text);
+        defer plan.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, plan.sql, "\"full_name\" = ?") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan.sql, "\"display\"") == null);
     }
+    // Rule 2: the physical spelling keeps working, untouched.
     {
         var q = root.vf_owner.Query();
         defer q.deinit();
         _ = try q.WhereEntQL("full_name = \"x\"");
+        var plan = try q.Explain(allocator, .text);
+        defer plan.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, plan.sql, "\"full_name\" = ?") != null);
+    }
+    // Rule 1 inside `has(...)`: the nested scope is the *target*, and its
+    // `StorageKey` field is rewritten the same way.
+    {
+        var q = root.vf_owner.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("has(pets, tag = \"x\")");
+        var plan = try q.Explain(allocator, .text);
+        defer plan.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, plan.sql, "\"pet_tag\" = ?") != null);
     }
     {
         var q = root.vf_owner.Query();
@@ -3245,6 +3295,20 @@ test "WhereEntQL rejects a field the entity does not have" {
         var q2 = root.vf_owner.Query();
         defer q2.deinit();
         try std.testing.expectError(error.UnknownField, q2.WhereEntQL("has(pets, nick = \"x\") AND age > 3"));
+    }
+    // Field name wins over a coincidental column name: `display` is the API
+    // name of one `VfMarked` field and the physical column of another. The
+    // field spelling resolves, so the predicate addresses `full_name`, not
+    // the column that happens to be called `display` (which the SELECT list
+    // still carries — the `= ?` suffix is what pins the predicate here).
+    {
+        var q = root.vf_marked.Query();
+        defer q.deinit();
+        _ = try q.WhereEntQL("display = \"x\"");
+        var plan = try q.Explain(allocator, .text);
+        defer plan.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, plan.sql, "\"full_name\" = ?") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan.sql, "\"display\" = ") == null);
     }
 }
 

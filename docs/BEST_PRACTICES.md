@@ -259,9 +259,21 @@ Only one name is exposed per layer:
 
 Raw escape hatches stay SQL-level: `sql.EQ`/`sql.OrderAsc` handed to the
 low-level `Selector`/`Update` builders, `SelectExpr`, `UpsertSetExpr.column`
-and its `{t:col}`/`{x:col}` tokens, edge `.OrderBy("col")`, and EntQL
-expression identifiers all take the **physical column name**. With
-`StorageKey` that means writing `user_name`, not `userName`.
+and its `{t:col}`/`{x:col}` tokens, and edge `.OrderBy("col")` all take the
+**physical column name**. With `StorageKey` that means writing `user_name`,
+not `userName`.
+
+**EntQL (v0.84.0) is field-name-first.** A `WhereEntQL` ident is resolved
+against the entity in scope at lowering: it matches a field's **API name** →
+the predicate is rewritten to that field's column (so `"userName = …"` filters
+`user_name`); it matches a physical **column** name but no field name → the
+column spelling keeps working; neither → `error.UnknownField` before any SQL
+is built (same for idents inside `has(...)` — they resolve against the edge
+*target*). If an entity declares a field whose API name equals another field's
+column name, the field-name reading wins. Hand-built `sql.Predicate`s entering
+through `Has{Edge}With` are checked against the target's columns the same way,
+so a junction-only bare column fails with `UnknownField` instead of binding to
+the junction table; `sql.Raw` stays verbatim by design.
 
 ## 3a. Predicate catalogue
 
@@ -526,6 +538,43 @@ Two boundaries to know: a statement using explicit `?NNN` indices with a gap
 reports the *highest* slot number, so a list sized to the used parameters is
 rejected (the builder only ever emits `?`); and unifying PostgreSQL onto the same
 error is not done yet, which is why the table above still has three rows.
+
+### Reading numbers back: `getInt` over a DECIMAL column, per dialect
+
+`field.Decimal` maps to a text column on every dialect, and `getInt` over that
+text does **not** agree across the drivers. This matters most when a DTO/struct
+field is an integer but the column holds a decimal string like `"12.34"`:
+
+| Dialect | strict scan | lenient scan |
+|---|---|---|
+| MySQL | parse fails → `error.TypeMismatch` | field default (documented lenient contract) |
+| PostgreSQL | parse fails → `error.TypeMismatch` | field default |
+| SQLite | `sqlite3_column_int64` coerces → **`12`, silently** | **`12`, silently** |
+
+SQLite's C API coerces instead of parsing, so the strict contract's
+`TypeMismatch` simply cannot happen there — a wrong column mapping is masked as
+a truncated value on SQLite but errors on the other two. **Advice: do not point
+an integer DTO field at a `Decimal` column**; use `field.Text`-style access
+(`getText` + parse) or a `Decimal`-typed destination. SQLite's coercion is
+pinned by a driver test precisely so that "fixing" it into a precise parse —
+which would turn currently succeeding reads into errors — is a reviewable
+decision, not an accident (`OPEN_ITEMS.md`, needs-a-decision table).
+
+### `Save()`'s returned id when there is no generated key
+
+`Save` reads the new row's id from `RETURNING` (PG/SQLite) or
+`mysql_insert_id()` (MySQL). The MySQL C API answers `0` when the statement did
+not touch an `AUTO_INCREMENT` value, and since v0.84.0 the driver maps that to
+"no id", so:
+
+- **Table without `AUTO_INCREMENT`** (externally managed or no default):
+  `Save` fails with `error.MissingLastInsertId` instead of writing a row whose
+  id is `0` and returning it as the new key.
+- **`SaveIgnore` that did not insert** (unique conflict): still returns
+  `id = 0` with no error — that is the cross-dialect convention for "no row
+  written", matching PG/SQLite's RETURNING miss.
+- **`SaveOrUpdate`** is unaffected: `ODKU`'s update branch reports the
+  *updated* row's id, never `0`.
 
 ### Scoping raw SQL (`zent.scope`)
 

@@ -357,10 +357,13 @@ pub fn appendHasNeighborsWith(b: *sql.Builder, step: Step, preds: []const sql.Pr
             // error at all. The predicate is about the target, so qualify it
             // there — `appendQualifiedPred` rewrites the shapes whose column is
             // a plain name and appends the rest verbatim (a predicate carrying
-            // its own SQL text cannot be rewritten safely), which leaves an
-            // EntQL comparison on a column that exists only on the junction
-            // binding there; validating EntQL field names against the target's
-            // schema is the tracked follow-up.
+            // its own SQL text cannot be rewritten safely). EntQL idents are
+            // now validated and rewritten against the target's schema before
+            // lowering (field-name-first, `query.zig`'s `validateEntqlFields`),
+            // and hand-built predicates entering through `Has{Edge}With` are
+            // checked against the target's columns at construction time
+            // (`predicate.zig`), so a junction-only bare column fails loudly
+            // instead of binding here.
             try sql.appendQualifiedPred(b, pred, if (step.edge_rel == .m2m) "t" else null);
         }
         try b.writeByte(')');
