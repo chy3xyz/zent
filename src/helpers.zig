@@ -250,6 +250,12 @@ pub fn ShardedEnv(comptime Driver: type, comptime Infos: anytype) type {
 
             var shards = try shard_mod.ShardSet(Infos).init(allocator, router, clients);
             errdefer shards.deinit();
+            // The router was empty at the hand-off and nothing was assigned
+            // through the local copy since, so dropping it here releases
+            // nothing; from here on `shards.router` is the canonical copy —
+            // every assignment (`assignTenant` / `rebalance`) and the release
+            // in `deinit` go through it. Mutating both copies would send
+            // `route` into a map a growth freed.
             return .{
                 .allocator = allocator,
                 .drivers = drivers,
@@ -264,6 +270,10 @@ pub fn ShardedEnv(comptime Driver: type, comptime Infos: anytype) type {
             // registered there before shards.deinit frees that slice. No-op
             // for shards that never registered an interceptor.
             for (self.shards.clients) |*c| codegen.DeinitClient(Infos, c);
+            // `ShardSet` borrows the router, and `shards.router` is the copy
+            // every mutation went through — release it before `shards.deinit`
+            // invalidates it.
+            self.shards.router.deinit();
             self.shards.deinit();
             self.allocator.free(self.clients);
             for (self.drivers) |dp| {

@@ -17,6 +17,16 @@ const migrate = zent.sql_schema;
 
 const User = @import("schema.zig").User;
 
+/// A pool keeps several connections open, and every `:memory:` open creates
+/// its own private database — tables migrated through one connection are
+/// invisible to the next, so with `min_connections = 2` this demo only ran
+/// when the pool's LIFO borrow happened to hand back the migrating connection.
+/// A shared-cache URI (`file:…?mode=memory&cache=shared`) cannot rescue it:
+/// zent's `SQLiteDriver.open` calls `sqlite3_open` without `SQLITE_OPEN_URI`
+/// (and nothing enables `SQLITE_CONFIG_URI`), so URI filenames are not
+/// honored. Every connection therefore opens the same real file.
+const db_path = "zentpool-demo.db";
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
@@ -24,11 +34,19 @@ pub fn main() !void {
     const user_info = graph.types[0];
     const infos = &[_]zent.codegen.graph.TypeInfo{user_info};
 
+    // A leftover file from an earlier run would carry its rows into this one
+    // (the `Only()` below expects exactly one user), so start empty and remove
+    // the file on the way out. This defer is declared before the pool's, so
+    // it runs after `pool.deinit()` has closed every connection. (`std.c.unlink`
+    // because the demo links libc and needs no `Io` just to remove a file.)
+    _ = std.c.unlink(db_path);
+    defer _ = std.c.unlink(db_path);
+
     // Warm up a pool of SQLite connections.
     var pool = try ConnPool(SQLiteDriver).init(allocator, .{
         .connect = struct {
             fn f(a: std.mem.Allocator) !SQLiteDriver {
-                return SQLiteDriver.open(a, ":memory:");
+                return SQLiteDriver.open(a, db_path);
             }
         }.f,
         .min_connections = 2,

@@ -9,6 +9,10 @@ pub const UserSettings = struct {
     notifications: bool,
 };
 
+/// Compose edges onto a `Schema()` type. Forwards these decls only:
+/// schema_name, fields, indexes, policy, is_view, view_sql, soft_delete.
+/// A schema that also needs `table_name`, `pk` or `annotations` *and* edges
+/// must set them on the composed type — this helper silently drops them.
 fn withEdges(comptime Base: type, comptime es: []const edge.Edge) type {
     return struct {
         pub const schema_name = Base.schema_name;

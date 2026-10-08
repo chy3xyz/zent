@@ -35,6 +35,11 @@ const OrderItem = schema.OrderItem;
 const Tag = schema.Tag;
 
 pub fn main() !void {
+    // page_allocator keeps the demo short, but query pages still follow the
+    // ownership contract: each `All()` page is released with the pairing
+    // `q.deinitRows(&rows)` (entities + list in one call). The single
+    // entities a Create/Only returns are left to the allocator for brevity —
+    // real callers wire `client.<entity>.deinitRow(&e)` (docs/ARCHITECTURE.md).
     const allocator = std.heap.page_allocator;
 
     // ------------------------------------------------------------------
@@ -56,6 +61,9 @@ pub fn main() !void {
     // ------------------------------------------------------------------
     // Open DB + migrate
     // ------------------------------------------------------------------
+    // `:memory:` is safe here because this demo holds exactly one connection.
+    // Each `:memory:` open is its own private database, so a pool (see
+    // examples/pool) cannot share one — that demo needs a real file.
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
     try migrate.migrateSchema(allocator, drv.asDriver(), graph.types);
@@ -142,6 +150,7 @@ pub fn main() !void {
         // Single-item order (espresso only)
         var ob = try client.order.Create();
         defer ob.deinit();
+        _ = try ob.setFieldValue("customer_id", alice.id);
         _ = try ob.setFieldValue("total", espresso.price);
         _ = try ob.setFieldValue("status", "pending");
         _ = try ob.setFieldValue("created_at", @as(i64, 1700000000));
@@ -167,8 +176,8 @@ pub fn main() !void {
         defer q.deinit();
         _ = try q.Where(.{prod_preds.priceGT(.{ .float = 50.0 })});
         _ = try q.OrderBy(&.{sql.Order{ .column = .{ .name = "price", .desc = true } }});
-        const prods = try q.All();
-        defer dropAll(infos, prod_info, allocator, prods);
+        var prods = try q.All();
+        defer q.deinitRows(&prods);
         for (prods.items) |p| {
             std.debug.print("  {s:20} ${d:>7.2}  stock={d}\n", .{ p.name, p.price, p.stock });
         }
@@ -180,8 +189,8 @@ pub fn main() !void {
         var q = client.product.Query();
         defer q.deinit();
         _ = try q.WithEdge("tags");
-        const prods = try q.All();
-        defer dropAll(infos, prod_info, allocator, prods);
+        var prods = try q.All();
+        defer q.deinitRows(&prods);
         for (prods.items) |p| {
             std.debug.print("  {s:20}", .{p.name});
             if (p.edges.tags) |tags| {
@@ -234,8 +243,8 @@ pub fn main() !void {
         defer q.deinit();
         _ = try q.GroupBy(&.{"value"});
         _ = q.Having(sql.GT("COUNT(*)", .{ .int = 1 }));
-        const tags = try q.All();
-        defer dropAll(infos, tag_info, allocator, tags);
+        var tags = try q.All();
+        defer q.deinitRows(&tags);
         for (tags.items) |t| {
             std.debug.print("  {s}\n", .{t.value});
         }
@@ -245,11 +254,15 @@ pub fn main() !void {
     std.debug.print("\n-- EntQL: 'price > 50 AND stock < 100' --\n", .{});
     {
         const pred = try zent.entql.parse(allocator, "price > 50 AND stock < 100");
+        // The parsed tree owns heap slices (`in` values, `like` text); release
+        // it once the query has run. Declared before the builder's defers, so
+        // it runs last — after the rows are read.
+        defer zent.entql.deinitPred(allocator, &pred);
         var q = client.product.Query();
         defer q.deinit();
         _ = try q.Where(&[_]sql.Predicate{pred});
-        const prods = try q.All();
-        defer dropAll(infos, prod_info, allocator, prods);
+        var prods = try q.All();
+        defer q.deinitRows(&prods);
         for (prods.items) |p| {
             std.debug.print("  {s:20} ${d:>7.2}  stock={d}\n", .{ p.name, p.price, p.stock });
         }
@@ -365,8 +378,6 @@ pub fn main() !void {
 
     // ------------------------------------------------------------------
     std.debug.print("\n=== All phases completed ===\n", .{});
-
-    std.debug.print("\n=== All phases completed ===\n", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +394,7 @@ fn createOrder(
     const total = mouse.price * 2.0 + keyboard.price * 1.0;
     var ob = try client.order.Create();
     defer ob.deinit();
+    _ = try ob.setFieldValue("customer_id", customer.id);
     _ = try ob.setFieldValue("total", total);
     _ = try ob.setFieldValue("status", "pending");
     _ = try ob.setFieldValue("created_at", @as(i64, 1700000000));
@@ -409,11 +421,4 @@ fn createOrder(
         _ = try ib.setFieldValue("order_id", order.id);
         _ = try ib.Save();
     }
-}
-
-fn dropAll(comptime infos: []const zent.codegen.graph.TypeInfo, comptime ti: zent.codegen.graph.TypeInfo, allocator: std.mem.Allocator, list: anytype) void {
-    _ = infos;
-    _ = ti;
-    _ = allocator;
-    list.deinit();
 }

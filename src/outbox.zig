@@ -14,10 +14,10 @@
 //!   // inside a transaction:
 //!   var tx = try zent.codegen.beginTx(infos, client);
 //!   ... business writes via tx.client ...
-//!   _ = try Outbox.enqueue(allocator, tx.client, now_ms, .{ ... });
+//!   _ = try Outbox.enqueue(tx.client, now_ms, .{ ... });
 //!   try tx.commit();          // event committed atomically
 //!   // after commit:
-//!   _ = try Outbox.dispatch(allocator, client, now_ms, publisher, 100);
+//!   _ = try Outbox.dispatch(allocator, client, now_ms, publisher, 100, 3);
 //!   // periodic sweeper (crash recovery):
 //!   _ = try Outbox.requeueStale(allocator, client, 300);
 
@@ -167,17 +167,34 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
                 found.deinit();
             }
             const out = try allocator.alloc(Entry, found.items.len);
-            errdefer allocator.free(out);
+            var filled: usize = 0;
+            // Same teardown shape as `collectRows` below: a failing dupe has
+            // to release both the row it was building and every completed row.
+            errdefer {
+                for (out[0..filled]) |e| {
+                    allocator.free(e.aggregate_type);
+                    allocator.free(e.event_type);
+                    allocator.free(e.payload);
+                }
+                allocator.free(out);
+            }
             for (found.items, 0..) |e, i| {
+                const aggregate_type = try allocator.dupe(u8, e.aggregate_type);
+                errdefer allocator.free(aggregate_type);
+                const event_type = try allocator.dupe(u8, e.event_type);
+                errdefer allocator.free(event_type);
+                const payload = try allocator.dupe(u8, e.payload);
+                errdefer allocator.free(payload);
                 out[i] = .{
                     .id = e.id,
-                    .aggregate_type = try allocator.dupe(u8, e.aggregate_type),
+                    .aggregate_type = aggregate_type,
                     .aggregate_id = e.aggregate_id,
-                    .event_type = try allocator.dupe(u8, e.event_type),
-                    .payload = try allocator.dupe(u8, e.payload),
+                    .event_type = event_type,
+                    .payload = payload,
                     .attempts = e.attempts,
                     .created_at = e.created_at,
                 };
+                filled = i + 1;
             }
             return out;
         }

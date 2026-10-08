@@ -21,14 +21,15 @@ const Doc = Schema("Doc", .{
 });
 
 pub fn main() !void {
-    // page_allocator keeps the demo short; see examples/start for the same
-    // convention. For production, wire deinitEntity/DeinitClient per the
-    // ownership contract in docs/ARCHITECTURE.md.
+    // page_allocator keeps the demo short; query pages are still released
+    // with the pairing `q.deinitRows(&docs)` (see printTitles), and the
+    // client's interceptor chain with `DeinitClient` below. For production
+    // also release the single entities via `client.<entity>.deinitRow(&e)` —
+    // the ownership contract is in docs/ARCHITECTURE.md.
     const allocator = std.heap.page_allocator;
 
     const graph = comptime buildGraph(&.{Doc});
     const infos = graph.types;
-    const doc_info = graph.types[0];
 
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -38,9 +39,11 @@ pub fn main() !void {
     var client = Client.makeClient(infos, allocator, drv.asDriver());
     defer Client.DeinitClient(infos, &client);
 
-    // Seed two tenants before the interceptor is registered so we can
-    // insert both tenant_id values. After UseInterceptor, omitted
-    // tenant_id on Create is filled from ctx (if-missing).
+    // Seed two tenants before the interceptor is registered so we can insert
+    // both tenant_id values explicitly. After UseInterceptor the create path
+    // runs the same `whereEq` as a *filler*: a Create that omits tenant_id is
+    // filled from ctx (an explicitly set tenant_id still wins) — demonstrated
+    // right after registration below.
     try insertDoc(&client, 1, "tenant-1 doc A", "alpha");
     try insertDoc(&client, 1, "tenant-1 doc B", "beta");
     try insertDoc(&client, 2, "tenant-2 doc C", "gamma");
@@ -59,17 +62,31 @@ pub fn main() !void {
         }.f,
     });
 
+    // The comment above promised it: a Create that omits tenant_id is filled
+    // from ctx (set-if-missing), so the row lands in tenant 1 without the
+    // caller naming a tenant. The Count()/printTitles() right below read the
+    // row back from the database and show it scoped to tenant 1.
+    var auto_b = try client.doc.Create();
+    defer auto_b.deinit();
+    _ = try auto_b.setFieldValue("title", "tenant-1 doc D (tenant_id filled)");
+    _ = try auto_b.setFieldValue("body", "no tenant_id set by the caller");
+    const auto_doc = try auto_b.Save();
+    std.debug.print(
+        "tenant={d}: Create() without tenant_id saved with tenant_id={d}\n",
+        .{ tenant, auto_doc.tenant_id },
+    );
+
     var q1 = client.doc.Query();
     defer q1.deinit();
     std.debug.print("tenant={d}: Count() = {d}\n", .{ tenant, try q1.Count() });
-    try printTitles(infos, doc_info, &client, allocator);
+    try printTitles(&client);
 
     // Switch tenant at runtime — the same code path now sees tenant 2 only.
     tenant = 2;
     var q2 = client.doc.Query();
     defer q2.deinit();
     std.debug.print("tenant={d}: Count() = {d}\n", .{ tenant, try q2.Count() });
-    try printTitles(infos, doc_info, &client, allocator);
+    try printTitles(&client);
 
     // Update is transparently scoped: no Where clause, yet only the current
     // tenant's rows are touched.
@@ -102,15 +119,14 @@ fn insertDoc(client: anytype, tenant: i64, title: []const u8, body: []const u8) 
     _ = try b.Save();
 }
 
-fn printTitles(comptime infos: anytype, comptime doc_info: anytype, client: anytype, allocator: std.mem.Allocator) !void {
+fn printTitles(client: anytype) !void {
     var q = client.doc.Query();
     defer q.deinit();
     var docs = try q.All();
-    defer docs.deinit();
+    // One call frees the entities and the list — the pairing release for an
+    // `All()` page (no per-item deinitEntity loop to keep in step).
+    defer q.deinitRows(&docs);
     for (docs.items) |*d| {
         std.debug.print("    id={d} tenant={d} title={s}\n", .{ d.id, d.tenant_id, d.title });
-    }
-    for (docs.items) |*d| {
-        zent.codegen.deinitEntity(infos, doc_info, d, allocator);
     }
 }

@@ -556,7 +556,16 @@ pub fn checkSchema(
     comptime infos: []const TypeInfo,
 ) ![]SchemaDrift {
     var drifts = std.array_list.Managed(SchemaDrift).init(allocator);
-    errdefer drifts.deinit();
+    errdefer {
+        // The success path hands the slice to `freeSchemaDrift`; the error path
+        // must release exactly the same owned fields for every entry that made
+        // it into the list, then the list itself. A bare `deinit` here leaked
+        // the `.extra_column` name and every index/FK detail already appended —
+        // reached whenever any introspection query below fails after the first
+        // append.
+        for (drifts.items) |d| freeDriftOwnedFields(allocator, d);
+        drifts.deinit();
+    }
     const dialect = driver.dialect();
 
     inline for (infos) |info| {
@@ -584,12 +593,15 @@ pub fn checkSchema(
                         // Type comparison is text-based and best-effort: SQLite
                         // is dynamically typed, and its declared type is all the
                         // metadata there is. `normalizeSqlType` exists for
-                        // exactly this comparison (the ALTER TYPE path uses it).
+                        // exactly this comparison, and the ALTER TYPE branch of
+                        // the plan runs it through the same
+                        // `normalizeTypeForCompare` — one comparison, so a plan
+                        // cannot disagree with the drift report it previews.
                         var schema_buf: [128]u8 = undefined;
                         var db_buf: [128]u8 = undefined;
-                        const schema_norm = try normalizeTypeForCompare(allocator, columnSQLType(col, dialect), &schema_buf);
+                        const schema_norm = try normalizeTypeForCompare(allocator, columnSQLType(col, dialect), &schema_buf, dialect);
                         defer schema_norm.deinit(allocator);
-                        const db_norm = try normalizeTypeForCompare(allocator, db_col.sql_type, &db_buf);
+                        const db_norm = try normalizeTypeForCompare(allocator, db_col.sql_type, &db_buf, dialect);
                         defer db_norm.deinit(allocator);
                         if (!std.mem.eql(u8, schema_norm.text, db_norm.text)) {
                             try drifts.append(.{
@@ -618,7 +630,7 @@ pub fn checkSchema(
                     if (std.mem.eql(u8, col.name, db_col.name)) known = true;
                 }
                 if (!known) {
-                    try drifts.append(.{
+                    try appendOwnedDrift(allocator, &drifts, .{
                         .table = table.name,
                         .column = try allocator.dupe(u8, db_col.name),
                         .kind = .extra_column,
@@ -655,7 +667,7 @@ pub fn checkSchema(
                         inline for (info.indexes) |idx| {
                             if (getExistingIndexByName(existing_idxs.items, idx.name)) |db_idx| {
                                 if (db_idx.columns_comparable and !columnsEqual(db_idx.columns, idx.columns)) {
-                                    try drifts.append(.{
+                                    try appendOwnedDrift(allocator, &drifts, .{
                                         .table = table.name,
                                         .kind = .index_columns,
                                         .index_name = idx.name,
@@ -674,7 +686,7 @@ pub fn checkSchema(
                                 // never make `index_columns` report a key list it
                                 // could not compare.
                                 if (db_idx.unique != idx.unique) {
-                                    try drifts.append(.{
+                                    try appendOwnedDrift(allocator, &drifts, .{
                                         .table = table.name,
                                         .kind = .index_uniqueness,
                                         .index_name = idx.name,
@@ -739,7 +751,7 @@ pub fn checkSchema(
 
                     inline for (table.foreign_keys) |fk| {
                         if (!foreignKeyPresent(existing_fks.items, fk)) {
-                            try drifts.append(.{
+                            try appendOwnedDrift(allocator, &drifts, .{
                                 .table = table.name,
                                 .column = if (fk.columns.len > 0) fk.columns[0] else "",
                                 .kind = .missing_foreign_key,
@@ -940,7 +952,7 @@ fn appendJunctionShapeDrifts(
 
     inline for (jtable.foreign_keys) |fk| {
         if (!foreignKeyPresent(existing_fks.items, fk)) {
-            try drifts.append(.{
+            try appendOwnedDrift(allocator, drifts, .{
                 .table = jtable.name,
                 .column = if (fk.columns.len > 0) fk.columns[0] else "",
                 .kind = .missing_foreign_key,
@@ -1254,16 +1266,45 @@ fn ownsIndexDetail(kind: SchemaDrift.Kind) bool {
     };
 }
 
+/// Frees one drift entry's owned fields — the `.extra_column` name
+/// (`column_owned`) and the detail the kinds `ownsIndexDetail` names — and
+/// nothing else; every other field borrows from `infos` or from comptime
+/// literals (see `SchemaDrift.column_owned` / `SchemaDrift.index_detail`).
+///
+/// The per-item half of `freeSchemaDrift`, kept separate because
+/// `checkSchema`'s error path and `appendOwnedDrift` need exactly this half:
+/// the classification of "what does this entry own" lives here alone.
+fn freeDriftOwnedFields(allocator: std.mem.Allocator, d: SchemaDrift) void {
+    if (d.column_owned) allocator.free(d.column);
+    if (ownsIndexDetail(d.kind)) allocator.free(d.index_detail);
+}
+
 /// Frees the slice, the `.extra_column` names it duplicated, and the detail
-/// carried by the kinds `ownsIndexDetail` names; every other entry borrows from
-/// `infos` or from comptime literals (see `SchemaDrift.column_owned` /
-/// `SchemaDrift.index_detail`).
+/// carried by the kinds `ownsIndexDetail` names.
 pub fn freeSchemaDrift(allocator: std.mem.Allocator, drifts: []SchemaDrift) void {
-    for (drifts) |d| {
-        if (d.column_owned) allocator.free(d.column);
-        if (ownsIndexDetail(d.kind)) allocator.free(d.index_detail);
-    }
+    for (drifts) |d| freeDriftOwnedFields(allocator, d);
     allocator.free(drifts);
+}
+
+/// Append one drift entry, releasing its freshly allocated owned fields when
+/// the `append` itself fails.
+///
+/// `try drifts.append(.{ .index_detail = try detailAlloc(…) })` allocates the
+/// detail **before** the list grows, and the growth is an allocation that can
+/// fail: the entry never reaches `drifts.items`, so the caller's error cleanup
+/// — which walks exactly that list — cannot see it and the detail leaks.
+/// Routing every append that carries an allocation through here makes the error
+/// path own the entry from the moment it exists. What "owned" means is read off
+/// the entry itself (`column_owned`, `ownsIndexDetail`), the same rule
+/// `freeSchemaDrift` applies, so an entry that owns nothing frees nothing.
+/// `appendPlanned` is the same shape for the plan list.
+fn appendOwnedDrift(
+    allocator: std.mem.Allocator,
+    drifts: *std.array_list.Managed(SchemaDrift),
+    drift: SchemaDrift,
+) !void {
+    errdefer freeDriftOwnedFields(allocator, drift);
+    try drifts.append(drift);
 }
 
 /// Assert that the schema and the database agree, for a startup step or a CI
@@ -1883,7 +1924,9 @@ fn auditTimestampDefault(column: ColumnDef, dialect: Dialect) ?[]const u8 {
 /// - Stripping size/precision modifiers: `varchar(255)` → `varchar`
 /// - Canonicalizing aliases: `character varying` → `varchar`, `int` → `integer`
 /// - Trimming whitespace
-fn normalizeSqlType(sql_type: []const u8, buf: []u8) ![]u8 {
+/// - On MySQL, mapping the server's storage names back onto the declared
+///   family (see `server_canonical` below)
+fn normalizeSqlType(sql_type: []const u8, buf: []u8, dialect: Dialect) ![]u8 {
     if (sql_type.len > buf.len) return error.NoSpaceLeft;
 
     // Lowercase and copy to buf
@@ -1901,7 +1944,24 @@ fn normalizeSqlType(sql_type: []const u8, buf: []u8) ![]u8 {
     // Canonicalize aliases — copy canonical name into buffer and return
     const canonical: ?[]const u8 = if (std.mem.eql(u8, normalized, "character varying")) "varchar" else if (std.mem.eql(u8, normalized, "int") or std.mem.eql(u8, normalized, "int4")) "integer" else if (std.mem.eql(u8, normalized, "double")) "double precision" else if (std.mem.eql(u8, normalized, "bool")) "boolean" else if (std.mem.eql(u8, normalized, "serial")) "integer" else if (std.mem.eql(u8, normalized, "bigserial")) "bigint" else if (std.mem.eql(u8, normalized, "timestamptz")) "timestamp with time zone" else null;
 
-    if (canonical) |canon| {
+    // MySQL answers `information_schema.columns.data_type` with the **storage
+    // type**, not the spelling the DDL used: BOOLEAN lands as `tinyint` (a
+    // `tinyint(1)`) and REAL as `double` (REAL is a DOUBLE synonym there;
+    // MariaDB behaves the same). zent emits both spellings dialect-independently
+    // (`field.sqlType`), so without mapping the server's answer back every MySQL
+    // table carrying a bool or a float reported a false `.type_mismatch` — and a
+    // run with `allow_data_loss` then planned an ALTER TYPE to "repair" it,
+    // which `alterColumnTypeSQL` refuses with `MySQLTypeChangeUnsafe`: planning
+    // failed hard, dry-run included, and the version was never recorded.
+    // Deliberately only these two, and gated on the dialect so PostgreSQL and
+    // SQLite normalize exactly as before: `tinyint` cannot collide with a real
+    // difference (zent's `.int` is emitted INTEGER and MySQL stores it as `int`,
+    // normalized to `integer` — a genuine `tinyint` column is still not an
+    // `.int`), and MySQL FLOAT keeps reporting `float`, distinct from the DOUBLE
+    // family REAL belongs to.
+    const server_canonical: ?[]const u8 = if (dialect.kind() != .mysql) null else if (std.mem.eql(u8, normalized, "tinyint")) "boolean" else if (std.mem.eql(u8, normalized, "real")) "double precision" else null;
+
+    if (server_canonical orelse canonical) |canon| {
         if (canon.len > buf.len) return error.NoSpaceLeft;
         @memcpy(buf[0..canon.len], canon);
         return buf[0..canon.len];
@@ -3233,20 +3293,30 @@ fn getMySQLForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
         const position = row.getInt(3) orelse continue;
         if (current == null or position == 1) {
             try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+            // Same copy-then-append shape as `getMySQLIndexes`: the dupe is
+            // released by an `errdefer` declared in the loop body when the
+            // `append` itself fails — the entry never reached `result`, so the
+            // function's `errdefer freeExistingForeignKeys` cannot free it.
+            const owned_ref_table = try allocator.dupe(u8, row.getText(1) orelse "");
+            errdefer allocator.free(owned_ref_table);
             try result.append(.{
                 .columns = &.{},
-                .ref_table = try allocator.dupe(u8, row.getText(1) orelse ""),
+                .ref_table = owned_ref_table,
             });
             current = result.items.len - 1;
             comparable = true;
         }
         if (row.getText(0)) |column| {
-            try cols.append(try allocator.dupe(u8, column));
+            const owned_column = try allocator.dupe(u8, column);
+            errdefer allocator.free(owned_column);
+            try cols.append(owned_column);
         } else {
             comparable = false; // no local column: not a shape to compare
         }
         if (row.getText(2)) |ref_column| {
-            try refs.append(try allocator.dupe(u8, ref_column));
+            const owned_ref_column = try allocator.dupe(u8, ref_column);
+            errdefer allocator.free(owned_ref_column);
+            try refs.append(owned_ref_column);
         } else {
             comparable = false; // referenced column not recorded
         }
@@ -3313,20 +3383,29 @@ fn getPostgresForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.D
         const position = row.getInt(4) orelse continue;
         if (current == null or position == 1) {
             try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+            // Same copy-then-append shape as `getMySQLIndexes`: the dupe is
+            // released by an `errdefer` declared in the loop body when the
+            // `append` itself fails.
+            const owned_ref_table = try allocator.dupe(u8, row.getText(2) orelse "");
+            errdefer allocator.free(owned_ref_table);
             try result.append(.{
                 .columns = &.{},
-                .ref_table = try allocator.dupe(u8, row.getText(2) orelse ""),
+                .ref_table = owned_ref_table,
             });
             current = result.items.len - 1;
             comparable = true;
         }
         if (row.getText(1)) |column| {
-            try cols.append(try allocator.dupe(u8, column));
+            const owned_column = try allocator.dupe(u8, column);
+            errdefer allocator.free(owned_column);
+            try cols.append(owned_column);
         } else {
             comparable = false;
         }
         if (row.getText(3)) |ref_column| {
-            try refs.append(try allocator.dupe(u8, ref_column));
+            const owned_ref_column = try allocator.dupe(u8, ref_column);
+            errdefer allocator.free(owned_ref_column);
+            try refs.append(owned_ref_column);
         } else {
             comparable = false;
         }
@@ -3384,20 +3463,29 @@ fn getSQLiteForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Dri
         const seq = row.getInt(1) orelse continue;
         if (current == null or seq == 0) {
             try closeExistingForeignKey(&result, current, &cols, &refs, comparable);
+            // Same copy-then-append shape as `getMySQLIndexes`: the dupe is
+            // released by an `errdefer` declared in the loop body when the
+            // `append` itself fails.
+            const owned_ref_table = try allocator.dupe(u8, row.getText(2) orelse "");
+            errdefer allocator.free(owned_ref_table);
             try result.append(.{
                 .columns = &.{},
-                .ref_table = try allocator.dupe(u8, row.getText(2) orelse ""),
+                .ref_table = owned_ref_table,
             });
             current = result.items.len - 1;
             comparable = true;
         }
         if (row.getText(3)) |column| {
-            try cols.append(try allocator.dupe(u8, column));
+            const owned_column = try allocator.dupe(u8, column);
+            errdefer allocator.free(owned_column);
+            try cols.append(owned_column);
         } else {
             comparable = false;
         }
         if (row.getText(4)) |ref_column| {
-            try refs.append(try allocator.dupe(u8, ref_column));
+            const owned_ref_column = try allocator.dupe(u8, ref_column);
+            errdefer allocator.free(owned_ref_column);
+            try refs.append(owned_ref_column);
         } else {
             comparable = false;
         }
@@ -3733,7 +3821,9 @@ fn dropColumnSQL(
 }
 
 /// `normalizeSqlType` into a caller-provided stack buffer, falling back to the
-/// heap when the declared type does not fit.
+/// heap when the declared type does not fit. The dialect rides along because
+/// the comparison is not spelling-identity on every server: MySQL reports its
+/// storage types under different names (see `normalizeSqlType`).
 ///
 /// The fallback is the point. This comparison used to read
 /// `normalizeSqlType(...) catch null` with a 128-byte stack buffer, so a type
@@ -3746,15 +3836,16 @@ fn normalizeTypeForCompare(
     allocator: std.mem.Allocator,
     sql_type: []const u8,
     stack_buf: *[128]u8,
+    dialect: Dialect,
 ) error{OutOfMemory}!NormalizedType {
-    if (normalizeSqlType(sql_type, stack_buf)) |norm| {
+    if (normalizeSqlType(sql_type, stack_buf, dialect)) |norm| {
         return .{ .text = norm, .owned = null };
     } else |err| switch (err) {
         error.NoSpaceLeft => {},
     }
 
     const heap = try allocator.alloc(u8, sql_type.len);
-    if (normalizeSqlType(sql_type, heap)) |norm| {
+    if (normalizeSqlType(sql_type, heap, dialect)) |norm| {
         return .{ .text = norm, .owned = heap };
     } else |_| {
         allocator.free(heap);
@@ -4145,12 +4236,20 @@ pub fn planMigrateStatements(
                 if (columnExists(existing_cols.items, col.name)) {
                     const existing_col = getExistingColumnByName(existing_cols.items, col.name) orelse unreachable;
                     const schema_type_upper = columnSQLType(col, dialect);
+                    // The same comparison `checkSchema` makes, through the same
+                    // `normalizeTypeForCompare`: one implementation, so a plan
+                    // cannot disagree with the drift report it previews — and
+                    // the heap fallback is why a declared type longer than the
+                    // stack buffer is *compared* here instead of erroring
+                    // `NoSpaceLeft` out of the whole plan.
                     var schema_buf: [128]u8 = undefined;
                     var db_buf: [128]u8 = undefined;
-                    const schema_norm = try normalizeSqlType(schema_type_upper, &schema_buf);
-                    const db_norm = try normalizeSqlType(existing_col.sql_type, &db_buf);
+                    const schema_norm = try normalizeTypeForCompare(allocator, schema_type_upper, &schema_buf, dialect);
+                    defer schema_norm.deinit(allocator);
+                    const db_norm = try normalizeTypeForCompare(allocator, existing_col.sql_type, &db_buf, dialect);
+                    defer db_norm.deinit(allocator);
 
-                    if (!std.mem.eql(u8, db_norm, schema_norm)) {
+                    if (!std.mem.eql(u8, schema_norm.text, db_norm.text)) {
                         // Skip ALTER TYPE on SQLite, which has no such statement
                         // (`alterColumnTypeSQL` refuses it); an unrecognised dialect
                         // is passed through so that function refuses it *by name*
@@ -7026,6 +7125,48 @@ test "getExistingViews reads the stored definition and answers an empty list oth
     try std.testing.expectEqual(@as(usize, 0), hostile.items.len);
 }
 
+test "MySQL's server-side type names compare equal to the declared family; PostgreSQL and SQLite keep their spellings" {
+    // MySQL stores BOOLEAN as `tinyint(1)` and REAL as DOUBLE, and
+    // `information_schema.columns.data_type` answers with the storage name
+    // (`tinyint`, `double`) whatever the DDL said — MariaDB the same. The
+    // comparison used to read those spellings literally, so every table with a
+    // bool or a float reported a false `.type_mismatch`, and an
+    // `allow_data_loss` plan then planned an ALTER TYPE to "repair" it and died
+    // on `MySQLTypeChangeUnsafe`.
+    var schema_buf: [128]u8 = undefined;
+    var db_buf: [128]u8 = undefined;
+
+    const schema_bool = try normalizeSqlType("BOOLEAN", &schema_buf, Dialect.mysql);
+    const db_tinyint = try normalizeSqlType("tinyint", &db_buf, Dialect.mysql);
+    try std.testing.expectEqualStrings(schema_bool, db_tinyint);
+
+    // A real difference survives the mapping: zent's `.int` is stored as `int`,
+    // and a genuine `tinyint` column is still not an `.int`.
+    const db_int = try normalizeSqlType("int", &db_buf, Dialect.mysql);
+    try std.testing.expect(!std.mem.eql(u8, schema_bool, db_int));
+
+    const schema_float = try normalizeSqlType("REAL", &schema_buf, Dialect.mysql);
+    const db_double = try normalizeSqlType("double", &db_buf, Dialect.mysql);
+    try std.testing.expectEqualStrings(schema_float, db_double);
+
+    // The aliases are MySQL's, not a general relaxation: PostgreSQL reports the
+    // declared spelling, where `real` (4 bytes) and `double precision` (8) are
+    // genuinely different types — and SQLite reads its declared type back
+    // verbatim.
+    const pg_real = try normalizeSqlType("REAL", &schema_buf, Dialect.postgres);
+    const pg_double = try normalizeSqlType("double", &db_buf, Dialect.postgres);
+    try std.testing.expectEqualStrings("real", pg_real);
+    try std.testing.expectEqualStrings("double precision", pg_double);
+    try std.testing.expect(!std.mem.eql(u8, pg_real, pg_double));
+
+    const pg_bool = try normalizeSqlType("BOOLEAN", &schema_buf, Dialect.postgres);
+    const pg_bool_db = try normalizeSqlType("boolean", &db_buf, Dialect.postgres);
+    try std.testing.expectEqualStrings(pg_bool, pg_bool_db);
+
+    const sqlite_bool = try normalizeSqlType("BOOLEAN", &schema_buf, Dialect.sqlite);
+    try std.testing.expectEqualStrings("boolean", sqlite_bool);
+}
+
 test "a declared type longer than the stack buffer is still compared" {
     // `catch null` used to make the whole comparison vanish for a type longer
     // than 128 bytes, and "no type_mismatch reported" cannot be told apart from
@@ -7042,20 +7183,21 @@ test "a declared type longer than the stack buffer is still compared" {
     var db_buf: [128]u8 = undefined;
 
     // Short types still use the stack buffer, so the common path allocates
-    // nothing.
-    const short = try normalizeTypeForCompare(alloc, "VARCHAR(255)", &schema_buf);
+    // nothing. (SQLite adds no aliases of its own, so this is the plain
+    // spelling-level comparison.)
+    const short = try normalizeTypeForCompare(alloc, "VARCHAR(255)", &schema_buf, Dialect.sqlite);
     defer short.deinit(alloc);
     try std.testing.expect(short.owned == null);
     try std.testing.expectEqualStrings("varchar", short.text);
 
     // A long one is normalized on the heap instead of being skipped.
-    const long = try normalizeTypeForCompare(alloc, &long_buf, &schema_buf);
+    const long = try normalizeTypeForCompare(alloc, &long_buf, &schema_buf, Dialect.sqlite);
     defer long.deinit(alloc);
     try std.testing.expect(long.owned != null);
     try std.testing.expectEqual(@as(usize, 256), long.text.len);
 
     // The comparison therefore still happens, and still reports a difference.
-    const db = try normalizeTypeForCompare(alloc, "INTEGER", &db_buf);
+    const db = try normalizeTypeForCompare(alloc, "INTEGER", &db_buf, Dialect.sqlite);
     defer db.deinit(alloc);
     try std.testing.expect(!std.mem.eql(u8, long.text, db.text));
 }

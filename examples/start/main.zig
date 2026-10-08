@@ -21,11 +21,15 @@ const UserSettings = start_schema.UserSettings;
 const ActiveUserView = start_schema.ActiveUserView;
 
 pub fn main() !void {
-    // Note: this example uses page_allocator for clarity. The library
-    // exposes entity ownership via `deinitEntity(infos, info, &entity, alloc)`;
-    // see `tests/integration/sqlite.zig` for an end-to-end test that uses
-    // SafeAllocator and confirms zero leaks. Wiring deinit into every
-    // call site of this demo is left as a follow-up.
+    // This demo uses page_allocator for clarity, but query pages still follow
+    // the ownership contract: an `All()` page is released with the pairing
+    // `q.deinitRows(&rows)` (entities + list in one call), a `QueryEdge` page
+    // with `client.user.deinitEdgeRows("cars", &cars)`, and an eager-loaded
+    // page with `qeager.deinitRows(&users)` — that one call also frees every
+    // eager-loaded edge slice. The single entities a Create/Only returns are
+    // left to the allocator; real callers wire `client.<entity>.deinitRow(&e)`
+    // (see docs/ARCHITECTURE.md, and tests/integration/sqlite.zig for the
+    // SafeAllocator-checked end-to-end shape).
     const allocator = std.heap.page_allocator;
 
     // --- Phase 1: Schema definition and comptime introspection ---
@@ -100,6 +104,9 @@ pub fn main() !void {
             std.debug.print("  Table SQL: {s}\n", .{sql_text});
         }
     }
+    // `next() == null` means "finished" or "broke"; only nextError() separates
+    // them, so a failed step is not reported as an empty list of tables.
+    if (table_check.nextError()) |err| return err;
 
     // --- Phase 2: Generated Client + CRUD ---
     std.debug.print("\n=== Phase 2: Generated CRUD ===\n", .{});
@@ -207,6 +214,10 @@ pub fn main() !void {
     // TRANSACTION demo
     std.debug.print("\n-- TRANSACTION --\n", .{});
     var tx = try zent.codegen.client.beginTx(infos, client);
+    // Released exactly once, commit or not: deinit frees the TxClient's event
+    // list and the driver Tx (a pool rolls the connection back rather than
+    // lending it out with someone else's transaction still open).
+    defer tx.deinit();
     var tx_group_builder = try tx.client.group.Create();
     defer tx_group_builder.deinit();
     _ = try tx_group_builder.setFieldValue("name", "TX Group");
@@ -239,7 +250,7 @@ pub fn main() !void {
     defer qbuilder.deinit();
     _ = try qbuilder.Where(.{user_preds.ageEQ(.{ .int = 30 })});
     var users = try qbuilder.All();
-    defer users.deinit();
+    defer qbuilder.deinitRows(&users);
     std.debug.print("Users with age=30: {d}\n", .{users.items.len});
     for (users.items) |u| {
         std.debug.print("  id={d}, name={s}, age={d}, status={s}, theme={s}\n", .{ u.id, u.name, u.age, u.status, u.settings.theme });
@@ -251,7 +262,7 @@ pub fn main() !void {
     defer qraw.deinit();
     _ = try qraw.Where(&[_]sql.Predicate{sql.Raw("age > 20")});
     var raw_users = try qraw.All();
-    defer raw_users.deinit();
+    defer qraw.deinitRows(&raw_users);
     std.debug.print("Users with raw predicate (age > 20): {d}\n", .{raw_users.items.len});
 
     // SUBQUERY predicates demo
@@ -260,7 +271,7 @@ pub fn main() !void {
     defer qsub.deinit();
     _ = try qsub.Where(&[_]sql.Predicate{sql.ExistsSubquery("SELECT 1 FROM \"car\" WHERE \"owner_id\" = \"user\".\"id\"")});
     var sub_users = try qsub.All();
-    defer sub_users.deinit();
+    defer qsub.deinitRows(&sub_users);
     std.debug.print("Users who own at least one car (EXISTS subquery): {d}\n", .{sub_users.items.len});
 
     // EDGE PREDICATES demo (HasNeighbors via generated predicates)
@@ -269,7 +280,7 @@ pub fn main() !void {
     defer qhas.deinit();
     _ = try qhas.Where(.{user_preds.HasCars()});
     var has_cars_users = try qhas.All();
-    defer has_cars_users.deinit();
+    defer qhas.deinitRows(&has_cars_users);
     std.debug.print("Users who have at least one car (HasCars predicate): {d}\n", .{has_cars_users.items.len});
     for (has_cars_users.items) |u| {
         std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
@@ -282,7 +293,7 @@ pub fn main() !void {
     const tesla_pred = client.car.predicates.modelEQ(.{ .string = "Tesla Model S" });
     _ = try qhas_with.Where(.{user_preds.HasCarsWith(&.{tesla_pred})});
     var has_tesla_users = try qhas_with.All();
-    defer has_tesla_users.deinit();
+    defer qhas_with.deinitRows(&has_tesla_users);
     std.debug.print("Users who own a Tesla Model S (HasCarsWith predicate): {d}\n", .{has_tesla_users.items.len});
     for (has_tesla_users.items) |u| {
         std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
@@ -313,7 +324,7 @@ pub fn main() !void {
     var view_query = client.active_user_view.Query();
     defer view_query.deinit();
     var active_users = try view_query.All();
-    defer active_users.deinit();
+    defer view_query.deinitRows(&active_users);
     std.debug.print("Active users from view: {d}\n", .{active_users.items.len});
     for (active_users.items) |u| {
         std.debug.print("  id={d}, name={s}, status={s}\n", .{ u.id, u.name, u.status });
@@ -322,7 +333,9 @@ pub fn main() !void {
     // QUERY Cars by owner (O2M edge traversal)
     std.debug.print("\n-- QUERY Cars (edge traversal) --\n", .{});
     var cars = try client.user.QueryEdge("cars", &.{alice.id});
-    defer cars.deinit();
+    // Edge pages hold the *target* entity, so the release is the client call
+    // that resolves the target's TypeInfo from the edge — not `cars.deinit()`.
+    defer client.user.deinitEdgeRows("cars", &cars);
     std.debug.print("Cars owned by Alice: {d}\n", .{cars.items.len});
     for (cars.items) |c| {
         std.debug.print("  id={d}, model={s}\n", .{ c.id, c.model });
@@ -331,7 +344,7 @@ pub fn main() !void {
     // QUERY Groups by user (M2M edge traversal)
     std.debug.print("\n-- QUERY Groups (M2M edge traversal) --\n", .{});
     var groups = try client.user.QueryEdge("groups", &.{alice.id});
-    defer groups.deinit();
+    defer client.user.deinitEdgeRows("groups", &groups);
     std.debug.print("Groups Alice belongs to: {d}\n", .{groups.items.len});
     for (groups.items) |g| {
         std.debug.print("  id={d}, name={s}\n", .{ g.id, g.name });
@@ -344,10 +357,10 @@ pub fn main() !void {
     _ = try qeager.WithEdge("cars");
     _ = try qeager.WithEdge("groups");
     var eager_users = try qeager.All();
-    defer {
-        qeager.deinitEdges(eager_users.items);
-        eager_users.deinit();
-    }
+    // One call frees the rows, the list *and* every eager-loaded edge slice
+    // (deinitRows -> deinitEntity recurses into edges) — no separate
+    // `deinitEdges` + list `deinit` pair to keep in step.
+    defer qeager.deinitRows(&eager_users);
     std.debug.print("Eager loaded users: {d}\n", .{eager_users.items.len});
     for (eager_users.items) |u| {
         std.debug.print("User: {s}\n", .{u.name});
@@ -399,7 +412,7 @@ pub fn main() !void {
     defer qpage.deinit();
     _ = qpage.Page(1, 2);
     var page1 = try qpage.All();
-    defer page1.deinit();
+    defer qpage.deinitRows(&page1);
     std.debug.print("Page 1 (2 per page): {d} users\n", .{page1.items.len});
 
     // DISTINCT
@@ -408,7 +421,7 @@ pub fn main() !void {
     defer qdistinct.deinit();
     _ = qdistinct.Distinct();
     var distinct_users = try qdistinct.All();
-    defer distinct_users.deinit();
+    defer qdistinct.deinitRows(&distinct_users);
     std.debug.print("Distinct users: {d}\n", .{distinct_users.items.len});
 
     // GROUP BY
@@ -417,7 +430,7 @@ pub fn main() !void {
     defer qg.deinit();
     _ = try qg.GroupBy(&.{"status"});
     var grouped = try qg.All();
-    defer grouped.deinit();
+    defer qg.deinitRows(&grouped);
     std.debug.print("Unique statuses: {d}\n", .{grouped.items.len});
     for (grouped.items) |u| {
         std.debug.print("  status={s}\n", .{u.status});
@@ -430,7 +443,7 @@ pub fn main() !void {
     _ = try qh.GroupBy(&.{"status"});
     _ = qh.Having(sql.GTE("COUNT(*)", .{ .int = 2 }));
     var having = try qh.All();
-    defer having.deinit();
+    defer qh.deinitRows(&having);
     std.debug.print("Statuses with >= 2 users: {d}\n", .{having.items.len});
     for (having.items) |u| {
         std.debug.print("  status={s}\n", .{u.status});
@@ -442,7 +455,7 @@ pub fn main() !void {
     defer q_by_edge.deinit();
     _ = try q_by_edge.OrderByEdgeCount("cars", true);
     var users_by_cars = try q_by_edge.All();
-    defer users_by_cars.deinit();
+    defer q_by_edge.deinitRows(&users_by_cars);
     std.debug.print("Users ordered by car count (desc):\n", .{});
     for (users_by_cars.items) |u| {
         std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
@@ -454,7 +467,7 @@ pub fn main() !void {
     defer q_by_edge2.deinit();
     _ = try q_by_edge2.OrderBy(&.{client.user.orders.byCarsCount(false)});
     var users_by_cars_asc = try q_by_edge2.All();
-    defer users_by_cars_asc.deinit();
+    defer q_by_edge2.deinitRows(&users_by_cars_asc);
     std.debug.print("Users ordered by car count (asc):\n", .{});
     for (users_by_cars_asc.items) |u| {
         std.debug.print("  id={d}, name={s}\n", .{ u.id, u.name });
@@ -579,7 +592,7 @@ pub fn main() !void {
     var gq1 = client.group.Query();
     defer gq1.deinit();
     var groups_before = try gq1.All();
-    defer groups_before.deinit();
+    defer gq1.deinitRows(&groups_before);
     std.debug.print("Groups before soft delete: {d}\n", .{groups_before.items.len});
 
     var gdel = client.group.Delete();
@@ -591,14 +604,14 @@ pub fn main() !void {
     var gq2 = client.group.Query();
     defer gq2.deinit();
     var groups_after = try gq2.All();
-    defer groups_after.deinit();
+    defer gq2.deinitRows(&groups_after);
     std.debug.print("Groups after soft delete: {d}\n", .{groups_after.items.len});
 
     var gq3 = client.group.Query();
     defer gq3.deinit();
     _ = gq3.WithTrashed();
     var groups_trashed = try gq3.All();
-    defer groups_trashed.deinit();
+    defer gq3.deinitRows(&groups_trashed);
     std.debug.print("Groups with trashed: {d}\n", .{groups_trashed.items.len});
 
     var gdel_force = client.group.Delete();
@@ -611,7 +624,7 @@ pub fn main() !void {
     defer gq4.deinit();
     _ = gq4.WithTrashed();
     var groups_final = try gq4.All();
-    defer groups_final.deinit();
+    defer gq4.deinitRows(&groups_final);
     std.debug.print("Groups after force delete (with trashed): {d}\n", .{groups_final.items.len});
 
     std.debug.print("\nAll phases (0-4) completed successfully.\n", .{});

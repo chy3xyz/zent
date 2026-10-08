@@ -3815,6 +3815,80 @@ test "MySQL: checkSchema reports a UNIQUE column and a foreign key the database 
     try testing.expectEqual(@as(usize, 0), absent.items.len);
 }
 
+test "MySQL: a bool and a float column produce no false type_mismatch drift" {
+    // MySQL stores BOOLEAN as `tinyint(1)` and REAL as DOUBLE, and
+    // `information_schema.columns.data_type` answers with the storage name
+    // (`tinyint`, `double`) whatever the DDL said — MariaDB the same. The type
+    // comparison used to read those spellings literally, so every table with a
+    // bool or a float reported `.type_mismatch`, and with `allow_data_loss` the
+    // plan then tried to "repair" the phantom difference and died on
+    // `MySQLTypeChangeUnsafe` — a hard planning failure, dry-run included, so
+    // the version was never recorded either. Portable on both servers: the DDL
+    // is plain, and the two `data_type` readbacks asserted below are the same
+    // on MySQL 8/9 and MariaDB 10.11.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyBoolFloat = schema("MyBoolFloat", .{
+        .fields = &.{
+            field.String("name"),
+            field.Bool("active"),
+            field.Float("score"),
+        },
+    });
+    const graph = comptime buildGraph(&.{MyBoolFloat});
+    const infos = graph.types;
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_bool_float", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_bool_float", &.{}) catch {};
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The premise the comparison has to accept rather than "fix": the server
+    // really did store both columns under its own names.
+    {
+        var rows = try drv.query(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'my_bool_float' AND table_schema = DATABASE() AND column_name IN ('active', 'score') ORDER BY column_name",
+            &.{},
+        );
+        defer rows.deinit();
+        const active = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("active", active.getText(0).?);
+        try testing.expectEqualStrings("tinyint", active.getText(1).?);
+        const score = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("score", score.getText(0).?);
+        try testing.expectEqualStrings("double", score.getText(1).?);
+    }
+
+    // Migrated and untouched: zero drift on the strictest gate — the
+    // `type_mismatch` that used to fire for both columns must not appear.
+    {
+        const agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, agreeing);
+        try testing.expectEqual(@as(usize, 0), agreeing.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // The plan the audit actually broke: with `allow_data_loss` the phantom
+    // mismatch reached `alterColumnTypeSQL`, which refuses on MySQL with
+    // `MySQLTypeChangeUnsafe`. Planning must succeed — on the preview and on
+    // the real path.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .dry_run = true,
+        .allow_data_loss = true,
+    });
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, migrate.MigrateOptions{
+        .allow_data_loss = true,
+    });
+
+    // Nothing was rewritten by either run (there was no difference to repair).
+    {
+        const still_agreeing = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, still_agreeing);
+        try testing.expectEqual(@as(usize, 0), still_agreeing.len);
+    }
+}
+
 test "MySQL: checkSchema reports a view the database does not have, and getExistingViews reads one it does" {
     // Views were the one declared shape `checkSchema` never looked at. The
     // failure that let through: the view is declared, `migrateSchema` records

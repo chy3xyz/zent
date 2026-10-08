@@ -4,6 +4,72 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **MySQL reported a false `type_mismatch` drift for every `bool` and `float`
+  column, and blocked migrations because of it.** `BOOLEAN` lands as
+  `tinyint(1)` and `REAL` as `double` on MySQL (MariaDB identical), but the
+  type-alias table was written in PostgreSQL spellings — so `checkSchema`
+  flagged those columns on every deployment, and an `allow_data_loss` run
+  planned an `ALTER COLUMN` MySQL cannot do, failing migration planning (and
+  dry-run) with `MySQLTypeChangeUnsafe` every time. `normalizeSqlType` gained
+  a dialect-gated server-canonical layer (`tinyint` ≡ `boolean`,
+  `real` ≡ `double precision`); PostgreSQL and SQLite are untouched, real
+  type differences still report, and a new MySQL integration test runs a
+  `Bool`+`Float` table through migrate → `assertSchema(.any)` → dry-run →
+  real migration with zero drift.
+- **`ShardSet`'s ownership contract made the documented usage a double
+  free.** `init` absorbs the `ShardRouter` by value (the copy shares the
+  tenant map), and `deinit` released it — while the module-header example
+  told callers to `defer router.deinit()` too. `ShardSet` now **borrows** the
+  router: the caller keeps and releases it, the header example is correct as
+  written, and the doc records the sharper rule the sweep surfaced — a
+  router **copied by value** must not be mutated after `init` (map growth
+  through one copy strands the other). `helpers.zig`'s `ShardedEnv`, the only
+  in-repo caller, was updated.
+- **`outbox.pending` leaked every string it had already copied** when a later
+  `dupe` failed in its copy loop (the `errdefer` freed only the slice). The
+  loop now tears down like `collectRows`: per-row `errdefer` plus a
+  `filled`-bounded batch unwind. Five new allocation-failure sweep cases pin
+  it and its neighbours (`pending`, `claim` in both driver shapes, shard map
+  growth, `ShardSet.init`).
+- **Nine copy-then-append OOM leaks across the three foreign-key
+  introspection readers** (MySQL/PostgreSQL/SQLite): a `dupe` that succeeded
+  before a failed `append` was owned by nobody. Same shape the index readers
+  had already fixed, now applied (per-item `errdefer` inside the loop).
+- **`checkSchema`'s error path leaked drift members it had already
+  appended.** The top `errdefer` deinitialised only the list, so owned
+  `index_detail`/`column` strings from earlier rows escaped on a later
+  failure. Appends of owned strings go through an `appendOwnedDrift` helper
+  (the plan path's `appendPlanned` shape) and the `errdefer` frees per item.
+- **`planMigrateStatements`' type comparison had no heap fallback**: a
+  hand-written `sql_type` longer than 128 bytes failed the planner with a bare
+  `NoSpaceLeft` where `checkSchema` (fixed earlier) compared on the heap. Both
+  now share `normalizeTypeForCompare`.
+- **The examples taught a dead memory contract — and leaked.** `examples/`
+  were written before the one-call release APIs existed and ran on
+  `page_allocator`, so nothing could see the leaks. Now: `start` releases
+  every page through `deinitRows` / `deinitEdgeRows`, commits its transaction
+  with the missing `tx.deinit()`, and checks `nextError()` after hand-rolled
+  row loops; `complex`'s `dropAll` — which accepted the ownership arguments
+  and dropped them, leaking whole pages while looking like an ownership API —
+  is gone, its orders actually set `customer_id` (the printed customer name
+  was a lie before), the EntQL parse tree is released, and the duplicated
+  completion line is removed; `pool` opens a real file instead of two
+  unrelated `:memory:` databases whose success depended on LIFO borrow order;
+  `interceptor` demonstrates the promised "Create without `tenant_id` is
+  filled from the context" instead of only claiming it. Every example still
+  runs green in CI's smoke step.
+
+### Documented
+
+- `OPEN_ITEMS`: the v0.85.0 audit results recorded — the introspection and
+  examples passes are read (with what they found), the sweep-gap row now
+  names exactly which `outbox`/`shard` entries remain unswept and why
+  (`Builder.init` swallowing OOM), and `splitSqlStatements`' copy-then-append
+  window joins the known-shape table. `AGENTS.md`'s memory contract gains the
+  one-owner-per-page rule and the `ShardSet` borrow rule.
+
 ## [0.84.0] - 2026-10-08
 
 ### Fixed

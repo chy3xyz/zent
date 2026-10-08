@@ -12,7 +12,7 @@
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (515 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (531 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -52,7 +52,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 515, integration 236 passed + 3 skipped
+`baseline` counts move with this: unit 531, integration 237 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -119,6 +119,7 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `q.All()` etc. returns `std.array_list.Managed(Entity)`. Free a page with `q.deinitRows(&rows)` or `client.<entity>.deinitRows(&rows)` (page + list, one call, list comes back empty so a second call is a no-op), a single with `client.<entity>.deinitRow(&e)`, and a `QueryEdge` page with `client.<source>.deinitEdgeRows("edge", &rows)`. `q.AllOwned()` is the one-call page for new code (`OwnedRows.deinit()` frees rows and list, safe twice) and `paged()`'s `PagedResult.deinit()` is a third contract — do not mix them, and do not hand a `PagedResult`'s inner list to `deinitRows`. The explicit `deinitEntity(infos, info, &entity, alloc)` per item + `users.deinit()` remains valid for generic code that already holds the graph; all of the shortcuts funnel into `codegen.entity.deinitEntityList`.
 - `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) MUST be `deinit`'d.
 - **Arena pages are one-way.** `AllIn` / `FirstIn` / `SaveIn` / `queryRowsIn` take `*std.heap.ArenaAllocator` and return a plain slice owned by that arena. The release is `arena.deinit()` and **nothing else** — never call `deinitEntity` / `deinitRow` / `deinitRows` / `freeOwnedStrings` on such a page (double free). Do not mix the two shapes on one page.
+- **One owner per page.** Freing each row by hand (`deinitEntity` per item) and then calling `deinitRows`/`deinitEntityList` on the same list double-frees every entity — `deinitRows` runs the per-item pass itself. Pick one shape per page. `ShardSet` **borrows** its `ShardRouter` (the caller creates, keeps and deinits it; a router copied by value into the set must not be mutated afterwards — the map is shared, and growth through one copy strands the other).
 - `driver.Tx` MUST be `deinit`'d exactly once, regardless of `commit`/`rollback`.
 - **A PostgreSQL cache entry owns a server-side statement, not just a `PGresult`.** Releasing one is `DEALLOCATE "<name>"` first (`PostgresDriver.releaseStmt`), then `PQclear`, then the handle. `PQclear` alone leaves the statement on the server, and the next `PQprepare` under the same content-hash name fails with 42P05 — while after a DDL the kept plan fails with 0A000 (`cached plan must not change result type`). Tolerating 42P05 is not a fix for either. The handle is `*PostgresDriver.PgStmt` because the release hook is handed the handle alone, with no SQL and no name.
 - `sql.QueryResult` (`{ sql, args }`) borrows from the builder; `OwnedQuery` (from `Builder.takeQuery` / `Selector.takeQuery`) transfers ownership and MUST be `deinit`'d.

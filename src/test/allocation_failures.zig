@@ -22,6 +22,7 @@ const graph_mod = @import("../codegen/graph.zig");
 const privacy = @import("../privacy/policy.zig");
 const field = @import("../core/field.zig");
 const schema_mod = @import("../core/schema.zig");
+const shard_mod = @import("../shard.zig");
 const TypeInfo = graph_mod.TypeInfo;
 
 var caaf_scope_pred: sql.Predicate = undefined;
@@ -109,4 +110,67 @@ test "scope.withClause unwinds cleanly when any single allocation fails" {
             try std.testing.expect(std.mem.startsWith(u8, clause, "SELECT * FROM caaf_row AND ("));
         }
     }.run, .{});
+}
+
+// ------------------------------------------------------------------
+// shard routing
+// ------------------------------------------------------------------
+
+const ShardAllocDoc = schema_mod.Schema("ShardAllocDoc", .{
+    .table_name = "shard_alloc_doc",
+    .fields = &.{ field.Int("tenant_id"), field.String("title") },
+});
+
+const shard_alloc_infos: []const TypeInfo = graph_mod.buildGraph(&.{ShardAllocDoc}).types;
+
+test "ShardRouter.assignTenant growth unwinds cleanly when any single allocation fails" {
+    // 64 tenants walk the map through several capacities, so the sweep fails
+    // the initial allocation and every growth rehash in turn; a failure has
+    // to leave the map consistent so `deinit` releases exactly what is still
+    // allocated.
+    const Grow = struct {
+        fn run(child: std.mem.Allocator) !void {
+            var router = try shard_mod.ShardRouter.init(child, 4);
+            defer router.deinit();
+            for (0..64) |i| {
+                try router.assignTenant(@intCast(i), i % 4);
+            }
+            try std.testing.expectEqual(@as(usize, 64), router.tenant_map.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Grow.run, .{});
+}
+
+test "ShardSet.init's client copy unwinds cleanly when the single allocation fails" {
+    const allocator = std.testing.allocator;
+    const codegen_client = @import("../codegen/client.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Shards = shard_mod.ShardSet(shard_alloc_infos);
+
+    // The clients (and the driver behind them) live outside the sweep: the
+    // only allocation `init` makes is the `dupe` of the client slice. Since
+    // `ShardSet` borrows the router, the set's `deinit` frees exactly that
+    // copy while the router's map is released here, by its owner — under the
+    // old absorbed-router contract this run double-freed the map.
+    var db = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer db.close();
+    const client_a = codegen_client.makeClient(shard_alloc_infos, allocator, db.asDriver());
+    const client_b = codegen_client.makeClient(shard_alloc_infos, allocator, db.asDriver());
+    const clients: []const Shards.RootClient = &.{ client_a, client_b };
+
+    var router = try shard_mod.ShardRouter.init(allocator, clients.len);
+    defer router.deinit();
+    try router.assignTenant(1, 0);
+
+    const InitSweep = struct {
+        fn run(child: std.mem.Allocator, r: shard_mod.ShardRouter, cs: []const Shards.RootClient) !void {
+            var shards = try Shards.init(child, r, cs);
+            defer shards.deinit();
+            try std.testing.expectEqual(cs.len, shards.clients.len);
+            // The borrowed router keeps answering through the set.
+            try std.testing.expectEqual(@as(usize, 0), shards.shardOf(1));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, InitSweep.run, .{ router, clients });
 }

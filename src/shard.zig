@@ -9,6 +9,8 @@
 //!   defer router.deinit();
 //!   try router.assignTenant(1, 0);   // explicit
 //!   try router.assignTenant(2, 1);
+//!   // `router` is borrowed, not absorbed: the caller keeps it alive and
+//!   // releases it itself.
 //!   var shards = try Shards.init(allocator, router, &.{ client_a, client_b });
 //!   defer shards.deinit();
 //!   const client = shards.clientForTenant(tenant_id);  // routed *Client
@@ -76,13 +78,29 @@ pub const ShardRouter = struct {
 /// A set of per-shard root Clients plus the router that selects among them.
 pub fn ShardSet(comptime infos: []const TypeInfo) type {
     return struct {
-        const RootClient = codegen.Client(infos);
+        /// The generated root client the set routes among. Public so callers
+        /// can type a client slice (`[]const Shards.RootClient`) without
+        /// reaching for `codegen.Client` themselves.
+        pub const RootClient = codegen.Client(infos);
         const Self = @This();
 
         allocator: std.mem.Allocator,
         router: ShardRouter,
         clients: []RootClient,
 
+        /// Assemble the shard set. `router` is **borrowed**: the caller keeps
+        /// it alive and releases it itself — `deinit` below frees only the
+        /// client copy. (`clients` is copied; the copy is what
+        /// `clientForTenant` hands out.)
+        ///
+        /// The by-value parameter hides one aliasing rule: a `ShardRouter`
+        /// copy shares the routing map's storage only until a `put` grows it,
+        /// and a growth re-points the map **inside the copy that grew** — the
+        /// other copy is left holding a freed pointer. So finish mutating the
+        /// router before `init` (the module example does) and afterwards
+        /// route through the set; if tenants must be assigned while the set
+        /// is live, go through `shards.router` — one copy receives every
+        /// mutation, and that same copy is the one to `deinit`.
         pub fn init(allocator: std.mem.Allocator, router: ShardRouter, clients: []const RootClient) !Self {
             if (clients.len != router.shard_count) return error.ShardCountMismatch;
             return .{
@@ -93,7 +111,6 @@ pub fn ShardSet(comptime infos: []const TypeInfo) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.router.deinit();
             self.allocator.free(self.clients);
             self.* = undefined;
         }
@@ -194,6 +211,9 @@ test "ShardSet routes writes to the tenant's shard" {
     const client_b = client_mod.makeClient(infos, allocator, shard_b.asDriver());
 
     var router = try ShardRouter.init(allocator, 2);
+    // The router is borrowed by the shard set, not absorbed: the caller owns
+    // and releases it (the old transfer shape leaked it here).
+    defer router.deinit();
     try router.assignTenant(1, 0);
     try router.assignTenant(2, 1);
     const clients: []const Shards.RootClient = &.{ client_a, client_b };

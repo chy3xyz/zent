@@ -1,4 +1,4 @@
-//! `std.testing.checkAllAllocationFailures` over the two owned-assembly paths
+//! `std.testing.checkAllAllocationFailures` over the owned-assembly paths
 //! the sibling sweep (`allocation_failures.zig`) does not reach:
 //!
 //!   - the CRUD copy path: `CrudService.getOwned` hands a scanned row to
@@ -9,7 +9,11 @@
 //!     `create`, its buffers and the payload strings are each failable;
 //!   - the migration planner: `migrate.planMigrateStatements` builds an ordered
 //!     list of statements, each of them its own buffer, out of the same kind of
-//!     `Allocator.print`/`dupe` chain.
+//!     `Allocator.print`/`dupe` chain;
+//!   - the outbox paths: `Outbox.pending` and `Outbox.claim` build an owned
+//!     `[]Entry` out of driver rows — one `alloc` plus three string dupes per
+//!     row — and `claim`'s MySQL shape wraps the same row reader in a
+//!     transaction whose rollback/deinit bookkeeping has to unwind with it.
 //!
 //! The method is the sibling file's: `checkAllAllocationFailures` runs the
 //! function once to count the allocations, then fails each one in turn and
@@ -768,4 +772,225 @@ test "a PostgreSQL index introspection unwinds cleanly when any single allocatio
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Plan.run, .{&stub});
+}
+
+// ------------------------------------------------------------------
+// (d) the outbox pending/claim paths
+// ------------------------------------------------------------------
+//
+// `Outbox.pending` and `Outbox.claim` assemble an owned `[]Entry` out of
+// driver rows: one `alloc` for the slice plus three string dupes per row.
+// `pending` runs behind the real query builder (the client's allocator scans
+// the fixture rows, so the swept ledger holds only `pending`'s own copy
+// loop — and its first allocation is a plain `alloc`, fail-loud, unlike
+// `Builder.init`), `claim` reads the RETURNING/SELECT rows through
+// `collectRows`, and the MySQL shape wraps the same reader in a transaction
+// whose `errdefer freeEntries` / `errdefer rollback` / `defer tx.deinit`
+// have to interleave around it. The stub below serves fixed rows to all
+// three and records which transaction lifecycle hooks ran, so the sweep
+// can hold that interleaving to the byte ledger.
+
+const outbox_mod = @import("../outbox.zig");
+
+const outbox_infos = graph_mod.buildGraph(&.{outbox_mod.OutboxMessage}).types;
+const OutboxOps = outbox_mod.Outbox(outbox_infos, outbox_mod.info);
+const OutboxRootClient = codegen.Client(outbox_infos);
+
+/// The minimal `anytype` client `claim` accepts (the shape outbox.zig's own
+/// step-failure test pins): just the driver.
+const OutboxDriverClient = struct { driver: driver.Driver };
+
+/// Outbox rows in the 7-column shape `claim` reads back: id, aggregate_type,
+/// aggregate_id, event_type, payload, attempts, created_at — integers at
+/// 0/2/5/6, text at 1/3/4.
+const outbox_claim_rows = [_]StubRow{
+    .{
+        .text = &.{ null, "product", null, "product.created", "{\"id\":1}", null, null },
+        .int = &.{ 1, null, 1, null, null, 0, 1000 },
+    },
+    .{
+        .text = &.{ null, "product", null, "product.updated", "{\"id\":2}", null, null },
+        .int = &.{ 2, null, 2, null, null, 0, 2000 },
+    },
+};
+
+/// The same rows in the 10-column shape the generated SELECT for
+/// `outbox_message` projects: id, aggregate_type, aggregate_id, event_type,
+/// payload, status, attempts, created_at, published_at, claimed_at (NULL —
+/// both text and int are absent, so `isNull` holds).
+const outbox_pending_rows = [_]StubRow{
+    .{
+        .text = &.{ null, "product", null, "product.created", "{\"id\":1}", "pending", null, null, null, null },
+        .int = &.{ 1, null, 1, null, null, null, 0, 1000, 0, null },
+    },
+    .{
+        .text = &.{ null, "product", null, "product.updated", "{\"id\":2}", "pending", null, null, null, null },
+        .int = &.{ 2, null, 2, null, null, null, 0, 2000, 0, null },
+    },
+};
+
+/// A driver serving fixed outbox rows. `claim`'s SQLite shape reads them
+/// through `driver.query`, the MySQL shape through `tx.query` (the handle
+/// borrows this same driver), and `pending` through the real query builder
+/// over `makeClient`. The rows are borrowed from the comptime catalog like
+/// the planner fixtures, so the stub itself never allocates and the swept
+/// ledger holds only the outbox code's own allocations.
+const OutboxStub = struct {
+    rows: []const StubRow = &.{},
+    driver_dialect: dialect.Dialect = .sqlite,
+    cursor: Cursor = .{ .rows = &.{} },
+    tx_begun: bool = false,
+    tx_committed: bool = false,
+    tx_rolled_back: bool = false,
+    tx_deinit_count: usize = 0,
+
+    fn asDriver(self: *OutboxStub) driver.Driver {
+        return .{ .ptr = self, .vtable = &outbox_stub_vtable };
+    }
+
+    fn answering(self: *OutboxStub, rows: []const StubRow) driver.Rows {
+        self.cursor = .{ .rows = rows };
+        return .{ .ptr = &self.cursor, .vtable = &cursor_vtable };
+    }
+
+    /// The transaction handle `claim`'s MySQL shape works through: query and
+    /// exec delegate to this same stub driver, and the lifecycle fns only
+    /// record what ran — an all-pass transaction, so the failure the sweep
+    /// injects is always an allocation inside the outbox code itself.
+    fn txHandle(self: *OutboxStub) driver.Tx {
+        self.tx_begun = true;
+        return .{
+            .inner = self.asDriver(),
+            .commitFn = txCommit,
+            .rollbackFn = txRollback,
+            .deinitFn = txDeinit,
+            .ptr = self,
+        };
+    }
+
+    fn txCommit(ptr: *anyopaque) driver.Error!void {
+        const self: *OutboxStub = @ptrCast(@alignCast(ptr));
+        self.tx_committed = true;
+    }
+
+    fn txRollback(ptr: *anyopaque) driver.Error!void {
+        const self: *OutboxStub = @ptrCast(@alignCast(ptr));
+        self.tx_rolled_back = true;
+    }
+
+    fn txDeinit(ptr: *anyopaque) void {
+        const self: *OutboxStub = @ptrCast(@alignCast(ptr));
+        self.tx_deinit_count += 1;
+    }
+
+    fn resetLifecycle(self: *OutboxStub) void {
+        self.tx_begun = false;
+        self.tx_committed = false;
+        self.tx_rolled_back = false;
+        self.tx_deinit_count = 0;
+    }
+};
+
+fn outboxStubExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const sql.Value) driver.Error!driver.Result {
+    return .{ .rows_affected = 1, .last_insert_id = null };
+}
+
+fn outboxStubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const sql.Value) driver.Error!driver.Rows {
+    const self: *OutboxStub = @ptrCast(@alignCast(ptr));
+    return self.answering(self.rows);
+}
+
+fn outboxStubBeginTx(ptr: *anyopaque) driver.Error!driver.Tx {
+    const self: *OutboxStub = @ptrCast(@alignCast(ptr));
+    return self.txHandle();
+}
+
+fn outboxStubDialect(ptr: *anyopaque) dialect.Dialect {
+    const self: *OutboxStub = @ptrCast(@alignCast(ptr));
+    return self.driver_dialect;
+}
+
+const outbox_stub_vtable = driver.Driver.VTable{
+    .exec = outboxStubExec,
+    .query = outboxStubQuery,
+    .beginTx = outboxStubBeginTx,
+    .close = stubClose,
+    .dialect = outboxStubDialect,
+    .ping = stubPing,
+    .inTransaction = stubInTransaction,
+    .beginSavepoint = stubBeginSavepoint,
+};
+
+test "outbox.pending unwinds cleanly when any single allocation fails" {
+    const allocator = std.testing.allocator;
+
+    // The failing dupe of a later row must release the strings of every row
+    // before it — the leak the sweep exists for (the pre-fix `pending` freed
+    // only the slice and lost the copies already made).
+    var stub = OutboxStub{ .rows = &outbox_pending_rows };
+    const root = codegen.makeClient(outbox_infos, allocator, stub.asDriver());
+
+    const Pending = struct {
+        fn run(child: std.mem.Allocator, client: OutboxRootClient) !void {
+            const entries = try OutboxOps.pending(child, client, 10);
+            defer OutboxOps.freeEntries(child, entries);
+            try std.testing.expectEqual(@as(usize, 2), entries.len);
+            try std.testing.expectEqualStrings("product.created", entries[0].event_type);
+            try std.testing.expectEqual(@as(i64, 2000), entries[1].created_at);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Pending.run, .{root});
+}
+
+test "outbox.claim (SQLite shape) unwinds cleanly when any single allocation fails" {
+    const allocator = std.testing.allocator;
+
+    // One statement, no transaction: `claim` reads the RETURNING rows through
+    // `collectRows`, whose per-iteration `errdefer`s release the three dupes
+    // of the row that failed and whose outer `errdefer` releases every
+    // completed row before the slice itself.
+    var stub = OutboxStub{ .rows = &outbox_claim_rows, .driver_dialect = .sqlite };
+
+    const Claim = struct {
+        fn run(child: std.mem.Allocator, client: OutboxDriverClient) !void {
+            const entries = try OutboxOps.claim(child, client, 10);
+            defer OutboxOps.freeEntries(child, entries);
+            try std.testing.expectEqual(@as(usize, 2), entries.len);
+            try std.testing.expectEqual(@as(i64, 1), entries[0].id);
+            try std.testing.expectEqual(@as(i64, 2), entries[1].id);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Claim.run, .{OutboxDriverClient{ .driver = stub.asDriver() }});
+}
+
+test "outbox.claim (MySQL transaction shape) unwinds cleanly when any single allocation fails" {
+    const allocator = std.testing.allocator;
+
+    // No UPDATE ... RETURNING on this dialect: `claim` reserves the rows
+    // inside a transaction — `beginTx`, `tx.query` (the same fixture rows),
+    // one `tx.exec` per row, `tx.commit` — so a failure anywhere in the
+    // reader has to unwind through `errdefer tx.rollback` and
+    // `defer tx.deinit` around `collectRows`' own teardown, each exactly
+    // once, with no commit recorded and no entry left behind.
+    var stub = OutboxStub{ .rows = &outbox_claim_rows, .driver_dialect = .mysql };
+
+    const ClaimTx = struct {
+        fn run(child: std.mem.Allocator, client: OutboxDriverClient, s: *OutboxStub) !void {
+            s.resetLifecycle();
+            const entries = try OutboxOps.claim(child, client, 10);
+            defer OutboxOps.freeEntries(child, entries);
+            try std.testing.expectEqual(@as(usize, 2), entries.len);
+            // A completing run reserved and committed the batch, and the
+            // handle was deinit'd exactly once without a rollback.
+            try std.testing.expect(s.tx_begun);
+            try std.testing.expect(s.tx_committed);
+            try std.testing.expect(!s.tx_rolled_back);
+            try std.testing.expectEqual(@as(usize, 1), s.tx_deinit_count);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        ClaimTx.run,
+        .{ OutboxDriverClient{ .driver = stub.asDriver() }, &stub },
+    );
 }
