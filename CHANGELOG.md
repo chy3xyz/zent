@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-10-08
+
 ### Fixed
 
 - **A `From`/`To` edge's foreign key always referenced `id`, ignoring the
