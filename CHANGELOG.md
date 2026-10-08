@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-10-08
+
 ### Fixed
 
 - **MySQL reported a false `type_mismatch` drift for every `bool` and `float`
