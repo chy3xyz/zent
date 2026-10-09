@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.87.0] - 2026-10-09
+
 ### Fixed
 
 - **Implicit-M2M junction tables ignored the ends' declared `table_name` and
