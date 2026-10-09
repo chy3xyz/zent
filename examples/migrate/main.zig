@@ -48,7 +48,30 @@ pub fn main(init: std.process.Init) !void {
 
     const dsn = init.environ_map.get("ZENT_DSN") orelse "sqlite:zent.db";
     const dir = init.environ_map.get("ZENT_MIGRATIONS_DIR") orelse "migrations";
-    const command = init.environ_map.get("ZENT_MIGRATE_CMD") orelse "up";
+    // `zig build migrate-rollback` passes the command as `--cmd down` instead
+    // of `setEnvironmentVariable`: any run-step variable replaces the child's
+    // whole environment with a map materialised from the build-script process,
+    // which would cut the caller's $ZENT_DSN off. The variable still works for
+    // a direct `zig-out/bin/migrate` invocation; the flag wins when both are
+    // set.
+    var command: []const u8 = init.environ_map.get("ZENT_MIGRATE_CMD") orelse "up";
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var i: usize = 1; // argv[0] is the program name.
+    while (i < argv.len) : (i += 1) {
+        if (std.mem.eql(u8, argv[i], "--cmd")) {
+            if (i + 1 >= argv.len) {
+                std.debug.print("--cmd needs a value (expected 'up' or 'down')\n", .{});
+                return error.MissingCommandValue;
+            }
+            command = argv[i + 1];
+            i += 1;
+        } else {
+            // Fail rather than fall through to "up": a typo'd flag on a
+            // rollback must not turn into a fresh apply.
+            std.debug.print("Unknown argument: {s} (only --cmd <up|down> is accepted)\n", .{argv[i]});
+            return error.UnknownArgument;
+        }
+    }
 
     var any_driver = try connectFromDsn(allocator, dsn);
     defer any_driver.close();
@@ -63,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
         try migrate.rollbackFiles(init.io, allocator, driver, dir, steps);
         std.debug.print("Rolled back {d} migration(s).\n", .{steps});
     } else {
-        std.debug.print("Unknown ZENT_MIGRATE_CMD: {s} (expected 'up' or 'down')\n", .{command});
+        std.debug.print("Unknown migration command: {s} (expected 'up' or 'down'; set via --cmd or $ZENT_MIGRATE_CMD)\n", .{command});
         return error.InvalidCommand;
     }
 }

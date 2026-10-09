@@ -4,6 +4,60 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Implicit-M2M junction tables ignored the ends' declared `table_name` and
+  `.pk`.** `junctionTableForEdge` derived the target side as
+  `toSnakeCase(target_name)` and referenced a literal `id` on both ends — the
+  same short-name defect the entity-table FKs carried before v0.84.0 (Z40),
+  on the junction path. The v0.84.0 ledger claimed no public API reached it;
+  that was wrong — `resolveGraphEdges` resolves two mutual `To` edges to
+  `.m2m` directly (it does not consult `resolveRelation`), so the path was
+  always live. It now resolves both ends through `edgeRefTarget` +
+  `graph.pkColumn` (declared overrides honoured, out-of-graph fallback
+  unchanged and pinned). Unit test on the derived shape plus a SQLite
+  end-to-end: migrate → `sqlite_master` DDL → `checkSchema` zero drift →
+  legal pair inserts pass, dangling inserts fail under enforced foreign keys.
+  Schemas using default names/`id` pks get byte-identical output.
+- **`zig build migrate-rollback` inherits the caller's DSN.** The command
+  travelled as `setEnvironmentVariable("ZENT_MIGRATE_CMD", …)`, and any
+  run-step variable replaces the child's whole environment with a map
+  materialised from the build-server process — the caller's `$ZENT_DSN`
+  never reached the rollback run (the plain `migrate` step always worked).
+  The command now travels as argv (`--cmd <up|down>`; both steps spawn with
+  the caller's environment), `examples/migrate` parses it and fails loudly on
+  an unknown argument — a typo'd flag must not turn a rollback into a fresh
+  apply — while `ZENT_MIGRATE_CMD` keeps working for direct binary runs.
+  `ZENT_MIGRATE_STEPS` is inherited again too.
+- **The cross-graph edge compile error now names the situation.** The
+  `@compileError` (which — correcting the ledger — is where cross-graph edges
+  have failed all along, not at runtime) gained the decisive sentence: if the
+  target type is declared in another `buildGraph` call of the app, that is
+  the Z16 limitation; move the schema into this graph or read the other
+  graph through its own client.
+
+### Documented
+
+- **Controlled JOIN (v1) design** published at
+  `docs/superpowers/specs/2026-10-09-controlled-join-design.md`: by-edge-name
+  `joinEdge` on the query builder, m2o/o2o-From only (fan-out and LIMIT
+  semantics stay exact), target projected into the entity's existing eager
+  edge field (release cascades for free), target scope chain qualified at
+  render time with the LEFT-JOIN-in-ON deviation, full risk register and
+  work breakdown. Awaiting a go-ahead; the downstream consumer counts ~157
+  of its 159 raw-SQL escape hatches as JOIN-shaped.
+- `OPEN_ITEMS` corrections from the same audit pass: the Z16 "fails at
+  runtime" wording was wrong (cross-graph edges fail at compile time through
+  a single `edgeTargetInfo` definition; 18 call sites) and is rewritten with
+  what stage 2 actually lacks; the junction row is rewritten now that its
+  "unreachable" premise fell; two new known shapes recorded — a `Through`
+  schema's declared `table_name` is ignored when the junction names it
+  (Z39-family residue, first m2m write answers `no such table`), and
+  cross-graph edges reach the database through the DDL face (dangling
+  fallback FK/junction, unguarded cross-graph `Through`) where compile-time
+  diagnostics cannot see them. The allocation-failure unit-test count and
+  baselines moved accordingly.
+
 ## [0.86.0] - 2026-10-08
 
 ### Added

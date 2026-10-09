@@ -240,8 +240,15 @@ pub fn build(b: *std.Build) void {
     const migrate_step = b.step("migrate", "Apply pending migrations from ZENT_MIGRATIONS_DIR (default: migrations)");
     migrate_step.dependOn(&run_migrate.step);
 
+    // The command travels as an argument, not `setEnvironmentVariable`: any
+    // run-step variable replaces the child's whole environment with a map
+    // materialised from the build-script process, so the caller's $ZENT_DSN —
+    // which `migrate` inherits and rollback needs just as much — never reached
+    // the rollback run. Both steps now spawn with the caller's environment and
+    // differ only in argv (`--cmd <up|down>`; the variable still works for a
+    // direct `zig-out/bin/migrate` invocation).
     const run_rollback = b.addRunArtifact(migrate_exe);
-    run_rollback.setEnvironmentVariable("ZENT_MIGRATE_CMD", "down");
+    run_rollback.addArgs(&.{ "--cmd", "down" });
     const rollback_step = b.step("migrate-rollback", "Roll back the most recent migration");
     rollback_step.dependOn(&run_rollback.step);
 

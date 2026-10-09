@@ -802,7 +802,7 @@ pub fn checkSchema(
         if (comptime !info.is_view) {
             inline for (info.edges) |e| {
                 if (e.relation == .m2m and e.through == null) {
-                    const jtable = comptime junctionTableForEdge(e, info);
+                    const jtable = comptime junctionTableForEdge(e, info, infos);
 
                     var already_seen = false;
                     for (seen_junctions.items) |seen_name| {
@@ -827,10 +827,10 @@ pub fn checkSchema(
                             try drifts.append(.{
                                 .table = jtable.name,
                                 .kind = .junction_name_collision,
-                                .index_detail = comptime junctionNameCollisionDetail(info, e, owner),
+                                .index_detail = comptime junctionNameCollisionDetail(info, e, owner, infos),
                             });
                         } else {
-                            try appendJunctionRelationDrifts(allocator, driver, &drifts, info, e, jtable);
+                            try appendJunctionRelationDrifts(allocator, driver, &drifts, info, e, jtable, infos);
                         }
                     }
                 }
@@ -856,6 +856,7 @@ fn appendJunctionRelationDrifts(
     comptime info: TypeInfo,
     comptime edge: EdgeInfo,
     comptime jtable: TableDef,
+    comptime all_infos: []const TypeInfo,
 ) !void {
     var junction_relation = try getExistingColumns(allocator, driver, jtable.name);
     defer freeExistingColumns(allocator, &junction_relation);
@@ -864,7 +865,7 @@ fn appendJunctionRelationDrifts(
         try drifts.append(.{
             .table = jtable.name,
             .kind = .missing_junction_table,
-            .index_detail = comptime missingJunctionTableDetail(info, edge),
+            .index_detail = comptime missingJunctionTableDetail(info, edge, all_infos),
         });
     } else {
         // A relation *is* there, so the shape questions get asked. They are the
@@ -872,7 +873,7 @@ fn appendJunctionRelationDrifts(
         // against the shape `junctionTableForEdge` derives — the definition
         // `migrateSchema` creates the table from and `buildEdgeStep` builds the
         // relation query against.
-        try appendJunctionShapeDrifts(allocator, driver, drifts, info, edge, junction_relation.items);
+        try appendJunctionShapeDrifts(allocator, driver, drifts, info, edge, junction_relation.items, all_infos);
     }
 }
 
@@ -909,8 +910,9 @@ fn appendJunctionShapeDrifts(
     comptime info: TypeInfo,
     comptime edge: EdgeInfo,
     existing: []const ExistingColumn,
+    comptime all_infos: []const TypeInfo,
 ) !void {
-    const jtable = comptime junctionTableForEdge(edge, info);
+    const jtable = comptime junctionTableForEdge(edge, info, all_infos);
     const dialect = driver.dialect();
 
     inline for (jtable.columns) |col| {
@@ -920,7 +922,7 @@ fn appendJunctionShapeDrifts(
                 .column = col.name,
                 .kind = .missing_column,
                 .schema_type = columnSQLType(col, dialect),
-                .index_detail = comptime missingJunctionColumnDetail(info, edge, col.name),
+                .index_detail = comptime missingJunctionColumnDetail(info, edge, col.name, all_infos),
             });
         }
     }
@@ -943,7 +945,7 @@ fn appendJunctionShapeDrifts(
         try drifts.append(.{
             .table = jtable.name,
             .kind = .junction_pair_uniqueness,
-            .index_detail = comptime junctionPairUniquenessDetail(info, edge),
+            .index_detail = comptime junctionPairUniquenessDetail(info, edge, all_infos),
         });
     }
 
@@ -1088,14 +1090,14 @@ const missingViewDriftDetail = "schema declares the view, database has no relati
 /// relation's absence, so a relation of that name is not reported here — it is
 /// compared on its shape by the reports beside it, which the clause names so the
 /// reader does not take the silence for completeness.
-fn missingJunctionTableDetail(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
+fn missingJunctionTableDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime all_infos: []const TypeInfo) []const u8 {
     comptime {
         const source_table = info.table_name;
-        const target_table = toSnakeCase(edge.target_name);
+        const target_table = edgeRefTarget(edge, all_infos).table;
         const a_first = std.mem.lessThan(u8, source_table, target_table);
         const left = if (a_first) source_table else target_table;
         const right = if (a_first) target_table else source_table;
-        const jtable = junctionTableForEdge(edge, info);
+        const jtable = junctionTableForEdge(edge, info, all_infos);
 
         return "schema declares the M2M edge " ++ left ++ " <-> " ++ right ++
             ", database has no relation named " ++ jtable.name ++
@@ -1132,9 +1134,9 @@ fn junctionNameOwner(comptime infos: []const TypeInfo, comptime jtable: TableDef
 /// The `.junction_name_collision` report. A comptime literal (see
 /// `ownsIndexDetail`), and it names both surfaces: which pair of entities
 /// derived the name, and which declared entity answers to it.
-fn junctionNameCollisionDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime owner: TypeInfo) []const u8 {
+fn junctionNameCollisionDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime owner: TypeInfo, comptime all_infos: []const TypeInfo) []const u8 {
     comptime {
-        return junctionShapeClause(info, edge) ++
+        return junctionShapeClause(info, edge, all_infos) ++
             ", but that name is the table of the entity " ++ owner.name ++
             " (schema '" ++ owner.name ++ "'); both are created with IF NOT EXISTS and entities are created first, " ++
             "so the junction's CREATE is a no-op and the relation query reads the other table's columns — " ++
@@ -1142,14 +1144,14 @@ fn junctionNameCollisionDetail(comptime info: TypeInfo, comptime edge: EdgeInfo,
     }
 }
 
-fn junctionShapeClause(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
+fn junctionShapeClause(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime all_infos: []const TypeInfo) []const u8 {
     comptime {
         const source_table = info.table_name;
-        const target_table = toSnakeCase(edge.target_name);
+        const target_table = edgeRefTarget(edge, all_infos).table;
         const a_first = std.mem.lessThan(u8, source_table, target_table);
         const left = if (a_first) source_table else target_table;
         const right = if (a_first) target_table else source_table;
-        const jtable = junctionTableForEdge(edge, info);
+        const jtable = junctionTableForEdge(edge, info, all_infos);
 
         return "schema declares the M2M edge " ++ left ++ " <-> " ++ right ++
             ", which joins through " ++ jtable.name ++
@@ -1161,9 +1163,9 @@ fn junctionShapeClause(comptime info: TypeInfo, comptime edge: EdgeInfo) []const
 /// junction table**. A comptime literal (see `ownsIndexDetail`), and the stake in
 /// one clause: the relation query names this column, so the database missing it
 /// fails every query over the edge rather than returning fewer rows.
-fn missingJunctionColumnDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime column: []const u8) []const u8 {
+fn missingJunctionColumnDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime column: []const u8, comptime all_infos: []const TypeInfo) []const u8 {
     comptime {
-        return junctionShapeClause(info, edge) ++ "; the relation query names " ++ column;
+        return junctionShapeClause(info, edge, all_infos) ++ "; the relation query names " ++ column;
     }
 }
 
@@ -1173,9 +1175,9 @@ fn missingJunctionColumnDetail(comptime info: TypeInfo, comptime edge: EdgeInfo,
 /// The *consequence* is in the sentence because it is the only part a reader
 /// cannot get from the drift kind: a duplicate pair is a write the database
 /// accepts, and it shows up on the read side as a neighbour returned twice.
-fn junctionPairUniquenessDetail(comptime info: TypeInfo, comptime edge: EdgeInfo) []const u8 {
+fn junctionPairUniquenessDetail(comptime info: TypeInfo, comptime edge: EdgeInfo, comptime all_infos: []const TypeInfo) []const u8 {
     comptime {
-        return junctionShapeClause(info, edge) ++
+        return junctionShapeClause(info, edge, all_infos) ++
             ", whose primary key is that pair; the database has no unique constraint over the two columns, " ++
             "so a duplicate pair is accepted and the relation query then returns the same neighbour twice";
     }
@@ -2070,10 +2072,10 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                     // target declaring `.pk` or a StorageKey-renamed `id` gets
                     // an FK to a column it does not have. Resolving it needs
                     // the target's TypeInfo, which this pub signature does not
-                    // carry — same legacy family as `junctionTableForEdge`'s
-                    // derived short names below. The migration paths are not
-                    // affected: they go through `tableFromTypeInfoCrossRef`,
-                    // which references `graph.pkColumn`.
+                    // carry. The migration paths are not affected: they go
+                    // through `tableFromTypeInfoCrossRef`, which references
+                    // `graph.pkColumn` — and so does `junctionTableForEdge`,
+                    // leaving this pub export the last of that family.
                     .ref_columns = &[_][]const u8{"id"},
                 };
                 foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
@@ -2095,10 +2097,10 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                     // target declaring `.pk` or a StorageKey-renamed `id` gets
                     // an FK to a column it does not have. Resolving it needs
                     // the target's TypeInfo, which this pub signature does not
-                    // carry — same legacy family as `junctionTableForEdge`'s
-                    // derived short names below. The migration paths are not
-                    // affected: they go through `tableFromTypeInfoCrossRef`,
-                    // which references `graph.pkColumn`.
+                    // carry. The migration paths are not affected: they go
+                    // through `tableFromTypeInfoCrossRef`, which references
+                    // `graph.pkColumn` — and so does `junctionTableForEdge`,
+                    // leaving this pub export the last of that family.
                     .ref_columns = &[_][]const u8{"id"},
                 };
                 foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
@@ -2125,14 +2127,26 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
 /// Generate a junction table definition for M2M edges.
 /// Columns and table name are deterministically ordered alphabetically
 /// so that whichever edge triggers creation first produces the same schema.
-/// Known legacy, not fixed here: both sides derive from `toSnakeCase` short
-/// names and the FKs reference a literal "id" — a declared `table_name` or
-/// custom pk on either end is not honoured (no public API reaches this path
-/// with the ends' TypeInfos).
-pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeInfo) TableDef {
+///
+/// Both ends resolve the way every other edge reference in this file does
+/// (`edgeRefTarget` + `graph.pkColumn`): the source end from `source_info`
+/// itself, the target end by looking the edge's target up in `all_infos` —
+/// a declared `table_name` and a declared `.pk` (or a `StorageKey`-renamed
+/// `id`) on either end are honoured, so the junction `migrateSchema` creates
+/// and the one `buildEdgeStep`/`getJunctionTable` read derive the same name,
+/// columns and referenced keys. A target outside the graph has no TypeInfo
+/// to ask and keeps the historical shape — `toSnakeCase(target_name)`
+/// referencing `"id"` — the same fallback `tableFromTypeInfoCrossRef` keeps,
+/// because the reference dangles either way.
+pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
     comptime {
+        // Two ends × per-end name/column concatenations, per junction edge
+        // inside the `inline for (infos)` migration loops: match the siblings'
+        // quota so a 15+ table graph does not trip the default.
+        @setEvalBranchQuota(50_000);
+        const ref = edgeRefTarget(edge, all_infos);
         const source_table = source_info.table_name;
-        const target_table = toSnakeCase(edge.target_name);
+        const target_table = ref.table;
 
         const a_first = std.mem.lessThan(u8, source_table, target_table);
 
@@ -2150,6 +2164,15 @@ pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeI
         const ref1 = if (a_first) source_table else target_table;
         const ref2 = if (a_first) target_table else source_table;
 
+        // Each reference names that end's primary-key column — `graph.pkColumn`
+        // of the end's TypeInfo, the same resolver the relation query uses.
+        // Out of the graph there is no TypeInfo to ask, and the reference is
+        // dangling whichever column it names.
+        const source_ref = pkColumn(source_info);
+        const target_ref = if (ref.info) |target| pkColumn(target) else "id";
+        const ref_col1 = if (a_first) source_ref else target_ref;
+        const ref_col2 = if (a_first) target_ref else source_ref;
+
         return TableDef{
             .name = table_name,
             .columns = &.{
@@ -2161,12 +2184,12 @@ pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeI
                 ForeignKeyDef{
                     .columns = &[_][]const u8{col1},
                     .ref_table = ref1,
-                    .ref_columns = &[_][]const u8{"id"},
+                    .ref_columns = &[_][]const u8{ref_col1},
                 },
                 ForeignKeyDef{
                     .columns = &[_][]const u8{col2},
                     .ref_table = ref2,
-                    .ref_columns = &[_][]const u8{"id"},
+                    .ref_columns = &[_][]const u8{ref_col2},
                 },
             },
         };
@@ -2445,7 +2468,7 @@ fn createTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, com
         if (info.is_view) continue;
         inline for (info.edges) |e| {
             if (e.relation == .m2m and e.through == null) {
-                const jtable = comptime junctionTableForEdge(e, info);
+                const jtable = comptime junctionTableForEdge(e, info, infos);
                 const sql = try createTableSQLAlloc(allocator, jtable, dialect);
                 defer allocator.free(sql);
                 _ = try driver_drv.exec(
@@ -4168,7 +4191,8 @@ pub fn planMigrateStatements(
         if (info.is_view) continue;
         inline for (info.edges) |e| {
             if (e.relation == .m2m and e.through == null) {
-                const jtable = comptime junctionTableForEdge(e, info);
+                const jtable = comptime junctionTableForEdge(e, info, infos);
+                const edge_target_table = comptime edgeRefTarget(e, infos).table;
                 // The name is an entity's table (see
                 // `.junction_name_collision`): the CREATE below is a no-op
                 // against the table that entity's own step just created, so
@@ -4177,13 +4201,15 @@ pub fn planMigrateStatements(
                 // exist — so it is said out loud at the moment it is created,
                 // in the dry run too.
                 // Only from the side whose table name sorts first — the side the junction
-                // name is derived *from*. Both sides of a symmetric edge reach this line,
-                // and one junction deserves one warning.
-                if (comptime std.mem.lessThan(u8, info.table_name, toSnakeCase(e.target_name))) {
+                // name is derived *from*, the same two names `junctionTableForEdge`
+                // sorted (a declared target `table_name`, not the short name). Both
+                // sides of a symmetric edge reach this line, and one junction
+                // deserves one warning.
+                if (comptime std.mem.lessThan(u8, info.table_name, edge_target_table)) {
                     if (comptime junctionNameOwner(infos, jtable)) |owner| {
                         zent_log.warn(
                             "zent: the M2M edge {s} <-> {s} joins through '{s}', which is already the table of entity {s}; the junction's CREATE TABLE IF NOT EXISTS is a no-op and the relation query will read that table's columns — give the entity a different table name or rename one side",
-                            .{ info.table_name, comptime toSnakeCase(e.target_name), jtable.name, owner.name },
+                            .{ info.table_name, edge_target_table, jtable.name, owner.name },
                         );
                     }
                 }
@@ -7620,4 +7646,168 @@ test "a cross-referenced To edge FK references the target's pk too (SQLite)" {
 
     _ = try drv.exec("INSERT INTO \"xdaofood_owner\" (\"oid\", \"label\") VALUES (1, 'o')", &.{});
     _ = try drv.exec("INSERT INTO \"xdaofood_upload_file\" (\"path\", \"owner_id\") VALUES ('/a.png', 1)", &.{});
+}
+
+test "junctionTableForEdge derives the ends' declared table names and pks" {
+    // The implicit-junction path (`.relation == .m2m`, no `Through`) used to
+    // derive the target side from `toSnakeCase(target_name)` and reference a
+    // literal "id" on both ends — the same short-name defect the entity-table
+    // FKs carried before v0.84.0. A target declaring `table_name` and `.pk`
+    // got a junction whose columns and REFERENCES named a table the entity
+    // does not live in and a column it does not have.
+    const allocator = std.testing.allocator;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const XfTagBase = schema("XfTag", .{
+        .table_name = "xdaofood_tag",
+        .pk = "tid",
+        .fields = &.{ field.Int("tid"), field.String("label") },
+    });
+    const XfMemberBase = schema("XfMember", .{ .fields = &.{field.String("name")} });
+    const XfMember = struct {
+        pub const schema_name = XfMemberBase.schema_name;
+        pub const fields = XfMemberBase.fields;
+        // Both sides declare the edge — that is what makes the relation M2M
+        // without a `Through`, the shape `junctionTableForEdge` serves.
+        pub const edges = &.{edge.To("tags", XfTagBase)};
+        pub const indexes = XfMemberBase.indexes;
+    };
+    const XfTag = struct {
+        pub const schema_name = XfTagBase.schema_name;
+        // Forward the overrides too: a composed type that drops them loses
+        // `table_name`/`pk` exactly the way the withEdges copies in the
+        // examples do, and the junction would silently fall back to the
+        // short name and "id".
+        pub const table_name = XfTagBase.table_name;
+        pub const pk = XfTagBase.pk;
+        pub const fields = XfTagBase.fields;
+        pub const edges = &.{edge.To("members", XfMemberBase)};
+        pub const indexes = XfTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ XfMember, XfTag });
+    const infos = graph.types;
+
+    const member_info = comptime graph.types[0];
+    const member_edge = comptime member_info.edges[0];
+    comptime std.debug.assert(member_edge.relation == .m2m and member_edge.through == null);
+
+    const jtable = comptime junctionTableForEdge(member_edge, member_info, infos);
+
+    // `xdaofood_tag` sorts before `xf_member`, so the *target* side is first:
+    // the declared table name wins over the `xf_tag` short name everywhere —
+    // junction name, column names, and the FK's referenced table.
+    try std.testing.expectEqualStrings("xdaofood_tag_xf_member", jtable.name);
+    try std.testing.expectEqual(@as(usize, 2), jtable.columns.len);
+    try std.testing.expectEqualStrings("xdaofood_tag_id", jtable.columns[0].name);
+    try std.testing.expectEqualStrings("xf_member_id", jtable.columns[1].name);
+    try std.testing.expectEqual(@as(usize, 2), jtable.primary_keys.len);
+    try std.testing.expectEqualStrings("xdaofood_tag_id", jtable.primary_keys[0]);
+    try std.testing.expectEqualStrings("xf_member_id", jtable.primary_keys[1]);
+
+    try std.testing.expectEqual(@as(usize, 2), jtable.foreign_keys.len);
+    // The target end references its declared table and its declared pk.
+    try std.testing.expectEqualStrings("xdaofood_tag_id", jtable.foreign_keys[0].columns[0]);
+    try std.testing.expectEqualStrings("xdaofood_tag", jtable.foreign_keys[0].ref_table);
+    try std.testing.expectEqualStrings("tid", jtable.foreign_keys[0].ref_columns[0]);
+    // The source end references the declared table it was given and its pk.
+    try std.testing.expectEqualStrings("xf_member_id", jtable.foreign_keys[1].columns[0]);
+    try std.testing.expectEqualStrings("xf_member", jtable.foreign_keys[1].ref_table);
+    try std.testing.expectEqualStrings("id", jtable.foreign_keys[1].ref_columns[0]);
+
+    // The rendered CREATE TABLE carries the same shape.
+    const sql = try createTableSQLAlloc(allocator, jtable, Dialect.sqlite);
+    defer allocator.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES \"xdaofood_tag\" (\"tid\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES \"xf_member\" (\"id\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "xf_tag") == null);
+
+    // Out of the graph the target has no TypeInfo to ask, and the reference
+    // dangles either way — the historical short-name/"id" fallback stands,
+    // pinned here so the fallback stays a decision rather than an accident.
+    const lone_infos = comptime &[_]TypeInfo{member_info};
+    const fallback = comptime junctionTableForEdge(member_edge, member_info, lone_infos);
+    try std.testing.expectEqualStrings("xf_member_xf_tag", fallback.name);
+    try std.testing.expectEqualStrings("xf_tag", fallback.foreign_keys[1].ref_table);
+    try std.testing.expectEqualStrings("id", fallback.foreign_keys[1].ref_columns[0]);
+}
+
+test "an implicit M2M junction references each end's declared table and pk (SQLite)" {
+    // Reachable through the public API: two mutual `To` edges without a
+    // `Through` resolve to `.m2m` (`resolveGraphEdges`), `migrateSchema`
+    // creates the junction `junctionTableForEdge` derives, and the relation
+    // query reads that table. With a target declaring `table_name` and
+    // `.pk`, the junction has to name the declared table and pk on both
+    // ends — under enforced foreign keys, not just in the DDL text.
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const ZtTagBase = schema("ZtTag", .{
+        .table_name = "zt_tag_xref",
+        .pk = "tid",
+        .fields = &.{ field.Int("tid"), field.String("label") },
+    });
+    const ZtMemberBase = schema("ZtMember", .{ .fields = &.{field.String("name")} });
+    const ZtMember = struct {
+        pub const schema_name = ZtMemberBase.schema_name;
+        pub const fields = ZtMemberBase.fields;
+        pub const edges = &.{edge.To("tags", ZtTagBase)};
+        pub const indexes = ZtMemberBase.indexes;
+    };
+    const ZtTag = struct {
+        pub const schema_name = ZtTagBase.schema_name;
+        // Forward the overrides — same rule as the unit test above.
+        pub const table_name = ZtTagBase.table_name;
+        pub const pk = ZtTagBase.pk;
+        pub const fields = ZtTagBase.fields;
+        pub const edges = &.{edge.To("members", ZtMemberBase)};
+        pub const indexes = ZtTagBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ ZtMember, ZtTag });
+    const infos = graph.types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The junction `migrateSchema` created names each end's declared table
+    // and pk: `zt_tag_xref` ("tid") for the target end, `zt_member` ("id")
+    // for the source one — the same junction name the relation query derives.
+    var meta = try drv.query(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'zt_member_zt_tag_xref'",
+        &.{},
+    );
+    defer meta.deinit();
+    const row = meta.next() orelse return error.NoTableRow;
+    const ddl = row.getText(0).?;
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "REFERENCES \"zt_tag_xref\" (\"tid\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "REFERENCES \"zt_member\" (\"id\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "\"zt_tag\"") == null);
+
+    // Migrated schema and check agree: the derived junction shape is the
+    // created one — columns, pair key and both foreign keys included.
+    const agreeing = try checkSchema(allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(allocator, agreeing);
+    try std.testing.expectEqual(@as(usize, 0), agreeing.len);
+
+    // End to end, foreign keys on (`SQLiteDriver.open` sets and verifies the
+    // pragma): both parent rows insert, the pair over them joins, and a
+    // dangling end is rejected — the constraints fire, not a mismatch.
+    _ = try drv.exec("INSERT INTO \"zt_member\" (\"id\", \"name\") VALUES (1, 'm')", &.{});
+    _ = try drv.exec("INSERT INTO \"zt_tag_xref\" (\"tid\", \"label\") VALUES (7, 't')", &.{});
+    _ = try drv.exec("INSERT INTO \"zt_member_zt_tag_xref\" (\"zt_member_id\", \"zt_tag_xref_id\") VALUES (1, 7)", &.{});
+    try std.testing.expectError(
+        error.ForeignKeyViolation,
+        drv.exec("INSERT INTO \"zt_member_zt_tag_xref\" (\"zt_member_id\", \"zt_tag_xref_id\") VALUES (1, 999)", &.{}),
+    );
+    try std.testing.expectError(
+        error.ForeignKeyViolation,
+        drv.exec("INSERT INTO \"zt_member_zt_tag_xref\" (\"zt_member_id\", \"zt_tag_xref_id\") VALUES (999, 7)", &.{}),
+    );
 }

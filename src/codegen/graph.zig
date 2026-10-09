@@ -119,7 +119,9 @@ pub fn edgeTargetInfo(comptime infos: []const TypeInfo, comptime source: TypeInf
     @compileError("zent: edge '" ++ edge.name ++ "' on '" ++ source.name ++ "' targets '" ++ edge.target_name ++
         "', which is not in this graph. Edges resolve only within a single graph (see docs/BEST_PRACTICES.md 8a):" ++
         " add the target schema to the graph you pass to buildGraph, or read it through the raw driver with" ++
-        " zent.scope. Cross-graph edges are tracked as Z16 in docs/ISSUES_FROM_ZAPI.md.");
+        " zent.scope. If '" ++ edge.target_name ++ "' is declared in another buildGraph call of your app," ++
+        " that is exactly the cross-graph limitation tracked as Z16 in docs/ISSUES_FROM_ZAPI.md:" ++
+        " move the schema into this graph, or drop the edge and read the other graph through its own client.");
 }
 
 /// Build a TypeInfo from a schema type at comptime.
