@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.88.2] - 2026-10-10
+
 ### Fixed
 
 - **The joined-build allocation sweep is deterministic on remap-capable
