@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.88.1] - 2026-10-10
+
 ### Fixed
 
 - **The joined build's scratch builder no longer swallows an OOM.** v0.88.0's
