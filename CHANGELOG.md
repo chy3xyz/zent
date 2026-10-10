@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.89.0] - 2026-10-10
+
 ### Added
 
 - **The allocation-failure sweep now covers the paths that could not be
