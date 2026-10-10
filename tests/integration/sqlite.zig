@@ -3682,6 +3682,59 @@ test "SQLite: checkSchema reports a UNIQUE column and a foreign key the database
     try testing.expectEqual(@as(usize, 0), agreeing.len);
 }
 
+test "SQLite: add_missing_foreign_keys is a no-op, and the drift stays a report" {
+    // SQLite has no `ALTER TABLE ADD CONSTRAINT`, so the only way to add a
+    // foreign key to a table that exists is to rebuild the table — a feature of
+    // its own, deliberately not part of this option. So the option changes
+    // nothing here: no statement is planned, the migration runs clean, the key
+    // is still absent, and `checkSchema` keeps reporting it. The boundary is
+    // asserted rather than assumed, so a future table-rebuild feature has to
+    // change this case on purpose.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const SqFkOwner = schema("SqFkOwner", .{ .fields = &.{field.String("name")} });
+    const SqFkCarBefore = schema("SqFkCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ SqFkOwner, SqFkCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    const SqFkCar = schema("SqFkCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+        .edges = &.{edge.From("owner", SqFkOwner)},
+    });
+    const graph = comptime buildGraph(&.{ SqFkOwner, SqFkCar });
+    const infos = graph.types;
+
+    _ = try drv.exec("ALTER TABLE sq_fk_car ADD COLUMN owner_id INTEGER", &.{});
+
+    // The plan, with the option on: nothing that adds a constraint, on SQLite.
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, .{ .add_missing_foreign_keys = true }, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+    for (plan.items) |st| {
+        try testing.expect(std.mem.indexOf(u8, st.sql, "ADD CONSTRAINT") == null);
+        try testing.expect(std.mem.indexOf(u8, st.sql, "VALIDATE CONSTRAINT") == null);
+        // A `CREATE TABLE`'s inline `FOREIGN KEY` is the only place one may
+        // appear: no ALTER was planned for it.
+        if (std.mem.indexOf(u8, st.sql, "ALTER TABLE") != null) {
+            try testing.expect(std.mem.indexOf(u8, st.sql, "FOREIGN KEY") == null);
+        }
+    }
+
+    // The real run is clean (the option is not an error here) and adds nothing.
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, .{ .add_missing_foreign_keys = true });
+    var keys = try migrate.getExistingForeignKeys(allocator, drv.asDriver(), "sq_fk_car");
+    defer migrate.freeExistingForeignKeys(allocator, &keys);
+    try testing.expectEqual(@as(usize, 0), keys.items.len);
+
+    const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, drifts);
+    try testing.expectEqual(@as(usize, 1), drifts.len);
+    try testing.expectEqual(migrate.SchemaDrift.Kind.missing_foreign_key, drifts[0].kind);
+}
+
 test "SQLite: checkSchema reports a view the database does not have, and getExistingViews reads one it does" {
     // Views were the one declared shape `checkSchema` never looked at (the
     // entity loop skipped `is_view` outright). The failure that let through:

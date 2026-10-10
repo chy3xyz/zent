@@ -268,3 +268,74 @@ key length, or defaulted.
 After converting, `sql_schema.checkSchema` stops reporting those columns. It
 compares normalized types (`varchar(255)` → `varchar`, `text` → `text`), so
 before the conversion each such column appears as `type_mismatch`.
+
+## 13. v0.83 → v0.91: the changes a consumer has to act on
+
+Ten releases' worth of behaviour, DDL and ownership changes accumulated while
+`CHANGELOG.md` recorded them one release at a time. This section is the
+consumer-side view: **what can break when you upgrade, what needs a database
+rebuild, and what is worth adopting.** Anything not listed here was additive or
+purely internal.
+
+### 13.1 Toolchain
+
+The pin moved from a `0.17.0-dev` snapshot to **Zig 0.17.0 stable** (v0.82.0)
+and `build.zig.zon`'s `minimum_zig_version` is `"0.17.0"`. A pre-release sorts
+below the release, so **an older dev snapshot is now refused** with
+"zig version … does not satisfy" — move the toolchain at the same time as the
+dependency. `std.builtin.*` spellings throughout the library were migrated to
+`std.lang.*` (v0.83.1); that is invisible to consumers.
+
+### 13.2 Behaviour changes that can break a running consumer
+
+| Change | What to do |
+|---|---|
+| **MySQL: a `Save` on a table without `AUTO_INCREMENT` now fails** (v0.84.0). `mysql_insert_id()` answers `0` when no auto-increment value was set; the driver now maps that to "no id", so the row's id is no longer silently written as `0` — the call answers `error.MissingLastInsertId` instead. `SaveIgnore` that did not insert keeps the cross-dialect `id = 0` convention, and `SaveOrUpdate` is unaffected (ODKU's update branch reports the updated row's id) | If you relied on the old behaviour, your table is missing its auto-increment (or the schema declares a key your DDL never created). Fix the schema; if the row genuinely has no generated key, read it back explicitly |
+| **EntQL addresses field names first** (v0.84.0). A `WhereEntQL` ident that matches a field's API name is rewritten to that field's physical column (`StorageKey`-aware, and inside `has(...)` against the edge target); a physical column spelling still works; neither answers `error.UnknownField`. If a field's API name equals another field's column name, the **field name wins** | Audit `WhereEntQL` strings that name a `StorageKey` column directly — they still work, but one that happens to spell a *field* name now filters that field |
+| **MySQL: a `SELECT` through the prepared `exec` path reports its row count** (v0.86.0). The prepared path used to answer `rows_affected_known = false` where the unprepared one answered a count (a divergence documented since v0.63.0) | Nothing, unless you branched on `rows_affected_known` for a SELECT sent to `exec` — prefer `query()` for reads |
+| **`ShardSet` borrows its `ShardRouter`** (v0.85.0). `ShardSet.deinit` no longer releases the router, and the old module-header example double-freed. A router **copied by value** into the set must not be mutated afterwards (the tenant map is shared; growing through one copy strands the other) | Callers must `deinit` the router they created. In-repo `helpers.ShardedEnv` already does |
+| **OOM propagates on four assembly paths** (v0.89.0): `scope.forTable`, `client.queryTargetsImpl`, the eager `loadEdgePath` and `BulkDeleteBuilder.init`. They used to build through `Builder.init`, which swallows a failed preallocation and degrades silently | Nothing, unless a caller assumed those calls cannot return `error.OutOfMemory` (it was already in their error sets) |
+| **`error.JoinWithGroupBy`** (v0.88.0) — raised by whichever of `joinEdge`/`GroupBy` comes second; **`error.MissingLastInsertId`** is now reachable (v0.84.0) | A `switch` over `QueryError`/`SaveError` needs its `else =>` arm, as always |
+| **`sql.MultiInsert`'s length assertion was removed** (v0.90.0) — it asserted the flat buffer's total size, the one thing a row-shape mistake leaves intact | Nothing; the row-shape check (`error.InconsistentRowFields`) is unchanged |
+
+### 13.3 DDL changes that need a rebuild on an existing database
+
+These change what the migration *derives*, so a table created by an older
+release stays as it was — `migrateSchema` will not repair it for you (the one
+exception is opt-in, below).
+
+| Change | Symptom on an existing database | What to do |
+|---|---|---|
+| **Z40: an edge FK's referenced column** (v0.84.0). `REFERENCES <table> (<col>)` now takes the target's `.pk` override / `StorageKey`-renamed column instead of a literal `"id"` | The child's INSERT fails with SQLite's `foreign key mismatch` (or the FK dangles on PG/MySQL) although reads work | Drop and recreate the constraint — SQLite: rebuild the table. `PRAGMA foreign_key_list(<child>)` shows what it points at today. The Z40 write-up in `ISSUES_FROM_ZAPI.md` has a discriminator query |
+| **Implicit-M2M junctions** (v0.87.0): the junction's table name and both columns now use the ends' declared `table_name`/`.pk` | An existing junction under the old short name is no longer the one the relation query reads (`no such table` on the first m2m write) | Rename/rebuild the junction table, or keep the old name by declaring the ends without overrides |
+| **A `Through` schema's declared `table_name`** (v0.88.0) now names the junction | Same shape: the through table exists under the declared name, the relation looks for the short one | Rebuild or rename |
+| **MySQL `bool`/`float` columns** (v0.85.0): the false `type_mismatch` is gone (`BOOLEAN` ≡ `tinyint`, `REAL` ≡ `double`) | A migration that used to **fail** while planning (`MySQLTypeChangeUnsafe`, including dry runs) now succeeds and reports no drift | Nothing — this one only removes a false alarm |
+| **MariaDB: `TEXT`/`BLOB` may carry a `DEFAULT`** (v0.90.0). The migration detects MariaDB and keeps MySQL's errno-1101 refusal for MySQL only | On MariaDB, a schema with a text default used to fail table creation; now the DDL is emitted | Nothing; MySQL behaviour is unchanged |
+
+### 13.4 Worth adopting
+
+| API | Since | Why |
+|---|---|---|
+| `field.String("x").VarChar(n)` | v0.86.0 | Expresses the MySQL `VARCHAR(255)` cap (DDL `VARCHAR(n)` on MySQL, `TEXT` elsewhere) **and** enforces it on the write path on every dialect (`error.ValidationFailed`) |
+| `client.<entity>.AllOwned(allocator)` | v0.86.0 | The one-call page release for a consumer holding a client without a live builder (same `OwnedRows` as the builder's `AllOwned`) |
+| `QueryBuilder.joinEdge(edge, .inner\|.left, .{ where, select, alias })` | v0.88.0 | A controlled single-round-trip JOIN for m2o lookups, with the target's full read contract and its columns projected into the eager edge field. Requires the entity to *declare* the edge — see §13.5 |
+| `InsertBuilder`/`UpdateBuilder`/`DeleteBuilder`/`BulkUpdateBuilder`'s `initCapacity` | v0.90.0 | Fallible twins of the constructors whose `init` swallows an allocation failure |
+| `SQLiteDriver.openWithOptions(…, .{ .strict_numeric_text = true })` | v0.90.0 | SQLite parses text numerics instead of coercing, so an integer field over a `Decimal`(TEXT) column fails loudly as it already did on PG/MySQL. Off by default |
+| `MigrateOptions.add_missing_foreign_keys` | v0.91.0 | Adds declared-but-absent foreign keys to **existing** tables (MySQL one statement; PostgreSQL `NOT VALID` + `VALIDATE`). Off by default; a violating row fails the migration loudly. SQLite is a documented no-op (it has no `ADD CONSTRAINT`) |
+
+### 13.5 If you are chasing raw SQL: declare the edges first
+
+A measured example, from a consumer with ~180 schemas and ~543 raw-SQL call
+sites (153 of them JOIN-shaped): **62% of its JOINs are single-hop m2o lookups
+and another 15% are several independent m2o lookups in one statement** — both
+of which `joinEdge` already expresses, including several `joinEdge` calls on
+one query. What blocked them was not the library: **their schemas declared no
+edges at all**, and every edge-based API (`joinEdge`, `WithEdge`,
+`WithEdgeOptions`) needs one. Declaring the m2o edges is the highest-yield step
+for that codebase, ahead of any new feature.
+
+Groups worth *not* chasing into the builder: report aggregation (`JOIN` +
+`GROUP BY` + `SUM`/`COUNT` over joined columns), self-joins with several
+aliases, and `UPDATE … FROM`. Their shapes are unbounded, the three dialects
+disagree, and they are precisely what `joinEdge` v1 refuses (`JoinWithGroupBy`)
+rather than approximates — keep them raw and scope them with `zent.scope`.

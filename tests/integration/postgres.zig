@@ -3614,6 +3614,268 @@ test "Postgres: checkSchema reports a UNIQUE column and a foreign key the databa
     try testing.expectEqual(@as(usize, 0), absent.items.len);
 }
 
+/// Rows in the migration history. Read through the driver rather than an
+/// exported helper: the assertion every case below makes is "this run advanced
+/// the schema version by nothing", and the table is the record that answers it.
+fn pgHistoryCount(drv: *PostgresDriver) !i64 {
+    var rows = try drv.query("SELECT COUNT(*) FROM zent_schema_migrations", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return 0;
+    return row.getInt(0) orelse 0;
+}
+
+/// The foreign keys `checkSchema` would read for `table`, straight from
+/// `pg_constraint`.
+fn pgForeignKeyCount(drv: *PostgresDriver, table: []const u8) !i64 {
+    var rows = try drv.query(
+        "SELECT COUNT(*) FROM pg_constraint WHERE conrelid = $1::regclass AND contype = 'f'",
+        &.{.{ .string = table }},
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return 0;
+    return row.getInt(0) orelse 0;
+}
+
+test "Postgres: add_missing_foreign_keys defaults to report-only, and plans no ALTER" {
+    // The Z31 residual: a `FOREIGN KEY` is inline in `CREATE TABLE`, so a table
+    // created before the edge existed keeps accepting orphans and only
+    // `checkSchema` says so. `MigrateOptions.add_missing_foreign_keys` is the
+    // repair; this case pins that the default repairs nothing — the drift is the
+    // report it always was, no DDL is planned, and no history row moves.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const PgFkOwner = schema("PgFkOwner", .{ .fields = &.{field.String("name")} });
+
+    // Leftovers from an interrupted run, and the child dropped before its parent
+    // (the defers run in reverse): a foreign key makes the parent's own DROP
+    // TABLE fail.
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_fk_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_fk_owner CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_fk_owner CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_fk_car", &.{}) catch {};
+
+    // The table as it was built: no edge yet, so no foreign key.
+    const PgFkCarBefore = schema("PgFkCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ PgFkOwner, PgFkCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    // The schema as it is now.
+    const PgFkCar = schema("PgFkCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+        .edges = &.{edge.From("owner", PgFkOwner)},
+    });
+    const graph = comptime buildGraph(&.{ PgFkOwner, PgFkCar });
+    const infos = graph.types;
+
+    // The edge's column exists out of band (its absence would be a
+    // `missing_column`, not the constraint this case is about); the key does not.
+    _ = try drv.exec("ALTER TABLE pg_fk_car ADD COLUMN owner_id INTEGER", &.{});
+
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_foreign_key, drifts[0].kind);
+        try testing.expectEqualStrings("owner_id", drifts[0].column);
+        // The classification is unchanged: still a write-only difference, so
+        // `read_breaking_only` stays green and `any` is the gate that fails.
+        try testing.expect(!drifts[0].breaksReads());
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The plan the default produces, read off the planner (the shared diff, not
+    // a second opinion): nothing that adds a constraint.
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, .{}, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+    for (plan.items) |st| {
+        try testing.expect(std.mem.indexOf(u8, st.sql, "ADD CONSTRAINT") == null);
+        try testing.expect(std.mem.indexOf(u8, st.sql, "VALIDATE CONSTRAINT") == null);
+    }
+
+    // And the real run is a no-op: no new history, still no key.
+    try testing.expectEqual(@as(i64, 0), try pgForeignKeyCount(&drv, "pg_fk_car"));
+    const history_before = try pgHistoryCount(&drv);
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    try testing.expectEqual(history_before, try pgHistoryCount(&drv));
+    try testing.expectEqual(@as(i64, 0), try pgForeignKeyCount(&drv, "pg_fk_car"));
+}
+
+test "Postgres: add_missing_foreign_keys adds a validated key, then plans nothing" {
+    // The opted-in half: the constraint is created under the deterministic name
+    // `fk_<table>_<column>`, `NOT VALID` + `VALIDATE` complete it, `checkSchema`
+    // reads it back by shape, and a second run plans no ALTER at all.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const PgFkAddOwner = schema("PgFkAddOwner", .{ .fields = &.{field.String("name")} });
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_fk_add_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_fk_add_owner CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_fk_add_owner CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_fk_add_car", &.{}) catch {};
+
+    const PgFkAddCarBefore = schema("PgFkAddCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ PgFkAddOwner, PgFkAddCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    const PgFkAddCar = schema("PgFkAddCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+        .edges = &.{edge.From("owner", PgFkAddOwner)},
+    });
+    const graph = comptime buildGraph(&.{ PgFkAddOwner, PgFkAddCar });
+    const infos = graph.types;
+
+    _ = try drv.exec("ALTER TABLE pg_fk_add_car ADD COLUMN owner_id INTEGER", &.{});
+
+    // The plan, before anything runs: the pair PostgreSQL needs — the add is
+    // `NOT VALID` (a catalog update under a short lock; the rows already in the
+    // table are not scanned) and the validation is the second statement, so a
+    // violating row fails there and names the constraint. The name is the
+    // derived `fk_<table>_<column>`; the comparison downstream is by shape, so
+    // this name is only the one this layer wrote.
+    const opts = migrate.MigrateOptions{ .add_missing_foreign_keys = true };
+    const expected_add = "ADD CONSTRAINT \"fk_pg_fk_add_car_owner_id\" FOREIGN KEY (\"owner_id\") REFERENCES \"pg_fk_add_owner\" (\"id\")";
+    const expected_validate = "VALIDATE CONSTRAINT \"fk_pg_fk_add_car_owner_id\"";
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, opts, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+    {
+        var added = false;
+        var validated = false;
+        for (plan.items) |st| {
+            if (std.mem.indexOf(u8, st.sql, expected_add) != null) {
+                added = true;
+                try testing.expect(std.mem.indexOf(u8, st.sql, "NOT VALID") != null);
+            }
+            if (std.mem.indexOf(u8, st.sql, expected_validate) != null) validated = true;
+        }
+        try testing.expect(added);
+        try testing.expect(validated);
+    }
+
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, opts);
+
+    // It exists under that name, and `VALIDATE` ran: `convalidated` is true.
+    {
+        var rows = try drv.query(
+            "SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'pg_fk_add_car'::regclass AND contype = 'f'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("fk_pg_fk_add_car_owner_id", row.getText(0).?);
+        // `VALIDATE` ran: `convalidated` is true, which is the `NOT VALID` half
+        // actually being finished rather than left half-done.
+        try testing.expect(row.getBool(1).?);
+        try testing.expect(rows.next() == null);
+    }
+
+    // `checkSchema` agrees — by shape, so the name PostgreSQL would have
+    // invented is irrelevant.
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+
+    // Idempotent: a second plan carries no constraint statement (the shape
+    // comparison `foreignKeyPresent` sees the key it just added) …
+    var plan2 = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, opts, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan2);
+    for (plan2.items) |st| {
+        try testing.expect(std.mem.indexOf(u8, st.sql, "ADD CONSTRAINT") == null);
+        try testing.expect(std.mem.indexOf(u8, st.sql, "VALIDATE CONSTRAINT") == null);
+    }
+
+    // … and the second real run advances nothing and leaves exactly one key.
+    const history_before = try pgHistoryCount(&drv);
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, opts);
+    try testing.expectEqual(history_before, try pgHistoryCount(&drv));
+    try testing.expectEqual(@as(i64, 1), try pgForeignKeyCount(&drv, "pg_fk_add_car"));
+}
+
+test "Postgres: add_missing_foreign_keys fails loudly on an orphan and advances nothing" {
+    // The reason the option is opt-in: the rows already in the table are the
+    // caller's decision. A dangling reference must make the migration fail — the
+    // `NOT VALID` add goes through, the `VALIDATE` scan is what refuses — and the
+    // failure must not leave a half-added constraint or a recorded version
+    // behind.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const PgFkBadOwner = schema("PgFkBadOwner", .{ .fields = &.{field.String("name")} });
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_fk_bad_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_fk_bad_owner CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_fk_bad_owner CASCADE", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_fk_bad_car", &.{}) catch {};
+
+    const PgFkBadCarBefore = schema("PgFkBadCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ PgFkBadOwner, PgFkBadCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    const PgFkBadCar = schema("PgFkBadCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+        .edges = &.{edge.From("owner", PgFkBadOwner)},
+    });
+    const graph = comptime buildGraph(&.{ PgFkBadOwner, PgFkBadCar });
+    const infos = graph.types;
+
+    _ = try drv.exec("ALTER TABLE pg_fk_bad_car ADD COLUMN owner_id INTEGER", &.{});
+    // The row the key must refuse: `model` and `vin` are both declared NOT NULL
+    // without a default, so they carry values; `owner_id` names nobody.
+    _ = try drv.exec(
+        "INSERT INTO pg_fk_bad_car (model, vin, owner_id) VALUES ('orphan', 'vin-orphan', 999999)",
+        &.{},
+    );
+
+    const opts = migrate.MigrateOptions{ .add_missing_foreign_keys = true };
+
+    // The plan is the same pair as the success case, and the second statement —
+    // the one that fails — names the constraint the error will name
+    // (`fk_pg_fk_bad_car_owner_id`; PostgreSQL's 23503 message reads
+    // `violates foreign key constraint "…"`).
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, opts, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+    {
+        var validated: ?[]const u8 = null;
+        for (plan.items) |st| {
+            if (std.mem.indexOf(u8, st.sql, "VALIDATE CONSTRAINT \"fk_pg_fk_bad_car_owner_id\"") != null) validated = st.sql;
+        }
+        try testing.expect(validated != null);
+    }
+
+    try testing.expectEqual(@as(i64, 0), try pgForeignKeyCount(&drv, "pg_fk_bad_car"));
+    const history_before = try pgHistoryCount(&drv);
+
+    try testing.expectError(
+        error.ForeignKeyViolation,
+        migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, opts),
+    );
+
+    // Both statements were in the migration's one transaction, so the failed
+    // `VALIDATE` rolled the `NOT VALID` add back with it: no key, no history
+    // row, no version advanced.
+    try testing.expectEqual(@as(i64, 0), try pgForeignKeyCount(&drv, "pg_fk_bad_car"));
+    try testing.expectEqual(history_before, try pgHistoryCount(&drv));
+
+    // And the drift is still the report it was, for the next attempt.
+    const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, drifts);
+    try testing.expectEqual(@as(usize, 1), drifts.len);
+    try testing.expectEqual(migrate.SchemaDrift.Kind.missing_foreign_key, drifts[0].kind);
+}
+
 test "Postgres: checkSchema reports a view the database does not have, and getExistingViews reads one it does" {
     // Views were the one declared shape `checkSchema` never looked at. The
     // failure that let through: the view is declared, `migrateSchema` records

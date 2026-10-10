@@ -3855,6 +3855,254 @@ test "MySQL: checkSchema reports a UNIQUE column and a foreign key the database 
     try testing.expectEqual(@as(usize, 0), absent.items.len);
 }
 
+/// Rows in the migration history. Read through the driver rather than an
+/// exported helper: the assertion every case below makes is "this run advanced
+/// the schema version by nothing", and the table is the record that answers it.
+fn myHistoryCount(drv: *MySQLDriver) !i64 {
+    var rows = try drv.query("SELECT COUNT(*) FROM zent_schema_migrations", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return 0;
+    return row.getInt(0) orelse 0;
+}
+
+/// The foreign keys `checkSchema` would read for `table`, out of the same
+/// standard `information_schema` the reader uses.
+fn myForeignKeyCount(drv: *MySQLDriver, table: []const u8) !i64 {
+    var rows = try drv.query(
+        "SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND table_name = ? AND constraint_type = 'FOREIGN KEY'",
+        &.{.{ .string = table }},
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return 0;
+    return row.getInt(0) orelse 0;
+}
+
+test "MySQL: add_missing_foreign_keys defaults to report-only, and plans no ALTER" {
+    // The Z31 residual: a `FOREIGN KEY` is inline in `CREATE TABLE`, so a table
+    // created before the edge existed keeps accepting orphans and only
+    // `checkSchema` says so. `MigrateOptions.add_missing_foreign_keys` is the
+    // repair; this case pins that the default repairs nothing — the drift is the
+    // report it always was, no DDL is planned, and no history row moves.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyFkOwner = schema("MyFkOwner", .{ .fields = &.{field.String("name")} });
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_fk_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_fk_owner", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_fk_owner", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_fk_car", &.{}) catch {};
+
+    // The table as it was built: no edge yet, so no foreign key.
+    const MyFkCarBefore = schema("MyFkCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ MyFkOwner, MyFkCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    // The schema as it is now.
+    const MyFkCar = schema("MyFkCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+        .edges = &.{edge.From("owner", MyFkOwner)},
+    });
+    const graph = comptime buildGraph(&.{ MyFkOwner, MyFkCar });
+    const infos = graph.types;
+
+    // The edge's column exists out of band; the key does not. MySQL's driver
+    // ignores FKs entirely (`foreign_key_checks` aside), so the gap is as quiet
+    // here as on the other two.
+    _ = try drv.exec("ALTER TABLE my_fk_car ADD COLUMN owner_id INTEGER", &.{});
+
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.missing_foreign_key, drifts[0].kind);
+        try testing.expectEqualStrings("owner_id", drifts[0].column);
+        try testing.expect(!drifts[0].breaksReads());
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .read_breaking_only);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), infos, .any));
+    }
+
+    // The plan the default produces: nothing that adds a constraint.
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, .{}, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+    for (plan.items) |st| {
+        try testing.expect(std.mem.indexOf(u8, st.sql, "ADD CONSTRAINT") == null);
+        try testing.expect(std.mem.indexOf(u8, st.sql, "VALIDATE CONSTRAINT") == null);
+    }
+
+    // And the real run is a no-op: no new history, still no key.
+    try testing.expectEqual(@as(i64, 0), try myForeignKeyCount(&drv, "my_fk_car"));
+    const history_before = try myHistoryCount(&drv);
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+    try testing.expectEqual(history_before, try myHistoryCount(&drv));
+    try testing.expectEqual(@as(i64, 0), try myForeignKeyCount(&drv, "my_fk_car"));
+}
+
+test "MySQL: add_missing_foreign_keys adds the key, then plans nothing" {
+    // The opted-in half: the constraint is added under the deterministic name
+    // `fk_<table>_<column>`, `checkSchema` reads it back by shape, and a second
+    // run plans no ALTER at all.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyFkAddOwner = schema("MyFkAddOwner", .{ .fields = &.{field.String("name")} });
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_fk_add_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_fk_add_owner", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_fk_add_owner", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_fk_add_car", &.{}) catch {};
+
+    const MyFkAddCarBefore = schema("MyFkAddCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ MyFkAddOwner, MyFkAddCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    const MyFkAddCar = schema("MyFkAddCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+        .edges = &.{edge.From("owner", MyFkAddOwner)},
+    });
+    const graph = comptime buildGraph(&.{ MyFkAddOwner, MyFkAddCar });
+    const infos = graph.types;
+
+    _ = try drv.exec("ALTER TABLE my_fk_add_car ADD COLUMN owner_id INTEGER", &.{});
+
+    // The plan, before anything runs: MySQL's single statement — no `NOT VALID`
+    // (that clause is PostgreSQL's alone), the derived name, and the declared
+    // actions. Nothing MySQL-specific is needed for the index an InnoDB foreign
+    // key requires: the server creates it for the key if no suitable one exists.
+    const opts = migrate.MigrateOptions{ .add_missing_foreign_keys = true };
+    const expected_add = "ALTER TABLE `my_fk_add_car` ADD CONSTRAINT `fk_my_fk_add_car_owner_id` FOREIGN KEY (`owner_id`) REFERENCES `my_fk_add_owner` (`id`)";
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, opts, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+    {
+        var added = false;
+        for (plan.items) |st| {
+            if (std.mem.indexOf(u8, st.sql, expected_add) != null) {
+                added = true;
+                try testing.expect(std.mem.indexOf(u8, st.sql, "NOT VALID") == null);
+            }
+            try testing.expect(std.mem.indexOf(u8, st.sql, "VALIDATE CONSTRAINT") == null);
+        }
+        try testing.expect(added);
+    }
+
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, opts);
+
+    // It exists under that name. Unlike PostgreSQL, MySQL keeps the name the
+    // statement gave it.
+    {
+        var rows = try drv.query(
+            "SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema = DATABASE() AND table_name = 'my_fk_add_car' AND constraint_type = 'FOREIGN KEY'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("fk_my_fk_add_car_owner_id", row.getText(0).?);
+        try testing.expect(rows.next() == null);
+    }
+
+    // `checkSchema` agrees — by shape, so a server-invented name would be just as
+    // invisible to it as this one.
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+
+    // Idempotent: a second plan carries no constraint statement (the shape
+    // comparison `foreignKeyPresent` sees the key it just added) …
+    var plan2 = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, opts, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan2);
+    for (plan2.items) |st| {
+        try testing.expect(std.mem.indexOf(u8, st.sql, "ADD CONSTRAINT") == null);
+    }
+
+    // … and the second real run advances nothing and leaves exactly one key.
+    const history_before = try myHistoryCount(&drv);
+    try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, opts);
+    try testing.expectEqual(history_before, try myHistoryCount(&drv));
+    try testing.expectEqual(@as(i64, 1), try myForeignKeyCount(&drv, "my_fk_add_car"));
+}
+
+test "MySQL: add_missing_foreign_keys fails loudly on an orphan and advances nothing" {
+    // The reason the option is opt-in: the rows already in the table are the
+    // caller's decision. InnoDB validates them as part of the `ALTER`, so a
+    // dangling reference makes the migration fail rather than silently leaving
+    // the constraint out — and the recorded version must not advance.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const MyFkBadOwner = schema("MyFkBadOwner", .{ .fields = &.{field.String("name")} });
+
+    _ = try drv.exec("DROP TABLE IF EXISTS my_fk_bad_car", &.{});
+    _ = try drv.exec("DROP TABLE IF EXISTS my_fk_bad_owner", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_fk_bad_owner", &.{}) catch {};
+    defer _ = drv.exec("DROP TABLE IF EXISTS my_fk_bad_car", &.{}) catch {};
+
+    const MyFkBadCarBefore = schema("MyFkBadCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+    });
+    const before_graph = comptime buildGraph(&.{ MyFkBadOwner, MyFkBadCarBefore });
+    try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
+
+    const MyFkBadCar = schema("MyFkBadCar", .{
+        .fields = &.{ field.String("model"), field.String("vin") },
+        .edges = &.{edge.From("owner", MyFkBadOwner)},
+    });
+    const graph = comptime buildGraph(&.{ MyFkBadOwner, MyFkBadCar });
+    const infos = graph.types;
+
+    _ = try drv.exec("ALTER TABLE my_fk_bad_car ADD COLUMN owner_id INTEGER", &.{});
+    // The row the key must refuse: `model` and `vin` are both declared NOT NULL
+    // without a default (MySQL's strict mode rejects the insert otherwise), so
+    // they carry values; `owner_id` names nobody.
+    _ = try drv.exec(
+        "INSERT INTO my_fk_bad_car (model, vin, owner_id) VALUES ('orphan', 'vin-orphan', 999999)",
+        &.{},
+    );
+
+    const opts = migrate.MigrateOptions{ .add_missing_foreign_keys = true };
+
+    // The statement that fails names the constraint the error will name — InnoDB
+    // reports errno 1452 (`… a foreign key constraint fails (… fk_…_owner_id)`).
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, opts, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+    {
+        var named = false;
+        for (plan.items) |st| {
+            if (std.mem.indexOf(u8, st.sql, "ADD CONSTRAINT `fk_my_fk_bad_car_owner_id`") != null) named = true;
+        }
+        try testing.expect(named);
+    }
+
+    try testing.expectEqual(@as(i64, 0), try myForeignKeyCount(&drv, "my_fk_bad_car"));
+    const history_before = try myHistoryCount(&drv);
+
+    try testing.expectError(
+        error.ForeignKeyViolation,
+        migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), infos, opts),
+    );
+
+    // MySQL DDL commits implicitly, so the guarantee is narrower than
+    // PostgreSQL's transaction: nothing *after* the failing statement ran (the
+    // plan is that one statement), the version it would have recorded was never
+    // written, and the server added no constraint.
+    try testing.expectEqual(@as(i64, 0), try myForeignKeyCount(&drv, "my_fk_bad_car"));
+    try testing.expectEqual(history_before, try myHistoryCount(&drv));
+
+    // And the drift is still the report it was, for the next attempt.
+    const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, drifts);
+    try testing.expectEqual(@as(usize, 1), drifts.len);
+    try testing.expectEqual(migrate.SchemaDrift.Kind.missing_foreign_key, drifts[0].kind);
+}
+
 test "MySQL: a bool and a float column produce no false type_mismatch drift" {
     // MySQL stores BOOLEAN as `tinyint(1)` and REAL as DOUBLE, and
     // `information_schema.columns.data_type` answers with the storage name

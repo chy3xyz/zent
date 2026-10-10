@@ -104,6 +104,56 @@ pub const MigrateOptions = struct {
     /// against live data.
     allow_nullability_change: bool = false,
 
+    /// If true, a **foreign key** the schema declares and the database does not
+    /// have is added to the table that already exists — the repair for
+    /// `SchemaDrift.Kind.missing_foreign_key`, which the default path only
+    /// reports.
+    ///
+    /// A `FOREIGN KEY` is inline in `CREATE TABLE`, so a table created before the
+    /// edge existed never gets the constraint and every dangling reference the
+    /// application expects the database to reject is accepted. This option emits
+    /// the `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` that closes the gap, and
+    /// the statement is **not** conditional: when the table already holds rows
+    /// that violate the key the migration fails with the driver's own
+    /// foreign-key error rather than quietly leaving the constraint out. That is
+    /// why it is opt-in, next to `drop_columns` / `allow_data_loss` / the
+    /// nullability convergence: it is a decision about the data already in the
+    /// table. False by default, so an existing deployment keeps the behaviour it
+    /// has and the drift stays a report.
+    ///
+    /// The name it gives the constraint is deterministic — `fk_<table>_<column>`,
+    /// with the columns joined by `_` for a composite key, the
+    /// `uq_<table>_<column>` shape `planUniqueColumnIndex` already uses. The
+    /// *comparison* stays by shape (`foreignKeyPresent`), so a database that has
+    /// the key under a name of its own (`t_col_fkey`, `t_ibfk_1`, or SQLite's
+    /// nothing) is not touched, and neither is a key the schema does not declare.
+    /// `ON DELETE` / `ON UPDATE` are emitted from the declaration, because a
+    /// repaired key that defaulted to `NO ACTION` would behave differently from
+    /// the one `CREATE TABLE` writes while `checkSchema` stayed silent — it does
+    /// not compare them.
+    ///
+    /// Dialects, and the differences are not hidden:
+    ///
+    ///   - **MySQL** emits the `ADD CONSTRAINT … FOREIGN KEY` directly. InnoDB
+    ///     validates the rows already in the table as part of it, so an orphan
+    ///     fails the migration with `error.ForeignKeyViolation`.
+    ///   - **PostgreSQL** emits it `NOT VALID` and then
+    ///     `ALTER TABLE … VALIDATE CONSTRAINT` as a second statement of the same
+    ///     plan: the add is a catalog update under a short lock, the scan is the
+    ///     validation, and a violating row fails *there*, with an error that
+    ///     names the constraint. The migration's own transaction means that
+    ///     failure rolls both statements back — nothing half-added is left
+    ///     behind. (A caller that executes the two planned statements itself has
+    ///     the re-entrant state instead: a failed `VALIDATE` leaves the
+    ///     constraint present but not validated, and since `foreignKeyPresent`
+    ///     compares by shape, a later run sees it as present and plans nothing.
+    ///     Validity is not part of that comparison, here or in `checkSchema`.)
+    ///   - **SQLite** is a **no-op** — see `planMissingForeignKeys`. It has no
+    ///     `ALTER TABLE ADD CONSTRAINT`, so the drift keeps being reported there
+    ///     and nothing is emitted; a SQLite run is otherwise byte-identical to
+    ///     the default.
+    add_missing_foreign_keys: bool = false,
+
     /// How long to wait for the cross-process migration lock before giving up
     /// with `error.MigrationLockTimeout`. `0` disables locking entirely.
     /// SQLite ignores this (single-writer database, see `lockMigration`).
@@ -341,15 +391,22 @@ pub const SchemaDrift = struct {
         /// from the entity's own `From` edges and the other entities' `To`
         /// edges) and the database has no foreign key with the same shape.
         ///
-        /// `migrateSchema` never adds one — an `ALTER TABLE ADD CONSTRAINT`
-        /// against a table that already holds rows can fail, and it is
-        /// deliberately non-destructive — so a table created before the edge
-        /// existed never gets the constraint, and every dangling reference the
-        /// application expects the database to reject is accepted.
+        /// `migrateSchema` adds one only when
+        /// `MigrateOptions.add_missing_foreign_keys` asks for it — an
+        /// `ALTER TABLE ADD CONSTRAINT` against a table that already holds rows
+        /// can fail, and the default is deliberately non-destructive — so by
+        /// default a table created before the edge existed never gets the
+        /// constraint, and every dangling reference the application expects the
+        /// database to reject is accepted. SQLite cannot repair it at all (no
+        /// `ADD CONSTRAINT`), so there the drift really is report-only.
         ///
         /// Compared **by shape, never by name**: PostgreSQL and MySQL invent the
-        /// names (`t_col_fkey`, `t_ibfk_1`) and SQLite keeps none at all.
-        /// `ON DELETE` / `ON UPDATE` are **not** compared (see `checkSchema`).
+        /// names (`t_col_fkey`, `t_ibfk_1`) and SQLite keeps none at all. The
+        /// repair therefore adds the key under its own deterministic name and
+        /// does not care what the database would have called it. `ON DELETE` /
+        /// `ON UPDATE` are **not** compared either (see `checkSchema`) — which is
+        /// why the added constraint carries the declared actions rather than the
+        /// `NO ACTION` a bare `FOREIGN KEY` would default to.
         ///
         /// The reverse direction — a foreign key the database has and the schema
         /// does not — is deliberately **not** reported; see `checkSchema`.
@@ -538,8 +595,11 @@ pub const SchemaDrift = struct {
 /// local column list, the target table, and the target column list must all
 /// match some foreign key in the database. Names are not compared — PostgreSQL
 /// and MySQL generate them (`t_col_fkey`, `t_ibfk_1`) and SQLite keeps none —
-/// and neither are `ON DELETE` / `ON UPDATE`, which `migrateSchema` does not
-/// converge and this does not read: **the actions are not compared at all.**
+/// and neither are `ON DELETE` / `ON UPDATE`: **the actions are never read**, so
+/// a key whose actions differ from the declaration is invisible here.
+/// `migrateSchema` only writes actions when it *adds* a key — the repair
+/// `MigrateOptions.add_missing_foreign_keys` opts into emits the declared ones —
+/// and an existing key it did not add is left with whatever it carries.
 /// A foreign key the database has and the schema does not is *not* reported: it
 /// can only reject writes the schema never promised, so a table with a
 /// hand-added constraint stays green, and `migrateSchema` already ignores
@@ -4187,6 +4247,130 @@ fn alterColumnNullabilitySQL(
     };
 }
 
+/// Generate the `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY …` that adds a
+/// declared foreign key to a table that already exists — the statement
+/// `MigrateOptions.add_missing_foreign_keys` opts into, and the repair for
+/// `SchemaDrift.Kind.missing_foreign_key`, which the default path only reports.
+///
+/// `not_valid` is PostgreSQL's `ADD CONSTRAINT … NOT VALID`: the constraint is
+/// created without scanning the table, so the rows already in it are not checked
+/// here and the lock is held for the catalog update alone. The scan is the
+/// separate `validateConstraintSQL` statement `planMissingForeignKeys` plans
+/// next to this one. PostgreSQL allows the clause on foreign key and check
+/// constraints only; no other dialect has it, and the caller never asks for it
+/// there.
+///
+/// `ON DELETE` / `ON UPDATE` come from the declaration, exactly as
+/// `createTableSQLAlloc` writes them: the repaired constraint has to mean what
+/// the inline one would have meant, and `checkSchema` does not compare the
+/// actions, so a silent `NO ACTION` would be a behaviour change it could not
+/// report.
+fn addForeignKeySQLAlloc(
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    fk: ForeignKeyDef,
+    dialect: Dialect,
+    not_valid: bool,
+) ![]const u8 {
+    // SQLite has no ADD CONSTRAINT; the caller already skips it, and this is the
+    // second, fail-loud guard rather than a silent emission of invalid SQL.
+    if (dialect.kind() == .sqlite) return error.UnsupportedDialect;
+
+    var buf = std.array_list.Managed(u8).init(allocator);
+    defer buf.deinit();
+
+    try buf.appendSlice("ALTER TABLE ");
+    try quoteIdentToBuffer(dialect, &buf, table_name);
+    try buf.appendSlice(" ADD CONSTRAINT ");
+    try quoteIdentToBuffer(dialect, &buf, constraint_name);
+    try buf.appendSlice(" FOREIGN KEY (");
+    for (fk.columns, 0..) |col, i| {
+        if (i > 0) try buf.appendSlice(", ");
+        try quoteIdentToBuffer(dialect, &buf, col);
+    }
+    try buf.appendSlice(") REFERENCES ");
+    try quoteIdentToBuffer(dialect, &buf, fk.ref_table);
+    try buf.appendSlice(" (");
+    for (fk.ref_columns, 0..) |col, i| {
+        if (i > 0) try buf.appendSlice(", ");
+        try quoteIdentToBuffer(dialect, &buf, col);
+    }
+    try buf.appendSlice(") ON DELETE ");
+    try buf.appendSlice(fk.on_delete);
+    try buf.appendSlice(" ON UPDATE ");
+    try buf.appendSlice(fk.on_update);
+    if (not_valid) try buf.appendSlice(" NOT VALID");
+    return buf.toOwnedSlice();
+}
+
+/// `ALTER TABLE … VALIDATE CONSTRAINT …`: the scan half of the PostgreSQL pair
+/// `addForeignKeySQLAlloc` opens with `NOT VALID`, and the statement a table
+/// holding an orphan fails on (`error.ForeignKeyViolation`, naming the
+/// constraint).
+///
+/// Two statements rather than one plain `ADD CONSTRAINT` because the two take
+/// different locks: the `NOT VALID` add holds `ACCESS EXCLUSIVE` for the catalog
+/// update alone, while the validation scan holds the weaker
+/// `SHARE UPDATE EXCLUSIVE`, so a large table is not blocked for the length of
+/// the scan. PostgreSQL only; both statements carry the same plan slot, so the
+/// preview and the run stay in step.
+fn validateConstraintSQLAlloc(
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    dialect: Dialect,
+) ![]const u8 {
+    if (dialect.kind() != .postgres) return error.UnsupportedDialect;
+
+    var buf = std.array_list.Managed(u8).init(allocator);
+    defer buf.deinit();
+    try buf.appendSlice("ALTER TABLE ");
+    try quoteIdentToBuffer(dialect, &buf, table_name);
+    try buf.appendSlice(" VALIDATE CONSTRAINT ");
+    try quoteIdentToBuffer(dialect, &buf, constraint_name);
+    return buf.toOwnedSlice();
+}
+
+/// The deterministic name `add_missing_foreign_keys` gives an added foreign key:
+/// `fk_<table>_<columns…>` — the `uq_<table>_<column>` shape
+/// `planUniqueColumnIndex` uses for a generated unique index. The table name is
+/// part of it because MySQL scopes a constraint name to the whole schema, so two
+/// tables must not collide on one; and an entity's foreign key is single-column,
+/// so the local column is unique within a table and one table gets one name per
+/// key. A name that does not fit `buf` answers null, and the key is left to the
+/// drift report rather than named with a truncation that could collide with
+/// another.
+///
+/// The comparison that *decides* whether to emit is shape-based
+/// (`foreignKeyPresent`), never name-based, so this name only has to be stable:
+/// the database may hold the key as `t_col_fkey`, `t_ibfk_1` or with no name at
+/// all, and it is left alone.
+///
+/// Not length-checked against the server's identifier limit (63 bytes on
+/// PostgreSQL, 64 on MySQL): like `uq_…`, the name is derived from the table and
+/// column names as declared, and a schema whose own names sit at that limit is
+/// the caller's decision — MySQL reports an over-long identifier rather than
+/// truncating it silently, so the failure is visible there.
+fn foreignKeyConstraintName(buf: []u8, table_name: []const u8, fk: ForeignKeyDef) ?[]const u8 {
+    var len: usize = 0;
+    if (!appendNamePart(buf, &len, "fk_")) return null;
+    if (!appendNamePart(buf, &len, table_name)) return null;
+    for (fk.columns) |col| {
+        if (!appendNamePart(buf, &len, "_")) return null;
+        if (!appendNamePart(buf, &len, col)) return null;
+    }
+    return buf[0..len];
+}
+
+/// Append `part` to a name accumulator, or answer false when it does not fit.
+fn appendNamePart(buf: []u8, len: *usize, part: []const u8) bool {
+    if (len.* + part.len > buf.len) return false;
+    @memcpy(buf[len.*..][0..part.len], part);
+    len.* += part.len;
+    return true;
+}
+
 test "ALTER ADD COLUMN is NOT NULL only when nullability convergence is asked for" {
     const alloc = std.testing.allocator;
 
@@ -4620,6 +4804,21 @@ pub fn planMigrateStatements(
                 try planUniqueColumnIndex(allocator, &plan, info, table, col, existing_idxs.items, dialect, mysql_server);
             }
         }
+
+        // A foreign key the schema declares and the database does not have — the
+        // other half of Z31, opt-in for the same reason `drop_columns` is: an
+        // `ALTER TABLE … ADD CONSTRAINT` can fail against a table that already
+        // holds rows, and that decision is the caller's (see
+        // `MigrateOptions.add_missing_foreign_keys` for what each dialect does
+        // with it). `created[i]` tables need nothing: the CREATE TABLE that made
+        // them carries its keys, and so does the one this run just planned.
+        //
+        // Last in the loop body on purpose: an FK whose column the migration adds
+        // in this same run needs the ADD COLUMN to come first in the plan, and it
+        // does — that statement is appended above.
+        if (opts.add_missing_foreign_keys and !created[i]) {
+            try planMissingForeignKeys(allocator, &plan, driver, table, dialect);
+        }
     }
 
     return plan;
@@ -4674,9 +4873,103 @@ fn planUniqueColumnIndex(
     );
 }
 
+/// Plan the `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` statements that repair
+/// the `missing_foreign_key` drift on a table that already exists — the body of
+/// `MigrateOptions.add_missing_foreign_keys`.
+///
+/// The gate is the same introspection `checkSchema` uses (`foreignKeyPresent`,
+/// by shape), so the run after a successful one sees the constraint this one
+/// added and plans nothing: the repair is idempotent for the same reason the
+/// drift report is stable. Only a key the schema declares and the database lacks
+/// is touched; the reverse direction — a constraint the database has and the
+/// schema does not — stays as silent here as it is in `checkSchema`.
+///
+/// PostgreSQL gets both halves of the pair (`addForeignKeySQLAlloc` with
+/// `NOT VALID`, then `validateConstraintSQLAlloc`); every other dialect gets the
+/// single plain statement. Both statements of the pair are planned, so a preview
+/// and the run it previews are the same list. The `VALIDATE` carries no version:
+/// it is the second half of one migration, and on the migration's own
+/// transaction a failure there rolls the whole thing back.
+///
+/// **SQLite is a no-op**, decided here rather than at the call site because it
+/// is a property of the dialect: SQLite has no `ALTER TABLE ADD CONSTRAINT` at
+/// all, and the only way to add or change one is to rebuild the table — a
+/// feature of its own, deliberately not smuggled into this option. So nothing is
+/// emitted, the drift keeps being reported there, and a SQLite run stays
+/// byte-identical to the default.
+///
+/// **M2M junction tables are not repaired here.** Their two keys are part of the
+/// `CREATE TABLE` that makes them (`junctionTableForEdge`), the junction
+/// traversal in `planMigrateStatements` is a separate one, and a key dropped out
+/// of band from a junction is a different repair from the one this option exists
+/// for — the drift report is where it stays.
+fn planMissingForeignKeys(
+    allocator: std.mem.Allocator,
+    plan: *std.array_list.Managed(PlannedStatement),
+    driver: sql_driver.Driver,
+    table: TableDef,
+    dialect: Dialect,
+) !void {
+    if (table.foreign_keys.len == 0) return;
+    if (dialect.kind() == .sqlite) return;
+
+    var existing = try getExistingForeignKeys(allocator, driver, table.name);
+    defer freeExistingForeignKeys(allocator, &existing);
+
+    var name_buf: [256]u8 = undefined;
+    for (table.foreign_keys) |fk| {
+        if (foreignKeyPresent(existing.items, fk)) continue;
+        const name = foreignKeyConstraintName(&name_buf, table.name, fk) orelse {
+            // A name this long cannot happen for a schema whose table and column
+            // names fit the server, but a silent skip would leave the caller
+            // believing the key was added: the drift report stays the answer.
+            zent_log.warn(
+                "zent: the foreign key {s}({s}) -> {s} needs a constraint name longer than {d} bytes; it was left to the drift report rather than truncated into one that could collide",
+                .{
+                    table.name,
+                    if (fk.columns.len > 0) fk.columns[0] else "",
+                    fk.ref_table,
+                    name_buf.len,
+                },
+            );
+            continue;
+        };
+        // One version per key, derived the way `add_column` / `create_index` do
+        // it: the local column names the key within its table, so the derived
+        // number cannot repeat for two keys of the same table.
+        const version = computeMigrationVersion(
+            table.name,
+            "add_foreign_key",
+            if (fk.columns.len > 0) fk.columns[0] else "",
+        );
+        if (dialect.kind() == .postgres) {
+            try appendPlanned(
+                allocator,
+                plan,
+                try addForeignKeySQLAlloc(allocator, table.name, name, fk, dialect, true),
+                version,
+            );
+            try appendPlanned(
+                allocator,
+                plan,
+                try validateConstraintSQLAlloc(allocator, table.name, name, dialect),
+                null,
+            );
+        } else {
+            try appendPlanned(
+                allocator,
+                plan,
+                try addForeignKeySQLAlloc(allocator, table.name, name, fk, dialect, false),
+                version,
+            );
+        }
+    }
+}
+
 /// Migrate schema: create missing tables, add missing columns, create missing
 /// indexes, and — when requested via `opts` — drop orphaned columns, alter
-/// column types, and/or converge nullability.
+/// column types, converge nullability, and/or add the foreign keys the schema
+/// declares and the database lacks.
 ///
 /// Phase 2 Task 8: every operation is recorded in `zent_schema_migrations`
 /// with a deterministic CRC32 version, and the entire run is wrapped in a
@@ -4690,6 +4983,10 @@ fn planUniqueColumnIndex(
 /// of the family: a NOT NULL column that has to be added, or an existing
 /// column whose nullability differs, is a data decision — see its doc comment
 /// for what each dialect can actually do with it.
+/// `opts.add_missing_foreign_keys` is the fourth: an `ALTER TABLE ADD
+/// CONSTRAINT` against a table that already holds rows can fail on data that
+/// violates the key, which is why the default only reports the drift (see
+/// `planMissingForeignKeys` for what each dialect emits, SQLite included).
 ///
 /// Concurrency: a cross-process advisory lock (`opts.lock_timeout_ms`, see
 /// `lockMigration`) is taken before any introspection so two instances
@@ -4793,8 +5090,8 @@ pub fn migrateSchemaWithOptions(
 }
 
 /// Backward-compatible entry point: calls `migrateSchemaWithOptions` with
-/// default `MigrateOptions{}` (no drops, no type changes). All existing callers
-/// continue to work without modification.
+/// default `MigrateOptions{}` (no drops, no type changes, no foreign keys added
+/// by `ALTER`). All existing callers continue to work without modification.
 pub fn migrateSchema(
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,

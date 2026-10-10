@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`MigrateOptions.add_missing_foreign_keys`** — the opt-in half of Z31: a
+  declared-but-absent foreign key on an **existing** table can now be added by
+  the migration instead of only reported. MySQL gets one `ALTER TABLE … ADD
+  CONSTRAINT`; PostgreSQL gets `… NOT VALID` followed by `VALIDATE CONSTRAINT`
+  in the same plan (the scan is where a violating row fails, naming the
+  constraint, and the transaction rolls both back); SQLite is a documented
+  no-op (it has no `ADD CONSTRAINT`, and a table rebuild is deliberately not
+  smuggled in). Constraint names follow the existing `uq_<table>_<col>` shape
+  (`fk_<table>_<cols>`), the decision is shape-based so a key living under any
+  name is left alone, and the run after a successful one plans nothing.
+  Default `false` keeps today's behaviour byte-identical — drift reported, no
+  DDL — and a violating row fails the migration loudly rather than leaving the
+  key out.
+- **`docs/UPGRADING.md` §13: the v0.83 → v0.91 consumer view.** Ten releases of
+  behaviour, DDL and ownership changes had accumulated one CHANGELOG entry at a
+  time; §13 collects what a consumer has to act on — the toolchain pin, the
+  behaviour changes that can break a running app (MySQL's `last_insert_id`,
+  EntQL's field-name-first addressing, the prepared-`exec` row count,
+  `ShardSet`'s borrow, OOM propagation on four paths, error-set growth), the
+  DDL changes that need a rebuild on an existing database (the Z40 FK column,
+  implicit-M2M junctions, a `Through` schema's table name), what is worth
+  adopting, and the measured advice for a codebase chasing its raw SQL.
+- **The benchmark baseline was refreshed** — it had been recorded in August,
+  before Zig 0.17.0 stable and the bench allocator swap, which left the
+  regression canary comparing today's numbers against a different toolchain.
+
+### Documented
+
+- **JOIN v2 is not on the roadmap, and now there is a measurement behind that.**
+  A consumer was analysed: 543 raw call sites, 153 JOIN-shaped across 131
+  statements — 62% single-hop m2o, 15% several independent m2o lookups in one
+  query (both already `joinEdge`), 1 true multi-hop chain, 12 o2m/m2m
+  projections, 28 report aggregations (16 of them joins-as-filter), 5
+  self-joins, 1 `UPDATE … FROM`. The bottleneck is **that consumer's schemas
+  declaring no edges**, not a missing feature; report aggregation, self-joins
+  and `UPDATE … FROM` stay raw by design. The ledger records both the numbers
+  and the decision.
+
 ## [0.90.0] - 2026-10-10
 
 ### Added
