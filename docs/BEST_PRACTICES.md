@@ -472,6 +472,7 @@ splice it in.
 | `sql.Explain` (`explainSql`) | n/a | diagnostic only: it wraps the statement in `EXPLAIN` and never executes it |
 | `sql_statement.checkStatement` | n/a | diagnostic only: it prepares the statement with the driver and discards it — no `step`/`execute`, and it takes the args, so it catches what `EXPLAIN` cannot |
 | `QueryBuilder` / `QueryEdge` / `WithEdge` | **yes** | nothing to do |
+| `QueryBuilder.joinEdge` (controlled JOIN, v0.88.0) | **yes** | nothing to do — the joined target's scope chain is appended and qualified to its alias by the builder |
 | `crud_helpers` entity helpers (`first`/`all`/…) | **yes** | they go through a builder |
 | `entql` (`Parse`) | **yes** | it lowers to builder predicates |
 | `PreparedCache` | n/a | keyed on the final SQL text, byte-compared — two tenants produce two entries, never a shared statement |
@@ -1021,6 +1022,48 @@ const owners = try q.All();
   escape hatch: soft-delete only, no policy, no interceptor. They return a
   foreign tenant's row if you hand them that tenant's parent id, so treat a
   call site as an audited decision that the ids were scoped elsewhere.
+
+### `joinEdge` vs `WithEdge` — pick by shape
+
+Building from v0.88.0, `QueryBuilder.joinEdge(edge, kind, opts)` puts a
+controlled JOIN in the statement itself. Both APIs apply the full read
+contract (soft delete → privacy → interceptor) to the target; they differ in
+what they can express:
+
+| | `WithEdge` / `WithEdgeOptions` | `joinEdge` (v1) |
+|---|---|---|
+| Round trips | two (main query + one batch query per edge) | one |
+| Admitted edges | all (o2m / m2m / m2o, nested `a.b` paths) | only edges whose FK lives in this table (m2o / o2o-`From`) |
+| `.inner` | EXISTS filter; the target loads afterwards | real `INNER JOIN`: filters **and** materialises in place |
+| `.left` | no filter; the edge slice may be null | `LEFT JOIN`: same rows, target may be null |
+| `Limit` / `Offset` / `Cursor` | `limit_mode` decides whether the page applies before or after the edge filter | unchanged — an admitted edge matches at most one row, so the page never multiplies |
+| Target columns | a separate result set, `to_columns` explicit | inlined as `<alias>__<column>` aliases, scanned into the eager edge field |
+| Reads as | `row.edges.customer` (after the load) | the same field, filled by the single statement |
+
+So: a **display lookup** (order → customer, product → brand) is one
+`joinEdge(..., .inner, .{})` away and saves a round trip; a **to-many load**
+(o2m, m2m) or a nested path stays `WithEdge`. Left-joining a lookup keeps the
+outer row when the target is missing (`row.edges.customer == null`), which is
+what `WithEdgeOptions(..., .{ .join = .left })` cannot express as inline
+columns.
+
+Two rules worth knowing before adopting it:
+
+- **The target's scope goes into `ON` for a left join, `WHERE` for an inner
+  one.** A left join with the target's soft-delete predicate in `WHERE` would
+  silently become an inner join; the builder places it correctly, and that is
+  the one place this path deliberately deviates from the other
+  `appendQualifiedPred` call sites.
+- **`select` is a whitelist of *target* field names, and the primary key is
+  always projected** even when you leave it out — the loader needs it to tell
+  "no match" from a match. `alias` defaults to the edge name, which is also
+  how a self-join stays unambiguous.
+
+A JOIN with `GroupBy` is refused (`error.JoinWithGroupBy`, raised by whichever
+of the two calls comes second), and `right`/`full` joins, o2m/m2m projection
+joins and cross-graph joins are out of v1 scope by design — see
+`docs/superpowers/specs/2026-10-09-controlled-join-design.md` for the
+reasoning and the v2 candidates.
 
 ## 5h. Nullability: schema vs database
 

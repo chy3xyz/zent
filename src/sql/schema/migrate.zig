@@ -7232,6 +7232,148 @@ test "checkSchema needs no junction table for an M2M edge with an explicit edge 
     try std.testing.expectEqual(@as(usize, 0), agreeing.len);
 }
 
+test "a through schema's declared table_name names the junction end to end (SQLite)" {
+    // v0.87.0 known-shape: the edge derived its junction from the through
+    // schema's *name* while the migration created and checked the through
+    // entity under its declared `table_name`. On a through schema with the
+    // override the DDL built `zt_link`, but every junction statement aimed at
+    // the short name — the first m2m write answered `no such table`, and
+    // checkSchema reported nothing because the through entity is checked as
+    // its own entity. Both faces now resolve through one rule
+    // (graph.throughTableName): the write, the adjacency read and the drift
+    // check all land on `zt_link`, and no short-name junction is created.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const client_mod = @import("../../codegen/client.zig");
+    const deinitEntity = @import("../../codegen/entity.zig").deinitEntity;
+
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+
+    const ZmTagBase = schema("ZmTag", .{ .fields = &.{field.String("label")} });
+    const ZmMemberBase = schema("ZmMember", .{ .fields = &.{field.String("name")} });
+    const ZmLink = schema("ZmMemberTag", .{
+        .fields = &.{ field.Int("zm_member_id"), field.Int("zm_tag_id") },
+        .table_name = "zt_link",
+    });
+    const ZmTag = struct {
+        pub const schema_name = ZmTagBase.schema_name;
+        pub const fields = ZmTagBase.fields;
+        pub const edges = &.{edge.To("members", ZmMemberBase).Through(ZmLink)};
+        pub const indexes = ZmTagBase.indexes;
+    };
+    const ZmMember = struct {
+        pub const schema_name = ZmMemberBase.schema_name;
+        pub const fields = ZmMemberBase.fields;
+        pub const edges = &.{edge.To("tags", ZmTagBase).Through(ZmLink)};
+        pub const indexes = ZmMemberBase.indexes;
+    };
+    const graph = comptime buildGraph(&.{ ZmMember, ZmTag, ZmLink });
+    const infos = graph.types;
+    const member_info = infos[0];
+    const tag_info = infos[1];
+
+    try migrateSchema(std.testing.allocator, drv.asDriver(), infos);
+
+    // The junction exists under its declared name — and under neither name
+    // the no-through derivation would invent.
+    var link_cols = try getExistingColumns(std.testing.allocator, drv.asDriver(), "zt_link");
+    defer freeExistingColumns(std.testing.allocator, &link_cols);
+    try std.testing.expectEqual(@as(usize, 3), link_cols.items.len); // id + the two pair columns
+    var phantom_a = try getExistingColumns(std.testing.allocator, drv.asDriver(), "zm_member_zm_tag");
+    defer freeExistingColumns(std.testing.allocator, &phantom_a);
+    try std.testing.expectEqual(@as(usize, 0), phantom_a.items.len);
+    var phantom_b = try getExistingColumns(std.testing.allocator, drv.asDriver(), "zm_tag_zm_member");
+    defer freeExistingColumns(std.testing.allocator, &phantom_b);
+    try std.testing.expectEqual(@as(usize, 0), phantom_b.items.len);
+
+    // Junction write path: the create builder's m2m AddEdge inserts into
+    // `zt_link` (it used to aim at `zm_member_zm_tag`).
+    const root = client_mod.makeClient(infos, std.testing.allocator, drv.asDriver());
+    var tag_ids: [2]i64 = undefined;
+    for ([_][]const u8{ "red", "blue" }, 0..) |label, i| {
+        var b = try root.zm_tag.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("label", label);
+        var row = try b.Save();
+        defer deinitEntity(infos, tag_info, &row, std.testing.allocator);
+        tag_ids[i] = row.id;
+    }
+    const member_id = id: {
+        var b = try root.zm_member.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "alice");
+        _ = try b.AddEdge("tags", &tag_ids);
+        var row = try b.Save();
+        defer deinitEntity(infos, member_info, &row, std.testing.allocator);
+        break :id row.id;
+    };
+    // And the rows are literally in `zt_link` — nothing referenced a
+    // short-name junction anywhere on the write path.
+    {
+        var rows = try drv.query("SELECT COUNT(*) FROM zt_link", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 2), row.getInt(0).?);
+    }
+
+    // Adjacency read: the eager load joins `zt_link` and reads both tags back.
+    {
+        var q = root.zm_member.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("tags");
+        const members = try q.All();
+        defer {
+            for (members.items) |*e| deinitEntity(infos, member_info, e, std.testing.allocator);
+            members.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), members.items.len);
+        const tags = members.items[0].edges.tags.?;
+        try std.testing.expectEqual(@as(usize, 2), tags.len);
+        var got_ids = [_]i64{ tags[0].id, tags[1].id };
+        std.mem.sort(i64, &got_ids, {}, std.sort.asc(i64));
+        var want_ids = tag_ids;
+        std.mem.sort(i64, &want_ids, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, &want_ids, &got_ids);
+    }
+
+    // The update path writes the same junction through buildEdgeStep: remove
+    // one tag, and the adjacency read answers one.
+    {
+        var u = root.zm_member.Update();
+        defer u.deinit();
+        _ = try u.setFieldValue("name", "alice2");
+        _ = try u.Where(.{root.zm_member.predicates.idEQ(.{ .int = member_id })});
+        _ = try u.RemoveEdgeIDs("tags", &.{tag_ids[0]});
+        try std.testing.expectEqual(@as(usize, 1), try u.Save());
+    }
+    {
+        var q = root.zm_member.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("tags");
+        const members = try q.All();
+        defer {
+            for (members.items) |*e| deinitEntity(infos, member_info, e, std.testing.allocator);
+            members.deinit();
+        }
+        try std.testing.expectEqual(@as(usize, 1), members.items.len);
+        const tags = members.items[0].edges.tags.?;
+        try std.testing.expectEqual(@as(usize, 1), tags.len);
+        try std.testing.expectEqual(tag_ids[1], tags[0].id);
+        try std.testing.expectEqualStrings("blue", tags[0].label);
+    }
+
+    // The through entity is checked under its declared table name and the
+    // junction loop skips through edges — zero drift on both faces.
+    const drifts = try checkSchema(std.testing.allocator, drv.asDriver(), infos);
+    defer freeSchemaDrift(std.testing.allocator, drifts);
+    try std.testing.expectEqual(@as(usize, 0), drifts.len);
+    try assertSchema(std.testing.allocator, drv.asDriver(), infos, .any);
+}
+
 test "getExistingViews reads the stored definition and answers an empty list otherwise (SQLite)" {
     const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
 

@@ -201,6 +201,11 @@ pub const Builder = struct {
 pub const TableBuilder = struct {
     name: []const u8,
     schema: ?[]const u8 = null,
+    /// SQL alias, rendered as `"name" alias` in FROM and JOIN alike. `null`
+    /// keeps the emitted SQL byte-identical to the unaliased form. The alias
+    /// is quoted through `Builder.ident`, so its case survives MySQL's
+    /// identifier folding.
+    alias: ?[]const u8 = null,
 
     pub fn c(self: TableBuilder, column: []const u8) ColumnRef {
         return .{ .table = self.name, .name = column };
@@ -212,6 +217,10 @@ pub const TableBuilder = struct {
             try b.writeByte('.');
         }
         try b.ident(self.name);
+        if (self.alias) |a| {
+            try b.writeByte(' ');
+            try b.ident(a);
+        }
     }
 };
 
@@ -689,6 +698,16 @@ fn writeQualifiedColumn(b: *Builder, qualifier: []const u8, column: []const u8) 
     try b.qualifiedIdent(column);
 }
 
+/// A predicate paired with the table (or alias) its bare columns qualify as
+/// at render time — `sql.appendQualifiedPred` applied by the renderer, not by
+/// the caller. This is how a joined statement scopes the joined table: the
+/// qualifier is a fact about the *statement*, so it cannot be baked into the
+/// predicate value without forking the predicate vocabulary.
+pub const QualPred = struct {
+    pred: Predicate,
+    qualifier: ?[]const u8,
+};
+
 pub fn Like(column: []const u8, value: Value) Predicate {
     return .{ .like = .{ .column = column, .value = value } };
 }
@@ -924,10 +943,41 @@ pub const JoinKind = enum {
     full,
 };
 
+/// `left = right` over two column identifiers — the ON-clause equality of a
+/// controlled JOIN (`Join.on_columns`). Each side renders through
+/// `Builder.qualifiedIdent`, so it may be dotted, and a `qualifier` field
+/// qualifies a bare column without pre-concatenating strings; identifiers
+/// come from graph metadata (comptime TypeInfo), so there is no injection
+/// surface and no bound argument.
+///
+/// Deliberately a `Join`-level shape rather than a `Predicate` union member:
+/// the union is switched over exhaustively in modules this file must not
+/// reach into (`predicate.zig`'s `hasWithPredOffender`, `entql`'s
+/// `deinitPred`), and an ON-only equality is not part of a WHERE vocabulary —
+/// it cannot be composed into a caller's predicate tree anyway.
+pub const ColumnEQ = struct {
+    left: []const u8,
+    right: []const u8,
+    left_qualifier: ?[]const u8 = null,
+    right_qualifier: ?[]const u8 = null,
+};
+
 pub const Join = struct {
     kind: JoinKind,
     table: TableBuilder,
-    on: Predicate,
+    /// WHERE-shaped predicate for the ON clause. `null` when the ON is
+    /// carried by `on_columns` instead. Existing literals passing `.on = …`
+    /// compile unchanged (the value coerces into the optional).
+    on: ?Predicate = null,
+    /// `left = right` column equality — the controlled-JOIN ON. Rendered
+    /// through `qualifiedIdent` per side; cannot carry bound arguments, which
+    /// is the point: the identifiers are schema constants.
+    on_columns: ?ColumnEQ = null,
+    /// Extra ON-clause predicates, each qualified at render time. This is
+    /// where a LEFT JOIN's target-scope predicates belong (see the R2 note in
+    /// `codegen/query.zig`'s join assembly): in WHERE they would turn the
+    /// left join into an inner one.
+    on_qualified: []const QualPred = &.{},
 
     pub fn appendTo(self: Join, b: *Builder) !void {
         switch (self.kind) {
@@ -938,7 +988,25 @@ pub const Join = struct {
         }
         try self.table.appendTo(b);
         try b.writeString(" ON ");
-        try self.on.appendTo(b);
+        if (self.on_columns) |pair| {
+            if (pair.left_qualifier) |q| {
+                try writeQualifiedColumn(b, q, pair.left);
+            } else {
+                try b.qualifiedIdent(pair.left);
+            }
+            try b.writeString(" = ");
+            if (pair.right_qualifier) |q| {
+                try writeQualifiedColumn(b, q, pair.right);
+            } else {
+                try b.qualifiedIdent(pair.right);
+            }
+        } else if (self.on) |pred| {
+            try pred.appendTo(b);
+        }
+        for (self.on_qualified) |qp| {
+            try b.writeString(" AND ");
+            try appendQualifiedPred(b, qp.pred, qp.qualifier);
+        }
     }
 };
 
@@ -987,6 +1055,10 @@ pub const Selector = struct {
     table: ?TableBuilder,
     joins: std.array_list.Managed(Join),
     predicates: std.array_list.Managed(Predicate),
+    /// Predicates qualified at render time (see `QualPred`). Rendered after
+    /// `predicates`, AND-joined, so an empty list keeps the WHERE clause
+    /// byte-identical to the pre-qualified form.
+    qualified_preds: std.array_list.Managed(QualPred),
     group_cols: std.array_list.Managed([]const u8),
     having_pred: ?Predicate,
     order_terms: std.array_list.Managed(Order),
@@ -1022,6 +1094,7 @@ pub const Selector = struct {
             .table = null,
             .joins = std.array_list.Managed(Join).init(allocator),
             .predicates = std.array_list.Managed(Predicate).init(allocator),
+            .qualified_preds = std.array_list.Managed(QualPred).init(allocator),
             .group_cols = std.array_list.Managed([]const u8).init(allocator),
             .having_pred = null,
             .order_terms = std.array_list.Managed(Order).init(allocator),
@@ -1043,6 +1116,7 @@ pub const Selector = struct {
         s.columns.deinit();
         s.joins.deinit();
         s.predicates.deinit();
+        s.qualified_preds.deinit();
         s.group_cols.deinit();
         s.order_terms.deinit();
         for (s.ctes.items) |*cte| cte.query.deinit();
@@ -1068,6 +1142,15 @@ pub const Selector = struct {
 
     pub fn where(s: *Selector, pred: Predicate) !*Selector {
         try s.predicates.append(pred);
+        return s;
+    }
+
+    /// Append a predicate whose bare columns qualify as `qualifier` at render
+    /// time (`sql.appendQualifiedPred`). The joined-statement counterpart of
+    /// `where`: the qualifier is a fact about the statement, so it stays out
+    /// of the predicate value.
+    pub fn whereQualified(s: *Selector, pred: Predicate, qualifier: ?[]const u8) !*Selector {
+        try s.qualified_preds.append(.{ .pred = pred, .qualifier = qualifier });
         return s;
     }
 
@@ -1160,6 +1243,26 @@ pub const Selector = struct {
         try s.ctes.append(.{ .name = name, .columns = null, .query = subquery });
     }
 
+    /// Shared WHERE writer for `query` / `takeQuery`: plain predicates first,
+    /// then the render-time-qualified ones, all AND-joined in append order.
+    /// One implementation on purpose — the two callers had already drifted
+    /// once in this file's history.
+    fn writeWhereClause(s: *Selector) !void {
+        if (s.predicates.items.len == 0 and s.qualified_preds.items.len == 0) return;
+        try s.b.writeString(" WHERE ");
+        var first = true;
+        for (s.predicates.items) |pred| {
+            if (!first) try s.b.writeString(" AND ");
+            first = false;
+            try pred.appendTo(&s.b);
+        }
+        for (s.qualified_preds.items) |qp| {
+            if (!first) try s.b.writeString(" AND ");
+            first = false;
+            try appendQualifiedPred(&s.b, qp.pred, qp.qualifier);
+        }
+    }
+
     pub fn query(s: *Selector) !QueryResult {
         if (s.ctes.items.len > 0) {
             try s.b.writeString("WITH ");
@@ -1190,13 +1293,7 @@ pub const Selector = struct {
             try s.b.writeByte(' ');
             try j.appendTo(&s.b);
         }
-        if (s.predicates.items.len > 0) {
-            try s.b.writeString(" WHERE ");
-            for (s.predicates.items, 0..) |pred, i| {
-                if (i > 0) try s.b.writeString(" AND ");
-                try pred.appendTo(&s.b);
-            }
-        }
+        try s.writeWhereClause();
         if (s.group_cols.items.len > 0) {
             try s.b.writeString(" GROUP BY ");
             for (s.group_cols.items, 0..) |col, i| {
@@ -1236,6 +1333,11 @@ pub const Selector = struct {
     /// the Selector is in an empty-but-valid state; its auxiliary arrays are
     /// released so the caller does not need to call `deinit`.
     pub fn takeQuery(s: *Selector) !OwnedQuery {
+        // No `errdefer s.deinit()` here: `s` is the caller's selector, and the
+        // caller's own `defer sel.deinit()` runs right after a failed
+        // `takeQuery` too — freeing the lists here turns that into a double
+        // free (the allocation-failure sweep aborts on it). The error path
+        // leaks nothing the caller's deinit does not release.
         if (s.ctes.items.len > 0) {
             try s.b.writeString("WITH ");
             for (s.ctes.items, 0..) |cte, i| {
@@ -1265,13 +1367,7 @@ pub const Selector = struct {
             try s.b.writeByte(' ');
             try j.appendTo(&s.b);
         }
-        if (s.predicates.items.len > 0) {
-            try s.b.writeString(" WHERE ");
-            for (s.predicates.items, 0..) |pred, i| {
-                if (i > 0) try s.b.writeString(" AND ");
-                try pred.appendTo(&s.b);
-            }
-        }
+        try s.writeWhereClause();
         if (s.group_cols.items.len > 0) {
             try s.b.writeString(" GROUP BY ");
             for (s.group_cols.items, 0..) |col, i| {
@@ -1310,6 +1406,8 @@ pub const Selector = struct {
         s.joins = std.array_list.Managed(Join).init(s.b.allocator);
         s.predicates.deinit();
         s.predicates = std.array_list.Managed(Predicate).init(s.b.allocator);
+        s.qualified_preds.deinit();
+        s.qualified_preds = std.array_list.Managed(QualPred).init(s.b.allocator);
         s.group_cols.deinit();
         s.group_cols = std.array_list.Managed([]const u8).init(s.b.allocator);
         s.order_terms.deinit();
@@ -2648,4 +2746,93 @@ test "appendEqUnlessPresent dedupes the pair, never the column alone" {
     try std.testing.expectEqual(@as(usize, 4), list.items.len);
     try appendEqUnlessPresent(&list, "region", .{ .string = "us" });
     try std.testing.expectEqual(@as(usize, 5), list.items.len);
+}
+
+test "TableBuilder alias renders in FROM and JOIN; null alias stays byte-identical" {
+    const allocator = std.testing.allocator;
+
+    // Aliased FROM and JOIN: the alias is quoted (`"order" "o"`), matching how
+    // the qualifier appears in column references and how `zent.scope` renders
+    // one — an unquoted alias would fold differently on MySQL.
+    var s = try Select(allocator, Dialect.sqlite, &.{
+        .{ .table = "o", .name = "id" },
+        .{ .table = "c", .name = "id", .alias = "c__id" },
+    });
+    defer s.deinit();
+    _ = s.from(.{ .name = "order", .alias = "o" });
+    _ = try s.join(.{
+        .kind = .left,
+        .table = .{ .name = "customer", .alias = "c" },
+        .on_columns = .{
+            .left = "id",
+            .left_qualifier = "c",
+            .right = "customer_id",
+            .right_qualifier = "o",
+        },
+    });
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "SELECT \"o\".\"id\", \"c\".\"id\" AS \"c__id\" FROM \"order\" \"o\" LEFT JOIN \"customer\" \"c\" ON \"c\".\"id\" = \"o\".\"customer_id\"",
+        q.sql,
+    );
+
+    // The pre-alias form is unchanged: the alias column is new, the old
+    // shape renders exactly the bytes it always did.
+    var plain = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    defer plain.deinit();
+    _ = plain.from(Table("users"));
+    const pq = try plain.query();
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM \"users\"", pq.sql);
+}
+
+test "ColumnEQ falls back to unqualified dotted identifiers" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.mysql, &.{.{ .table = "o", .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("orders"));
+    _ = try s.join(.{
+        .kind = .inner,
+        .table = .{ .name = "customer", .alias = "buyer" },
+        .on_columns = .{ .left = "buyer.id", .right = "o.customer_id" },
+    });
+    const q = try s.query();
+    // A dotted side carries its own qualifier (qualifiedIdent); the other
+    // renders with the MySQL quote character.
+    try std.testing.expectEqualStrings(
+        "SELECT `o`.`id` FROM `orders` INNER JOIN `customer` `buyer` ON `buyer`.`id` = `o`.`customer_id`",
+        q.sql,
+    );
+}
+
+test "qualified WHERE predicates render with their qualifier" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.sqlite, &.{.{ .table = "o", .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("orders"));
+    _ = try s.where(EQ("amount", .{ .int = 3 }));
+    // Render-time qualification: the plain predicate renders bare, the
+    // qualified one with its alias, both AND-joined in append order.
+    _ = try s.whereQualified(IsNull("deleted_at"), "c");
+    _ = try s.whereQualified(EQ("app_id", .{ .int = 9 }), "c");
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "SELECT \"o\".\"id\" FROM \"orders\" WHERE \"amount\" = ? AND \"c\".\"deleted_at\" IS NULL AND \"c\".\"app_id\" = ?",
+        q.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 2), q.args.len);
+
+    // PostgreSQL: plain predicates render first and take the earlier
+    // placeholders; the qualified ones follow, so placeholder numbering stays
+    // in SQL order end to end regardless of the order the caller appended.
+    var pg = try Select(allocator, Dialect.postgres, &.{.{ .table = "o", .name = "id" }});
+    defer pg.deinit();
+    _ = pg.from(Table("orders"));
+    _ = try pg.whereQualified(IsNull("deleted_at"), "c");
+    _ = try pg.where(EQ("amount", .{ .int = 3 }));
+    const pgq = try pg.query();
+    try std.testing.expectEqualStrings(
+        "SELECT \"o\".\"id\" FROM \"orders\" WHERE \"amount\" = $1 AND \"c\".\"deleted_at\" IS NULL",
+        pgq.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 1), pgq.args.len);
 }

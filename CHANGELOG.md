@@ -4,6 +4,74 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Controlled JOIN v1: `QueryBuilder.joinEdge`.** The single biggest raw-SQL
+  surface (a downstream consumer counted ~157 of its 159 escape hatches as
+  JOIN-shaped) gets a schema-aware entry: `joinEdge(edge, .inner|.left,
+  .{ .where, .select, .alias })` resolves the target from graph metadata (by
+  edge name — declared `table_name` respected, the Z39 lesson), puts the
+  target's **full read contract** on it (soft delete → privacy →
+  interceptor, qualified to the join alias at render time), and projects the
+  target's columns into the entity's existing eager edge field as
+  `<alias>__<column>` aliases — one statement, one round trip, released by
+  the same `deinitRows` cascade as any other page. Designed around what keeps
+  the semantics exact: only edges whose FK lives in this table are admitted
+  (m2o/o2o-`From`), so a page never multiplies and `Limit`/`Offset`/`Cursor`
+  keep their meaning; the target's scope predicates go into `ON` for a left
+  join and `WHERE` for an inner one (in `WHERE` a left join would silently
+  become an inner one); the primary key is always projected so the loader can
+  tell "no match" from a match; `GroupBy` + join is refused with the new
+  `error.JoinWithGroupBy` member from whichever call comes second; and
+  `FOR UPDATE` on PostgreSQL automatically scopes to the source table
+  (`FOR UPDATE OF <source>`). Design, risk register and v2 candidates:
+  `docs/superpowers/specs/2026-10-09-controlled-join-design.md`; the
+  `joinEdge` vs `WithEdge` decision table is in `BEST_PRACTICES` §5g, and the
+  scoping table now lists the new path as scoped-by-default.
+
+### Fixed
+
+- **A `Through` junction took the through schema's short name instead of its
+  declared `table_name`.** `toEdgeInfo` derived `through_name =
+  toSnakeCase(schema_name)`, so a through schema declaring `table_name` got
+  its table created under the declared name (through schemas are migrated as
+  ordinary entities) while every relation write and read aimed at the short
+  name — the Z39 family's derived-vs-declared residue on the Through path,
+  answering `no such table` on the first m2m write with no `checkSchema`
+  drift to warn anyone. The name now comes from one resolver
+  (`throughTableName`: declared override first, `toSnakeCase` fallback),
+  which every consumer of the through identity shares, and an end-to-end
+  SQLite test pins it: migrate → only the declared table exists → `AddEdge`
+  writes there → `WithEdge` reads it back → `RemoveEdgeIDs` → `checkSchema`
+  clean. Schemas without the override render byte-identically.
+- **Every query build stranded its selector's buffers on the error path.**
+  The allocation-failure sweep for the joined build caught it: a `Selector`
+  taken into a local by `sql.Select(...)` is only released by `takeQuery`, so
+  any failure in between (a `where` append, a join append, an OOM inside
+  `takeQuery` itself) leaked the SQL buffer, the args list and the columns
+  list — in all five build paths (`buildQuery`, `buildQueryWithFirst`,
+  `buildCountQuery`, `buildAggregateQuery`, `buildIDsQuery`). Each now guards
+  the selector with `errdefer selector.deinit()`. Pre-existing, invisible
+  until the sweep exercised a build path end to end.
+- **Three copy-then-append leaks in the join assembly** (`alias`, the
+  `<alias>__<column>` result name, and the LEFT-join scope slice): a copy that
+  succeeded before a failed `append` was owned by nobody. Each is written as
+  a scoped disarming guard (copy → `errdefer free` → append inside its own
+  block), which is also the pattern `AGENTS.md`'s memory contract now spells
+  out — a bare `errdefer` around the whole body frees an item the list
+  already owns, and the sweep aborts on that double free.
+
+### Documented
+
+- `AGENTS.md`: the copy-then-append rule and the selector-`errdefer` rule
+  join the memory contract; unit baseline 554.
+- `BEST_PRACTICES` §5g: `joinEdge` vs `WithEdge` decision table, the two
+  adoption rules (scope placement by join kind, `select`/`alias` semantics).
+- `OPEN_ITEMS`: the Through row is closed; a new row records exactly what
+  controlled JOIN v1 leaves out and why (right/full, o2m/m2m projection,
+  `GroupBy`, aggregates, cross-graph) so the boundary is a decision rather
+  than an omission.
+
 ## [0.87.0] - 2026-10-09
 
 ### Fixed

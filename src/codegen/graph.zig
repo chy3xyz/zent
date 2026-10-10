@@ -231,6 +231,30 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, co
     }
 }
 
+/// Junction table name for an edge declared `Through(schema)`: the through
+/// schema's declared `table_name` when it declares one, else the snake_case
+/// of its schema name — the same rule `fromSchema` applies to the schema's
+/// own TypeInfo, so the table the migration side creates and checks (the
+/// through entity is built as an ordinary entity) is the one every junction
+/// statement aims at.
+///
+/// v0.87.0 known-shape residue, fixed here: `toEdgeInfo` derived
+/// `toSnakeCase(schema_name)` alone, so a through schema declaring
+/// `table_name` got its DDL under the declared name while the m2m write
+/// (create.zig) and the adjacency reads (buildEdgeStep) targeted the short
+/// name — the first junction write answered `no such table`, and checkSchema
+/// reported no drift because the through entity is checked under its own
+/// declared name.
+pub fn throughTableName(comptime t: type) []const u8 {
+    comptime {
+        @setEvalBranchQuota(1000000);
+        if (@hasDecl(t, "table_name")) {
+            if (t.table_name) |tn| return tn;
+        }
+        return toSnakeCase(t.schema_name);
+    }
+}
+
 fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
     comptime {
         @setEvalBranchQuota(1000000);
@@ -262,7 +286,7 @@ fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
             }
         }
 
-        const through_name: ?[]const u8 = if (e.through) |t| toSnakeCase(t.schema_name) else null;
+        const through_name: ?[]const u8 = if (e.through) |t| throughTableName(t) else null;
 
         return EdgeInfo{
             .name = e.name,
@@ -954,6 +978,58 @@ test "From edge with explicit FK field does not duplicate declared columns" {
     try std.testing.expectEqualStrings("order_id", step.from_column);
     try std.testing.expectEqualStrings("file_id", step.to_column);
     try std.testing.expectEqualStrings("photo_id", step.edge_columns[0]);
+}
+
+test "Through edge resolves the junction to the through schema's declared table_name" {
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+
+    const TagBase = schema("Tag", .{ .fields = &.{field.String("label")} });
+    const MemberBase = schema("Member", .{ .fields = &.{field.String("name")} });
+    const Link = schema("MemberTag", .{
+        .fields = &.{ field.Int("member_id"), field.Int("tag_id") },
+        .table_name = "zt_link",
+    });
+    const LinkPlain = schema("MemberTagPlain", .{
+        .fields = &.{ field.Int("member_id"), field.Int("tag_id") },
+    });
+    const Tag = struct {
+        pub const schema_name = TagBase.schema_name;
+        pub const fields = TagBase.fields;
+        pub const edges = &.{edge.To("members", MemberBase).Through(Link)};
+        pub const indexes = TagBase.indexes;
+    };
+    const Member = struct {
+        pub const schema_name = MemberBase.schema_name;
+        pub const fields = MemberBase.fields;
+        pub const edges = &.{edge.To("tags", TagBase).Through(Link)};
+        pub const indexes = MemberBase.indexes;
+    };
+    const MemberPlain = struct {
+        pub const schema_name = MemberBase.schema_name;
+        pub const fields = MemberBase.fields;
+        pub const edges = &.{edge.To("tags", TagBase).Through(LinkPlain)};
+        pub const indexes = MemberBase.indexes;
+    };
+
+    // Declared table_name wins on the edge, and every junction reader —
+    // through_name on the EdgeInfo (create.zig's write path) and the
+    // eager-load step's edge_table (buildEdgeStep) — sees the same name the
+    // through entity's own TypeInfo carries. Resolved through buildGraph so
+    // the pair of To edges is detected as m2m, exactly as at runtime.
+    const graph = comptime buildGraph(&.{ Member, Tag, Link });
+    const infos = graph.types;
+    try std.testing.expectEqual(edge_mod.Relation.m2m, infos[0].edges[0].relation);
+    try std.testing.expectEqualStrings("zt_link", infos[0].edges[0].through_name.?);
+    const step = comptime buildEdgeStep(infos[0].edges[0], infos[0], infos[1]);
+    try std.testing.expectEqualStrings("zt_link", step.edge_table);
+    const link_info = comptime fromSchema(Link);
+    try std.testing.expectEqualStrings("zt_link", link_info.table_name);
+
+    // No override: the historical snake derivation, byte-for-byte unchanged.
+    const member_plain_info = comptime fromSchema(MemberPlain);
+    try std.testing.expectEqualStrings("member_tag_plain", member_plain_info.edges[0].through_name.?);
 }
 
 const StressGen = struct {

@@ -403,6 +403,14 @@ fn loadEdgePath(
 }
 
 /// How `WithEdgeOptions` joins an eager-loaded edge.
+///
+/// This kind *filters* the parent query (the `.inner` shape is a schema-aware
+/// EXISTS) and the target itself arrives through the second eager-load query.
+/// The controlled JOIN is a different feature with different machinery: see
+/// `JoinEdgeKind` / `QueryBuilder.joinEdge`, which JOINs the target into the
+/// parent statement, materialises it in one round trip, and keeps only this
+/// enum's inner/left vocabulary — the two are deliberately not folded
+/// together (design §5).
 pub const EdgeJoinKind = enum {
     /// Keep parents with no matching edge targets (edge slice stays null).
     left,
@@ -434,6 +442,143 @@ const WithEdgeEntry = struct {
     opts: WithEdgeOpts,
 };
 
+/// How `joinEdge` joins an edge target into the parent query. Type-level
+/// whitelist: right/full joins are not representable, and the fan-out kinds
+/// (o2m/m2m) are rejected at comptime before this enum is ever consulted —
+/// a join that multiplies rows under LIMIT is exactly what v1 refuses (see
+/// `joinEdge`).
+pub const JoinEdgeKind = enum {
+    /// Drop parent rows with no matching target.
+    inner,
+    /// Keep them; the eager edge field stays null.
+    left,
+};
+
+/// Options for `QueryBuilder.joinEdge`.
+pub const JoinEdgeOpts = struct {
+    /// Predicates over the **target** entity, ANDed into the statement. Every
+    /// column-bearing shape must address the target (API field name or
+    /// physical column); raw fragments pass through unvalidated — anything
+    /// else answers `error.UnknownField` from `joinEdge`.
+    where: ?[]const sql.Predicate = null,
+    /// Target fields to project; `null` = all, in field order. The target's
+    /// primary key is always projected: it is what a LEFT JOIN's match
+    /// detection reads. Unknown names answer `error.UnknownField`.
+    select: ?[]const []const u8 = null,
+    /// SQL alias for the joined table; defaults to the edge name, which is
+    /// also what disambiguates a self-join.
+    alias: ?[]const u8 = null,
+};
+
+/// The comptime admission predicate of `joinEdge`: the same test
+/// `addEdgeFields` (codegen/graph.zig) applies before injecting a FK column —
+/// the FK lives in the outer table, so a join matches at most one target row
+/// per outer row and `Limit`/`Offset`/`Page`/`Cursor*` semantics do not move.
+fn joinEdgeAdmissible(comptime edge: EdgeInfo) bool {
+    return edge.kind == .from and (edge.relation == .m2o or edge.relation == .o2o);
+}
+
+/// Whether `name` can address a column of a joinEdge's target: the target's
+/// API field name, its physical column name (`StorageKey`), or a
+/// caller-qualified `t.col` — a dotted name carries its own table, exactly as
+/// `sql.appendQualifiedPred` treats it, so it is not second-guessed here.
+fn joinEdgeColumnKnown(comptime target: TypeInfo, name: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, name, '.') != null) return true;
+    inline for (target.fields) |f| {
+        if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, f.column_name, name)) return true;
+    }
+    return false;
+}
+
+/// The first column identifier in `pred` that addresses nothing the joinEdge
+/// target has, or `null` when every column-bearing predicate addresses it.
+/// Shape-for-shape the `hasWithPredOffender` walk (codegen/predicate.zig —
+/// private there, so this is the joinEdge-scoped twin, kept to the same
+/// prong list on purpose): fragments carrying their own SQL (`raw`,
+/// `raw_args`, subqueries, function-generated EXISTS) are not second-guessed,
+/// and `.has_neighbors_with` addresses its own target one hop further.
+fn joinEdgePredOffender(comptime target: TypeInfo, pred: sql.Predicate) ?[]const u8 {
+    switch (pred) {
+        .eq, .ne, .gt, .lt, .gte, .lte, .like, .eq_fold => |op| {
+            if (!joinEdgeColumnKnown(target, op.column)) return op.column;
+        },
+        .in, .not_in => |op| {
+            if (!joinEdgeColumnKnown(target, op.column)) return op.column;
+        },
+        .or_in => |op| {
+            if (!joinEdgeColumnKnown(target, op.column)) return op.column;
+        },
+        .like_escaped => |op| {
+            if (!joinEdgeColumnKnown(target, op.column)) return op.column;
+        },
+        .is_null, .is_not_null => |column| {
+            if (!joinEdgeColumnKnown(target, column)) return column;
+        },
+        .in_subquery => |op| {
+            if (!joinEdgeColumnKnown(target, op.column)) return op.column;
+        },
+        .and_ => |op| {
+            if (joinEdgePredOffender(target, op.left.*)) |column| return column;
+            if (joinEdgePredOffender(target, op.right.*)) |column| return column;
+        },
+        .or_ => |op| {
+            if (joinEdgePredOffender(target, op.left.*)) |column| return column;
+            if (joinEdgePredOffender(target, op.right.*)) |column| return column;
+        },
+        .not_ => |inner| return joinEdgePredOffender(target, inner.*),
+        .not_has_edge,
+        .raw,
+        .raw_args,
+        .exists_subquery,
+        .exists_fn,
+        .not_exists_fn,
+        .has_neighbors_with,
+        .in_select,
+        .has_edge,
+        => {},
+    }
+    return null;
+}
+
+/// Builder-side record of one `joinEdge` call. Everything the assembly and
+/// the loader need is resolved here, where the edge is comptime — the two
+/// consumers below run on runtime entries and cannot re-derive a
+/// `TypeInfo` from a runtime edge name.
+const JoinEdgeEntry = struct {
+    /// The comptime call-site string (static storage).
+    edge_name: []const u8,
+    kind: JoinEdgeKind,
+    /// SQL alias: `opts.alias` or the edge name. Owned.
+    alias: []u8,
+    /// Target table (static schema string) and the two join columns
+    /// (target PK, source FK — both static).
+    target_table: []const u8,
+    target_pk_column: []const u8,
+    source_fk_column: []const u8,
+    /// Physical columns projected from the target, in target field order
+    /// (the `select` subset plus the primary key). Elements are static; the
+    /// slice is owned.
+    target_columns: []const []const u8,
+    /// Name-based scanner map, parallel to `target_columns`:
+    /// Zig field name -> result-set alias `<alias>__<column>` (owned strings).
+    scan_map: []const sql_scan.ColumnMap,
+    /// Result-set alias of the target's primary key (LEFT-join match probe).
+    pk_result_alias: []const u8,
+    /// Caller `where` predicates, owned shallow copies (the caller's slice
+    /// may be a temporary, mirroring what `Where` copies into
+    /// `self.predicates`).
+    preds: std.ArrayListUnmanaged(sql.Predicate),
+    /// Every heap string this entry allocated (the alias and each
+    /// `<alias>__<column>` result name) — `alias` is `owned_strings[0]`, so
+    /// this one loop is the whole release.
+    owned_strings: std.ArrayListUnmanaged([]u8),
+
+    fn deinitStrings(entry: *JoinEdgeEntry, allocator: std.mem.Allocator) void {
+        for (entry.owned_strings.items) |s| allocator.free(s);
+        entry.owned_strings.deinit(allocator);
+    }
+};
+
 /// Generate a Query builder for an entity.
 pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, comptime Entity: type) type {
     return struct {
@@ -456,6 +601,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         distinct: bool,
         with_trashed: bool,
         with_edges: std.ArrayListUnmanaged(WithEdgeEntry),
+        /// Controlled JOINs registered by `joinEdge`. Resolved per call into
+        /// runtime entries (see `JoinEdgeEntry`); the assembly and the loader
+        /// consume them from here.
+        join_edges: std.ArrayListUnmanaged(JoinEdgeEntry),
         group_cols: std.ArrayListUnmanaged([]const u8),
         or_in_chunks: std.ArrayListUnmanaged([]const []const sql.Value),
         having_pred: ?sql.Predicate,
@@ -487,6 +636,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 .distinct = false,
                 .with_trashed = false,
                 .with_edges = .empty,
+                .join_edges = .empty,
                 .group_cols = .empty,
                 .or_in_chunks = .empty,
                 .having_pred = null,
@@ -507,6 +657,13 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             self.predicates.deinit();
             self.order_terms.deinit();
             self.with_edges.deinit(self.allocator);
+            for (self.join_edges.items) |*entry| {
+                self.allocator.free(entry.target_columns);
+                self.allocator.free(entry.scan_map);
+                entry.deinitStrings(self.allocator);
+                entry.preds.deinit(self.allocator);
+            }
+            self.join_edges.deinit(self.allocator);
             self.group_cols.deinit(self.allocator);
         }
 
@@ -730,13 +887,197 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             return self;
         }
 
+        /// Controlled JOIN (v1): join the edge's target table into this
+        /// query's statement and materialise each parent's target into the
+        /// eager edge field (`row.edges.<edge>.?[0]`) — one round trip, the
+        /// same release path as `WithEdge` (`deinitRows` frees it).
+        ///
+        /// Admission is comptime, with the same predicate `addEdgeFields`
+        /// uses for FK injection (graph.zig): the edge must be `edge.From`
+        /// (relation m2o or o2o) — the FK lives in *this* table, so a join
+        /// matches at most one target per parent row and `Limit`/`Offset`/
+        /// `Page`/`Cursor*` semantics do not move. o2m/m2m edges would
+        /// multiply rows under LIMIT and are a `@compileError` naming the
+        /// alternatives (`WithEdge` / `WithEdgeOptions(.{ .join = .inner })`).
+        ///
+        /// Runtime contract:
+        ///  - `opts.where` predicates are validated against the **target**
+        ///    schema (field name or physical column; raw fragments exempt)
+        ///    and — with the target's own scope chain — qualify at render
+        ///    time with the join alias. On a LEFT JOIN they go into the ON
+        ///    clause, not WHERE: in WHERE they would turn the left join into
+        ///    an inner one (R2 — the one deliberate deviation from the three
+        ///    `appendQualifiedPred` precedents, pinned by tests).
+        ///  - `opts.select` names the projected target fields; the target's
+        ///    primary key is always projected (LEFT-join match probe).
+        ///    Unknown names, like unknown `where` columns, answer
+        ///    `error.UnknownField`.
+        ///  - The alias defaults to the edge name (self-join-safe).
+        ///  - `GroupBy` on a joined query answers
+        ///    `error.JoinWithGroupBy` — at **configuration time**, from this
+        ///    call or from `GroupBy`, whichever creates the conflicting
+        ///    combination. The member therefore lives in these builders'
+        ///    inferred error sets, not in `QueryError`, and the read methods'
+        ///    declared sets are unchanged. It is a deliberate refusal (v1
+        ///    does no aggregation over joined columns); a later version that
+        ///    lifts it will widen `QueryError` instead.
+        ///  - `Count`/`IDs`/aggregates never assemble joins (their selectors
+        ///    are independent), so they silently ignore `joinEdge` the way
+        ///    they ignore `WithEdge`.
+        ///  - `ForUpdate` on PostgreSQL automatically scopes the lock with
+        ///    `FOR UPDATE OF <source table>` (R5); SQLite/MySQL are
+        ///    unchanged.
+        ///  - `loadEdgePath` skips a head edge already served here, so
+        ///    `WithEdge` and `joinEdge` on the same edge do not double-load.
+        ///
+        /// One entry per edge: calling `joinEdge` again on the same edge
+        /// re-opens it with the new options.
+        pub fn joinEdge(self: *Self, comptime edge_name: []const u8, kind: JoinEdgeKind, opts: JoinEdgeOpts) !*Self {
+            const edge = comptime blk: {
+                for (info.edges) |e| {
+                    if (std.mem.eql(u8, e.name, edge_name)) break :blk e;
+                }
+                @compileError("Edge not found: " ++ edge_name ++ " on " ++ info.name);
+            };
+            if (comptime !joinEdgeAdmissible(edge)) {
+                @compileError("zent: joinEdge('" ++ edge_name ++ "') on '" ++ info.name ++
+                    "' is only defined for FK-in-this-table edges (edge.From with relation m2o/o2o);" ++
+                    " this edge is a " ++ @tagName(edge.relation) ++ " edge whose foreign key lives in the target," ++
+                    " so a join would multiply rows under LIMIT. Alternatives: WithEdge(\"" ++ edge_name ++
+                    "\") to eager-load it, or WithEdgeOptions(\"" ++ edge_name ++ "\", .{ .join = .inner })" ++
+                    " to filter parents by it in SQL.");
+            }
+            const target_info = comptime edgeTargetInfo(infos, info, edge);
+            const step = comptime buildEdgeStep(edge, info, target_info);
+
+            // R8: the join and a GROUP BY never coexist in v1 — the conflict
+            // is refused where it is *created*, so it can only come from this
+            // call or from `GroupBy` (see the doc block above for why this
+            // stays out of `QueryError`).
+            if (self.group_cols.items.len > 0) return error.JoinWithGroupBy;
+
+            if (opts.select) |sel| {
+                for (sel) |name| {
+                    var known = false;
+                    inline for (target_info.fields) |f| {
+                        if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, f.column_name, name)) known = true;
+                    }
+                    if (!known) return error.UnknownField;
+                }
+            }
+            if (opts.where) |preds| {
+                for (preds) |pred| {
+                    if (joinEdgePredOffender(target_info, pred)) |_| return error.UnknownField;
+                }
+            }
+
+            var entry = JoinEdgeEntry{
+                .edge_name = edge_name,
+                .kind = kind,
+                .alias = undefined,
+                .target_table = target_info.table_name,
+                .target_pk_column = pkColumn(target_info),
+                .source_fk_column = step.edge_columns[0],
+                // Empty until their real slices land below, so a failure in an
+                // earlier allocation finds a no-op free instead of `undefined`.
+                .target_columns = &.{},
+                .scan_map = &.{},
+                .pk_result_alias = undefined,
+                .preds = .empty,
+                .owned_strings = .empty,
+            };
+            // One owner for every allocation below: `commit` guards the
+            // hand-over into `join_edges` (and the replace path frees the old
+            // entry only after the new one is complete).
+            var committed = false;
+            errdefer if (!committed) {
+                self.allocator.free(entry.target_columns);
+                self.allocator.free(entry.scan_map);
+                entry.deinitStrings(self.allocator);
+                entry.preds.deinit(self.allocator);
+            };
+
+            // Copy-then-append: a failure between the two would leave the
+            // copy owned by nobody (`deinitStrings` only sees what is in the
+            // list), so the block keeps its own errdefer.
+            {
+                const alias_copy = try self.allocator.dupe(u8, opts.alias orelse edge_name);
+                errdefer self.allocator.free(alias_copy);
+                try entry.owned_strings.append(self.allocator, alias_copy);
+                entry.alias = alias_copy;
+            }
+
+            // Target projection: the select subset (or every field) in target
+            // field order, plus the primary key — always. Each projected
+            // column carries the `<alias>__<column>` result name the loader
+            // scans by.
+            var cols = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer cols.deinit(self.allocator);
+            var maps = std.ArrayListUnmanaged(sql_scan.ColumnMap).empty;
+            errdefer maps.deinit(self.allocator);
+            inline for (target_info.fields) |f| {
+                const wanted = if (opts.select) |sel| blk: {
+                    var found = false;
+                    for (sel) |name| {
+                        if (std.mem.eql(u8, f.name, name) or std.mem.eql(u8, f.column_name, name)) found = true;
+                    }
+                    break :blk found;
+                } else true;
+                const is_pk = comptime std.mem.eql(u8, f.name, target_info.pk_field);
+                // The primary key is always projected so the loader can tell
+                // "no match" (LEFT JOIN) from a match, even when `select`
+                // leaves it out of the caller's list.
+                if (wanted or is_pk) {
+                    const result_alias = try self.allocator.print("{s}__{s}", .{ entry.alias, f.column_name });
+                    // The guard is scoped to the append: once the copy is in
+                    // the list the entry's own cleanup owns it, and a later
+                    // failure in this iteration must not free it again.
+                    {
+                        errdefer self.allocator.free(result_alias);
+                        try entry.owned_strings.append(self.allocator, result_alias);
+                    }
+                    try cols.append(self.allocator, f.column_name);
+                    try maps.append(self.allocator, .{ .name = f.name, .column = result_alias });
+                    if (is_pk) entry.pk_result_alias = result_alias;
+                }
+            }
+            entry.target_columns = try cols.toOwnedSlice(self.allocator);
+            entry.scan_map = try maps.toOwnedSlice(self.allocator);
+
+            if (opts.where) |preds| {
+                try entry.preds.appendSlice(self.allocator, preds);
+            }
+
+            // One entry per edge: a second `joinEdge` on the same edge
+            // re-opens it, releasing the replaced entry's allocations.
+            for (self.join_edges.items) |*existing| {
+                if (std.mem.eql(u8, existing.edge_name, edge_name)) {
+                    self.allocator.free(existing.target_columns);
+                    self.allocator.free(existing.scan_map);
+                    existing.deinitStrings(self.allocator);
+                    existing.preds.deinit(self.allocator);
+                    existing.* = entry;
+                    committed = true;
+                    return self;
+                }
+            }
+            try self.join_edges.append(self.allocator, entry);
+            committed = true;
+            return self;
+        }
+
+        /// GROUP BY the given columns. Refused with `error.JoinWithGroupBy`
+        /// while the builder carries a `joinEdge` JOIN — aggregation over a
+        /// joined statement is deliberately out of scope for v1 (R8), and the
+        /// conflict is refused where it is created: by this call, or by
+        /// `joinEdge` if the grouping came first. See `joinEdge`'s doc block.
         pub fn GroupBy(self: *Self, columns: []const []const u8) !*Self {
+            if (self.join_edges.items.len > 0) return error.JoinWithGroupBy;
             for (columns) |c| {
                 try self.group_cols.append(self.allocator, columnName(info, c));
             }
             return self;
         }
-
         pub fn Having(self: *Self, pred: sql.Predicate) *Self {
             self.having_pred = pred;
             return self;
@@ -792,7 +1133,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
 
         const QueryError = sql_driver.Error || error{ PrivacyDenied, NotFound, NotSingular, TypeMismatch, ColumnCountMismatch, MissingColumn, InvalidEdge, InvalidCursor, BuildFailed, UuidEdgesUnsupported, InterceptFailed };
         const BuildError = error{ OutOfMemory, BuildFailed };
-        const ExplainError = error{ OutOfMemory, BuildFailed, InvalidCursor, UnsupportedDialect };
+        const ExplainError = QueryError || error{ UnsupportedDialect, JoinWithGroupBy };
         /// `Sum` / `Avg` / `Max` / `Min`: the four methods that answer from a
         /// single aggregate value. A separate set rather than a member of
         /// `QueryError`, which every reader shares: adding to that one would
@@ -1009,6 +1350,9 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 else
                     try scanEntity(info, Entity, alloc, row);
                 errdefer deinitEntity(infos, info, &entity, alloc);
+                // Joined targets ride the same row; a failure here frees the
+                // entity (and any targets scanned before it) via the errdefer.
+                try self.loadJoinedEdges(alloc, row, &entity);
                 try result.append(entity);
             }
             if (rows.nextError()) |e| return e;
@@ -1038,7 +1382,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// into memory — safe for large tables.
         ///
         /// The returned QueryIterator MUST be deinited. Does NOT support
-        /// eager edge loading (WithEdge); use All() for that.
+        /// eager edge loading (WithEdge); use All() for that. A `joinEdge`
+        /// JOIN is still assembled into the SQL (so INNER scoping filters),
+        /// but the streamed scan never materialises the joined targets —
+        /// they ride the row unread. Use All() for joined reads.
         pub fn Iterate(self: *Self) QueryError!QueryIterator {
             const pol = try self.checkPolicy();
             try self.injectPrivacyFilters(pol);
@@ -1108,6 +1455,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             else
                 try scanEntity(info, Entity, alloc, row);
             errdefer deinitEntity(infos, info, &entity, alloc);
+            try self.loadJoinedEdges(alloc, row, &entity);
 
             const duration_us: u64 = nowUs() - start;
             if (self.logger.onQuery) |log| {
@@ -1162,6 +1510,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
 
             var entities_arr = [_]Entity{entity};
+            try self.loadJoinedEdges(self.allocator, row, &entities_arr[0]);
             for (self.with_edges.items) |we| {
                 try self.loadEdges(self.allocator, we.path, &entities_arr);
             }
@@ -1239,6 +1588,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// count, and `result.deinit()` frees both entities and the list —
         /// do NOT call `deinitEntity` per row yourself. Contrast with `All()`,
         /// which returns the plain `std.array_list.Managed(Entity)`.
+        /// Note `Count` never assembles `joinEdge` JOINs, so with a join whose
+        /// INNER scope filters rows, `total` counts the unjoined row set —
+        /// build the page without a join, or count separately, when that
+        /// distinction matters.
         pub fn paged(self: *Self, page: usize, page_size: usize) (QueryError || error{InvalidPageSize})!PagedResult {
             if (page_size == 0) return error.InvalidPageSize;
             const total = try self.Count();
@@ -1309,6 +1662,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const key_col = sql.ColumnRef{ .table = null, .name = col, .raw = false };
             const cnt_col = sql.ColumnRef{ .table = null, .name = "COUNT(*)", .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{ key_col, cnt_col });
+            errdefer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -1547,6 +1901,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const key_col = sql.ColumnRef{ .table = null, .name = group_col, .raw = false };
             const val_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{ key_col, val_col });
+            errdefer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -1591,10 +1946,60 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// for `AllIn`/`FirstIn`.
         fn loadEdges(self: *Self, alloc: std.mem.Allocator, edge_path: []const u8, entities: []Entity) !void {
             if (entities.len == 0) return;
+            // A head edge served by `joinEdge` is already materialised in the
+            // eager field; loading it again would run a second query and
+            // overwrite (then double-free) the joined rows (design §5). Dot
+            // paths into a joined edge are skipped wholesale — nested loads
+            // off a joined target are a v2 shape.
+            {
+                const head = splitEdgePath(edge_path).head;
+                for (self.join_edges.items) |je| {
+                    if (std.mem.eql(u8, je.edge_name, head)) return;
+                }
+            }
             const ptrs = try alloc.alloc(*Entity, entities.len);
             defer alloc.free(ptrs);
             for (entities, 0..) |*e, i| ptrs[i] = e;
             return loadEdgePath(infos, info, Entity, alloc, self.driver, self.execution_context, ptrs, edge_path, self.privacy_ctx, self.interceptors, self.with_trashed);
+        }
+
+        /// Scan a joined target row into the entity's eager edge field — the
+        /// one-round-trip counterpart of `loadEdgePath`. m2o/o2o joins match
+        /// at most one target, so the slice is a single element. The target's
+        /// columns arrive under their `<alias>__<column>` result names and are
+        /// read by name (`scan_map`), so a `select` subset scans exactly its
+        /// projection; a NULL in the target's primary key means the outer row
+        /// matched nothing (LEFT JOIN) and the eager field stays null. The
+        /// JSON-arena ownership contract is loadEdgePath's: the target's
+        /// document bytes live in a per-entity arena that
+        /// `deinitEntityEdges` releases, its strings dupe into `alloc`.
+        fn loadJoinedEdges(self: *Self, alloc: std.mem.Allocator, row: sql_driver.Row, entity: *Entity) !void {
+            if (self.join_edges.items.len == 0) return;
+            inline for (info.edges) |edge| {
+                for (self.join_edges.items) |*je| {
+                    if (!std.mem.eql(u8, je.edge_name, edge.name)) continue;
+                    const target_info = comptime edgeTargetInfo(infos, info, edge);
+                    const EdgeFieldType = @FieldType(@FieldType(Entity, "edges"), edge.name);
+                    const TargetEntity = @typeInfo(@typeInfo(EdgeFieldType).optional.child).pointer.child;
+                    const pk_idx = sql_scan.findColumnIndex(row, je.pk_result_alias) orelse return error.MissingColumn;
+                    if (row.isNull(pk_idx)) continue;
+                    const arena = try alloc.create(std.heap.ArenaAllocator);
+                    arena.* = std.heap.ArenaAllocator.init(alloc);
+                    const target = sql_scan.scanRowNamedMappedWithArena(TargetEntity, alloc, row, je.scan_map, arena) catch |err| {
+                        arena.deinit();
+                        alloc.destroy(arena);
+                        if (err == error.TypeMismatch) explainScanFailure(target_info, TargetEntity, row);
+                        return err;
+                    };
+                    const slice = alloc.alloc(TargetEntity, 1) catch |err| {
+                        arena.deinit();
+                        alloc.destroy(arena);
+                        return err;
+                    };
+                    slice[0] = target;
+                    @field(entity.edges, edge.name) = slice;
+                }
+            }
         }
 
         fn buildQuery(self: *Self, comptime column_count: usize) !sql.OwnedQuery {
@@ -1605,8 +2010,16 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         /// `IDs()` uses it to project the primary key — which is not
         /// necessarily the first declared field — and, by naming its own
         /// column, also ignores a caller-supplied `Select(...)`: the method's
-        /// contract is the keys of the matching rows, not a projection.
+        /// contract is the keys of the matching rows, not a projection. A
+        /// non-null `first_col` also disables join assembly: an IDs page has
+        /// no place to put a joined target.
         fn buildQueryWithFirst(self: *Self, comptime column_count: usize, comptime first_col: ?[]const u8) !sql.OwnedQuery {
+            // Join assembly serves whole-entity reads only. (A joined query
+            // with a GROUP BY cannot reach this point: `joinEdge` and `GroupBy`
+            // refuse the combination when it is created — `error.JoinWithGroupBy`
+            // lives in their inferred sets, not in the read methods' `QueryError`.)
+            const with_joins = comptime first_col == null;
+            const joins_active = with_joins and self.join_edges.items.len > 0;
             const t = sql.Table(info.table_name);
             var all_cols: [column_count][]const u8 = undefined;
             inline for (info.fields[0..column_count], 0..) |f, i| all_cols[i] = f.column_name;
@@ -1615,10 +2028,79 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 all_cols[0..column_count]
             else
                 self.select_cols orelse all_cols[0..column_count];
-            var columns: [info.fields.len]sql.ColumnRef = undefined;
-            // `Select` stores field names; emit their physical columns.
-            for (cols, 0..) |cname, i| columns[i] = t.c(columnName(info, cname));
-            var selector = try sql.Select(self.allocator, self.driver.dialect(), columns[0..cols.len]);
+
+            // With a join in the statement, every outer-side reference this
+            // function builds (cursor columns, their ORDER BY, caller order
+            // terms) qualifies with the source table (R4); the dotted
+            // spellings render dialect-correct through a scratch builder whose
+            // buffer must outlive `takeQuery` — hence the function-scope
+            // defers, which run after the return value is built.
+            var scratch: ?sql.Builder = if (joins_active) sql.Builder.init(self.allocator, self.driver.dialect()) else null;
+            defer if (scratch) |*sb| sb.deinit();
+            // Renders `qualifier.column` (quoted per dialect) and returns a
+            // slice into the scratch buffer.
+            const qualified = struct {
+                fn col(sb: *sql.Builder, qualifier: []const u8, name: []const u8) ![]const u8 {
+                    const start = sb.buffer.items.len;
+                    try sb.ident(qualifier);
+                    try sb.writeByte('.');
+                    try sb.ident(name);
+                    return sb.buffer.items[start..];
+                }
+            }.col;
+            // The source-table-qualified form of one of this entity's columns.
+            const outerQualified = struct {
+                fn f(scratch_slot: *?sql.Builder, comptime table: []const u8, name: []const u8) ![]const u8 {
+                    const sb = &(scratch_slot.*.?);
+                    const start = sb.buffer.items.len;
+                    try sb.ident(table);
+                    try sb.writeByte('.');
+                    try sb.ident(name);
+                    return sb.buffer.items[start..];
+                }
+            }.f;
+
+            // Per-join ON-scope slices (LEFT joins): Join values stored in the
+            // selector borrow them until `takeQuery` renders, so the release
+            // must sit at function scope, not inside the join loop.
+            var on_allocs: std.ArrayListUnmanaged([]sql.QualPred) = .empty;
+            defer {
+                for (on_allocs.items) |s| self.allocator.free(s);
+                on_allocs.deinit(self.allocator);
+            }
+
+            var joined_columns: ?[]sql.ColumnRef = null;
+            defer if (joined_columns) |jc| self.allocator.free(jc);
+            var selector = blk: {
+                if (!joins_active) {
+                    var columns: [info.fields.len]sql.ColumnRef = undefined;
+                    // `Select` stores field names; emit their physical columns.
+                    for (cols, 0..) |cname, i| columns[i] = t.c(columnName(info, cname));
+                    break :blk try sql.Select(self.allocator, self.driver.dialect(), columns[0..cols.len]);
+                }
+                // R4: with a join present, outer projections carry the source
+                // table qualifier, and each joined target projects its
+                // (select-filtered) columns under `<alias>__<column>` result
+                // names — never `*`, so an ALTER TABLE that appended a column
+                // cannot shift the positional scan (Z35 / Step.to_columns).
+                var count: usize = cols.len;
+                for (self.join_edges.items) |je| count += je.target_columns.len;
+                const columns = try self.allocator.alloc(sql.ColumnRef, count);
+                joined_columns = columns;
+                var n: usize = 0;
+                for (cols) |cname| {
+                    columns[n] = .{ .table = info.table_name, .name = columnName(info, cname) };
+                    n += 1;
+                }
+                for (self.join_edges.items) |je| {
+                    for (je.target_columns, je.scan_map) |col, m| {
+                        columns[n] = .{ .table = je.alias, .name = col, .alias = m.column };
+                        n += 1;
+                    }
+                }
+                break :blk try sql.Select(self.allocator, self.driver.dialect(), columns[0..n]);
+            };
+            errdefer selector.deinit();
             _ = selector.from(t);
             _ = selector.setDistinct(self.distinct);
 
@@ -1627,6 +2109,14 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     _ = try selector.where(pred);
                 }
             }
+            // The cursor's column spellings qualify like every outer-side
+            // reference when a join is present (a bare `id` is ambiguous the
+            // moment both sides of the join own one).
+            const cursor_col_sql: ?[]const u8 = if (self.cursor_col) |col|
+                if (joins_active) try outerQualified(&scratch, info.table_name, columnName(info, col)) else columnName(info, col)
+            else
+                null;
+            const pk_col_sql = if (joins_active) try outerQualified(&scratch, info.table_name, pkColumn(info)) else pkColumn(info);
             if (self.cursor_col) |col| {
                 if (self.cursor_val) |val| {
                     if (val == .null) return error.InvalidCursor;
@@ -1639,8 +2129,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                         }
                     }
                     if (!col_valid) return error.InvalidCursor;
-                    const col_sql = columnName(info, col);
-                    const pk_col = pkColumn(info);
+                    const col_sql = cursor_col_sql.?;
+                    const pk_col = pk_col_sql;
                     if (self.cursor_id) |id_val| {
                         // Composite keyset: (col > ?) OR (col = ? AND id > ?)
                         // — ties on the cursor column never drop rows.
@@ -1662,7 +2152,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 }
             }
             if (info.soft_delete and !self.with_trashed) {
-                _ = try selector.where(sql.IsNull("deleted_at"));
+                // The source's own soft-delete scope qualifies with the source
+                // table under a join (both sides may carry the column).
+                const sd_col_joined = comptime (info.table_name ++ ".deleted_at");
+                _ = try selector.where(sql.IsNull(if (joins_active) sd_col_joined else "deleted_at"));
             }
             if (self.group_cols.items.len > 0) {
                 _ = try selector.groupBy(self.group_cols.items);
@@ -1671,8 +2164,8 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 _ = selector.having(pred);
             }
             if (self.cursor_col) |col| {
-                const col_sql = columnName(info, col);
-                const pk_col = pkColumn(info);
+                const col_sql = cursor_col_sql.?;
+                const pk_col = pk_col_sql;
                 // When cursor pagination is active, ensure ORDER BY col ASC/DESC is present.
                 if (self.order_terms.items.len == 0) {
                     if (self.cursor_desc) {
@@ -1687,7 +2180,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                     for (self.order_terms.items) |term| {
                         switch (term) {
                             .column => |o| {
-                                if (std.mem.eql(u8, o.name, pk_col)) {
+                                if (std.mem.eql(u8, o.name, pkColumn(info))) {
                                     has_id = true;
                                     break;
                                 }
@@ -1706,7 +2199,83 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             }
             if (self.order_terms.items.len > 0) {
                 for (self.order_terms.items) |term| {
+                    // A `.column` term qualifies with the source table under a
+                    // join (R4); the qualified spelling is rendered raw, since
+                    // a `.column` term emits a single identifier.
+                    if (joins_active) {
+                        switch (term) {
+                            .column => |o| {
+                                _ = try selector.orderBy(.{ .raw = .{
+                                    .sql = try qualified(&(scratch.?), info.table_name, o.name),
+                                    .desc = o.desc,
+                                } });
+                                continue;
+                            },
+                            .expr, .raw => {},
+                        }
+                    }
                     _ = try selector.orderBy(term);
+                }
+            }
+            if (joins_active) {
+                // One JOIN per entry; the ON is the FK equality (dialect-quoted
+                // through qualifiedIdent, schema constants on both sides, no
+                // bound argument), and the target's scope chain — soft delete,
+                // privacy policy, interceptor chain, then the caller's
+                // `where` — qualifies with the join alias at render time.
+                // Placement per kind (R2, the deliberate deviation from the
+                // three appendQualifiedPred precedents):
+                //   INNER → WHERE (same row set as the eager-load contract);
+                //   LEFT  → ON, because in WHERE those predicates would turn
+                //           the left join into an inner one.
+                inline for (info.edges) |edge| {
+                    for (self.join_edges.items) |*je| {
+                        if (!std.mem.eql(u8, je.edge_name, edge.name)) continue;
+                        const target_info = comptime edgeTargetInfo(infos, info, edge);
+                        var scope: std.ArrayListUnmanaged(sql.Predicate) = .empty;
+                        defer scope.deinit(self.allocator);
+                        try appendTargetScopePreds(target_info, &scope, self.allocator, self.privacy_ctx, self.interceptors, self.with_trashed, .query);
+                        var join_val = sql.Join{
+                            .kind = if (je.kind == .inner) .inner else .left,
+                            .table = .{ .name = target_info.table_name, .alias = je.alias },
+                            .on_columns = .{
+                                .left = je.target_pk_column,
+                                .left_qualifier = je.alias,
+                                .right = je.source_fk_column,
+                                .right_qualifier = info.table_name,
+                            },
+                        };
+                        if (je.kind == .inner) {
+                            for (scope.items) |p| _ = try selector.whereQualified(p, je.alias);
+                            for (je.preds.items) |p| _ = try selector.whereQualified(p, je.alias);
+                        } else {
+                            // The slice outlives `scope` (freed at the end of
+                            // this prong): `QualifiedPred` holds copies of the
+                            // predicate *values*, and the only pointer-bearing
+                            // shapes (`and_`/`or_`/`not_`) point at storage the
+                            // policy/interceptor layers already keep alive for
+                            // the whole build — the same borrowed-until-render
+                            // contract every WHERE predicate has.
+                            const qpreds = try self.allocator.alloc(sql.QualPred, scope.items.len + je.preds.items.len);
+                            // Copy-then-append again: the batch cleanup only
+                            // walks what reached `on_allocs`.
+                            {
+                                errdefer self.allocator.free(qpreds);
+                                try on_allocs.append(self.allocator, qpreds);
+                            }
+                            var qi: usize = 0;
+                            for (scope.items) |p| {
+                                qpreds[qi] = .{ .pred = p, .qualifier = je.alias };
+                                qi += 1;
+                            }
+                            for (je.preds.items) |p| {
+                                qpreds[qi] = .{ .pred = p, .qualifier = je.alias };
+                                qi += 1;
+                            }
+                            join_val.on_qualified = qpreds;
+                        }
+                        _ = try selector.join(join_val);
+                    }
                 }
             }
             if (self.limit_val) |n| {
@@ -1716,8 +2285,15 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                 _ = selector.offset(n);
             }
             if (self.for_update) {
+                // R5: with a join in the statement, PostgreSQL's row lock
+                // must stay on the source table — locking the joined
+                // target too would be a wider lock than the unjoined read.
+                // The source is never aliased, so its alias IS its table
+                // name; `writeLockSuffix` emits OF on PostgreSQL only, so
+                // SQLite/MySQL are unchanged either way.
+                const of: ?[]const u8 = self.for_update_of;
                 _ = selector.forUpdateWith(.{
-                    .of = self.for_update_of,
+                    .of = if (of) |locked| locked else if (joins_active) info.table_name else null,
                     .skip_locked = self.skip_locked,
                     .nowait = self.nowait,
                 });
@@ -1739,6 +2315,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const t = sql.Table(info.table_name);
             const count_col = sql.ColumnRef{ .table = null, .name = if (grouped) "1" else "COUNT(*)", .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{count_col});
+            errdefer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -1777,6 +2354,7 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             const t = sql.Table(info.table_name);
             const agg_col = sql.ColumnRef{ .table = null, .name = agg_expr, .raw = true };
             var selector = try sql.Select(self.allocator, self.driver.dialect(), &.{agg_col});
+            errdefer selector.deinit();
             _ = selector.from(t);
             if (self.predicates.items.len > 0) {
                 for (self.predicates.items) |pred| {
@@ -3492,4 +4070,534 @@ test "an OwnedRows and a PagedResult release in either order" {
         try std.testing.expectEqualStrings("u2", owned.items.items[2].name);
         owned.deinit();
     }
+}
+
+// ------------------------------------------------------------------
+// Controlled JOIN (joinEdge) — v1
+// ------------------------------------------------------------------
+
+const JoinMockDriver = struct {
+    dialect_value: Dialect = .sqlite,
+
+    pub fn asDriver(self: *@This()) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn mockExec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        unreachable;
+    }
+    fn mockQuery(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        unreachable;
+    }
+    fn mockBeginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        unreachable;
+    }
+    fn mockClose(_: *anyopaque) void {}
+    fn mockDialect(ptr: *anyopaque) Dialect {
+        const self: *JoinMockDriver = @ptrCast(@alignCast(ptr));
+        return self.dialect_value;
+    }
+    fn mockPing(_: *anyopaque) sql_driver.Error!void {
+        unreachable;
+    }
+    fn mockInTransaction(_: *anyopaque) bool {
+        unreachable;
+    }
+    fn mockBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        unreachable;
+    }
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = mockExec,
+        .query = mockQuery,
+        .beginTx = mockBeginTx,
+        .close = mockClose,
+        .dialect = mockDialect,
+        .ping = mockPing,
+        .inTransaction = mockInTransaction,
+        .beginSavepoint = mockBeginSavepoint,
+    };
+};
+
+test "joinEdge admission mirrors addEdgeFields' FK injection (o2m/m2m are a compile error)" {
+    // The @compileError itself cannot be exercised in-tree (it fails the
+    // build by design), so this pins the *predicate* that guard branches on:
+    // the exact admission test addEdgeFields (codegen/graph.zig) applies
+    // before injecting a FK column. A To edge's FK lives in the target, so a
+    // join there would multiply rows under LIMIT — never admissible.
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const AdmCustomer = schema("JoinAdmCustomer", .{ .fields = &.{field.String("name")} });
+    const AdmOrder = schema("JoinAdmOrder", .{
+        .fields = &.{field.Int("buyer_id")},
+        .edges = &.{edge.From("buyer", AdmCustomer).Field("buyer_id")},
+    });
+    const AdmCustomerTo = schema("JoinAdmCustomerTo", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("orders", AdmOrder)},
+    });
+
+    const graph = comptime buildGraph(&.{ AdmCustomer, AdmOrder, AdmCustomerTo });
+    const infos = graph.types;
+    comptime {
+        if (!joinEdgeAdmissible(infos[1].edges[0])) @compileError("an m2o From edge must be joinEdge-admissible");
+        if (joinEdgeAdmissible(infos[2].edges[0])) @compileError("an o2m To edge must not be joinEdge-admissible");
+    }
+}
+
+test "joinEdge SQL: m2o inner pins projection aliases, ON columns and outer qualification" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const PinCustomer = schema("JoinPinCustomer", .{ .fields = &.{field.String("name")} });
+    const PinOrder = schema("JoinPinOrder", .{
+        .fields = &.{ field.Int("buyer_id"), field.Int("amount") },
+        .edges = &.{edge.From("buyer", PinCustomer).Field("buyer_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ PinCustomer, PinOrder });
+    const infos = graph.types;
+    const order_info = infos[1];
+    const OrderEntity = comptime EntityGenerator(infos, order_info);
+    const OrderQuery = QueryBuilder(infos, order_info, OrderEntity);
+
+    var mock = JoinMockDriver{};
+    var q = OrderQuery.init(allocator, mock.asDriver(), null);
+    defer q.deinit();
+    _ = try q.joinEdge("buyer", .inner, .{});
+    const built = try q.buildQuery(order_info.fields.len);
+    defer built.deinit();
+
+    // R4: the outer projection is source-qualified; the target projects its
+    // fields in field order under `<alias>__<column>` (the alias defaults to
+    // the edge *name* — "buyer", not the table name); the ON is the FK
+    // equality with no bound argument. Never `*`.
+    try std.testing.expectEqualStrings(
+        "SELECT \"join_pin_order\".\"id\", \"join_pin_order\".\"buyer_id\", \"join_pin_order\".\"amount\", " ++
+            "\"buyer\".\"id\" AS \"buyer__id\", \"buyer\".\"name\" AS \"buyer__name\" " ++
+            "FROM \"join_pin_order\" INNER JOIN \"join_pin_customer\" \"buyer\" " ++
+            "ON \"buyer\".\"id\" = \"join_pin_order\".\"buyer_id\"",
+        built.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 0), built.args.len);
+}
+
+test "joinEdge SQL: LEFT puts the target scope in ON, INNER in WHERE (R2)" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const mixin = @import("../core/mixin.zig");
+    const buildGraph = @import("graph.zig").buildGraph;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const SoftCustomer = schema("JoinPinSoftCustomer", .{
+        .fields = &.{field.String("name")},
+        .mixins = &.{mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const SoftOrder = schema("JoinPinSoftOrder", .{
+        .fields = &.{ field.Int("buyer_id"), field.Int("amount") },
+        .edges = &.{edge.From("buyer", SoftCustomer).Field("buyer_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ SoftCustomer, SoftOrder });
+    const infos = graph.types;
+    const order_info = infos[1];
+    const OrderEntity = comptime EntityGenerator(infos, order_info);
+    const OrderQuery = QueryBuilder(infos, order_info, OrderEntity);
+
+    // LEFT: the target's soft-delete scope is part of the ON clause — in
+    // WHERE it would turn the left join into an inner one. There is no WHERE
+    // at all in this statement (the source is not soft-deleting).
+    {
+        var mock = JoinMockDriver{};
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .left, .{});
+        const built = try q.buildQuery(order_info.fields.len);
+        defer built.deinit();
+        try std.testing.expectEqualStrings(
+            "SELECT \"join_pin_soft_order\".\"id\", \"join_pin_soft_order\".\"buyer_id\", \"join_pin_soft_order\".\"amount\", " ++
+                "\"buyer\".\"id\" AS \"buyer__id\", \"buyer\".\"name\" AS \"buyer__name\", " ++
+                "\"buyer\".\"deleted_at\" AS \"buyer__deleted_at\" " ++
+                "FROM \"join_pin_soft_order\" LEFT JOIN \"join_pin_soft_customer\" \"buyer\" " ++
+                "ON \"buyer\".\"id\" = \"join_pin_soft_order\".\"buyer_id\" AND \"buyer\".\"deleted_at\" IS NULL",
+            built.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 0), built.args.len);
+        try std.testing.expect(std.mem.indexOf(u8, built.sql, " WHERE ") == null);
+    }
+
+    // INNER: the same predicate is a WHERE condition, exactly as the
+    // three appendQualifiedPred precedents render it.
+    {
+        var mock = JoinMockDriver{};
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        const built = try q.buildQuery(order_info.fields.len);
+        defer built.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, built.sql, "INNER JOIN \"join_pin_soft_customer\" \"buyer\" ON \"buyer\".\"id\" = \"join_pin_soft_order\".\"buyer_id\" WHERE \"buyer\".\"deleted_at\" IS NULL") != null);
+    }
+}
+
+test "joinEdge SQL: select subset, custom alias, caller where and interceptor all qualify with the alias" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const mixin = @import("../core/mixin.zig");
+    const buildGraph = @import("graph.zig").buildGraph;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const SoftCustomer = schema("JoinPinSoft2Customer", .{
+        .fields = &.{field.String("name")},
+        .mixins = &.{mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const SoftOrder = schema("JoinPinSoft2Order", .{
+        .fields = &.{ field.Int("buyer_id"), field.Int("amount") },
+        .edges = &.{edge.From("buyer", SoftCustomer).Field("buyer_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ SoftCustomer, SoftOrder });
+    const infos = graph.types;
+    const order_info = infos[1];
+    const OrderEntity = comptime EntityGenerator(infos, order_info);
+    const OrderQuery = QueryBuilder(infos, order_info, OrderEntity);
+
+    // A multi-tenant interceptor writes app-level equality through the
+    // target's own sink; a caller `where` refines it. Both must qualify with
+    // the *custom* alias ("c"), and the target's pk stays in the projection —
+    // it is what LEFT-join match detection reads.
+    var mock = JoinMockDriver{};
+    var q = OrderQuery.init(allocator, mock.asDriver(), null);
+    defer q.deinit();
+    var chain = intercept.InterceptorChain.init(allocator);
+    defer chain.deinit();
+    try chain.use(.{ .intercept = struct {
+        fn inject(ctx: ?*anyopaque, view: *intercept.QueryView) anyerror!void {
+            _ = ctx;
+            try view.whereEq("name", .{ .string = "acme" });
+        }
+    }.inject });
+    q.interceptors = &chain;
+
+    _ = try q.joinEdge("buyer", .inner, .{
+        .where = &.{sql.EQ("name", .{ .string = "zzz" })},
+        .select = &.{"name"},
+        .alias = "c",
+    });
+    const built = try q.buildQuery(order_info.fields.len);
+    defer built.deinit();
+
+    try std.testing.expectEqualStrings(
+        "SELECT \"join_pin_soft2_order\".\"id\", \"join_pin_soft2_order\".\"buyer_id\", \"join_pin_soft2_order\".\"amount\", " ++
+            "\"c\".\"id\" AS \"c__id\", \"c\".\"name\" AS \"c__name\" " ++
+            "FROM \"join_pin_soft2_order\" INNER JOIN \"join_pin_soft2_customer\" \"c\" " ++
+            "ON \"c\".\"id\" = \"join_pin_soft2_order\".\"buyer_id\" " ++
+            "WHERE \"c\".\"deleted_at\" IS NULL AND \"c\".\"name\" = ? AND \"c\".\"name\" = ?",
+        built.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 2), built.args.len);
+    try std.testing.expectEqualStrings("acme", built.args[0].string);
+    try std.testing.expectEqualStrings("zzz", built.args[1].string);
+
+    // PostgreSQL: the qualified predicates' placeholders stay in SQL order.
+    var pg_mock = JoinMockDriver{ .dialect_value = .postgres };
+    var pq = OrderQuery.init(allocator, pg_mock.asDriver(), null);
+    defer pq.deinit();
+    _ = try pq.joinEdge("buyer", .inner, .{});
+    const pbuilt = try pq.buildQuery(order_info.fields.len);
+    defer pbuilt.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, pbuilt.sql, "WHERE \"buyer\".\"deleted_at\" IS NULL") != null);
+    try std.testing.expectEqual(@as(usize, 0), pbuilt.args.len);
+}
+
+test "joinEdge refuses to combine with GroupBy (JoinWithGroupBy), in either order" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const PinCustomer = schema("JoinGroupCustomer", .{ .fields = &.{field.String("name")} });
+    const PinOrder = schema("JoinGroupOrder", .{
+        .fields = &.{ field.Int("buyer_id"), field.Int("amount") },
+        .edges = &.{edge.From("buyer", PinCustomer).Field("buyer_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ PinCustomer, PinOrder });
+    const infos = graph.types;
+    const order_info = infos[1];
+    const OrderEntity = comptime EntityGenerator(infos, order_info);
+    const OrderQuery = QueryBuilder(infos, order_info, OrderEntity);
+
+    // join first, then GroupBy: the conflict is refused where it is created,
+    // so this fires at configuration time and the builder never assembles a
+    // joined GROUP BY statement. (The read methods' QueryError is unchanged —
+    // the member lives in the two config-time methods' inferred sets.)
+    {
+        var q = OrderQuery.init(allocator, undefined, null);
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        try std.testing.expectError(error.JoinWithGroupBy, q.GroupBy(&.{"amount"}));
+        // The refusal is clean: no grouping half-landed.
+        try std.testing.expectEqual(@as(usize, 0), q.group_cols.items.len);
+    }
+    // GroupBy first, then join.
+    {
+        var q = OrderQuery.init(allocator, undefined, null);
+        defer q.deinit();
+        _ = try q.GroupBy(&.{"amount"});
+        try std.testing.expectError(error.JoinWithGroupBy, q.joinEdge("buyer", .inner, .{}));
+        try std.testing.expectEqual(@as(usize, 0), q.join_edges.items.len);
+    }
+    // joinEdge on an unknown select field answers UnknownField (validated
+    // against the target schema, like the generated With-predicates).
+    {
+        var q = OrderQuery.init(allocator, undefined, null);
+        defer q.deinit();
+        try std.testing.expectError(error.UnknownField, q.joinEdge("buyer", .inner, .{ .select = &.{"nope"} }));
+        try std.testing.expectError(error.UnknownField, q.joinEdge("buyer", .inner, .{ .where = &.{sql.EQ("nope", .{ .int = 1 })} }));
+        // Raw fragments are exempt from the column walk, by contract.
+        _ = try q.joinEdge("buyer", .inner, .{ .where = &.{sql.Raw("1 = 1")} });
+    }
+}
+
+test "joinEdge round trip fills the eager edge, releases cleanly and skips re-loading" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const migrate = @import("../sql/schema/migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("client.zig");
+
+    const Customer = schema("JoinRtCustomer", .{ .fields = &.{field.String("name")} });
+    const Order = schema("JoinRtOrder", .{
+        // Optional FK: the NULL row is what a LEFT JOIN must keep and an
+        // INNER JOIN must drop.
+        .fields = &.{ field.Int("buyer_id").Optional(), field.Int("amount") },
+        .edges = &.{edge.From("buyer", Customer).Field("buyer_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ Customer, Order });
+    const infos = graph.types;
+    const customer_info = comptime fromSchema(Customer);
+    const order_info = comptime fromSchema(Order);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const root = client_mod.makeClient(infos, allocator, driver.asDriver());
+
+    const cid: i64 = cid: {
+        var b = try root.join_rt_customer.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "acme");
+        var row = try b.Save();
+        defer deinitEntity(infos, customer_info, &row, allocator);
+        break :cid row.id;
+    };
+    {
+        var b = try root.join_rt_order.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("buyer_id", cid);
+        _ = try b.setFieldValue("amount", @as(i64, 10));
+        var row = try b.Save();
+        defer deinitEntity(infos, order_info, &row, allocator);
+    }
+    {
+        // No buyer: the unmatched LEFT row.
+        var b = try root.join_rt_order.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("amount", @as(i64, 20));
+        var row = try b.Save();
+        defer deinitEntity(infos, order_info, &row, allocator);
+    }
+
+    // INNER: one round trip; the target lands in the eager edge field as a
+    // single-element slice; deinitRows releases rows *and* targets (the
+    // testing allocator fails the test on any leak).
+    {
+        var q = root.join_rt_order.Query();
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        var rows = try q.All();
+        defer q.deinitRows(&rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+        const buyer = rows.items[0].edges.buyer.?;
+        try std.testing.expectEqual(@as(usize, 1), buyer.len);
+        try std.testing.expectEqual(cid, buyer[0].id);
+        try std.testing.expectEqualStrings("acme", buyer[0].name);
+    }
+
+    // select subset: the projection scans by its `alias__field` names; the
+    // pk is still there (forced), unselected fields keep zero values.
+    {
+        var q = root.join_rt_order.Query();
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{ .select = &.{"name"} });
+        var rows = try q.All();
+        defer q.deinitRows(&rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+        const buyer = rows.items[0].edges.buyer.?;
+        try std.testing.expectEqualStrings("acme", buyer[0].name);
+        try std.testing.expectEqual(cid, buyer[0].id);
+    }
+
+    // LEFT: the unmatched outer row stays, its eager edge field null; the
+    // matched row is filled as before.
+    {
+        var q = root.join_rt_order.Query();
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .left, .{});
+        var rows = try q.All();
+        defer q.deinitRows(&rows);
+        try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+        for (rows.items) |*o| {
+            if (o.amount == 10) {
+                try std.testing.expect(o.edges.buyer != null);
+                try std.testing.expectEqualStrings("acme", o.edges.buyer.?[0].name);
+            } else {
+                try std.testing.expect(o.edges.buyer == null);
+            }
+        }
+    }
+
+    // IDs() never assembles the join: it answers the keys of every matching
+    // row, including the one INNER would have dropped.
+    {
+        var q = root.join_rt_order.Query();
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        var ids = try q.IDs();
+        defer ids.deinit();
+        try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+    }
+
+    // WithEdge on a join-served head edge is skipped, not re-loaded (§5):
+    // the eager field still holds exactly the joined single target.
+    {
+        var q = root.join_rt_order.Query();
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        _ = try q.WithEdge("buyer");
+        var rows = try q.All();
+        defer q.deinitRows(&rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+        try std.testing.expectEqual(@as(usize, 1), rows.items[0].edges.buyer.?.len);
+    }
+}
+
+test "joinEdge SQL: ForUpdate scopes the PG row lock to the source table (R5)" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const PinCustomer = schema("JoinLockCustomer", .{ .fields = &.{field.String("name")} });
+    const PinOrder = schema("JoinLockOrder", .{
+        .fields = &.{ field.Int("buyer_id"), field.Int("amount") },
+        .edges = &.{edge.From("buyer", PinCustomer).Field("buyer_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ PinCustomer, PinOrder });
+    const infos = graph.types;
+    const order_info = infos[1];
+    const OrderEntity = comptime EntityGenerator(infos, order_info);
+    const OrderQuery = QueryBuilder(infos, order_info, OrderEntity);
+
+    // PostgreSQL: the lock names the (unaliased) source table, never the
+    // joined target.
+    {
+        var mock = JoinMockDriver{ .dialect_value = .postgres };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        _ = q.ForUpdate();
+        const built = try q.buildQuery(order_info.fields.len);
+        defer built.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, built.sql, " FOR UPDATE OF \"join_lock_order\"") != null);
+    }
+    // A caller-supplied `OF` wins over the automatic one.
+    {
+        var mock = JoinMockDriver{ .dialect_value = .postgres };
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        _ = q.ForUpdateWith(.{ .of = "custom" });
+        const built = try q.buildQuery(order_info.fields.len);
+        defer built.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, built.sql, " FOR UPDATE OF \"custom\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, built.sql, " OF \"join_lock_order\"") == null);
+    }
+    // SQLite and MySQL keep the plain suffix (`writeLockSuffix` emits OF on
+    // PostgreSQL only) — unchanged behaviour, join or not.
+    {
+        var mock = JoinMockDriver{};
+        var q = OrderQuery.init(allocator, mock.asDriver(), null);
+        defer q.deinit();
+        _ = try q.joinEdge("buyer", .inner, .{});
+        _ = q.ForUpdate();
+        const built = try q.buildQuery(order_info.fields.len);
+        defer built.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, built.sql, " FOR UPDATE OF ") == null);
+        try std.testing.expect(std.mem.endsWith(u8, built.sql, " FOR UPDATE"));
+    }
+}
+
+test "joinEdge assembly unwinds cleanly when any single allocation fails" {
+    // The assembly allocates per call: the entry's alias strings and scan
+    // maps, the widened projection, the scratch qualifier buffer, the target
+    // scope list and the LEFT join's ON slices. Each one failing in turn must
+    // unwind without stranding any of the others.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const mixin = @import("../core/mixin.zig");
+    const buildGraph = @import("graph.zig").buildGraph;
+    const EntityGenerator = @import("entity.zig").Entity;
+
+    const SweepCustomer = schema("JoinSweepCustomer", .{
+        .fields = &.{field.String("name")},
+        .mixins = &.{mixin.SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const SweepOrder = schema("JoinSweepOrder", .{
+        .fields = &.{ field.Int("buyer_id"), field.Int("amount") },
+        .edges = &.{edge.From("sweeper", SweepCustomer).Field("buyer_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ SweepCustomer, SweepOrder });
+    const infos = graph.types;
+    const order_info = infos[1];
+    const OrderEntity = comptime EntityGenerator(infos, order_info);
+    const OrderQuery = QueryBuilder(infos, order_info, OrderEntity);
+
+    try std.testing.checkAllAllocationFailures(allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            var mock = JoinMockDriver{};
+            var q = OrderQuery.init(a, mock.asDriver(), null);
+            defer q.deinit();
+            _ = try q.joinEdge("sweeper", .left, .{ .alias = "sw" });
+            const built = try q.buildQuery(order_info.fields.len);
+            built.deinit();
+        }
+    }.run, .{});
 }
