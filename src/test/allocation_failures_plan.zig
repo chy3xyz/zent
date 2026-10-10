@@ -855,6 +855,12 @@ const outbox_pending_rows = [_]StubRow{
 const OutboxStub = struct {
     rows: []const StubRow = &.{},
     driver_dialect: dialect.Dialect = .sqlite,
+    /// What `exec` answers. Defaults are the "one row written, no key to
+    /// report" shape the read paths assume; the write paths below raise
+    /// `exec_last_insert_id` for the MySQL create branch, which reads the key
+    /// from the driver's report rather than from a RETURNING row.
+    exec_rows_affected: usize = 1,
+    exec_last_insert_id: ?i64 = null,
     cursor: Cursor = .{ .rows = &.{} },
     tx_begun: bool = false,
     tx_committed: bool = false,
@@ -908,8 +914,9 @@ const OutboxStub = struct {
     }
 };
 
-fn outboxStubExec(_: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const sql.Value) driver.Error!driver.Result {
-    return .{ .rows_affected = 1, .last_insert_id = null };
+fn outboxStubExec(ptr: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const sql.Value) driver.Error!driver.Result {
+    const self: *OutboxStub = @ptrCast(@alignCast(ptr));
+    return .{ .rows_affected = self.exec_rows_affected, .last_insert_id = self.exec_last_insert_id };
 }
 
 fn outboxStubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, _: []const u8, _: []const sql.Value) driver.Error!driver.Rows {
@@ -1010,6 +1017,317 @@ test "outbox.claim (MySQL transaction shape) unwinds cleanly when any single all
         ClaimTx.run,
         .{ OutboxDriverClient{ .driver = stub.asDriver() }, &stub },
     );
+}
+
+// ------------------------------------------------------------------
+// (f) the outbox write paths
+// ------------------------------------------------------------------
+//
+// `enqueue`, `markPublished` / `markFailed` / `requeue`, `requeueStale` and
+// `dispatch` are the write half of the outbox. Unlike the read paths above,
+// every allocation they make goes through the *generated builder's* allocator
+// — `CreateBuilder.saveInternal`'s `InsertBuilder.initCapacity`
+// (`codegen/create.zig:396`, `:497`), the entity `UpdateBuilder`'s
+// `sql.UpdateBuilder.initCapacity` (`codegen/update_delete.zig:748`) and
+// `requeueStale`'s own `UpdateBuilder.initCapacity` (`src/outbox.zig:276`) —
+// which is the client's allocator, not the `allocator` argument the outbox
+// entry points carry (three of them ignore that argument entirely). So the
+// client has to be built *inside* the swept run, on the failing allocator;
+// building it outside would leave the ledger empty and the sweep vacuous.
+//
+// Until `initCapacity` existed those call sites went through the
+// OOM-swallowing `InsertBuilder.init` / `UpdateBuilder.init` factories, whose
+// empty fallback lists re-raised the failure on the next append — which is
+// why the swallow was invisible in these sweeps and why the preallocation
+// itself could not be failed. With the fallible constructors the two
+// preallocations (`Builder.initCapacity`'s SQL buffer and args array) are
+// counted points, and a failure there unwinds through the builder's own
+// `errdefer`.
+//
+// No hooks and no interceptors are registered: an interceptor collapses a
+// failing chain into `error.InterceptFailed` (`runInterceptors`' documented
+// contract), and a failing *after*-hook is swallowed with a warn, so either
+// would turn an injected `OutOfMemory` into a different, non-OOM outcome and
+// the sweep would report it as a defect rather than covering one.
+//
+// The `enqueue` case found a real leak on its first run: `saveInternal` built
+// `entity` and filled it field by field after the statement, but the caller
+// only receives it through `return entity`, so a failure in the field-copy
+// loop (or the junction inserts after it) stranded every string already duped
+// into the row plus its JSON arena. The sweep failed at `fail_index 17/20`
+// with 7 bytes outstanding — the first field's `product` — and the fix is the
+// `errdefer deinitEntity(…)` now sitting at `codegen/create.zig:375`.
+
+/// Sweep `run` over every allocation point, after proving it has one.
+///
+/// `checkAllAllocationFailures` fails silently on a run that makes *no*
+/// allocation: it counts zero points, loops zero times and passes. The write
+/// paths above are exactly where that trap sits — a case that built its client
+/// on the backing allocator would cover nothing while looking green. The probe
+/// run below trips that before the sweep starts.
+fn sweepRun(comptime run: anytype, args: anytype) !void {
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try @call(.auto, run, .{probe.allocator()} ++ args);
+    try std.testing.expect(probe.alloc_index > 0);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, run, args);
+}
+
+/// The row the `RETURNING "id"` path of `CreateBuilder.saveInternal` reads
+/// back: one integer column, the inserted primary key. `enqueue` returns it.
+const outbox_returning_row = [_]StubRow{
+    .{ .int = &.{42} },
+};
+
+/// Two `RETURNING "id"` rows, the wide shape `BulkInsertBuilder.saveInternal`
+/// reads when a chunk inserted two rows.
+const outbox_bulk_returning_rows = [_]StubRow{
+    .{ .int = &.{1} },
+    .{ .int = &.{2} },
+};
+
+test "outbox.enqueue (RETURNING shape) unwinds cleanly when any single allocation fails" {
+    // The RETURNING branch of `saveInternal`: the generated `Create`,
+    // `setFieldValue`'s value list, the INSERT's own columns/rows, `takeQuery`
+    // and the `RETURNING` suffix buffer, then the entity's field copies. A
+    // failure anywhere has to release the builder and leave `deinitEntity` the
+    // only remaining owner of the row.
+    var stub = OutboxStub{ .rows = &outbox_returning_row, .driver_dialect = .sqlite };
+
+    const Enqueue = struct {
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            const id = try OutboxOps.enqueue(client, 1000, .{
+                .aggregate_type = "product",
+                .aggregate_id = 1,
+                .event_type = "product.created",
+                .payload = "{\"id\":1}",
+            });
+            try std.testing.expectEqual(@as(i64, 42), id);
+        }
+    };
+    try sweepRun(Enqueue.run, .{&stub});
+}
+
+test "outbox.enqueue (MySQL key shape) unwinds cleanly when any single allocation fails" {
+    // MySQL has no `RETURNING`, so `saveInternal` takes its other branch: the
+    // same builder assembly, then `driver.exec` and the key read out of the
+    // driver's `last_insert_id` report. The pre-check, the statement and the
+    // entity assembly are the same; what differs is the tail the sweep now
+    // covers on both sides.
+    var stub = OutboxStub{ .driver_dialect = .mysql, .exec_last_insert_id = 42 };
+
+    const Enqueue = struct {
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            const id = try OutboxOps.enqueue(client, 1000, .{
+                .aggregate_type = "product",
+                .aggregate_id = 1,
+                .event_type = "product.created",
+                .payload = "{\"id\":1}",
+            });
+            try std.testing.expectEqual(@as(i64, 42), id);
+        }
+    };
+    try sweepRun(Enqueue.run, .{&stub});
+}
+
+test "outbox bulk insert (RETURNING shape) unwinds cleanly when any single allocation fails" {
+    // `BulkInsertBuilder.saveInternal`'s assembly: the batch's own list of
+    // rows, the per-row `Value` lists, the shared `columns` list, the flattened
+    // `chunk_values` buffer and the `MultiInsert` statement with its RETURNING
+    // tail, then the id list. One chunk, two rows, so the sweep walks the
+    // multi-row path rather than the single-row one.
+    var stub = OutboxStub{ .rows = &outbox_bulk_returning_rows, .driver_dialect = .sqlite };
+
+    const Bulk = struct {
+        /// `init` already parks one empty row, so the first row is filled
+        /// without a `Next()`; `Next()` starts the second.
+        fn setRow(b: anytype) !void {
+            _ = try b.setFieldValue("aggregate_type", "product");
+            _ = try b.setFieldValue("aggregate_id", 1);
+            _ = try b.setFieldValue("event_type", "product.created");
+            _ = try b.setFieldValue("payload", "{\"id\":1}");
+            _ = try b.setFieldValue("status", "pending");
+            _ = try b.setFieldValue("attempts", 0);
+            _ = try b.setFieldValue("created_at", 1000);
+            _ = try b.setFieldValue("published_at", 0);
+        }
+
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            var b = try client.outbox_message.BulkInsert();
+            defer b.deinit();
+            try setRow(&b);
+            _ = try b.Next();
+            try setRow(&b);
+            var ids = try b.Save();
+            defer ids.deinit();
+            try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+            try std.testing.expectEqual(@as(i64, 1), ids.items[0]);
+            try std.testing.expectEqual(@as(i64, 2), ids.items[1]);
+        }
+    };
+    try sweepRun(Bulk.run, .{&stub});
+}
+
+test "outbox bulk insert (MySQL per-row shape) unwinds cleanly when any single allocation fails" {
+    // MySQL's bulk path sends one single-row `MultiInsert` per row and reads
+    // each id from that statement's `last_insert_id` — the branch that refuses
+    // the `base + i` fabrication. The stub answers the same key for every row
+    // (it has one fixed `exec` result), which is enough for the ledger: what
+    // the sweep covers is the per-row builder/statement/append teardown.
+    var stub = OutboxStub{ .driver_dialect = .mysql, .exec_last_insert_id = 42 };
+
+    const Bulk = struct {
+        fn setRow(b: anytype) !void {
+            _ = try b.setFieldValue("aggregate_type", "product");
+            _ = try b.setFieldValue("aggregate_id", 1);
+            _ = try b.setFieldValue("event_type", "product.created");
+            _ = try b.setFieldValue("payload", "{\"id\":1}");
+            _ = try b.setFieldValue("status", "pending");
+            _ = try b.setFieldValue("attempts", 0);
+            _ = try b.setFieldValue("created_at", 1000);
+            _ = try b.setFieldValue("published_at", 0);
+        }
+
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            var b = try client.outbox_message.BulkInsert();
+            defer b.deinit();
+            try setRow(&b);
+            _ = try b.Next();
+            try setRow(&b);
+            var ids = try b.Save();
+            defer ids.deinit();
+            try std.testing.expectEqual(@as(usize, 2), ids.items.len);
+            try std.testing.expectEqual(@as(i64, 42), ids.items[0]);
+            try std.testing.expectEqual(@as(i64, 42), ids.items[1]);
+        }
+    };
+    try sweepRun(Bulk.run, .{&stub});
+}
+
+test "outbox.markPublished unwinds cleanly when any single allocation fails" {
+    // The entity `Update` path (`update_delete.zig:748`): three SET values, one
+    // WHERE predicate, the `UpdateBuilder.initCapacity` preallocation and the
+    // rendered statement. `claimed_at` is set to NULL, so an optional field's
+    // value travels through the same list as the two strings.
+    var stub = OutboxStub{};
+
+    const Mark = struct {
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            try OutboxOps.markPublished(swept, client, 7, 2000);
+        }
+    };
+    try sweepRun(Mark.run, .{&stub});
+}
+
+test "outbox.markFailed unwinds cleanly when any single allocation fails" {
+    // Same entity UPDATE as `markPublished` with a different SET list
+    // (`status`, the integer `attempts`, `claimed_at`), so the value shapes and
+    // the arg list it renders are a second, independent pass.
+    var stub = OutboxStub{};
+
+    const Mark = struct {
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            try OutboxOps.markFailed(swept, client, 7, 4);
+        }
+    };
+    try sweepRun(Mark.run, .{&stub});
+}
+
+test "outbox.requeue unwinds cleanly when any single allocation fails" {
+    var stub = OutboxStub{};
+
+    const Mark = struct {
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            try OutboxOps.requeue(swept, client, 7, 4);
+        }
+    };
+    try sweepRun(Mark.run, .{&stub});
+}
+
+test "outbox.requeueStale unwinds cleanly when any single allocation fails" {
+    // `requeueStale` owns its `UpdateBuilder` outright (`src/outbox.zig:276`):
+    // two SET values, the `status` predicate, and — below `older_than_secs >
+    // 0` — the OR of `claimed_at IS NULL` and `claimed_at < cutoff`, whose two
+    // borrowed predicate leaves have to stay alive until the statement is
+    // rendered. The age branch is live here (`300`), which is the shape the
+    // sweeper actually runs.
+    var stub = OutboxStub{};
+
+    const RequeueStale = struct {
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            const n = try OutboxOps.requeueStale(swept, client, 300);
+            try std.testing.expectEqual(@as(usize, 1), n);
+        }
+    };
+    try sweepRun(RequeueStale.run, .{&stub});
+}
+
+test "outbox.dispatch (success path) unwinds cleanly when any single allocation fails" {
+    // The whole at-least-once loop over a claimed batch: `claim`'s row reader
+    // (the fixture rows through `collectRows`), then one `markPublished` per
+    // entry — the entity UPDATE again, now driven from a loop whose frame also
+    // owns the claimed slice. The publisher succeeds, so the tail under test is
+    // the publish-and-mark half.
+    var stub = OutboxStub{ .rows = &outbox_claim_rows, .driver_dialect = .sqlite };
+
+    const Dispatch = struct {
+        fn publish(_: ?*anyopaque, _: outbox_mod.Entry) anyerror!void {}
+
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            const n = try OutboxOps.dispatch(swept, client, 3000, .{ .call = publish }, 10, 3);
+            try std.testing.expectEqual(@as(usize, 2), n);
+        }
+    };
+    try sweepRun(Dispatch.run, .{&stub});
+}
+
+test "outbox.dispatch (retry path) unwinds cleanly when any single allocation fails" {
+    // The failure half of the same loop: every publish fails, so each entry is
+    // requeued with an incremented attempt count and the per-row error never
+    // leaves the loop. `dispatched` stays 0 and the claimed slice is freed on
+    // every unwind of the requeue that follows it.
+    var stub = OutboxStub{ .rows = &outbox_claim_rows, .driver_dialect = .sqlite };
+
+    const Dispatch = struct {
+        fn publish(_: ?*anyopaque, _: outbox_mod.Entry) anyerror!void {
+            return error.PublisherDown;
+        }
+
+        fn run(child: std.mem.Allocator, s: *OutboxStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+            const client = codegen.makeClient(outbox_infos, swept, s.asDriver());
+            const n = try OutboxOps.dispatch(swept, client, 3000, .{ .call = publish }, 10, 3);
+            try std.testing.expectEqual(@as(usize, 0), n);
+        }
+    };
+    try sweepRun(Dispatch.run, .{&stub});
 }
 
 // ------------------------------------------------------------------

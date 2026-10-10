@@ -137,8 +137,9 @@ fn buildM2MAddQuery(
     target_id: i64,
     preds: []const sql.Predicate,
 ) !sql.OwnedQuery {
-    var ib = sql.InsertOrIgnore(allocator, dialect, step.edge_table);
+    var ib = try sql.InsertBuilder.initCapacity(allocator, dialect, step.edge_table);
     defer ib.deinit();
+    ib.or_ignore = true;
     _ = try ib.columns(&.{ step.sourcePK(), step.targetPK() });
     var items = [_]sql.SelectItem{
         .{ .column = step.from_column },
@@ -167,7 +168,7 @@ fn buildM2MRemoveQuery(
     var vals = try allocator.alloc(sql.Value, ids.len);
     defer allocator.free(vals);
     for (ids, 0..) |id, i| vals[i] = .{ .int = id };
-    var db = sql.Delete(allocator, dialect, step.edge_table);
+    var db = try sql.DeleteBuilder.initCapacity(allocator, dialect, step.edge_table);
     defer db.deinit();
     _ = try db.where(sql.In(step.targetPK(), vals));
     _ = try db.where(sql.InSelect(step.sourcePK(), source_table, step.from_column, preds));
@@ -182,7 +183,7 @@ fn buildM2MClearQuery(
     source_table: []const u8,
     preds: []const sql.Predicate,
 ) !sql.OwnedQuery {
-    var db = sql.Delete(allocator, dialect, step.edge_table);
+    var db = try sql.DeleteBuilder.initCapacity(allocator, dialect, step.edge_table);
     defer db.deinit();
     _ = try db.where(sql.InSelect(step.sourcePK(), source_table, step.from_column, preds));
     return db.takeQuery();
@@ -199,7 +200,7 @@ fn buildTargetDetachQuery(
     target_soft_delete: bool,
     preds: []const sql.Predicate,
 ) !sql.OwnedQuery {
-    var ub = sql.Update(allocator, dialect, step.to_table);
+    var ub = try sql.UpdateBuilder.initCapacity(allocator, dialect, step.to_table);
     defer ub.deinit();
     _ = try ub.set(step.edge_columns[0], .null);
     _ = try ub.where(sql.InSelect(step.edge_columns[0], source_table, step.from_column, preds));
@@ -225,7 +226,7 @@ fn buildTargetAttachQuery(
     var vals = try allocator.alloc(sql.Value, ids.len);
     defer allocator.free(vals);
     for (ids, 0..) |id, i| vals[i] = .{ .int = id };
-    var ub = sql.Update(allocator, dialect, step.to_table);
+    var ub = try sql.UpdateBuilder.initCapacity(allocator, dialect, step.to_table);
     defer ub.deinit();
     _ = try ub.setSubquery(step.edge_columns[0], source_table, step.from_column, preds);
     _ = try ub.where(sql.In(step.to_column, vals));
@@ -744,7 +745,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
             }
             const version_locked = version_field != null and version_old_value != null;
 
-            var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
+            var builder = try sql.UpdateBuilder.initCapacity(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
 
             if (version_field) |vf| {
@@ -1077,7 +1078,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             // restore the same way they reach every other write — this was the
             // one write path that never ran the chain.
             try self.runInterceptors(.update);
-            var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
+            var builder = try sql.UpdateBuilder.initCapacity(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .null);
             _ = try builder.where(sql.EQ(pkColumn(info), .{ .int = id }));
@@ -1148,7 +1149,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
 
             // Get current timestamp (seconds since epoch)
             const now: i64 = @intCast(time(null));
-            var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
+            var builder = try sql.UpdateBuilder.initCapacity(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .{ .int = now });
 
@@ -1266,7 +1267,7 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             };
             const version_locked = version_field != null and self.version_value != null;
 
-            var builder = sql.Delete(self.allocator, self.driver.dialect(), info.table_name);
+            var builder = try sql.DeleteBuilder.initCapacity(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
 
             if (version_field) |vf| {
@@ -1335,6 +1336,10 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         execution_context: sql_driver.ExecutionContext = .{},
 
         pub fn init(allocator: std.mem.Allocator, driver: sql_driver.Driver, hooks: []const Hook, privacy_ctx: ?privacy.PrivacyContext) Self {
+            // The swallowing constructor, not its fallible twin: this signature
+            // cannot fail — `client.<entity>.BulkUpdate()` calls it without
+            // `try`. `sql.BulkUpdateBuilder.initCapacity` is the shape a
+            // fallible caller (or a sweep) needs.
             var b = sql.BulkUpdateBuilder.init(allocator, driver.dialect(), info.table_name);
             b.id_column = pkColumn(info);
             return .{
@@ -1682,7 +1687,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
             var total: usize = 0;
             for (self.b.groups.items) |g| {
                 if (g.items.len == 0) continue;
-                var builder = sql.Update(self.allocator, self.driver.dialect(), info.table_name);
+                var builder = try sql.UpdateBuilder.initCapacity(self.allocator, self.driver.dialect(), info.table_name);
                 defer builder.deinit();
                 _ = try builder.setExpr("deleted_at", epochExpr(self.driver.dialect()));
                 for (g.items) |p| {

@@ -1421,12 +1421,13 @@ test "MySQL: an ALTER ADD COLUMN that would be errno 1101 is refused before it i
     const before_graph = comptime buildGraph(&.{BeforeBase});
     try migrate.migrateSchema(allocator, drv.asDriver(), before_graph.types);
 
-    // `field.Text` is TEXT on MySQL (only `String`/`Enum` are VARCHAR(255)),
-    // and MySQL refuses a DEFAULT on it — so the ADD COLUMN this schema asks
-    // for is errno 1101. The refusal is zent's own error, raised client-side
-    // before the statement is sent, which is why it is the same on MySQL and
-    // on MariaDB (whose 10.2+ *does* allow a TEXT default — the guard is
-    // deliberately the stricter of the two servers' rules).
+    // `field.Text` is TEXT on MySQL (only `String`/`Enum` are VARCHAR(255)).
+    // MySQL refuses a DEFAULT on it — errno 1101 — so the ADD COLUMN this
+    // schema asks for is refused by zent client-side, before the statement is
+    // sent. MariaDB >= 10.2.1 *does* allow a TEXT default, and the migration
+    // identifies the server from `SELECT VERSION()` before generating DDL, so
+    // there the same ALTER is emitted and lands. The two servers genuinely
+    // differ, so the branch below asserts one answer each.
     const AfterBase = schema("MyAlterGuard", .{
         .fields = &.{
             field.String("name"),
@@ -1434,6 +1435,31 @@ test "MySQL: an ALTER ADD COLUMN that would be errno 1101 is refused before it i
         },
     });
     const after_graph = comptime buildGraph(&.{AfterBase});
+
+    if (try isMariaDB(&drv)) {
+        // The dry run plans the ALTER instead of printing SQL the server would
+        // reject: the preview and the run share one server identification, so
+        // this is the same classification the migration below reaches.
+        try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), after_graph.types, migrate.MigrateOptions{ .dry_run = true });
+
+        try migrate.migrateSchema(allocator, drv.asDriver(), after_graph.types);
+
+        // The column is there and carries the declared default. MariaDB
+        // reports `column_default` as the literal expression text (`'none'`),
+        // MySQL 8+ without the quoting — so the assertion looks for the value
+        // inside whatever text the catalog returns, which holds on both.
+        var added = try drv.query(
+            "SELECT column_default FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+            &.{ .{ .string = "my_alter_guard" }, .{ .string = "body" } },
+        );
+        defer added.deinit();
+        const added_row = added.next() orelse return error.NoRow;
+        const default_text = added_row.getText(0) orelse return error.NoRow;
+        try testing.expect(std.mem.indexOf(u8, default_text, "none") != null);
+        try testing.expect(added.next() == null);
+        return;
+    }
+
     try testing.expectError(
         error.MySQLTextColumnCannotHaveDefault,
         migrate.migrateSchema(allocator, drv.asDriver(), after_graph.types),
@@ -1449,12 +1475,9 @@ test "MySQL: an ALTER ADD COLUMN that would be errno 1101 is refused before it i
     const row = rows.next() orelse return error.NoRow;
     try testing.expectEqual(@as(i64, 0), row.getInt(0).?);
 
-    // The dry run answers the same way, and it does so through the CREATE-side
-    // guard: it prints the CREATE TABLE this schema would need, and that
-    // statement carries the same DEFAULT. (It emits no ALTER at all — see the
-    // note on `MigrateOptions.dry_run` — so this is the only guard it can
-    // reach, and the point here is that it reaches one instead of printing SQL
-    // the server would reject.)
+    // The dry run answers the same way — through the ALTER this run would take
+    // (the table already exists; only the column is missing), so the guard the
+    // preview reaches is the same one the run would.
     try testing.expectError(
         error.MySQLTextColumnCannotHaveDefault,
         migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), after_graph.types, migrate.MigrateOptions{ .dry_run = true }),
@@ -1620,10 +1643,11 @@ test "MySQL: dry-run fails closed on a TEXT DEFAULT in ALTER like the real path"
     const graph_v1 = comptime buildGraph(&.{V1});
     try migrate.migrateSchema(allocator, drv.asDriver(), graph_v1.types);
 
-    // V2 adds a TEXT column with a DEFAULT — a shape MySQL rejects, which
-    // must be diagnosed at generation time on BOTH paths, never printed or
-    // executed. The guard is a pure function of the schema, so this holds on
-    // MariaDB too.
+    // V2 adds a TEXT column with a DEFAULT — a shape MySQL rejects and
+    // MariaDB >= 10.2.1 accepts. The migration identifies the server before
+    // generating DDL, so the branch below asserts one answer per server; what
+    // must hold on both is that the preview and the run agree, because they
+    // plan through the same diff.
     const V2 = schema("MyDrText", .{
         .fields = &.{
             field.String("name"),
@@ -1631,6 +1655,22 @@ test "MySQL: dry-run fails closed on a TEXT DEFAULT in ALTER like the real path"
         },
     });
     const graph_v2 = comptime buildGraph(&.{V2});
+
+    if (try isMariaDB(&drv)) {
+        // Dry run first, while the column really is missing, so it plans — and
+        // emits — the ALTER the run then executes.
+        try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), graph_v2.types, migrate.MigrateOptions{ .dry_run = true });
+        try migrate.migrateSchemaWithOptions(allocator, drv.asDriver(), graph_v2.types, .{});
+
+        var added = try drv.query(
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'my_dr_text' AND table_schema = DATABASE() AND column_name = 'body'",
+            &.{},
+        );
+        defer added.deinit();
+        const added_row = added.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 1), added_row.getInt(0).?);
+        return;
+    }
 
     try testing.expectError(
         error.MySQLTextColumnCannotHaveDefault,

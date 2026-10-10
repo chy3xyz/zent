@@ -366,6 +366,13 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
             // std.json.Value field (std rejects zeroing Value); zeroInit
             // handles that (Value fields default to .null).
             var entity: Entity = @import("../sql/scan.zig").zeroInit(Entity);
+            // The statement has run by the time the row is filled, and the
+            // caller only receives `entity` on success (`return entity` at the
+            // end) — so a failure in the field-copy loop below, or in the
+            // junction inserts after it, would strand every string already
+            // duped into the row, plus its JSON arena, with no owner left to
+            // release them. On success this guard is disarmed by the return.
+            errdefer @import("entity.zig").deinitEntity(infos, info, &entity, entity_alloc);
             if (supports_returning) {
                 // A textual (uuid) primary key has no source but the caller's
                 // own value here too — RETURNING only hands back what the
@@ -381,12 +388,17 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 if (comptime @FieldType(Entity, info.pk_field) != i64) {
                     if (textPrimaryKeyFrom(self.values.items, info.pk_field) == null) return error.MissingPrimaryKey;
                 }
-                var builder = if (or_replace and is_sqlite and self.upsert_set_exprs == null)
-                    sql.InsertOrReplace(self.allocator, dialect, info.table_name)
-                else if (ignore_conflicts and is_sqlite)
-                    sql.InsertOrIgnore(self.allocator, dialect, info.table_name)
-                else
-                    sql.Insert(self.allocator, dialect, info.table_name);
+                // The fallible constructor, not the `Insert`/`InsertOrReplace`
+                // factories: those keep `Builder.init`'s swallowed
+                // preallocation for their infallible signatures, while `Save`
+                // can propagate it. The mode flags are the ones the factories
+                // set.
+                var builder = try sql.InsertBuilder.initCapacity(self.allocator, dialect, info.table_name);
+                if (or_replace and is_sqlite and self.upsert_set_exprs == null) {
+                    builder.or_replace = true;
+                } else if (ignore_conflicts and is_sqlite) {
+                    builder.or_ignore = true;
+                }
                 defer builder.deinit();
                 _ = try builder.columns(columns.items);
                 _ = try builder.values(args.items);
@@ -482,10 +494,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 if (comptime @FieldType(Entity, info.pk_field) != i64) {
                     if (textPrimaryKeyFrom(self.values.items, info.pk_field) == null) return error.MissingPrimaryKey;
                 }
-                var builder = if (ignore_conflicts)
-                    sql.InsertOrIgnore(self.allocator, dialect, info.table_name)
-                else
-                    sql.Insert(self.allocator, dialect, info.table_name);
+                var builder = try sql.InsertBuilder.initCapacity(self.allocator, dialect, info.table_name);
+                if (ignore_conflicts) builder.or_ignore = true;
                 defer builder.deinit();
                 _ = try builder.columns(columns.items);
                 _ = try builder.values(args.items);
@@ -607,7 +617,7 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                             // generated SQL has the correct placeholders
                             // ($1, $2 for PG; ?, ? for SQLite/MySQL) and
                             // identifier quoting (` for MySQL, " otherwise).
-                            var ib = sql.Insert(self.allocator, self.driver.dialect(), ji.junction_table);
+                            var ib = try sql.InsertBuilder.initCapacity(self.allocator, self.driver.dialect(), ji.junction_table);
                             defer ib.deinit();
                             _ = try ib.columns(&.{ ji.source_col, ji.target_col });
                             _ = try ib.values(&.{
@@ -1199,10 +1209,11 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         /// fields in the same order. A row that does not is rejected with
         /// `error.InconsistentRowFields` *before* any statement runs: the values
         /// of such a row are flattened in its own order, so a row missing a
-        /// field would leave allocator-fill bytes bound as its value, an extra
-        /// field would run past the flattened buffer, and the length check in
-        /// `sql.MultiInsert` would hold throughout. The batch is not written and
-        /// the row index is reported in a `warn`.
+        /// field would leave allocator-fill bytes bound as its value and an extra
+        /// field would run past the flattened buffer — that buffer is sized from
+        /// the column list, not from the rows, so neither mismatch is caught
+        /// further down. The batch is not written and the row index is reported
+        /// in a `warn`.
         pub fn Save(self: *Self) SaveError!std.array_list.Managed(i64) {
             return self.saveInternal(false, null);
         }
@@ -1281,11 +1292,10 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
             // own order, so a row that disagrees does not fail anywhere: its
             // values are bound to the wrong columns, a row missing a field
             // leaves the tail of its flattened values at allocator-fill bytes
-            // (`0xaa` under `std.testing.allocator`), an extra field runs past
-            // the flattened buffer, and `MultiInsert`'s
-            // `values.len == columns.len * row_count` holds in every one of
-            // those cases. A batch that would be written wrong is not written
-            // at all.
+            // (`0xaa` under `std.testing.allocator`), and an extra field runs
+            // past the flattened buffer, which is sized from the column list
+            // rather than from the rows. A batch that would be written wrong is
+            // not written at all.
             //
             // Compared **by position, not as a set**: rows holding the same
             // fields in a different order bind just as wrongly, so a set
@@ -2173,10 +2183,10 @@ test "bulk insert: a row that names different fields is rejected, and nothing is
 
     // Row 0 sets (name, age); row 1 sets `age` only. The batch is one INSERT
     // with row 0's column list, so `25` would be bound to the `name` column and
-    // the allocator-fill bytes behind the flattened values to `age` — the
-    // statement's own length check (`columns.len * row_count == values.len`)
-    // would still hold, because the buffer it reads is allocated for the column
-    // list, not sized by what the rows actually set.
+    // the allocator-fill bytes behind the flattened values to `age` — and the
+    // statement it would become carries no check that tells the two apart,
+    // because the buffer it reads is allocated for the column list, not sized
+    // by what the rows actually set.
     var short_row = IdScriptDriver{ .script = &.{ 1, 2 } };
     defer short_row.freeCapture();
     var b = try BulkBuilder.init(std.testing.allocator, short_row.asDriver(), &.{}, null);

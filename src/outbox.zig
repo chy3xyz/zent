@@ -273,7 +273,7 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             const d = @field(client, "driver");
             const table = outbox_info.table_name;
 
-            var b = sql.Update(allocator, d.dialect(), table);
+            var b = try sql.UpdateBuilder.initCapacity(allocator, d.dialect(), table);
             defer b.deinit();
             _ = try b.set("status", .{ .string = Status.pending });
             _ = try b.set("claimed_at", .null);

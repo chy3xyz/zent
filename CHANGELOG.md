@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Fallible twins for the four remaining builder constructors.**
+  `InsertBuilder.initCapacity`, `UpdateBuilder.initCapacity`,
+  `DeleteBuilder.initCapacity` and `BulkUpdateBuilder.initCapacity` (same
+  `256`/`8` capacities as their `init`) let a caller see an allocation failure
+  instead of having it swallowed, and every internal production site moved
+  onto them: the INSERT assembly (`create.zig`, both the RETURNING and MySQL
+  branches, plus the junction insert), the UPDATE/DELETE/edge-write assembly
+  (`update_delete.zig`, ten sites), `outbox.requeueStale`, and `MultiInsert`
+  itself. The infallible `init`s and the `Insert`/`Update`/`Delete` factories
+  are unchanged — making them fallible is a consumer-visible break, which is
+  also why the *generated* `client.<entity>.BulkUpdate()` stays out of the
+  sweep for now. Outbox write paths are now modellable, and eleven new sweep
+  cases cover them (below).
+- **`SQLiteDriver` can parse text numerics instead of coercing**
+  (`.strict_numeric_text`, off by default): see the fix note — an i64 DTO
+  field over a `Decimal`(TEXT) column can now fail loudly on SQLite the way it
+  already does on PostgreSQL and MySQL.
+- **The migration can tell MySQL and MariaDB apart.** It reads `SELECT
+  VERSION()` once per migration and lets MariaDB keep a `DEFAULT` on a
+  `TEXT`/`BLOB` column (allowed since MariaDB 10.2.1) while MySQL keeps the
+  errno-1101 refusal. A failed probe falls back to the MySQL rule and warns;
+  the DDL-only entry points (no connection) stay strict; a schema without any
+  text default never probes at all, which keeps the sweep stubs' statement
+  models intact.
+
+### Fixed
+
+- **`CreateBuilder.saveInternal` leaked the row it had just built.** The
+  post-insert field copies (strings, JSON arena) had no `errdefer`, so an OOM
+  while copying — or in the junction insert after them — stranded everything
+  copied so far. The entity is now guarded from its first field onward
+  (`errdefer deinitEntity(…)`, disarmed by the successful `return entity`).
+  The first sweep case for `outbox.enqueue` fails at `fail_index 17/20`
+  without it.
+- **`sql.MultiInsert`'s length assertion was deleted.** It asserted the flat
+  `values` buffer's total size, which is the one quantity a row-shape mistake
+  leaves intact — it read like the row check while proving nothing about it
+  (that check lives in `codegen/create.zig` as `error.InconsistentRowFields`).
+  Its doc now states the caller's obligation instead, and the three comments
+  citing it are updated.
+
+### Documented
+
+- **The Z16 comptime graph registry is not implementable, and now we know
+  why.** Zig 0.17 has no mutable comptime global state: a container-level
+  `var` cannot be read or written at comptime ("operation is runtime due to
+  this operand"), `comptime var` is a syntax error outside a function body,
+  and a lazily analysed file does not even guarantee a registration statement
+  runs — fifteen experiments, all in `/tmp`, recorded in `OPEN_ITEMS`. The
+  compile-time error keeps the v0.87.0 message and the migration keeps the
+  v0.89.0 warn; the only clean shape for naming the owning graph stays stage
+  2b's explicit pipeline, deferred on ROI as before.
+- `OPEN_ITEMS`: the SQLite coercion row is resolved as an opt-in (the default
+  stays), the MariaDB text-default and `MultiInsert` rows are closed, the sweep
+  row now names the generated-API surface as the only remaining blocker, and
+  `BEST_PRACTICES` §5's DTO matrix documents the switch.
+
 ## [0.89.0] - 2026-10-10
 
 ### Added

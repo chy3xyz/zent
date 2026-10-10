@@ -21,6 +21,12 @@ pub const SQLiteDriver = struct {
     /// requests race. Recursive so a tx body / eager-load recursion can issue
     /// nested statements on the same thread while holding the lock.
     mutex: RecursiveMutex = .{},
+    /// When true, `getInt`/`getFloat` parse a TEXT-affinity column's value
+    /// exactly instead of letting the C API coerce it — `"12.34"` answers null
+    /// for `getInt` rather than `12`. Off by default, which is the historical
+    /// behaviour; see `OpenOptions.strict_numeric_text` for the whole contract
+    /// and for how it is used on a decimal column read into an integer DTO.
+    strict_numeric_text: bool = false,
 
     /// How `open` / `openWithOptions` configure the connection they hand back.
     pub const OpenOptions = struct {
@@ -36,6 +42,39 @@ pub const SQLiteDriver = struct {
         /// and must stay writable — the reason belongs in a comment where it is
         /// set, because nothing downstream can see the difference.
         enforce_foreign_keys: bool = true,
+
+        /// Parse a TEXT-affinity column's value exactly instead of letting
+        /// SQLite's C API coerce it to a number.
+        ///
+        /// **Defaults to false: the historical behaviour, unchanged.**
+        /// `sqlite3_column_int64` over the TEXT value `"12.34"` answers `12` with
+        /// no error — in strict and lenient scans alike. PostgreSQL and MySQL
+        /// parse the text and answer null on a non-number, which the scan layer
+        /// turns into `error.TypeMismatch` (strict) or the field's default
+        /// (lenient); SQLite alone truncated. Since `field.Decimal` is TEXT on
+        /// SQLite (and `field.String` is TEXT everywhere), an i64 DTO field over
+        /// a decimal column silently lost the fraction on SQLite only.
+        ///
+        /// With this on, `getInt`/`getFloat` read such a column as text and parse
+        /// it exactly; a value that is not a number in full answers null, and the
+        /// scan layer already knows what to do with a null — the same thing it
+        /// does on the other two dialects. It is opt-in rather than the default
+        /// because an exact parse turns reads that succeed today into errors, and
+        /// that is a decision for the consumer whose data it is.
+        ///
+        /// What decides is the **declared type** having SQLite's TEXT affinity
+        /// (`TEXT`, `CLOB`, `VARCHAR`, `CHAR`, case-insensitively — the same rule
+        /// SQLite uses to choose the column's affinity) together with the value's
+        /// storage class actually being text. So a column declared `INTEGER`
+        /// reads identically in both modes, and so does any numeric value; a
+        /// result column that is an expression (`SELECT amount + 0`) carries no
+        /// declared type and keeps the coercing read.
+        ///
+        /// Migration path for "DECIMAL column, i64 DTO field": turn this on and
+        /// the read fails loudly on that column instead of truncating, which is
+        /// the signal to give the DTO field the text (or f64) type the column
+        /// actually holds.
+        strict_numeric_text: bool = false,
     };
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !SQLiteDriver {
@@ -65,7 +104,12 @@ pub const SQLiteDriver = struct {
         }
         const default_busy_timeout: c_int = 5000;
         _ = c.sqlite3_busy_timeout(db.?, default_busy_timeout);
-        var drv = SQLiteDriver{ .db = db.?, .allocator = allocator, .default_busy_timeout = default_busy_timeout };
+        var drv = SQLiteDriver{
+            .db = db.?,
+            .allocator = allocator,
+            .default_busy_timeout = default_busy_timeout,
+            .strict_numeric_text = options.strict_numeric_text,
+        };
         if (options.enforce_foreign_keys) {
             drv.enforceForeignKeys() catch |err| {
                 // Fail closed: a connection whose FK switch could not be set is
@@ -789,14 +833,43 @@ const SQLiteRows = struct {
 
     fn getInt(ptr: *anyopaque, index: usize) ?i64 {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
-        if (c.sqlite3_column_type(self.stmt, @intCast(index)) == c.SQLITE_NULL) return null;
-        return c.sqlite3_column_int64(self.stmt, @intCast(index));
+        const idx: c_int = @intCast(index);
+        if (c.sqlite3_column_type(self.stmt, idx) == c.SQLITE_NULL) return null;
+        if (self.driver.strict_numeric_text) {
+            if (self.textForStrictParse(idx)) |text| return parseStrictInt64(text);
+        }
+        return c.sqlite3_column_int64(self.stmt, idx);
     }
 
     fn getFloat(ptr: *anyopaque, index: usize) ?f64 {
         const self: *SQLiteRows = @ptrCast(@alignCast(ptr));
-        if (c.sqlite3_column_type(self.stmt, @intCast(index)) == c.SQLITE_NULL) return null;
-        return c.sqlite3_column_double(self.stmt, @intCast(index));
+        const idx: c_int = @intCast(index);
+        if (c.sqlite3_column_type(self.stmt, idx) == c.SQLITE_NULL) return null;
+        if (self.driver.strict_numeric_text) {
+            if (self.textForStrictParse(idx)) |text| return parseStrictFloat64(text);
+        }
+        return c.sqlite3_column_double(self.stmt, idx);
+    }
+
+    /// The column's value as text when `strict_numeric_text` should parse it
+    /// rather than let the C API convert, or null when the coercing read is the
+    /// right one.
+    ///
+    /// Both halves are needed. The value's storage class must be text — a
+    /// numeric value needs no parse and must not be turned into a string round
+    /// trip — and the column's declared type must have SQLite's TEXT affinity,
+    /// which is what makes the stored bytes text in the first place. A result
+    /// column that is an expression carries no declared type
+    /// (`sqlite3_column_decltype` answers null), so a query that computes a value
+    /// keeps the historical coercion; the columns a scan reads are the table's
+    /// own, and those carry it.
+    fn textForStrictParse(self: *SQLiteRows, idx: c_int) ?[]const u8 {
+        if (c.sqlite3_column_type(self.stmt, idx) != c.SQLITE_TEXT) return null;
+        const decl = c.sqlite3_column_decltype(self.stmt, idx) orelse return null;
+        if (!hasTextAffinity(std.mem.span(decl))) return null;
+        const text = c.sqlite3_column_text(self.stmt, idx) orelse return null;
+        const len = c.sqlite3_column_bytes(self.stmt, idx);
+        return text[0..@intCast(len)];
     }
 
     fn getText(ptr: *anyopaque, index: usize) ?[]const u8 {
@@ -826,6 +899,67 @@ const SQLiteRows = struct {
 
 fn finalizeStmt(_: void, stmt: *c.sqlite3_stmt) void {
     _ = c.sqlite3_finalize(stmt);
+}
+
+/// ASCII whitespace `parseStrictInt64` / `parseStrictFloat64` trim off both
+/// ends of a text value before parsing it.
+///
+/// PostgreSQL's `'  12  '::bigint` and MySQL's `CAST('  12  ' AS SIGNED)`
+/// both accept the spaces, so a text column that was written with padding
+/// must not become a null here — the strict mode exists to stop *silent*
+/// coercion, not to be stricter than the dialects it is matching.
+const numeric_text_whitespace = " \t\n\r\x0b\x0c";
+
+/// Whether a declared column type has SQLite's TEXT affinity: its type name
+/// contains "CHAR", "CLOB" or "TEXT", case-insensitively (the rule in §3.1 of
+/// SQLite's datatype doc). `VARCHAR(255)` qualifies through "CHAR", so a column
+/// declared with the MySQL spelling is parsed here too.
+///
+/// A declaration SQLite itself would give NUMERIC affinity — `DECIMAL`, say —
+/// does **not** qualify, and a numeric read of it keeps the coercing behaviour:
+/// SQLite stores such a value as a number, so the text the strict mode would
+/// parse is not there to begin with. (`field.Decimal` is declared `TEXT` on
+/// SQLite for exactly that reason, and `TEXT` is the shape this switches on.)
+fn hasTextAffinity(declared: []const u8) bool {
+    return std.ascii.findIgnoreCase(declared, "char") != null or
+        std.ascii.findIgnoreCase(declared, "clob") != null or
+        std.ascii.findIgnoreCase(declared, "text") != null;
+}
+
+/// Parse a text value as an i64 only if the whole (trimmed) string is one.
+///
+/// Deliberately stricter than `std.fmt.parseInt`, which ignores `_` digit
+/// separators (`"1_2"` answers 12) — PostgreSQL and MySQL reject that as input,
+/// so accepting it here would be a coercion of exactly the kind the strict mode
+/// is turning off. A leading `+`/`-` is accepted; a decimal point, an exponent,
+/// embedded whitespace, a trailing sign or an empty string are not; a value
+/// outside i64 answers null rather than wrapping.
+///
+/// Null is the same answer PostgreSQL and MySQL give for a non-integer text
+/// value, and it is what the scan layer turns into `error.TypeMismatch` (strict
+/// scans) or the field's default (lenient scans).
+fn parseStrictInt64(text: []const u8) ?i64 {
+    const trimmed = std.mem.trim(u8, text, numeric_text_whitespace);
+    if (trimmed.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, '_') != null) return null;
+    return std.fmt.parseInt(i64, trimmed, 10) catch null;
+}
+
+/// Parse a text value as an f64 only if the whole (trimmed) string is a number
+/// — `std.fmt.parseFloat` already refuses trailing bytes (`"1abc"`), so the
+/// only additions here are the surrounding-whitespace trim and the same `_`
+/// rejection `parseStrictInt64` makes.
+///
+/// What `parseFloat` accepts is what this accepts: `inf`/`infinity`/`nan`
+/// spellings (PostgreSQL's `float8` input takes them too, MySQL's does not) and
+/// a magnitude too large for f64, which saturates to `inf` because `parseFloat`
+/// reports no overflow error. A caller that must not see a non-finite value
+/// checks `std.math.isFinite`.
+fn parseStrictFloat64(text: []const u8) ?f64 {
+    const trimmed = std.mem.trim(u8, text, numeric_text_whitespace);
+    if (trimmed.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, '_') != null) return null;
+    return std.fmt.parseFloat(f64, trimmed) catch null;
 }
 
 /// Same-thread recursive mutex, so a transaction (or eager-load recursion)
@@ -1103,6 +1237,132 @@ test "SQLite: a TEXT numeric value coerces silently in getInt — pinned contrac
     defer rows.deinit();
     try std.testing.expectEqual(@as(i64, 12), rows.next().?.getInt(0).?);
     try std.testing.expect(rows.next() == null);
+}
+
+test "SQLite: strict_numeric_text parses a TEXT-affinity column instead of coercing it" {
+    const allocator = std.testing.allocator;
+
+    // The same table on the same value, opened with the switch on. The default
+    // mode's answer (12) is pinned by the test above and must not move; this is
+    // the opt-in that turns the read into the answer the other two dialects
+    // give — null, which the scan layer knows how to handle.
+    var drv = try SQLiteDriver.openWithOptions(allocator, ":memory:", .{ .strict_numeric_text = true });
+    defer drv.close();
+    const d = drv.asDriver();
+
+    _ = try d.exec("CREATE TABLE t (amount TEXT, n INTEGER, note VARCHAR(10))", &.{});
+    _ = try d.exec("INSERT INTO t (amount, n, note) VALUES ('12.34', 7, '12')", &.{});
+
+    // A non-integer text value is not an integer: null, not the truncated 12.
+    {
+        var rows = try d.query("SELECT amount FROM t", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expect(row.getInt(0) == null);
+        // It is a perfectly good float, though — the strictness is on the
+        // integer parse, not on the value.
+        try std.testing.expectEqual(@as(f64, 12.34), row.getFloat(0).?);
+        try std.testing.expectEqualStrings("12.34", row.getText(0).?);
+    }
+
+    // A value that is an integer in full is one, and the surrounding whitespace
+    // both other dialects trim is accepted (`numeric_text_whitespace`).
+    _ = try d.exec("INSERT INTO t (amount, n, note) VALUES (' 12 ', 0, 'x')", &.{});
+    {
+        var rows = try d.query("SELECT amount FROM t WHERE n = 0", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 12), row.getInt(0).?);
+        try std.testing.expectEqual(@as(f64, 12), row.getFloat(0).?);
+    }
+
+    // An INTEGER column is read the same way in both modes — the declaration
+    // decides, and this one is not text.
+    {
+        var rows = try d.query("SELECT n FROM t WHERE n = 7", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 7), row.getInt(0).?);
+    }
+
+    // `VARCHAR(10)` has TEXT affinity too (SQLite's rule is "the type name
+    // contains CHAR/CLOB/TEXT"), so a MySQL-style declaration is parsed here as
+    // well — the affinity rule, not the exact spelling, decides.
+    {
+        var rows = try d.query("SELECT note FROM t WHERE n = 7", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 12), row.getInt(0).?);
+    }
+
+    // NULL is still NULL, and a text value that is not a number at all answers
+    // null rather than 0.
+    _ = try d.exec("INSERT INTO t (amount, n, note) VALUES ('abc', 0, 'x')", &.{});
+    {
+        var rows = try d.query("SELECT amount FROM t WHERE amount = 'abc'", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expect(row.getInt(0) == null);
+        try std.testing.expect(row.getFloat(0) == null);
+    }
+    _ = try d.exec("INSERT INTO t (amount, n, note) VALUES (NULL, 0, 'x')", &.{});
+    {
+        var rows = try d.query("SELECT amount FROM t WHERE amount IS NULL", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expect(row.getInt(0) == null);
+        try std.testing.expect(row.isNull(0));
+    }
+
+    // A result column that is an expression carries no declared type, so it
+    // keeps the coercing read in both modes (`textForStrictParse`).
+    {
+        var rows = try d.query("SELECT amount || '' FROM t WHERE amount = '12.34'", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 12), row.getInt(0).?);
+    }
+}
+
+test "SQLite: the strict numeric parsers consume a whole number and nothing else" {
+    // Signs, the whitespace both other dialects trim, and plain digits are
+    // numbers.
+    try std.testing.expectEqual(@as(i64, 12), parseStrictInt64("12").?);
+    try std.testing.expectEqual(@as(i64, 12), parseStrictInt64("+12").?);
+    try std.testing.expectEqual(@as(i64, -12), parseStrictInt64("-12").?);
+    try std.testing.expectEqual(@as(i64, 12), parseStrictInt64(" 12 ").?);
+    try std.testing.expectEqual(@as(i64, 12), parseStrictInt64("\t12\n").?);
+    try std.testing.expectEqual(@as(i64, 0), parseStrictInt64("0").?);
+
+    // Anything a text value may carry that is not an integer is null, including
+    // the `_` separator `std.fmt.parseInt` would have accepted as 12.
+    for ([_][]const u8{ "", " ", "+", "-", "12.34", "12.0", "12abc", "1 2", "1_2", "abc", "0x10" }) |bad| {
+        try std.testing.expect(parseStrictInt64(bad) == null);
+    }
+    // Out of range is null rather than a wrapped value.
+    try std.testing.expect(parseStrictInt64("99999999999999999999999") == null);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), parseStrictInt64("-9223372036854775808").?);
+
+    try std.testing.expectEqual(@as(f64, 12.34), parseStrictFloat64("12.34").?);
+    try std.testing.expectEqual(@as(f64, 12), parseStrictFloat64(" 12 ").?);
+    try std.testing.expectEqual(@as(f64, -1500), parseStrictFloat64("-1.5e3").?);
+    try std.testing.expectEqual(@as(f64, 12), parseStrictFloat64("12").?);
+    for ([_][]const u8{ "", " ", ".", "1abc", "1_2.5", "1 2", "12..3" }) |bad| {
+        try std.testing.expect(parseStrictFloat64(bad) == null);
+    }
+    // `parseFloat` accepts these spellings, so the strict parse does too; an
+    // out-of-range magnitude saturates rather than failing.
+    try std.testing.expect(std.math.isNan(parseStrictFloat64("nan").?));
+    try std.testing.expect(std.math.isInf(parseStrictFloat64("inf").?));
+    try std.testing.expect(std.math.isInf(parseStrictFloat64("1e400").?));
+
+    // SQLite's own affinity rule decides which declared types are parsed.
+    for ([_][]const u8{ "TEXT", "text", "CLOB", "CHAR(10)", "VARCHAR(255)", "nvarchar(8)" }) |decl| {
+        try std.testing.expect(hasTextAffinity(decl));
+    }
+    for ([_][]const u8{ "INTEGER", "BIGINT", "DECIMAL(38,10)", "NUMERIC", "REAL", "DOUBLE", "BLOB", "" }) |decl| {
+        try std.testing.expect(!hasTextAffinity(decl));
+    }
 }
 
 test "SQLite counts a repeated name once and a gapped ?NNN by its number" {

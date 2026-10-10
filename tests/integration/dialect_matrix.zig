@@ -139,8 +139,11 @@
 //!    10.11 while a development machine usually runs MySQL 8/9, so no case may
 //!    require one on both servers.
 //! 5. **`field.Text` with a DEFAULT.** MariaDB creates the column, MySQL refuses
-//!    it (errno 1101), and the DDL layer cannot tell the two servers apart. Both
-//!    answers are correct for the server that gave them.
+//!    it (errno 1101). The migration paths (`migrateSchema`, `createAllTables`)
+//!    identify the server through `SELECT VERSION()` and follow its rule, so a
+//!    schema with one is migratable on MariaDB and refused on MySQL — the
+//!    per-server branch lives in `mysql.zig`. A matrix case still cannot carry
+//!    it (it is one answer for all three dialects), so it stays excluded here.
 //! 6. **Time zone and time precision.** `deleted_at`/`created_at` are epoch
 //!    seconds written by the *client* (`time(null)`), while any server-side
 //!    clock or `NOW()` may carry a different precision or zone. A case may

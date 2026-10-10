@@ -1520,6 +1520,27 @@ fn isMySqlBlobTextJsonType(sql_type: []const u8) bool {
     return false;
 }
 
+/// Which server is behind a `.mysql`-kind connection, for the DDL rules the two
+/// server families do not share.
+///
+/// MySQL and MariaDB speak the same wire protocol and share the errno
+/// numbering, but not every rule: **MariaDB >= 10.2.1 accepts a `DEFAULT` on a
+/// BLOB/TEXT column**, which MySQL refuses with errno 1101 (the column cannot
+/// have a default value). Everything else `findMySqlTextRestriction` classifies
+/// — the key-length restriction behind errno 1170 — is refused by both, so it is
+/// the same on either server.
+///
+/// The name is derived once per migration from `SELECT VERSION()` (see
+/// `detectMySqlServer`) and threaded through the DDL generators, so a preview
+/// and the run it previews classify identically.
+pub const MySqlServer = enum {
+    /// MySQL — or a server that could not be identified, which is deliberately
+    /// treated as MySQL so an unknown server never gets a rule relaxed for it.
+    mysql,
+    /// MariaDB, identified by "MariaDB" in `SELECT VERSION()`.
+    mariadb,
+};
+
 /// The named errors a MySQL BLOB/TEXT/JSON restriction turns into.
 ///
 /// Two names rather than one `MySQLTextColumnRestriction`, because they have
@@ -1584,6 +1605,12 @@ fn columnDefByName(table: TableDef, name: []const u8) ?ColumnDef {
 /// Pure: no allocation, no connection, no database. Returns null for every
 /// dialect but MySQL, whose restriction this is.
 ///
+/// The rules applied are **MySQL's**, the stricter of the two server families:
+/// a caller that knows it is talking to MariaDB (and only such a caller can
+/// know, see `detectMySqlServer`) uses `findMySqlTextRestrictionWithServer`,
+/// which drops the `DEFAULT` restriction on MariaDB >= 10.2.1. This spelling
+/// stays the default so an unidentified server is never given the relaxed rule.
+///
 /// Each caller passes exactly what its statement contains:
 /// `createTableSQLAlloc` passes the table's columns and no indexes (a table
 /// statement never emits `table.indexes`, and rejecting a table that already
@@ -1591,12 +1618,29 @@ fn columnDefByName(table: TableDef, name: []const u8) ?ColumnDef {
 /// failed deploy), and `createIndexSQLForTableAlloc` passes the one index it
 /// is about to emit. That keeps the check honest about the SQL it precedes.
 pub fn findMySqlTextRestriction(table: TableDef, indexes: []const IndexDef, dialect: Dialect) ?MySqlTextRestriction {
+    return findMySqlTextRestrictionWithServer(table, indexes, dialect, .mysql);
+}
+
+/// `findMySqlTextRestriction`, told which server the statement is for.
+///
+/// `server` is consulted for exactly one kind: `.default_value`. MariaDB has
+/// accepted a `DEFAULT` on a BLOB/TEXT/JSON column since 10.2.1, so on
+/// `.mariadb` that column is not a restriction and the scan moves on — a
+/// column that is *also* UNIQUE (or a PRIMARY KEY, or a key of an index) is
+/// still reported, because the key-length rule is shared. On `.mysql` this is
+/// byte-for-byte `findMySqlTextRestriction`'s answer.
+pub fn findMySqlTextRestrictionWithServer(
+    table: TableDef,
+    indexes: []const IndexDef,
+    dialect: Dialect,
+    server: MySqlServer,
+) ?MySqlTextRestriction {
     if (dialect.kind() != .mysql) return null;
 
     for (table.columns) |col| {
         const sql_type = columnSQLType(col, dialect);
         if (!isMySqlBlobTextJsonType(sql_type)) continue;
-        const kind: MySqlTextRestriction.Kind = if (col.default_value != null)
+        const kind: MySqlTextRestriction.Kind = if (col.default_value != null and server == .mysql)
             .default_value
         else if (col.unique and !col.primary_key)
             .unique
@@ -1623,6 +1667,80 @@ pub fn findMySqlTextRestriction(table: TableDef, indexes: []const IndexDef, dial
         }
     }
     return null;
+}
+
+/// Identify the server behind a `.mysql`-kind connection from
+/// `SELECT VERSION()`, or answer `.mysql` when it cannot be identified.
+///
+/// This is the one probe that lets the DDL layer tell MySQL and MariaDB apart
+/// (they share the errno numbering but not every rule — see `MySqlServer`), and
+/// it runs once per migration, on the same connection the introspection uses.
+///
+/// **Failures are conservative and never propagate.** A server that refuses the
+/// query — no privilege, a connection mid-failure, a proxy that answers
+/// something else — is treated as MySQL, so an unidentified server keeps every
+/// restriction and never has one relaxed for it. Each failure logs a `warn`
+/// naming the reason, so an operator sees why a MariaDB deploy still writes
+/// MySQL-shaped DDL. The function has no error return on purpose: this probe is
+/// not a step a migration can fail on. It is also read-only (`query`, never
+/// `exec`), so the dry run can call the same code path.
+fn detectMySqlServer(drv: sql_driver.Driver) MySqlServer {
+    var rows = drv.query("SELECT VERSION()", &.{}) catch |err| {
+        zent_log.warn(
+            "zent: could not identify the MySQL/MariaDB server ({s}); applying MySQL's stricter BLOB/TEXT rules",
+            .{@errorName(err)},
+        );
+        return .mysql;
+    };
+    defer rows.deinit();
+    const row = rows.next() orelse {
+        const reason = if (rows.nextError()) |err| @errorName(err) else "no rows";
+        zent_log.warn(
+            "zent: could not identify the MySQL/MariaDB server ({s}); applying MySQL's stricter BLOB/TEXT rules",
+            .{reason},
+        );
+        return .mysql;
+    };
+    const version = row.getText(0) orelse {
+        zent_log.warn(
+            "zent: could not identify the MySQL/MariaDB server (SELECT VERSION() answered no text); applying MySQL's stricter BLOB/TEXT rules",
+            .{},
+        );
+        return .mysql;
+    };
+    return classifyMySqlServer(version);
+}
+
+/// The classification half of `detectMySqlServer`, split out so the spelling
+/// MariaDB is recognised by is pinned without a server: MariaDB's version
+/// strings read `10.11.6-MariaDB-1~deb12u1` and MySQL's `9.7.0`. The substring
+/// is the same one `tests/integration/mysql.zig`'s `isMariaDB` looks for.
+fn classifyMySqlServer(version: []const u8) MySqlServer {
+    return if (std.mem.indexOf(u8, version, "MariaDB") != null) .mariadb else .mysql;
+}
+
+/// Whether any table this plan can emit a `DEFAULT` for declares a
+/// BLOB/TEXT/JSON column on MySQL — the one shape where MySQL and MariaDB
+/// disagree, and therefore the only shape for which identifying the server can
+/// change the SQL.
+///
+/// Pure and comptime: a schema whose text columns carry no `DEFAULT` produces
+/// the same statements on both servers, so it is not worth a catalog round trip
+/// to ask which one is there. The probe is then skipped and the MySQL rules are
+/// used, which is exactly what the generators do with `.mysql` anyway. (The
+/// statement-modelling stub tests in `src/test/allocation_failures_plan.zig`
+/// depend on this: an unannounced `SELECT VERSION()` would be a statement they
+/// never claimed.)
+fn graphHasMySqlTextDefault(comptime infos: []const TypeInfo) bool {
+    inline for (infos) |info| {
+        if (info.is_view) continue;
+        const table = comptime tableFromTypeInfoCrossRef(info, infos);
+        inline for (table.columns) |col| {
+            if (col.default_value == null) continue;
+            if (isMySqlBlobTextJsonType(columnSQLType(col, Dialect.mysql))) return true;
+        }
+    }
+    return false;
 }
 
 /// Log what the error name cannot carry — which table, which column, which
@@ -2205,8 +2323,28 @@ pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeI
 /// `findMySqlTextRestriction`). Indexes are not `CREATE TABLE`'s business —
 /// `table.indexes` is never emitted here — so they are checked by
 /// `createIndexSQLForTableAlloc`.
+///
+/// This applies MySQL's rules; a caller that identified its server as MariaDB
+/// (see `detectMySqlServer`) uses `createTableSQLAllocWithServer`, which emits
+/// the `DEFAULT` MariaDB >= 10.2.1 accepts.
 pub fn createTableSQLAlloc(allocator: std.mem.Allocator, table: TableDef, dialect: Dialect) ![]const u8 {
-    if (findMySqlTextRestriction(table, &.{}, dialect)) |restriction| {
+    return createTableSQLAllocWithServer(allocator, table, dialect, .mysql);
+}
+
+/// `createTableSQLAlloc`, told which server the statement is for.
+///
+/// The only difference is which text-column restrictions are enforced before
+/// the SQL is built: on `.mariadb` a BLOB/TEXT `DEFAULT` is allowed through (and
+/// then emitted below like any other column's), while UNIQUE and PRIMARY KEY
+/// stay refused. On `.mysql` the output is identical to
+/// `createTableSQLAlloc`.
+pub fn createTableSQLAllocWithServer(
+    allocator: std.mem.Allocator,
+    table: TableDef,
+    dialect: Dialect,
+    server: MySqlServer,
+) ![]const u8 {
+    if (findMySqlTextRestrictionWithServer(table, &.{}, dialect, server)) |restriction| {
         return reportMySqlTextRestriction(restriction);
     }
 
@@ -2352,8 +2490,30 @@ pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect)
 /// `error.MySQLTextColumnCannotBeIndexed` with a logged table/column/reason,
 /// and every caller that goes through this function inherits it — including
 /// the dry run, which prints the SQL it would have executed.
+///
+/// This applies MySQL's rules; `createIndexSQLForTableAllocWithServer` is the
+/// spelling for a caller that identified its server, and it differs only for a
+/// table carrying a text `DEFAULT` the index is not the one to refuse.
 pub fn createIndexSQLForTableAlloc(allocator: std.mem.Allocator, index: IndexDef, table: TableDef, dialect: Dialect) ![]const u8 {
-    if (findMySqlTextRestriction(table, &.{index}, dialect)) |restriction| {
+    return createIndexSQLForTableAllocWithServer(allocator, index, table, dialect, .mysql);
+}
+
+/// `createIndexSQLForTableAlloc`, told which server the statement is for.
+///
+/// The index itself is refused on both families — a key column that is
+/// BLOB/TEXT/JSON is errno 1170 on MariaDB too. `server` matters because the
+/// scan walks the table's columns first: a text column carrying a `DEFAULT`
+/// used to report `.default_value` here even though this statement does not
+/// write that default, which on MariaDB would refuse the index for a reason
+/// the server does not have.
+pub fn createIndexSQLForTableAllocWithServer(
+    allocator: std.mem.Allocator,
+    index: IndexDef,
+    table: TableDef,
+    dialect: Dialect,
+    server: MySqlServer,
+) ![]const u8 {
+    if (findMySqlTextRestrictionWithServer(table, &.{index}, dialect, server)) |restriction| {
         return reportMySqlTextRestriction(restriction);
     }
     return createIndexSQLAlloc(allocator, index, table.name, dialect);
@@ -2437,7 +2597,15 @@ test "CREATE VIEW uses the clause each dialect actually accepts" {
 /// Generated SQL is allocated from `allocator` and freed with the same
 /// allocator, so callers must pass the allocator they track (e.g. a testing
 /// allocator or an arena).
-fn createTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+///
+/// `server` is the one `createAllTables` probed (`detectMySqlServer`); it only
+/// matters for a text column with a `DEFAULT`, which MariaDB accepts.
+fn createTables(
+    allocator: std.mem.Allocator,
+    driver_drv: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    server: MySqlServer,
+) !void {
     const dialect = driver_drv.dialect();
 
     // Create main entity tables (skip views)
@@ -2456,7 +2624,7 @@ fn createTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, com
         } else {
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
             warnOutOfGraphEdgeRefs(info, infos);
-            const sql = try createTableSQLAlloc(allocator, table, dialect);
+            const sql = try createTableSQLAllocWithServer(allocator, table, dialect, server);
             defer allocator.free(sql);
             _ = try driver_drv.exec(sql, &.{});
         }
@@ -2470,7 +2638,7 @@ fn createTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, com
         inline for (info.edges) |e| {
             if (e.relation == .m2m and e.through == null) {
                 const jtable = comptime junctionTableForEdge(e, info, infos);
-                const sql = try createTableSQLAlloc(allocator, jtable, dialect);
+                const sql = try createTableSQLAllocWithServer(allocator, jtable, dialect, server);
                 defer allocator.free(sql);
                 _ = try driver_drv.exec(
                     sql,
@@ -2490,7 +2658,14 @@ fn createTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, com
 /// automatic column/index additions on re-run.
 pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver_drv.dialect();
-    try createTables(allocator, driver_drv, infos);
+    // One probe per entry point, shared by the table and index statements so
+    // both classify a text `DEFAULT` the same way, and skipped entirely when
+    // the schema declares none (see `graphHasMySqlTextDefault`).
+    const mysql_server: MySqlServer = if (dialect.kind() == .mysql and graphHasMySqlTextDefault(infos))
+        detectMySqlServer(driver_drv)
+    else
+        .mysql;
+    try createTables(allocator, driver_drv, infos, mysql_server);
 
     inline for (infos) |info| {
         if (info.is_view or info.indexes.len == 0) continue;
@@ -2538,7 +2713,7 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
             else
                 false;
             if (!already_exists) {
-                const sql = try createIndexSQLForTableAlloc(allocator, idx_def, table, dialect);
+                const sql = try createIndexSQLForTableAllocWithServer(allocator, idx_def, table, dialect, mysql_server);
                 defer allocator.free(sql);
                 _ = try driver_drv.exec(sql, &.{});
             }
@@ -3787,12 +3962,17 @@ fn getExistingColumnByName(columns: []const ExistingColumn, name: []const u8) ?E
 /// exists — the case where the CREATE-side guard never runs. The two go through
 /// the same classification (`findMySqlTextRestriction`), so the diagnosis and
 /// the way out are the same sentence in both places.
+///
+/// `server` is what lets MariaDB through: on MariaDB >= 10.2.1 the same
+/// `ADD COLUMN … DEFAULT 'x'` is legal and this emits it, while on MySQL it is
+/// still refused (see `MySqlServer`). Every other restriction is unchanged.
 fn alterTableAddColumnSQL(
     allocator: std.mem.Allocator,
     table_name: []const u8,
     col: ColumnDef,
     dialect: Dialect,
     converge_not_null: bool,
+    server: MySqlServer,
 ) ![]const u8 {
     // The check is handed exactly what the statement below emits: a name, a
     // type, and — where one exists — a DEFAULT. UNIQUE and PRIMARY KEY are
@@ -3810,7 +3990,7 @@ fn alterTableAddColumnSQL(
         .not_null = col.not_null,
         .default_value = col.default_value,
     };
-    if (findMySqlTextRestriction(.{ .name = table_name, .columns = &.{emitted}, .primary_keys = &.{} }, &.{}, dialect)) |restriction| {
+    if (findMySqlTextRestrictionWithServer(.{ .name = table_name, .columns = &.{emitted}, .primary_keys = &.{} }, &.{}, dialect, server)) |restriction| {
         return reportMySqlTextRestriction(restriction);
     }
 
@@ -4020,7 +4200,7 @@ test "ALTER ADD COLUMN is NOT NULL only when nullability convergence is asked fo
 
     // Default: the column arrives nullable, which is the drift `checkNullability`
     // then reports — the behaviour every existing caller has.
-    const loose = try alterTableAddColumnSQL(alloc, "t", col, Dialect.sqlite, false);
+    const loose = try alterTableAddColumnSQL(alloc, "t", col, Dialect.sqlite, false, .mysql);
     defer alloc.free(loose);
     try std.testing.expectEqualStrings(
         "ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT DEFAULT 'pending'",
@@ -4028,7 +4208,7 @@ test "ALTER ADD COLUMN is NOT NULL only when nullability convergence is asked fo
     );
 
     // Opted in: the default is what the rows already in the table take.
-    const strict = try alterTableAddColumnSQL(alloc, "t", col, Dialect.sqlite, true);
+    const strict = try alterTableAddColumnSQL(alloc, "t", col, Dialect.sqlite, true, .mysql);
     defer alloc.free(strict);
     try std.testing.expectEqualStrings(
         "ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT NOT NULL DEFAULT 'pending'",
@@ -4042,7 +4222,7 @@ test "ALTER ADD COLUMN is NOT NULL only when nullability convergence is asked fo
         .logical_type = .time,
         .not_null = true,
     };
-    const audit_sql = try alterTableAddColumnSQL(alloc, "t", audit, Dialect.sqlite, true);
+    const audit_sql = try alterTableAddColumnSQL(alloc, "t", audit, Dialect.sqlite, true, .mysql);
     defer alloc.free(audit_sql);
     try std.testing.expectEqualStrings(
         "ALTER TABLE \"t\" ADD COLUMN \"created_at\" BIGINT NOT NULL DEFAULT (unixepoch())",
@@ -4053,7 +4233,7 @@ test "ALTER ADD COLUMN is NOT NULL only when nullability convergence is asked fo
     var optional_col = col;
     optional_col.not_null = false;
     optional_col.default_value = null;
-    const optional_sql = try alterTableAddColumnSQL(alloc, "t", optional_col, Dialect.sqlite, true);
+    const optional_sql = try alterTableAddColumnSQL(alloc, "t", optional_col, Dialect.sqlite, true, .mysql);
     defer alloc.free(optional_sql);
     try std.testing.expectEqualStrings("ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT", optional_sql);
 }
@@ -4068,12 +4248,12 @@ test "a NOT NULL column with no DEFAULT refuses instead of arriving nullable" {
 
     try std.testing.expectError(
         error.NotNullNeedsDefault,
-        alterTableAddColumnSQL(std.testing.allocator, "t", col, Dialect.sqlite, true),
+        alterTableAddColumnSQL(std.testing.allocator, "t", col, Dialect.sqlite, true, .mysql),
     );
 
     // Without the option the column is still added — the old behaviour is only
     // ever left behind by an explicit decision.
-    const sql = try alterTableAddColumnSQL(std.testing.allocator, "t", col, Dialect.sqlite, false);
+    const sql = try alterTableAddColumnSQL(std.testing.allocator, "t", col, Dialect.sqlite, false, .mysql);
     defer std.testing.allocator.free(sql);
     try std.testing.expectEqualStrings("ALTER TABLE \"t\" ADD COLUMN \"status\" TEXT", sql);
 }
@@ -4179,6 +4359,19 @@ pub fn planMigrateStatements(
     var plan = std.array_list.Managed(PlannedStatement).init(allocator);
     errdefer freePlannedStatements(allocator, &plan);
 
+    // Which server the DDL is for, asked at most once per plan. A `.mysql`-kind
+    // connection may be MySQL or MariaDB and the two disagree about a text
+    // `DEFAULT` (see `MySqlServer`); every generator below is handed this so a
+    // preview and the run it previews classify the same. The probe only runs
+    // when the schema actually declares such a `DEFAULT` (`graphHasMySqlTextDefault`),
+    // and on any other dialect — or when the probe cannot answer — this stays
+    // `.mysql`: the stricter rules, which is the only answer that never widens
+    // what a server accepts.
+    const mysql_server: MySqlServer = if (dialect.kind() == .mysql and graphHasMySqlTextDefault(infos))
+        detectMySqlServer(driver)
+    else
+        .mysql;
+
     // Step 1: create tables, views, and M2M junction tables. `created[i]`
     // records whether entity i is created by this run, so step 2 can tell
     // "fresh table, matches the schema by construction" apart from "existing
@@ -4213,7 +4406,7 @@ pub fn planMigrateStatements(
             // CREATE TABLE IF NOT EXISTS is a no-op and the real path still
             // diffs — and adds to — the existing table.
             if (!versionContains(applied, version)) {
-                try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, table, dialect), version);
+                try appendPlanned(allocator, &plan, try createTableSQLAllocWithServer(allocator, table, dialect, mysql_server), version);
                 var existing = try getExistingColumns(allocator, driver, table.name);
                 if (existing.items.len == 0) {
                     existing.deinit();
@@ -4227,7 +4420,7 @@ pub fn planMigrateStatements(
                 var existing = try getExistingColumns(allocator, driver, table.name);
                 if (existing.items.len == 0) {
                     existing.deinit();
-                    try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, table, dialect), version);
+                    try appendPlanned(allocator, &plan, try createTableSQLAllocWithServer(allocator, table, dialect, mysql_server), version);
                     created[i] = true;
                 } else {
                     freeExistingColumns(allocator, &existing);
@@ -4266,14 +4459,14 @@ pub fn planMigrateStatements(
                 }
                 const version = computeMigrationVersion(jtable.name, "create_junction", "");
                 if (!versionContains(applied, version)) {
-                    try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, jtable, dialect), version);
+                    try appendPlanned(allocator, &plan, try createTableSQLAllocWithServer(allocator, jtable, dialect, mysql_server), version);
                 } else {
                     // Version is recorded but the junction table may have
                     // been dropped out-of-band. Re-create it if missing.
                     var existing = try getExistingColumns(allocator, driver, jtable.name);
                     if (existing.items.len == 0) {
                         existing.deinit();
-                        try appendPlanned(allocator, &plan, try createTableSQLAlloc(allocator, jtable, dialect), version);
+                        try appendPlanned(allocator, &plan, try createTableSQLAllocWithServer(allocator, jtable, dialect, mysql_server), version);
                     } else {
                         freeExistingColumns(allocator, &existing);
                     }
@@ -4300,7 +4493,7 @@ pub fn planMigrateStatements(
                     try appendPlanned(
                         allocator,
                         &plan,
-                        try alterTableAddColumnSQL(allocator, table.name, col, dialect, opts.allow_nullability_change),
+                        try alterTableAddColumnSQL(allocator, table.name, col, dialect, opts.allow_nullability_change, mysql_server),
                         computeMigrationVersion(info.table_name, "add_column", col.name),
                     );
                 }
@@ -4399,7 +4592,7 @@ pub fn planMigrateStatements(
                 try appendPlanned(
                     allocator,
                     &plan,
-                    try createIndexSQLForTableAlloc(allocator, idx_def, table, dialect),
+                    try createIndexSQLForTableAllocWithServer(allocator, idx_def, table, dialect, mysql_server),
                     version,
                 );
             }
@@ -4424,7 +4617,7 @@ pub fn planMigrateStatements(
         // `uniqueColumnChecked` — it is unique by construction.
         if (!created[i] and !hasUnreadableUniqueIndex(existing_idxs.items)) {
             inline for (table.columns) |col| {
-                try planUniqueColumnIndex(allocator, &plan, info, table, col, existing_idxs.items, dialect);
+                try planUniqueColumnIndex(allocator, &plan, info, table, col, existing_idxs.items, dialect, mysql_server);
             }
         }
     }
@@ -4449,6 +4642,7 @@ fn planUniqueColumnIndex(
     col: ColumnDef,
     existing_idxs: []const ExistingIndex,
     dialect: Dialect,
+    server: MySqlServer,
 ) !void {
     if (!uniqueColumnChecked(col, table)) return;
     if (indexForcesColumnAlone(existing_idxs, col.name)) return;
@@ -4461,7 +4655,7 @@ fn planUniqueColumnIndex(
     }
 
     const uniq_def = IndexDef{ .name = idx_name, .columns = &[_][]const u8{col.name}, .unique = true };
-    if (findMySqlTextRestriction(table, &.{uniq_def}, dialect)) |_| {
+    if (findMySqlTextRestrictionWithServer(table, &.{uniq_def}, dialect, server)) |_| {
         // MySQL cannot index a BLOB/TEXT/JSON key without a key length, and a
         // prefix would change what the UNIQUE index means. The create-table
         // path warns for the same column; skipping keeps the migration alive
@@ -4475,7 +4669,7 @@ fn planUniqueColumnIndex(
     try appendPlanned(
         allocator,
         plan,
-        try createIndexSQLForTableAlloc(allocator, uniq_def, table, dialect),
+        try createIndexSQLForTableAllocWithServer(allocator, uniq_def, table, dialect, server),
         computeMigrationVersion(info.table_name, "create_unique_index", col.name),
     );
 }
@@ -6028,7 +6222,7 @@ test "MySQL ALTER ADD COLUMN refuses a BLOB/TEXT DEFAULT" {
     const text_default = ColumnDef{ .name = "body", .sql_type = "TEXT", .default_value = "'x'" };
     try std.testing.expectError(
         error.MySQLTextColumnCannotHaveDefault,
-        alterTableAddColumnSQL(std.testing.allocator, "article", text_default, mysql, false),
+        alterTableAddColumnSQL(std.testing.allocator, "article", text_default, mysql, false, .mysql),
     );
 
     // `allow_nullability_change` takes the NOT NULL branch, which emits the
@@ -6037,7 +6231,7 @@ test "MySQL ALTER ADD COLUMN refuses a BLOB/TEXT DEFAULT" {
     const not_null_default = ColumnDef{ .name = "body", .sql_type = "TEXT", .default_value = "'x'", .not_null = true };
     try std.testing.expectError(
         error.MySQLTextColumnCannotHaveDefault,
-        alterTableAddColumnSQL(std.testing.allocator, "article", not_null_default, mysql, true),
+        alterTableAddColumnSQL(std.testing.allocator, "article", not_null_default, mysql, true, .mysql),
     );
 
     // `field.Bytes` is BLOB on MySQL and carries errno 1101 like TEXT does.
@@ -6046,27 +6240,27 @@ test "MySQL ALTER ADD COLUMN refuses a BLOB/TEXT DEFAULT" {
         const blob_default = ColumnDef{ .name = "payload", .sql_type = sql_type, .default_value = "'{}'" };
         try std.testing.expectError(
             error.MySQLTextColumnCannotHaveDefault,
-            alterTableAddColumnSQL(std.testing.allocator, "article", blob_default, mysql, false),
+            alterTableAddColumnSQL(std.testing.allocator, "article", blob_default, mysql, false, .mysql),
         );
     }
 
     // Everything the server accepts still renders: the guard is about the type
     // carrying a DEFAULT, not about the ALTER.
     const varchar_default = ColumnDef{ .name = "title", .sql_type = "VARCHAR(255)", .default_value = "'t'" };
-    const ok = try alterTableAddColumnSQL(std.testing.allocator, "article", varchar_default, mysql, false);
+    const ok = try alterTableAddColumnSQL(std.testing.allocator, "article", varchar_default, mysql, false, .mysql);
     defer std.testing.allocator.free(ok);
     try std.testing.expectEqualStrings("ALTER TABLE `article` ADD COLUMN `title` VARCHAR(255) DEFAULT 't'", ok);
 
     // A TEXT column without a default is legal, and is what the schema gets.
     const text_plain = ColumnDef{ .name = "body", .sql_type = "TEXT" };
-    const plain = try alterTableAddColumnSQL(std.testing.allocator, "article", text_plain, mysql, false);
+    const plain = try alterTableAddColumnSQL(std.testing.allocator, "article", text_plain, mysql, false, .mysql);
     defer std.testing.allocator.free(plain);
     try std.testing.expectEqualStrings("ALTER TABLE `article` ADD COLUMN `body` TEXT", plain);
 
     // PostgreSQL and SQLite have no such restriction and must still generate
     // the statement — the check is dialect-gated, not a blanket refusal.
     for ([_]Dialect{ Dialect.sqlite, Dialect.postgres }) |dialect| {
-        const sql = try alterTableAddColumnSQL(std.testing.allocator, "article", text_default, dialect, false);
+        const sql = try alterTableAddColumnSQL(std.testing.allocator, "article", text_default, dialect, false, .mysql);
         defer std.testing.allocator.free(sql);
         try std.testing.expectEqualStrings("ALTER TABLE \"article\" ADD COLUMN \"body\" TEXT DEFAULT 'x'", sql);
     }
@@ -6077,9 +6271,139 @@ test "MySQL ALTER ADD COLUMN refuses a BLOB/TEXT DEFAULT" {
     // constraint — not the DEFAULT this guard exists for — and the CREATE-side
     // guard is where a schema declaring it is refused.
     const unique_text = ColumnDef{ .name = "body", .sql_type = "TEXT", .unique = true };
-    const unique_sql = try alterTableAddColumnSQL(std.testing.allocator, "article", unique_text, mysql, false);
+    const unique_sql = try alterTableAddColumnSQL(std.testing.allocator, "article", unique_text, mysql, false, .mysql);
     defer std.testing.allocator.free(unique_sql);
     try std.testing.expectEqualStrings("ALTER TABLE `article` ADD COLUMN `body` TEXT", unique_sql);
+}
+
+test "MariaDB: a TEXT DEFAULT is allowed where MySQL refuses it" {
+    const mysql = Dialect{ .name = "mysql" };
+
+    // One table, one difference: MySQL refuses `body TEXT DEFAULT 'x'` (errno
+    // 1101), MariaDB >= 10.2.1 accepts it. The restriction scan is the single
+    // place that decides, so every generator below follows from it.
+    const default_text = TableDef{
+        .name = "article",
+        .columns = &.{
+            ColumnDef{ .name = "id", .sql_type = "INTEGER", .primary_key = true },
+            ColumnDef{ .name = "body", .sql_type = "TEXT", .default_value = "'x'" },
+        },
+        .primary_keys = &.{"id"},
+    };
+
+    // MySQL: unchanged, still refused.
+    try std.testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        createTableSQLAllocWithServer(std.testing.allocator, default_text, mysql, .mysql),
+    );
+    try std.testing.expectEqual(
+        MySqlTextRestriction.Kind.default_value,
+        findMySqlTextRestrictionWithServer(default_text, &.{}, mysql, .mysql).?.kind,
+    );
+
+    // MariaDB: no restriction, and the statement carries the DEFAULT.
+    try std.testing.expect(findMySqlTextRestrictionWithServer(default_text, &.{}, mysql, .mariadb) == null);
+    const mariadb_sql = try createTableSQLAllocWithServer(std.testing.allocator, default_text, mysql, .mariadb);
+    defer std.testing.allocator.free(mariadb_sql);
+    try std.testing.expectEqualStrings(
+        "CREATE TABLE IF NOT EXISTS `article` (\n  `id` INTEGER PRIMARY KEY,\n  `body` TEXT DEFAULT 'x'\n)",
+        mariadb_sql,
+    );
+
+    // Blob types are the same errno 1101 on MySQL and the same relaxation on
+    // MariaDB — the rule is about the DEFAULT on a BLOB/TEXT column, not about
+    // the TEXT spelling.
+    const blob_default = TableDef{
+        .name = "article",
+        .columns = &.{ColumnDef{ .name = "payload", .sql_type = "LONGBLOB", .default_value = "'{}'" }},
+        .primary_keys = &.{},
+    };
+    try std.testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        createTableSQLAllocWithServer(std.testing.allocator, blob_default, mysql, .mysql),
+    );
+    const blob_sql = try createTableSQLAllocWithServer(std.testing.allocator, blob_default, mysql, .mariadb);
+    defer std.testing.allocator.free(blob_sql);
+    try std.testing.expectEqualStrings(
+        "CREATE TABLE IF NOT EXISTS `article` (\n  `payload` LONGBLOB DEFAULT '{}'\n)",
+        blob_sql,
+    );
+
+    // What is *not* relaxed: the key-length rule. A UNIQUE text column is still
+    // errno 1170 on MariaDB, and one that also carries a DEFAULT reports the
+    // UNIQUE — the relaxed kind must not swallow the refused one.
+    const unique_text = TableDef{
+        .name = "article",
+        .columns = &.{ColumnDef{ .name = "body", .sql_type = "TEXT", .unique = true, .default_value = "'x'" }},
+        .primary_keys = &.{},
+    };
+    try std.testing.expectEqual(
+        MySqlTextRestriction.Kind.unique,
+        findMySqlTextRestrictionWithServer(unique_text, &.{}, mysql, .mariadb).?.kind,
+    );
+    try std.testing.expectError(
+        error.MySQLTextColumnCannotBeIndexed,
+        createTableSQLAllocWithServer(std.testing.allocator, unique_text, mysql, .mariadb),
+    );
+
+    // ... and an index over a text column, likewise.
+    const indexed = TableDef{
+        .name = "article",
+        .columns = &.{ColumnDef{ .name = "body", .sql_type = "TEXT" }},
+        .primary_keys = &.{},
+    };
+    const on_text = IndexDef{ .name = "idx_body", .columns = &.{"body"}, .unique = false };
+    try std.testing.expectEqual(
+        MySqlTextRestriction.Kind.index,
+        findMySqlTextRestrictionWithServer(indexed, &.{on_text}, mysql, .mariadb).?.kind,
+    );
+    try std.testing.expectError(
+        error.MySQLTextColumnCannotBeIndexed,
+        createIndexSQLForTableAllocWithServer(std.testing.allocator, on_text, indexed, mysql, .mariadb),
+    );
+
+    // The ALTER path follows the same answer — it is the path reached when the
+    // table already exists, so the CREATE-side guard never runs for it.
+    const body = ColumnDef{ .name = "body", .sql_type = "TEXT", .default_value = "'x'" };
+    try std.testing.expectError(
+        error.MySQLTextColumnCannotHaveDefault,
+        alterTableAddColumnSQL(std.testing.allocator, "article", body, mysql, false, .mysql),
+    );
+    const alter_sql = try alterTableAddColumnSQL(std.testing.allocator, "article", body, mysql, false, .mariadb);
+    defer std.testing.allocator.free(alter_sql);
+    try std.testing.expectEqualStrings("ALTER TABLE `article` ADD COLUMN `body` TEXT DEFAULT 'x'", alter_sql);
+
+    // A non-MySQL dialect never consults the server name: the same table is
+    // emitted either way.
+    for ([_]Dialect{ Dialect.sqlite, Dialect.postgres }) |other| {
+        const sql = try createTableSQLAllocWithServer(std.testing.allocator, default_text, other, .mysql);
+        defer std.testing.allocator.free(sql);
+        try std.testing.expect(std.mem.indexOf(u8, sql, "DEFAULT 'x'") != null);
+    }
+}
+
+test "MySQL/MariaDB identification is the version string, and an unknown server keeps MySQL's rules" {
+    // MariaDB's version strings carry the family name; MySQL's do not. This is
+    // the spelling the DDL layer branches on, so it is pinned here and in
+    // `tests/integration/mysql.zig`'s `isMariaDB`.
+    try std.testing.expectEqual(MySqlServer.mariadb, classifyMySqlServer("10.11.6-MariaDB-1~deb12u1"));
+    try std.testing.expectEqual(MySqlServer.mariadb, classifyMySqlServer("5.5.5-10.2.1-MariaDB"));
+    try std.testing.expectEqual(MySqlServer.mysql, classifyMySqlServer("9.7.0"));
+    try std.testing.expectEqual(MySqlServer.mysql, classifyMySqlServer("8.0.36"));
+    // A version that identifies nothing keeps the stricter rules, so a proxy or
+    // a stripped string never relaxes a guard.
+    try std.testing.expectEqual(MySqlServer.mysql, classifyMySqlServer(""));
+    try std.testing.expectEqual(MySqlServer.mysql, classifyMySqlServer("10.11.6"));
+
+    // The probe never turns into a migration failure. The only server here is
+    // SQLite, whose `SELECT VERSION()` does not answer (and whose version would
+    // not name MariaDB either way), so this is the conservative path: warn and
+    // answer `.mysql`. The success path is exercised against a real server by
+    // the MySQL integration tests.
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
+    defer drv.close();
+    try std.testing.expectEqual(MySqlServer.mysql, detectMySqlServer(drv.asDriver()));
 }
 
 test "SQLite introspection refuses a table name that would break the PRAGMA" {

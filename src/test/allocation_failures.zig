@@ -239,6 +239,40 @@ test "BulkDeleteBuilder.init unwinds cleanly when any single allocation fails" {
 }
 
 // ------------------------------------------------------------------
+// multi-row insert assembly
+// ------------------------------------------------------------------
+
+test "MultiInsert unwinds cleanly when any single allocation fails" {
+    // The multi-row INSERT assembly (`sql/builder.zig`): the fallible
+    // `InsertBuilder.initCapacity` that names the builder's two preallocated
+    // buffers, the column list, one `Value` list per row, the render and the
+    // `takeQuery` move-out. `defer ib.deinit()` owns everything the builder
+    // collected, so the case pins that no row's list survives a failure
+    // between its own append and the statement's move-out.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(child: std.mem.Allocator) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const allocator = no_remap.asAllocator();
+            var q = try sql.MultiInsert(
+                allocator,
+                .sqlite,
+                "caaf_row",
+                &.{ "tenant", "title" },
+                3,
+                &.{
+                    .{ .string = "a" }, .{ .string = "one" },
+                    .{ .string = "b" }, .{ .string = "two" },
+                    .{ .string = "c" }, .{ .string = "three" },
+                },
+            );
+            defer q.deinit();
+            try std.testing.expect(std.mem.startsWith(u8, q.sql, "INSERT INTO \"caaf_row\""));
+            try std.testing.expectEqual(@as(usize, 6), q.args.len);
+        }
+    }.run, .{});
+}
+
+// ------------------------------------------------------------------
 // shard routing
 // ------------------------------------------------------------------
 

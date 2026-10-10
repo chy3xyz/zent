@@ -1446,9 +1446,29 @@ pub const InsertBuilder = struct {
     select_items: []const SelectItem = &.{},
     select_preds: []const Predicate = &.{},
 
+    /// Cannot fail: a failed preallocation is swallowed by `Builder.init`
+    /// (see there), which leaves an empty builder whose first append reports
+    /// the out-of-memory. Reach for `initCapacity` — the fallible twin with
+    /// the same capacities — when the failure has to reach the caller.
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
+            .table = table,
+            .col_names = std.array_list.Managed([]const u8).init(allocator),
+            .rows = std.array_list.Managed(std.array_list.Managed(Value)).init(allocator),
+            .or_replace = false,
+            .or_ignore = false,
+        };
+    }
+
+    /// The fallible twin of `init`: the same builder with the same
+    /// capacities (`Builder.initCapacity(…, 256, 8, …)`, the defaults
+    /// `Builder.init` preallocates), except that a failed preallocation is
+    /// returned instead of being swallowed. The three lists start empty and
+    /// do not allocate, so the builder is the only failure point.
+    pub fn initCapacity(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) !InsertBuilder {
+        return .{
+            .b = try Builder.initCapacity(allocator, 256, 8, dialect),
             .table = table,
             .col_names = std.array_list.Managed([]const u8).init(allocator),
             .rows = std.array_list.Managed(std.array_list.Managed(Value)).init(allocator),
@@ -1562,16 +1582,22 @@ pub const InsertBuilder = struct {
     }
 };
 
+/// Swallows a failed preallocation (see `InsertBuilder.init`); call
+/// `InsertBuilder.initCapacity` when that failure has to reach the caller.
 pub fn Insert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
     return InsertBuilder.init(allocator, dialect, table);
 }
 
+/// Swallows a failed preallocation (see `InsertBuilder.init`); call
+/// `InsertBuilder.initCapacity` when that failure has to reach the caller.
 pub fn InsertOrReplace(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
     var builder = InsertBuilder.init(allocator, dialect, table);
     builder.or_replace = true;
     return builder;
 }
 
+/// Swallows a failed preallocation (see `InsertBuilder.init`); call
+/// `InsertBuilder.initCapacity` when that failure has to reach the caller.
 pub fn InsertOrIgnore(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) InsertBuilder {
     var builder = InsertBuilder.init(allocator, dialect, table);
     builder.or_ignore = true;
@@ -1582,11 +1608,19 @@ pub fn InsertOrIgnore(allocator: std.mem.Allocator, dialect: Dialect, table: []c
 /// `values` is a flat slice: [row1col1, row1col2, ..., row2col1, row2col2, ...]
 /// Returns an OwnedQuery with SQL like:
 ///   INSERT INTO "t" ("c1","c2") VALUES ($1,$2),($3,$4),...
+///
+/// The slice is read as `row_count` rows of `columns.len` values each, so it
+/// must carry exactly that many — that is the caller's blob of values, split
+/// positionally below. It is *not* checked against the rows it encodes: a
+/// batch whose rows disagree on their fields reads as a well-sized buffer
+/// too, and the only layer that has the rows as rows is the insert layer
+/// (`codegen/create.zig`), which rejects such a batch before any statement
+/// runs (v0.69.0). A length assertion here would look like that check and
+/// prove nothing about it.
 pub fn MultiInsert(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8, columns: []const []const u8, row_count: usize, values: []const Value) !OwnedQuery {
     std.debug.assert(columns.len > 0);
     std.debug.assert(row_count > 0);
-    std.debug.assert(values.len == columns.len * row_count);
-    var ib = InsertBuilder.init(allocator, dialect, table);
+    var ib = try InsertBuilder.initCapacity(allocator, dialect, table);
     defer ib.deinit();
     _ = try ib.columns(columns);
     const cols_per_row = columns.len;
@@ -1655,9 +1689,25 @@ pub const UpdateBuilder = struct {
     sets: std.array_list.Managed(UpdateSet),
     wheres: std.array_list.Managed(Predicate),
 
+    /// Cannot fail: a failed preallocation is swallowed by `Builder.init`
+    /// (see there). Use `initCapacity` when the failure must reach the
+    /// caller.
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) UpdateBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
+            .table = table,
+            .sets = std.array_list.Managed(UpdateSet).init(allocator),
+            .wheres = std.array_list.Managed(Predicate).init(allocator),
+        };
+    }
+
+    /// The fallible twin of `init`, with the capacities `Builder.init`
+    /// preallocates (`256, 8`) and its out-of-memory reported instead of
+    /// swallowed. The two lists start empty and do not allocate, so the
+    /// builder is the only failure point.
+    pub fn initCapacity(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) !UpdateBuilder {
+        return .{
+            .b = try Builder.initCapacity(allocator, 256, 8, dialect),
             .table = table,
             .sets = std.array_list.Managed(UpdateSet).init(allocator),
             .wheres = std.array_list.Managed(Predicate).init(allocator),
@@ -1790,6 +1840,8 @@ pub fn appendExprWithArgs(b: *Builder, expr: []const u8, args: []const Value) !v
     if (arg_idx != args.len) return error.ExprArgMismatch;
 }
 
+/// Swallows a failed preallocation (see `UpdateBuilder.init`); call
+/// `UpdateBuilder.initCapacity` when that failure has to reach the caller.
 pub fn Update(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) UpdateBuilder {
     return UpdateBuilder.init(allocator, dialect, table);
 }
@@ -1803,9 +1855,24 @@ pub const DeleteBuilder = struct {
     table: []const u8,
     wheres: std.array_list.Managed(Predicate),
 
+    /// Cannot fail: a failed preallocation is swallowed by `Builder.init`
+    /// (see there). Use `initCapacity` when the failure must reach the
+    /// caller.
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) DeleteBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
+            .table = table,
+            .wheres = std.array_list.Managed(Predicate).init(allocator),
+        };
+    }
+
+    /// The fallible twin of `init`, with the capacities `Builder.init`
+    /// preallocates (`256, 8`) and its out-of-memory reported instead of
+    /// swallowed. The predicate list starts empty and does not allocate, so
+    /// the builder is the only failure point.
+    pub fn initCapacity(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) !DeleteBuilder {
+        return .{
+            .b = try Builder.initCapacity(allocator, 256, 8, dialect),
             .table = table,
             .wheres = std.array_list.Managed(Predicate).init(allocator),
         };
@@ -1848,6 +1915,8 @@ pub const DeleteBuilder = struct {
     }
 };
 
+/// Swallows a failed preallocation (see `DeleteBuilder.init`); call
+/// `DeleteBuilder.initCapacity` when that failure has to reach the caller.
 pub fn Delete(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) DeleteBuilder {
     return DeleteBuilder.init(allocator, dialect, table);
 }
@@ -1873,9 +1942,26 @@ pub const BulkUpdateBuilder = struct {
     rows: std.array_list.Managed(BulkUpdateRow),
     predicates: std.array_list.Managed(Predicate),
 
+    /// Cannot fail: a failed preallocation is swallowed by `Builder.init`
+    /// (see there). Use `initCapacity` when the failure must reach the
+    /// caller.
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) BulkUpdateBuilder {
         return .{
             .b = Builder.init(allocator, dialect),
+            .table = table,
+            .id_column = "id",
+            .rows = std.array_list.Managed(BulkUpdateRow).init(allocator),
+            .predicates = std.array_list.Managed(Predicate).init(allocator),
+        };
+    }
+
+    /// The fallible twin of `init`, with the capacities `Builder.init`
+    /// preallocates (`256, 8`) and its out-of-memory reported instead of
+    /// swallowed. The two lists start empty and do not allocate, so the
+    /// builder is the only failure point.
+    pub fn initCapacity(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) !BulkUpdateBuilder {
+        return .{
+            .b = try Builder.initCapacity(allocator, 256, 8, dialect),
             .table = table,
             .id_column = "id",
             .rows = std.array_list.Managed(BulkUpdateRow).init(allocator),

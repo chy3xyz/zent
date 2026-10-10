@@ -567,7 +567,18 @@ SQLite's C API coerces instead of parsing, so the strict contract's
 `TypeMismatch` simply cannot happen there — a wrong column mapping is masked as
 a truncated value on SQLite but errors on the other two. **Advice: do not point
 an integer DTO field at a `Decimal` column**; use `field.Text`-style access
-(`getText` + parse) or a `Decimal`-typed destination. SQLite's coercion is
+(`getText` + parse) or a `Decimal`-typed destination.
+
+**SQLite can be made to behave (v0.90.0, opt-in):**
+`SQLiteDriver.openWithOptions(allocator, path, .{ .strict_numeric_text = true })`
+makes `getInt`/`getFloat` parse instead of coerce whenever the column has TEXT
+affinity *and* the value's storage class is TEXT — the `Decimal` case exactly.
+Integers reject a fractional part, a separator and an overflow (each answers
+`null`, which the strict scanner reports as `TypeMismatch` and the lenient one
+turns into the field's default), `+`/`-` and surrounding whitespace are
+accepted like PG and MySQL accept them, and expression columns (no declared
+type) keep the old behaviour. The default is unchanged on purpose: flipping it
+would turn reads that succeed today into errors. SQLite's coercion is
 pinned by a driver test precisely so that "fixing" it into a precise parse —
 which would turn currently succeeding reads into errors — is a reviewable
 decision, not an accident (`OPEN_ITEMS.md`, needs-a-decision table).
