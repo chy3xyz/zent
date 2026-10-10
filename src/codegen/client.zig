@@ -748,7 +748,7 @@ fn queryTargetsImpl(
         try extra_preds.append(allocator, sql.IsNull("deleted_at"));
     }
 
-    var b = sql.Builder.init(allocator, driver.dialect());
+    var b = try sql.Builder.initCapacity(allocator, 256, 8, driver.dialect());
     defer b.deinit();
     graph_neighbors.appendSetNeighborsFiltered(&b, step, parent_ids, extra_preds.items) catch |err| {
         return if (err == error.OutOfMemory) error.OutOfMemory else error.BuildFailed;

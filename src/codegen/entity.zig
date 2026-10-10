@@ -302,31 +302,42 @@ fn deinitEntityEdges(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         const ItemType = @typeInfo(EdgeArrType).pointer.child;
         const edges_ptr: *?[]ItemType = &@field(self.edges, e.name);
         if (edges_ptr.*) |arr| {
-            for (arr) |*item| {
-                // Eager-loaded targets carry their own JSON arena (see
-                // loadEdgePath); release it before the owning fields.
-                if (comptime @hasField(ItemType, "json_arena")) {
-                    if (item.json_arena) |arena| {
-                        arena.deinit();
-                        allocator.destroy(arena);
-                        item.json_arena = null;
-                    }
-                }
-                inline for (target_info.fields) |tf| {
-                    if (!comptime isOwningField(tf.zig_type)) continue;
-                    const item_field_type = if (tf.optional) ?tf.zig_type else tf.zig_type;
-                    const item_fp: *item_field_type = &@field(item, tf.name);
-                    FreeField(item_field_type, item_fp, allocator);
-                }
-                // Terminal targets (PlainFields) carry no edges container;
-                // the comptime guard stops that instantiation from being
-                // analyzed.
-                if (comptime @hasField(ItemType, "edges")) {
-                    deinitEntityEdges(infos, target_info, item, allocator);
-                }
-            }
+            for (arr) |*item| deinitEagerTarget(infos, target_info, item, allocator);
             allocator.free(arr);
         }
+    }
+}
+
+/// Free one eager-loaded target item — the `LightEntity` / `PlainFields` shape
+/// `loadEdgePath` scans — releasing its JSON arena, its owning fields and, when
+/// the item type carries an edges container, its own loaded edges.
+///
+/// This is the per-item body of `deinitEntityEdges`, exposed because a target
+/// can be held outside an edge array: `loadEdgePath` parks scanned targets in a
+/// per-parent map before it copies them into the parents' edge slices, and a
+/// failure before that transfer has to release the parked items. `deinitEntity`
+/// cannot be used for them — it always calls `deinitEntityEdges`, which reads
+/// `self.edges`, and a terminal `PlainFields` target has no such member.
+pub fn deinitEagerTarget(comptime infos: []const TypeInfo, comptime info: TypeInfo, self: anytype, allocator: std.mem.Allocator) void {
+    // Eager-loaded targets carry their own JSON arena (see loadEdgePath);
+    // release it before the owning fields.
+    if (comptime @hasField(@TypeOf(self.*), "json_arena")) {
+        if (self.json_arena) |arena| {
+            arena.deinit();
+            allocator.destroy(arena);
+            self.json_arena = null;
+        }
+    }
+    inline for (info.fields) |tf| {
+        if (!comptime isOwningField(tf.zig_type)) continue;
+        const field_type = if (tf.optional) ?tf.zig_type else tf.zig_type;
+        const fp: *field_type = &@field(self, tf.name);
+        FreeField(field_type, fp, allocator);
+    }
+    // Terminal targets (PlainFields) carry no edges container; the comptime
+    // guard stops that instantiation from being analyzed.
+    if (comptime @hasField(@TypeOf(self.*), "edges")) {
+        deinitEntityEdges(infos, info, self, allocator);
     }
 }
 

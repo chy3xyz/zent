@@ -25,6 +25,58 @@ const schema_mod = @import("../core/schema.zig");
 const shard_mod = @import("../shard.zig");
 const TypeInfo = graph_mod.TypeInfo;
 
+/// A pass-through allocator whose `remap` always declines, so a list that
+/// grows is forced through `alignedAlloc` + copy instead of the in-place
+/// `remap` fast path.
+///
+/// `checkAllAllocationFailures` counts *allocations*, and an `ArrayList`'s
+/// growth asks `allocator.remap` first (see `ensureTotalCapacityPrecise`): a
+/// remap that happens to succeed counts nothing. Whether it succeeds depends
+/// on the addresses a run is given, so on a platform whose allocator can grow
+/// in place (`mremap` on Linux) the number of counted allocation points varies
+/// run to run and the sweep reports `NondeterministicMemoryUsage` — a failure
+/// that is invisible on macOS, where remap declines. Declining every remap
+/// makes each growth an alloc+copy the sweep can fail deterministically.
+/// `takeQuery`'s `toOwnedSlice` is a remap too, so the same wrapper pins the
+/// move-out path.
+///
+/// The joined-build sweep in `codegen/query.zig` carries the same adapter
+/// (kept as a local copy here rather than importing a test-only file from
+/// another test).
+const NoRemap = struct {
+    inner: std.mem.Allocator,
+
+    fn asAllocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
 var caaf_scope_pred: sql.Predicate = undefined;
 
 fn caafScopeFilter(ctx: privacy.PrivacyContext) ?*const anyopaque {
@@ -46,10 +98,18 @@ const caaf_infos: []const TypeInfo = caaf_graph.types;
 
 test "scope.forTable unwinds cleanly when any single allocation fails" {
     // Soft delete + a policy filter + an interceptor-free render: the fragment
-    // allocates while collecting predicates, while rendering the builder's
-    // buffer, and once more when ownership is handed over.
+    // allocates while collecting predicates, once for each of the builder's
+    // two preallocated buffers (`sql.Builder.initCapacity` at
+    // `codegen/scope.zig:120`), and once more when ownership is handed over by
+    // `takeQuery`. (The sweep passes with the old, OOM-swallowing `Builder.init`
+    // as well — the next write into the fallback's empty buffer re-raises the
+    // failure — so what it pins is the fragment's ownership, not the swallow.)
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-        fn run(allocator: std.mem.Allocator) !void {
+        fn run(child: std.mem.Allocator) !void {
+            // The builder's buffers grow and shrink through `remap`; declining
+            // it keeps the counted allocation points fixed (see `NoRemap`).
+            var no_remap = NoRemap{ .inner = child };
+            const allocator = no_remap.asAllocator();
             var frag = try scope.forTable(
                 caaf_infos,
                 "caaf_row",
@@ -62,6 +122,36 @@ test "scope.forTable unwinds cleanly when any single allocation fails" {
             defer frag.deinit();
             try std.testing.expect(frag.sql.len > 0);
             try std.testing.expect(frag.args.len == 1);
+        }
+    }.run, .{});
+}
+
+test "scope.forTable on a numbered dialect with an alias unwinds cleanly when any single allocation fails" {
+    // The same `sql.Builder.initCapacity` site (`codegen/scope.zig:120`) on the
+    // other render shape a caller can ask for: a PostgreSQL fragment, every
+    // predicate qualified with the alias the caller's statement uses, and
+    // numbering that starts after the four arguments the head already bound —
+    // `"t"."deleted_at" IS NULL AND "t"."tenant" = $5`. The placeholder buffer
+    // and the qualified-identifier path allocate differently from the SQLite
+    // case above, so this is a second, independent pass over the same two
+    // preallocations.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(child: std.mem.Allocator) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const allocator = no_remap.asAllocator();
+            var frag = try scope.forTable(
+                caaf_infos,
+                "caaf_row",
+                allocator,
+                .postgres,
+                privacy.PrivacyContext{ .tenant_id = 7 },
+                null,
+                .{ .alias = "t", .arg_index = 5 },
+            );
+            defer frag.deinit();
+            try std.testing.expect(std.mem.indexOf(u8, frag.sql, "\"t\".\"deleted_at\" IS NULL") != null);
+            try std.testing.expect(std.mem.indexOf(u8, frag.sql, "\"t\".\"tenant\" = $5") != null);
+            try std.testing.expectEqual(@as(usize, 1), frag.args.len);
         }
     }.run, .{});
 }
@@ -108,6 +198,42 @@ test "scope.withClause unwinds cleanly when any single allocation fails" {
             const clause = try scope.withClause(frag, allocator, "SELECT * FROM caaf_row", true);
             defer allocator.free(clause);
             try std.testing.expect(std.mem.startsWith(u8, clause, "SELECT * FROM caaf_row AND ("));
+        }
+    }.run, .{});
+}
+
+// ------------------------------------------------------------------
+// bulk delete builder
+// ------------------------------------------------------------------
+
+test "BulkDeleteBuilder.init unwinds cleanly when any single allocation fails" {
+    // `init` owns three allocations: the builder's SQL buffer and its args
+    // array (`initCapacity` at `sql/builder.zig:2049`), then the first
+    // predicate group appended to `groups`. A failure of that last append is
+    // the case the builder's own `errdefer self.b.deinit()` covers — without
+    // it the two buffers the struct literal already took ownership of are
+    // stranded (measured: remove the `errdefer` and this case fails at
+    // `fail_index 2/6`, reporting the 256-byte SQL buffer and the 192-byte args
+    // array leaked). `takeQuery` then re-walks the whole statement, including
+    // the predicate render and the move-out of both buffers.
+    //
+    // A predicate is mandatory (Z34): a group-less or predicate-less bulk
+    // delete answers `error.NoPredicate` instead of deleting every row, so the
+    // case supplies one and pins that `takeQuery` succeeds.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(child: std.mem.Allocator) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const allocator = no_remap.asAllocator();
+
+            var d = try sql.BulkDeleteBuilder.init(allocator, .sqlite, "caaf_row");
+            defer d.deinit();
+            _ = try d.where(sql.EQ("tenant", .{ .int = 7 }));
+
+            var q = try d.takeQuery();
+            defer q.deinit();
+            try std.testing.expect(std.mem.startsWith(u8, q.sql, "DELETE FROM \"caaf_row\" WHERE "));
+            try std.testing.expectEqual(@as(usize, 1), q.args.len);
+            try std.testing.expectEqual(@as(i64, 7), q.args[0].int);
         }
     }.run, .{});
 }

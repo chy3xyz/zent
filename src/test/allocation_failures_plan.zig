@@ -13,7 +13,15 @@
 //!   - the outbox paths: `Outbox.pending` and `Outbox.claim` build an owned
 //!     `[]Entry` out of driver rows — one `alloc` plus three string dupes per
 //!     row — and `claim`'s MySQL shape wraps the same row reader in a
-//!     transaction whose rollback/deinit bookkeeping has to unwind with it.
+//!     transaction whose rollback/deinit bookkeeping has to unwind with it;
+//!   - the codegen neighbour assembly paths (section (e)): `loadEdgePath`
+//!     (the eager loader behind `WithEdge`) and `client.queryTargets*` both
+//!     assemble a target read the same way, and `loadEdgePath` parks a scanned
+//!     target in a per-parent map before it copies the map into the parents'
+//!     edge slices. A failure in between — a missing `__fk` column, the map's
+//!     own growth, the append — used to strand that target's duplicated
+//!     strings and its JSON arena; both the in-flight guard and the map
+//!     teardown are held to the byte ledger here.
 //!
 //! The method is the sibling file's: `checkAllAllocationFailures` runs the
 //! function once to count the allocations, then fails each one in turn and
@@ -284,6 +292,11 @@ const plan_infos = graph_mod.buildGraph(&.{ PlanDoc, PlanTag }).types;
 /// answers NULL — which is also how a driver reports a column the accessor
 /// asked for and the result set does not have.
 ///
+/// `names` is the column-name list, for the readers that address a column by
+/// name rather than by position (`scan.findColumnIndex(row, "__fk")` in the
+/// eager loader). It is empty for the catalog fixtures, whose reads are all
+/// positional.
+///
 /// The positions each dialect reads: SQLite's `table_info` (name, type,
 /// notnull, pk at 1/2/3/5) and `index_list` (name, unique at 1/2/4); MySQL's
 /// `information_schema.columns` (name, type, `is_nullable` at 0/1/2) and
@@ -293,6 +306,7 @@ const plan_infos = graph_mod.buildGraph(&.{ PlanDoc, PlanTag }).types;
 const StubRow = struct {
     text: []const ?[]const u8 = &.{},
     int: []const ?i64 = &.{},
+    names: []const []const u8 = &.{},
 };
 
 fn stubRowOf(ptr: *anyopaque) *const StubRow {
@@ -300,16 +314,19 @@ fn stubRowOf(ptr: *anyopaque) *const StubRow {
 }
 
 /// The fixture's width, which is what a driver reports for a result set: the
-/// longer of the two column lists. SQLite's `index_list` read only asks whether
-/// there is a column past 4 (the `partial` flag), so a row with the six columns
-/// that read uses still answers.
+/// longest of the three column lists (the neighbours' rows name a trailing
+/// `__fk` column the value lists do not carry). SQLite's `index_list` read only
+/// asks whether there is a column past 4 (the `partial` flag), so a row with
+/// the six columns that read uses still answers.
 fn stubColumnCount(ptr: *anyopaque) usize {
     const row = stubRowOf(ptr);
-    return @max(row.text.len, row.int.len);
+    return @max(@max(row.text.len, row.int.len), row.names.len);
 }
 
-fn stubColumnName(_: *anyopaque, _: usize) []const u8 {
-    return "";
+fn stubColumnName(ptr: *anyopaque, i: usize) []const u8 {
+    const row = stubRowOf(ptr);
+    if (i >= row.names.len) return "";
+    return row.names[i];
 }
 
 fn stubGetBool(ptr: *anyopaque, i: usize) ?bool {
@@ -993,4 +1010,257 @@ test "outbox.claim (MySQL transaction shape) unwinds cleanly when any single all
         ClaimTx.run,
         .{ OutboxDriverClient{ .driver = stub.asDriver() }, &stub },
     );
+}
+
+// ------------------------------------------------------------------
+// (e) the codegen neighbour assembly paths
+// ------------------------------------------------------------------
+//
+// `loadEdgePath` — the eager loader behind `QueryBuilder.WithEdge`, which
+// `All`/`First` run once the parent rows are scanned — and
+// `client.queryTargets*` — the reader behind `EntityClient.QueryEdge` — share
+// one assembly: a target read contract, a `sql.Builder`, a
+// `graph_neighbors.appendSetNeighborsFiltered` call, then a positional scan of
+// every returned row into an owned entity. Both used `sql.Builder.init`, the
+// *swallowing* shape that absorbs an `OutOfMemory` and falls back to empty
+// lists; the convergence to `initCapacity` (`codegen/query.zig:302`,
+// `codegen/client.zig:751`) replaced it with a failure the caller propagates.
+//
+// What these cases pin is the assembly's **ownership**, not the swallow: with
+// `init` the sweep passes too (measured), because the very next write into the
+// fallback's empty buffer re-raises the `OutOfMemory` that `init` absorbed, so
+// the same fail index is covered either way. The eager loader's per-parent map
+// is where the bytes actually went missing — a target scanned but not yet
+// appended, or a whole map list left behind on a failure — and the sweep below
+// is what found it; `graph_neighbors.appendSetNeighborsFiltered`'s own output
+// is a separate case in the sibling read sweep.
+//
+// The stub serves the statements a traversal issues — the parent SELECT and
+// the neighbour SELECT — out of borrowed rows (`StubRow`), so it allocates
+// nothing and the swept ledger holds only the codegen path's own allocations.
+// `NoRemap` is the same `remap`-declining adapter the joined-build sweep
+// carries (kept as a local copy here; a test-only file is not imported into
+// another test root at the top level): a list growth that remaps in place
+// counts no allocation, which is what makes the sweep red on Linux and green
+// on macOS, so every growth is forced through `alignedAlloc` + copy.
+
+const entity_mod = @import("../codegen/entity.zig");
+
+/// A pass-through allocator whose `remap` always declines; see the section
+/// comment above and `codegen/query.zig`'s joined-build sweep for the same
+/// adapter.
+const NoRemap = struct {
+    inner: std.mem.Allocator,
+
+    fn asAllocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
+/// A parent/child pair with an o2m `To` edge, so the neighbour SQL keeps the
+/// FK on the target (`parent_id IN (…)`) — the shape
+/// `appendSetNeighborsFiltered` emits for a first eager level, and the one
+/// `queryTargets` reads.
+const CaafEdgeChild = Schema("CaafEdgeChild", .{
+    .table_name = "caaf_edge_child",
+    .fields = &.{ field.Int("parent_id"), field.String("body") },
+});
+
+const CaafEdgeParent = Schema("CaafEdgeParent", .{
+    .table_name = "caaf_edge_parent",
+    .fields = &.{field.String("name")},
+    .edges = &.{edge.To("children", CaafEdgeChild).Field("parent_id")},
+});
+
+const caaf_edge_infos: []const TypeInfo = graph_mod.buildGraph(&.{ CaafEdgeParent, CaafEdgeChild }).types;
+const caaf_edge_parent_info = graph_mod.fromSchema(CaafEdgeParent);
+const caaf_edge_child_info = graph_mod.fromSchema(CaafEdgeChild);
+
+/// Two parent rows in the order the generated SELECT projects the parent's own
+/// columns: `id`, `name`. Two, not one, so the transfer loop below runs its
+/// `dupe` a second time *after* the first parent's list was emptied — the
+/// failure that would double free the first parent's edge slice if the emptied
+/// list were still walked by the map teardown.
+const caaf_edge_parent_rows = [_]StubRow{
+    .{ .names = &.{ "id", "name" }, .text = &.{ null, "parent-one" }, .int = &.{ 1, null } },
+    .{ .names = &.{ "id", "name" }, .text = &.{ null, "parent-two" }, .int = &.{ 2, null } },
+};
+
+/// Three child rows, in the neighbour projection's order: the target's columns
+/// in field order (`id`, `parent_id`, `body`) followed by the computed `__fk` —
+/// for an o2m edge that is the FK value, i.e. the parent id, which is what
+/// tells the eager loader which parent each row belongs to. Two rows land on
+/// parent 1 and one on parent 2, so the per-parent map holds two lists with
+/// different lengths. The trailing name is load-bearing: `loadEdgePath` finds
+/// the column with `findColumnIndex(row, "__fk")`, so a fixture without `names`
+/// would fail the lookup rather than the sweep.
+const caaf_edge_child_rows = [_]StubRow{
+    .{ .names = &.{ "id", "parent_id", "body", "__fk" }, .text = &.{ null, null, "first", null }, .int = &.{ 10, 1, null, 1 } },
+    .{ .names = &.{ "id", "parent_id", "body", "__fk" }, .text = &.{ null, null, "second", null }, .int = &.{ 11, 1, null, 1 } },
+    .{ .names = &.{ "id", "parent_id", "body", "__fk" }, .text = &.{ null, null, "only", null }, .int = &.{ 12, 2, null, 2 } },
+};
+
+/// A driver serving both statements of a neighbour traversal: the one naming
+/// `target_table` gets the neighbour rows, the one naming `parent_table` the
+/// parent rows. `unmatched` counts a statement neither name claims, so a
+/// changed projection cannot silently be answered "no rows" and pass.
+const NeighborStub = struct {
+    parent_table: []const u8,
+    target_table: []const u8,
+    parent_rows: []const StubRow = &.{},
+    target_rows: []const StubRow = &.{},
+    unmatched: usize = 0,
+    cursor: Cursor = .{ .rows = &.{} },
+
+    fn asDriver(self: *NeighborStub) driver.Driver {
+        return .{ .ptr = self, .vtable = &neighbor_stub_vtable };
+    }
+
+    fn answering(self: *NeighborStub, rows: []const StubRow) driver.Rows {
+        self.cursor = .{ .rows = rows };
+        return .{ .ptr = &self.cursor, .vtable = &cursor_vtable };
+    }
+};
+
+fn neighborStubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) driver.Error!driver.Rows {
+    const self: *NeighborStub = @ptrCast(@alignCast(ptr));
+    // The target match comes first: its statement names only the target, but a
+    // junction-shaped edge would name both tables, and the narrower match is
+    // the one the traversal is asking about.
+    if (self.target_table.len > 0 and std.mem.indexOf(u8, query_sql, self.target_table) != null) {
+        return self.answering(self.target_rows);
+    }
+    if (self.parent_table.len > 0 and std.mem.indexOf(u8, query_sql, self.parent_table) != null) {
+        return self.answering(self.parent_rows);
+    }
+    self.unmatched += 1;
+    return self.answering(&.{});
+}
+
+fn neighborStubDialect(_: *anyopaque) dialect.Dialect {
+    return .sqlite;
+}
+
+const neighbor_stub_vtable = stubVTable(neighborStubQuery, neighborStubDialect);
+
+test "loadEdgePath unwinds cleanly when any single allocation fails" {
+    // The whole eager read, from the parent SELECT to the edge slices written
+    // back into the scanned parents. The sweep's target is the neighbour
+    // assembly (`loadEdgePath`): the parent id array, the neighbour builder's
+    // two buffers, the per-parent `__fk` map, each scanned target's duplicated
+    // strings and its JSON arena, and the edge slice. A failure anywhere has to
+    // leave the frame releasable — the map's still-parked targets and value
+    // lists, the target in flight, the id array and the builder's buffers —
+    // which is what the byte ledger checks. It caught exactly that: a failure
+    // between scanning a target and copying it into a parent's slice used to
+    // strand the target's arena and strings (see `loadEdgePath`'s map teardown).
+    const allocator = std.testing.allocator;
+    const ParentClient = codegen.EntityClient(caaf_edge_infos, caaf_edge_parent_info);
+
+    var stub = NeighborStub{
+        .parent_table = "\"caaf_edge_parent\"",
+        .target_table = "\"caaf_edge_child\"",
+        .parent_rows = &caaf_edge_parent_rows,
+        .target_rows = &caaf_edge_child_rows,
+    };
+
+    const Load = struct {
+        fn run(child: std.mem.Allocator, s: *NeighborStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+
+            var client = ParentClient.init(swept, s.asDriver());
+            var q = client.Query();
+            defer q.deinit();
+            _ = try q.WithEdge("children");
+
+            var parents = try q.All();
+            defer {
+                for (parents.items) |*p| entity_mod.deinitEntity(caaf_edge_infos, caaf_edge_parent_info, p, swept);
+                parents.deinit();
+            }
+
+            try std.testing.expectEqual(@as(usize, 0), s.unmatched);
+            try std.testing.expectEqual(@as(usize, 2), parents.items.len);
+            const first = parents.items[0].edges.children.?;
+            try std.testing.expectEqual(@as(usize, 2), first.len);
+            try std.testing.expectEqual(@as(i64, 10), first[0].id);
+            try std.testing.expectEqualStrings("second", first[1].body);
+            const second = parents.items[1].edges.children.?;
+            try std.testing.expectEqual(@as(usize, 1), second.len);
+            try std.testing.expectEqualStrings("only", second[0].body);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Load.run, .{&stub});
+}
+
+test "client.queryTargets unwinds cleanly when any single allocation fails" {
+    // The neighbour reader behind `EntityClient.QueryEdge`, in its scoped
+    // shape: the parent-id `Value` array, the target read contract's predicate
+    // list, the neighbour builder (`Builder.initCapacity` at
+    // `codegen/client.zig:751`), the scanned targets and the result list. The
+    // errdefer that releases every entity already scanned before the slice
+    // itself is what the ledger holds to account on the failure path.
+    const allocator = std.testing.allocator;
+
+    var stub = NeighborStub{
+        .parent_table = "\"caaf_edge_parent\"",
+        .target_table = "\"caaf_edge_child\"",
+        .target_rows = &caaf_edge_child_rows,
+    };
+
+    const Read = struct {
+        fn run(child: std.mem.Allocator, s: *NeighborStub) !void {
+            var no_remap = NoRemap{ .inner = child };
+            const swept = no_remap.asAllocator();
+
+            var got = try codegen.queryTargets(
+                caaf_edge_infos,
+                "CaafEdgeParent",
+                "children",
+                &.{ 1, 2 },
+                swept,
+                s.asDriver(),
+                null,
+                null,
+            );
+            defer {
+                for (got.items) |*e| entity_mod.deinitEntity(caaf_edge_infos, caaf_edge_child_info, e, swept);
+                got.deinit();
+            }
+
+            try std.testing.expectEqual(@as(usize, 0), s.unmatched);
+            try std.testing.expectEqual(@as(usize, 3), got.items.len);
+            try std.testing.expectEqual(@as(i64, 10), got.items[0].id);
+            try std.testing.expectEqualStrings("second", got.items[1].body);
+            try std.testing.expectEqualStrings("only", got.items[2].body);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Read.run, .{&stub});
 }

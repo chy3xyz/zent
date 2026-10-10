@@ -2455,6 +2455,7 @@ fn createTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, com
             );
         } else {
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
+            warnOutOfGraphEdgeRefs(info, infos);
             const sql = try createTableSQLAlloc(allocator, table, dialect);
             defer allocator.free(sql);
             _ = try driver_drv.exec(sql, &.{});
@@ -2575,6 +2576,55 @@ fn edgeRefTarget(comptime e: EdgeInfo, comptime all_infos: []const TypeInfo) Edg
                 return .{ .table = ti.table_name, .info = ti };
         }
         return .{ .table = toSnakeCase(e.target_name), .info = null };
+    }
+}
+
+/// The edges whose foreign key goes through `edgeRefTarget`: a From m2o/o2o
+/// edge gets the FK column in this table, and an M2M edge without a `Through`
+/// gets one in the junction `junctionTableForEdge` derives. All other edges
+/// reference an in-graph entity by construction.
+fn edgeFKUsesRefTarget(comptime e: EdgeInfo) bool {
+    return (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) or
+        (e.relation == .m2m and e.through == null);
+}
+
+/// Say out loud which edge crosses this graph, so the foreign key it builds is
+/// a dangling reference.
+///
+/// Every surface that resolves an edge for a *query* refuses this at compile
+/// time (`codegen/graph.edgeTargetInfo`, Z16), but a migration-only consumer —
+/// the multi-database deployment that migrates each graph on its own — never
+/// builds a Client, and `migrateSchema` / `createAllTables` build the table
+/// from the `infos` alone. `edgeRefTarget` then falls back to the historical
+/// `toSnakeCase(target_name)` + `"id"` reference. That fallback stays: the
+/// referenced table may legitimately exist in *another* database (or be created
+/// before its child), so the migration must not fail on it, and `checkSchema`
+/// compares against the same derived shape and stays silent. The one thing
+/// missing was *which* edge crossed the graph — the database error never says
+/// it (SQLite: `no such table` on the child's first INSERT; PostgreSQL/MySQL:
+/// a rejected CREATE or a silently dangling FK).
+///
+/// Warning once per (source entity, edge) is structural, not tracked state:
+/// `inline for` visits each edge of `info` once, and each migration entry point
+/// calls this once per entity. `planMigrateStatements` is the shared planner of
+/// both the dry run and the real run, so neither rebuild of the table
+/// definition warns twice; `createTables` is the legacy path and never runs in
+/// the same migration.
+fn warnOutOfGraphEdgeRefs(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) void {
+    inline for (info.edges) |e| {
+        // `toSnakeCase` lives in a `comptime` block and cannot be called from a
+        // runtime frame, so the derived name is computed where the edge's name
+        // still is a comptime value.
+        const derived: ?[]const u8 = comptime if (edgeFKUsesRefTarget(e) and edgeRefTarget(e, all_infos).info == null)
+            toSnakeCase(e.target_name)
+        else
+            null;
+        if (derived) |table| {
+            zent_log.warn(
+                "zent: the edge '{s}' on entity {s} targets {s}, which is not in this graph's infos; its foreign key references the derived table '{s}' and will be dangling — migrate each graph separately in a multi-database deployment, or add {s} to this graph (cross-graph edges are Z16)",
+                .{ e.name, info.name, e.target_name, table, e.target_name },
+            );
+        }
     }
 }
 
@@ -4152,6 +4202,7 @@ pub fn planMigrateStatements(
             }
         } else {
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
+            warnOutOfGraphEdgeRefs(info, infos);
             const version = computeMigrationVersion(info.table_name, "create_table", "");
             // `created` is true only when the table is genuinely absent
             // before this run: only then does the CREATE build a fresh table
@@ -7952,4 +8003,137 @@ test "an implicit M2M junction references each end's declared table and pk (SQLi
         error.ForeignKeyViolation,
         drv.exec("INSERT INTO \"zt_member_zt_tag_xref\" (\"zt_member_id\", \"zt_tag_xref_id\") VALUES (999, 7)", &.{}),
     );
+}
+
+test "an edge FK to a target outside the graph keeps the historical derived shape" {
+    // The decision `warnOutOfGraphEdgeRefs` exists to make visible: a From edge
+    // whose target is not in `all_infos` still gets the historical fallback —
+    // `toSnakeCase(target_name)` and a literal "id" — rather than an error or a
+    // drift kind. That is deliberate: a multi-database deployment migrates each
+    // graph on its own, so the referenced table may live in another database (or
+    // be created later), and only the *migration* is visible to a consumer that
+    // never generates a Client. `junctionTableForEdge`'s twin is already pinned
+    // in "junctionTableForEdge derives the ends' declared table names and pks";
+    // this is the entity-table half, which had no pin.
+    const allocator = std.testing.allocator;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const UploadFile = schema("UploadFile", .{
+        .table_name = "xdaofood_upload_file",
+        .pk = "fid",
+        .fields = &.{ field.Int("fid"), field.String("path") },
+    });
+    const OrderProduct = schema("OrderProduct", .{
+        .fields = &.{ field.Int("image_id"), field.String("title") },
+        .edges = &.{edge.From("file", UploadFile).Field("image_id")},
+    });
+
+    // UploadFile deliberately omitted: this edge crosses the graph. The graph
+    // still builds — only the query/CRUD surface (`edgeTargetInfo`) refuses it.
+    const graph = comptime buildGraph(&.{OrderProduct});
+    const infos = graph.types;
+    const info = comptime graph.types[0];
+    comptime std.debug.assert(info.edges[0].relation == .m2o);
+
+    const table = comptime tableFromTypeInfoCrossRef(info, infos);
+
+    // Exactly one FK: the from edge's. The target's declared `table_name` and pk
+    // are unknowable out here, so the short derived name and the literal "id"
+    // stand — the same shape `checkSchema` compares against (hence its silence).
+    try std.testing.expectEqual(@as(usize, 1), table.foreign_keys.len);
+    try std.testing.expectEqualStrings("image_id", table.foreign_keys[0].columns[0]);
+    try std.testing.expectEqualStrings("upload_file", table.foreign_keys[0].ref_table);
+    try std.testing.expectEqualStrings("id", table.foreign_keys[0].ref_columns[0]);
+
+    // The rendered DDL is the dangling reference the warning names.
+    const sql = try createTableSQLAlloc(allocator, table, Dialect.sqlite);
+    defer allocator.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES \"upload_file\" (\"id\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "xdaofood_upload_file") == null);
+}
+
+const WarnCapture = struct {
+    var buf: [2048]u8 = undefined;
+    var len: usize = 0;
+
+    fn sink(_: zent_log.Level, message: []const u8) void {
+        const n = @min(message.len, buf.len - len);
+        if (n == 0) return;
+        @memcpy(buf[len..][0..n], message[0..n]);
+        len += n;
+        if (len < buf.len) {
+            buf[len] = '\n';
+            len += 1;
+        }
+    }
+
+    fn reset() void {
+        len = 0;
+    }
+
+    fn occurrences(needle: []const u8) usize {
+        return std.mem.count(u8, buf[0..len], needle);
+    }
+};
+
+test "migrateSchema warns once about an edge that crosses the graph (SQLite)" {
+    // On the migration-only path a cross-graph edge is *visible*, not fatal: no
+    // error and no drift kind are added, because a multi-database deployment
+    // relies on the dangling FK still being creatable (and `checkSchema` stays
+    // silent against the same derived shape). The warning is the whole
+    // deliverable, and it is assertable in-tree through `zent_log.setSink` —
+    // the library's own sink, documented for exactly this, not the root
+    // module's `logFn` — so it is asserted here rather than left to a code read.
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const UploadFile = schema("UploadFile", .{
+        .table_name = "xdaofood_upload_file",
+        .fields = &.{ field.Int("id"), field.String("path") },
+    });
+    const OrderProduct = schema("OrderProduct", .{
+        .fields = &.{ field.Int("image_id"), field.String("title") },
+        .edges = &.{edge.From("file", UploadFile).Field("image_id")},
+    });
+
+    const graph = comptime buildGraph(&.{OrderProduct});
+    const infos = graph.types;
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    // One line for the one crossing edge — the dedup the shared planner gives
+    // (it rebuilds the table definition in both steps and still warns once).
+    // Counted by a distinctive phrase so an unrelated warning cannot inflate it.
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("is not in this graph's infos"));
+    // The four names the database error never carries: edge, source, target and
+    // the derived table it will reference. `"targets UploadFile"` rather than
+    // `"UploadFile"`, which the closing suggestion repeats.
+    try std.testing.expect(WarnCapture.occurrences("'file'") == 1);
+    try std.testing.expect(WarnCapture.occurrences("OrderProduct") == 1);
+    try std.testing.expect(WarnCapture.occurrences("targets UploadFile") == 1);
+    try std.testing.expect(WarnCapture.occurrences("'upload_file'") == 1);
+    try std.testing.expect(WarnCapture.occurrences("Z16") == 1);
+
+    // Behaviour unchanged: the derived, dangling FK is still created, byte for
+    // byte what the shape test above pins.
+    var meta = try drv.query(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'order_product'",
+        &.{},
+    );
+    defer meta.deinit();
+    const row = meta.next() orelse return error.NoTableRow;
+    try std.testing.expect(std.mem.indexOf(u8, row.getText(0).?, "REFERENCES \"upload_file\" (\"id\")") != null);
 }

@@ -4,6 +4,62 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The allocation-failure sweep now covers the paths that could not be
+  modelled before.** Moving the fallible production builder sites off the
+  swallowing `Builder.init` (below) made four paths sweepable, and each got a
+  case: `zent.scope.forTable` in both its plain and numbered-dialect
+  renderings, `BulkDeleteBuilder.init`, the eager `loadEdgePath`, and
+  `client.queryTargetsImpl`. Every case runs its body under a `NoRemap`
+  adapter — without it a list-growing path answers
+  `NondeterministicMemoryUsage` on platforms whose allocator can grow in
+  place (see v0.88.2). `entity.deinitEagerTarget` is the per-item release
+  `deinitEntityEdges` already performed, extracted so a caller holding a
+  scanned-but-unattached eager target can release it through the same code.
+
+### Fixed
+
+- **The eager-load reader leaked on its error path.** The new sweep caught it
+  twice over: a target already scanned (its `json_arena`, its strings) was
+  dropped when `getOrPut`/`append` failed before it entered the per-parent
+  map; and the map's teardown released only the list buffer, so a target
+  parked in an entry kept its arena alive. Both now release through
+  `deinitEagerTarget`, the transfer loop moved to `getPtr` and clears each
+  list as it hands it over (so the teardown can never double-free), and the
+  text-primary-key copy is guarded by a scope that disarms once the map owns
+  it. The case fails at `fail_index 13/19` and `15/19` before the fix.
+- **`BulkDeleteBuilder.init` stranded its buffers when the first group
+  append failed** — the preallocated SQL buffer and args list were allocated
+  before the append and freed by nobody. One `errdefer self.b.deinit()` (the
+  case fails at `fail_index 2/6` without it).
+- **Four production paths swallowed their own OOM.** `scope.forTable`,
+  `client.queryTargetsImpl`, `loadEdgePath` and `BulkDeleteBuilder.init`
+  created their builder through `Builder.init`, which catches a failed
+  `initCapacity` and returns a zero-capacity builder — the failure vanished
+  and the statement was assembled through growing lists instead. All four now
+  call `try sql.Builder.initCapacity(allocator, 256, 8, dialect)` (the same
+  capacities `Builder.init` used), so the failure reaches the caller. Every
+  *infallible* wrapper (`InsertBuilder.init`, `UpdateBuilder.init`,
+  `DeleteBuilder.init`, `BulkUpdateBuilder.init`) is deliberately unchanged —
+  making those fallible is a public-API break, and it is exactly what keeps
+  the `outbox` write path off the sweep; the ledger now says so.
+
+### Changed
+
+- **A cross-graph edge is now visible where only migrations run.** Queries and
+  CRUD fail at compile time (`edgeTargetInfo`), but a graph that is only
+  migrated never calls it, so a cross-graph From-edge FK silently dangled
+  (short name + `"id"`), a cross-graph implicit-M2M junction did the same, and
+  a cross-graph `Through` schema had no guard at all — the only symptom being
+  a database error that named neither the edge nor the graph. The migration
+  now warns once per (source entity, edge), naming the edge, the source, the
+  target type and the derived table it will reference, and pointing at the two
+  ways out (migrate each graph separately, or add the schema to this graph).
+  Behaviour is deliberately unchanged: the fallback FK still renders, so
+  multi-database deployments that rely on it keep working; the fail-loud
+  options stay on the ledger awaiting a consumer.
+
 ## [0.88.2] - 2026-10-10
 
 ### Fixed

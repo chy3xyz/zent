@@ -135,6 +135,7 @@ const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;
 const deinitEntity = @import("entity.zig").deinitEntity;
 const deinitEntityList = @import("entity.zig").deinitEntityList;
+const deinitEagerTarget = @import("entity.zig").deinitEagerTarget;
 const EntityGen = @import("entity.zig").Entity;
 const graph_step = @import("../graph/step.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
@@ -299,7 +300,7 @@ fn loadEdgePath(
                 parent_id_values[i] = idValue(@field(e.*, ParentInfo.pk_field));
             }
 
-            var b = sql.Builder.init(allocator, driver.dialect());
+            var b = try sql.Builder.initCapacity(allocator, 256, 8, driver.dialect());
             defer b.deinit();
 
             // Eager-loaded neighbors honor the same read contract as the
@@ -322,10 +323,17 @@ fn loadEdgePath(
             defer rows.deinit();
 
             var map = MapT.init(allocator);
+            // The map owns every scanned target until the transfer loop below
+            // hands a parent its slice. `deinit` on a list releases only the
+            // buffer, so whatever is still in a list here — a failure before
+            // the transfer, or a parent the transfer loop never reached — has
+            // to be freed item by item first. The transfer loop empties the
+            // lists it has already handed over, so nothing is released twice.
             defer {
                 var it = map.iterator();
                 while (it.next()) |entry| {
                     if (comptime IdType != i64) allocator.free(entry.key_ptr.*);
+                    for (entry.value_ptr.items) |*item| deinitEagerTarget(infos, target_info, item, allocator);
                     entry.value_ptr.deinit(allocator);
                 }
                 map.deinit();
@@ -333,8 +341,9 @@ fn loadEdgePath(
 
             while (rows.next()) |row| {
                 // Eager-loaded targets get the same arena-based JSON ownership
-                // contract as full entities (deinitEntityEdges releases it).
-                const target = if (comptime @hasField(TargetEntity, "json_arena")) blk: {
+                // contract as full entities (`deinitEagerTarget` releases it
+                // here, `deinitEntityEdges` once it is in an edge slice).
+                var target = if (comptime @hasField(TargetEntity, "json_arena")) blk: {
                     const arena = try allocator.create(std.heap.ArenaAllocator);
                     arena.* = std.heap.ArenaAllocator.init(allocator);
                     errdefer {
@@ -349,6 +358,13 @@ fn loadEdgePath(
                     if (err == error.TypeMismatch) explainScanFailure(target_info, TargetEntity, row);
                     return err;
                 };
+                // The scanned target — its duplicated strings and the arena
+                // above — belongs to this frame until the append below hands
+                // it to the map's list. Nothing else owns it across the
+                // `findColumnIndex` / `getOrPut` / `append` failures in
+                // between, so the guard travels with the iteration.
+                errdefer deinitEagerTarget(infos, target_info, &target, allocator);
+
                 const fk_idx = sql_scan.findColumnIndex(row, "__fk") orelse return error.MissingColumn;
                 const parent_id: IdType = if (comptime IdType == i64)
                     row.getInt(fk_idx) orelse return error.TypeMismatch
@@ -357,7 +373,19 @@ fn loadEdgePath(
                     break :blk try allocator.dupe(u8, text);
                 };
 
-                var gop = try map.getOrPut(parent_id);
+                // A textual key is a second owned value: the map stores the
+                // slice as the key rather than copying it, so the dupe belongs
+                // to this frame until `getOrPut` decides. An integer key owns
+                // nothing. The guard is scoped to the block, so a failure of
+                // the append after it cannot double free the key — the map has
+                // taken it (new insert) or the `found_existing` branch below
+                // has freed it.
+                var gop = blk: {
+                    errdefer {
+                        if (comptime IdType != i64) allocator.free(parent_id);
+                    }
+                    break :blk try map.getOrPut(parent_id);
+                };
                 if (gop.found_existing) {
                     if (comptime IdType != i64) allocator.free(parent_id);
                 } else {
@@ -368,9 +396,13 @@ fn loadEdgePath(
             if (rows.nextError()) |e| return e;
 
             for (entities) |e| {
-                if (map.get(@field(e.*, ParentInfo.pk_field))) |list| {
+                if (map.getPtr(@field(e.*, ParentInfo.pk_field))) |list| {
                     const slice = try allocator.dupe(TargetEntity, list.items);
                     @field(e.edges, edge.name) = slice;
+                    // Ownership of the items moved into the edge slice; empty
+                    // the list so the teardown above cannot free them again.
+                    list.deinit(allocator);
+                    list.* = .empty;
                 }
             }
 

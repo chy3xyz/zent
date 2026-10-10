@@ -117,7 +117,7 @@ pub fn forTable(
         .{ .name = "sqlite3" }
     else
         dialect;
-    var b = sql.Builder.init(allocator, render_dialect);
+    var b = try sql.Builder.initCapacity(allocator, 256, 8, render_dialect);
     b.arg_base = opts.arg_index - 1;
     defer b.deinit();
     if (preds.items.len > 0) {

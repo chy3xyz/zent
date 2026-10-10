@@ -2046,10 +2046,13 @@ pub const BulkDeleteBuilder = struct {
 
     pub fn init(allocator: std.mem.Allocator, dialect: Dialect, table: []const u8) !BulkDeleteBuilder {
         var self = BulkDeleteBuilder{
-            .b = Builder.init(allocator, dialect),
+            .b = try Builder.initCapacity(allocator, 256, 8, dialect),
             .table = table,
             .groups = std.array_list.Managed(std.array_list.Managed(Predicate)).init(allocator),
         };
+        // `b` already owns its two preallocated buffers here, so a failure of
+        // the append below has to release them.
+        errdefer self.b.deinit();
         try self.groups.append(std.array_list.Managed(Predicate).init(allocator));
         return self;
     }
