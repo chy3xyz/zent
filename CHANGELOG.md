@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.91.0] - 2026-10-10
+
 ### Added
 
 - **`MigrateOptions.add_missing_foreign_keys`** — the opt-in half of Z31: a
