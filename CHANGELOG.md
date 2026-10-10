@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The joined build's scratch builder no longer swallows an OOM.** v0.88.0's
+  `buildQueryWithFirst` created it through `sql.Builder.init`, which by design
+  catches a failed `initCapacity` and hands back a zero-capacity builder — so
+  the failure vanished and the statement was assembled through a growing list
+  instead. Linux CI answered `error.NondeterministicMemoryUsage` on the new
+  allocation-failure case (the run allocates a different number of times
+  depending on whether the swallow happened); macOS happened to agree with the
+  baseline. The path now uses `try sql.Builder.initCapacity(…)`, which
+  propagates and leaves the failure policy to the caller — the same reason the
+  OPEN_ITEMS sweep gap names `Builder.init` as the blocker for sweeping
+  builders that route through it.
+
 ## [0.88.0] - 2026-10-10
 
 ### Added

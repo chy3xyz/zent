@@ -2035,7 +2035,15 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             // spellings render dialect-correct through a scratch builder whose
             // buffer must outlive `takeQuery` — hence the function-scope
             // defers, which run after the return value is built.
-            var scratch: ?sql.Builder = if (joins_active) sql.Builder.init(self.allocator, self.driver.dialect()) else null;
+            // `Builder.initCapacity`, not `Builder.init`: the latter swallows an
+            // OOM and hands back a zero-capacity builder, which both hides the
+            // failure from the caller and makes the joined build's allocation
+            // count depend on whether the swallow happened (the allocation
+            // sweep answers `NondeterministicMemoryUsage` for exactly that).
+            var scratch: ?sql.Builder = if (joins_active)
+                try sql.Builder.initCapacity(self.allocator, 256, 8, self.driver.dialect())
+            else
+                null;
             defer if (scratch) |*sb| sb.deinit();
             // Renders `qualifier.column` (quoted per dialect) and returns a
             // slice into the scratch buffer.
