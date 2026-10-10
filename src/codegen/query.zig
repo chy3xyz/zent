@@ -4598,10 +4598,54 @@ test "joinEdge assembly unwinds cleanly when any single allocation fails" {
     const OrderEntity = comptime EntityGenerator(infos, order_info);
     const OrderQuery = QueryBuilder(infos, order_info, OrderEntity);
 
+    // `remap` always declines here. List growth asks `allocator.remap` first
+    // and counts nothing when it succeeds, so on a platform whose allocator
+    // can grow in place (Linux `mremap`) the number of *counted* allocations
+    // varies with the addresses a run happens to get — and
+    // `checkAllAllocationFailures` reads a pass that induced no failure as
+    // `NondeterministicMemoryUsage` (ubuntu-latest red, macOS green, before
+    // this wrapper). Declining remap makes every growth an alloc+copy, which
+    // is the model the sweep is built on.
+    const NoRemap = struct {
+        inner: std.mem.Allocator,
+
+        fn asAllocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable = std.mem.Allocator.VTable{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        };
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.rawAlloc(len, alignment, ra);
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.rawResize(memory, alignment, new_len, ra);
+        }
+
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.rawFree(memory, alignment, ra);
+        }
+    };
+
     try std.testing.checkAllAllocationFailures(allocator, struct {
         fn run(a: std.mem.Allocator) !void {
+            var no_remap = NoRemap{ .inner = a };
+            const run_alloc = no_remap.asAllocator();
             var mock = JoinMockDriver{};
-            var q = OrderQuery.init(a, mock.asDriver(), null);
+            var q = OrderQuery.init(run_alloc, mock.asDriver(), null);
             defer q.deinit();
             _ = try q.joinEdge("sweeper", .left, .{ .alias = "sw" });
             const built = try q.buildQuery(order_info.fields.len);

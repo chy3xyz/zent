@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The joined-build allocation sweep is deterministic on remap-capable
+  platforms.** v0.88.1's attempt (propagating the scratch builder's OOM) did
+  not address the real cause: `ArrayList` growth asks `allocator.remap`
+  first, and a successful remap costs **zero counted allocations** — on Linux
+  (`mremap`) whether that succeeds depends on the addresses a run happens to
+  get, so the same body allocates a different number of times than the
+  baseline pass and `checkAllAllocationFailures` answers
+  `error.NondeterministicMemoryUsage` (macOS cannot grow in place, so it
+  stayed green). The case now runs its body under a small adapter whose
+  `remap` always declines, which is the model the sweep is built on. The
+  `Builder.initCapacity` change stays — it was a real improvement (see
+  below), just not this bug.
+
 ## [0.88.1] - 2026-10-10
 
 ### Fixed
