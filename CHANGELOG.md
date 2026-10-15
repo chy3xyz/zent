@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.94.0] - 2026-10-16
+
 ### Added
 
 - **A migration checks its PostgreSQL extensions before it touches anything.**
