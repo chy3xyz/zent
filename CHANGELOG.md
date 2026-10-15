@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.93.0] - 2026-10-15
+
 ### Added
 
 - **A public wall clock, `zent.walltime`** (`nowSecs`/`nowMilli`/`nowMicros`/
