@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.92.0] - 2026-10-15
+
 ### Added
 
 - **`field.Vector(name, dims)` — pgvector columns, searchable end to end.**
