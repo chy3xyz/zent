@@ -1673,9 +1673,10 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
             if (row.isNull(col)) return .null;
             if (row.getInt(col)) |v| return .{ .int = v };
             if (row.getFloat(col)) |v| return .{ .float = v };
-            // Dup text/blob while rows is alive: getters borrow driver buffers.
-            if (row.getText(col)) |v| return .{ .string = try allocator.dupe(u8, v) };
-            if (row.getBlob(col)) |v| return .{ .bytes = try allocator.dupe(u8, v) };
+            // The owned getters carry the "copy while the row is current"
+            // rule, so the lifetime contract lives in one place.
+            if (try row.textDup(allocator, col)) |v| return .{ .string = v };
+            if (try row.blobDup(allocator, col)) |v| return .{ .bytes = v };
             return error.TypeMismatch;
         }
 

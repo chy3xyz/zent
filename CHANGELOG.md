@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`sql_dialect_expr.nowSecsParenthesized(dialect)`** — the same epoch-seconds
+  expression spelled for a DDL `DEFAULT`, where the whole thing has to be
+  parenthesized on MySQL and PostgreSQL (SQLite's spelling already carries its
+  parentheses). Each backend's spelling is now a single constant that both
+  shapes read, so the audit-timestamp default can no longer drift from the
+  set-expression form.
+
+### Changed
+
+- **The wall clock has one implementation everywhere.** `migrate.zig`'s own
+  libc `time()` call (the fourth private copy, writing `applied_at`) now reads
+  `zent.walltime`, and its declaration of `time` is gone. Its
+  `auditTimestampDefault` no longer carries a second copy of the
+  epoch-seconds mapping either — it derives from `dialect_expr`, with the
+  emitted DDL byte-identical (the pinned DDL tests did not move).
+- **The new owned getters are used where the copy was hand-rolled.**
+  `codegen/query.zig`'s value-mapping path and `outbox.zig`'s claim reader now
+  call `row.textDup`/`blobDup` instead of restating "dupe while the row is
+  alive", so the borrowed-slice rule has one place to change. Behaviour is
+  unchanged, including the `OutboxRowMissingColumn` answer for a NULL column.
+
 ## [0.93.0] - 2026-10-15
 
 ### Added

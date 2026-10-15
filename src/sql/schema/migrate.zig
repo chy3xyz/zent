@@ -8,8 +8,8 @@ const Dialect = @import("../dialect.zig").Dialect;
 const sql_driver = @import("../driver.zig");
 const Value = @import("../builder.zig").Value;
 const zent_log = @import("../../runtime/log.zig");
-
-extern fn time(time_t: [*c]c_long) c_long;
+const walltime = @import("../walltime.zig");
+const dialect_expr = @import("../dialect_expr.zig");
 
 /// Transaction safety by backend
 ///
@@ -26,11 +26,11 @@ extern fn time(time_t: [*c]c_long) c_long;
 ///
 /// This is a known, documented limitation of MySQL — do not attempt to make
 /// DDL transactional on MySQL; the guarantee is best-effort per backend.
-/// Current Unix timestamp in seconds.
-/// Uses libc `time()` because Zig 0.17 removed `std.time.timestamp()`;
-/// `applied_at` is informational and not used by migration logic.
+/// Current Unix timestamp in seconds, from the one wall clock the library
+/// keeps (`zent.walltime`); `applied_at` is informational and not used by
+/// migration logic.
 fn unixTimestamp() i64 {
-    return @as(i64, @intCast(time(null)));
+    return walltime.nowSecs();
 }
 
 /// Version scheme for migration operations.
@@ -2160,13 +2160,9 @@ fn auditTimestampDefault(column: ColumnDef, dialect: Dialect) ?[]const u8 {
     if (column.default_value != null) return null;
     if (column.logical_type == null or column.logical_type.? != .time) return null;
     if (!std.mem.eql(u8, column.name, "created_at") and !std.mem.eql(u8, column.name, "updated_at")) return null;
-    return switch (dialect.kind()) {
-        .postgres => "(EXTRACT(EPOCH FROM now())::bigint)",
-        .mysql => "(UNIX_TIMESTAMP())",
-        // SQLite's unixepoch(), and the fallback an unnamed dialect has always
-        // taken.
-        .sqlite, .unknown => "(unixepoch())",
-    };
+    // The spelling lives in `sql/dialect_expr.zig`; this form is the same
+    // expression with the parentheses a DDL `DEFAULT` needs.
+    return dialect_expr.nowSecsParenthesized(dialect);
 }
 
 /// Normalize a SQL type name for dialect-agnostic comparison by:

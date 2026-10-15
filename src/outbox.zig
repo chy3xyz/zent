@@ -422,12 +422,12 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             }
             while (rows.next()) |row| {
                 const id = row.getInt(0) orelse return error.OutboxRowMissingColumn;
-                const aggregate_type = try allocator.dupe(u8, row.getText(1) orelse return error.OutboxRowMissingColumn);
+                const aggregate_type = try row.textDup(allocator, 1) orelse return error.OutboxRowMissingColumn;
                 errdefer allocator.free(aggregate_type);
                 const aggregate_id = row.getInt(2) orelse return error.OutboxRowMissingColumn;
-                const event_type = try allocator.dupe(u8, row.getText(3) orelse return error.OutboxRowMissingColumn);
+                const event_type = try row.textDup(allocator, 3) orelse return error.OutboxRowMissingColumn;
                 errdefer allocator.free(event_type);
-                const payload = try allocator.dupe(u8, row.getText(4) orelse return error.OutboxRowMissingColumn);
+                const payload = try row.textDup(allocator, 4) orelse return error.OutboxRowMissingColumn;
                 errdefer allocator.free(payload);
                 const attempts = row.getInt(5) orelse return error.OutboxRowMissingColumn;
                 const created_at = row.getInt(6) orelse return error.OutboxRowMissingColumn;

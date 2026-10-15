@@ -55,11 +55,27 @@ const Dialect = @import("dialect.zig").Dialect;
 /// timestamp has to come from the process that runs the statement.
 pub fn nowSecs(dialect: Dialect) []const u8 {
     return switch (dialect.kind()) {
-        .postgres => "EXTRACT(EPOCH FROM now())::bigint",
-        .mysql => "UNIX_TIMESTAMP()",
-        .sqlite, .unknown => "(unixepoch())",
+        .postgres => now_secs_postgres,
+        .mysql => now_secs_mysql,
+        .sqlite, .unknown => now_secs_sqlite,
     };
 }
+
+/// The same expression spelled for a DDL `DEFAULT`, which needs the whole thing
+/// parenthesized (`(UNIX_TIMESTAMP())`, not `UNIX_TIMESTAMP()`) on MySQL and
+/// PostgreSQL. SQLite's spelling already carries its parentheses, so it is
+/// emitted unchanged — one definition per backend, two shapes over it.
+pub fn nowSecsParenthesized(dialect: Dialect) []const u8 {
+    return switch (dialect.kind()) {
+        .postgres => "(" ++ now_secs_postgres ++ ")",
+        .mysql => "(" ++ now_secs_mysql ++ ")",
+        .sqlite, .unknown => now_secs_sqlite,
+    };
+}
+
+const now_secs_postgres = "EXTRACT(EPOCH FROM now())::bigint";
+const now_secs_mysql = "UNIX_TIMESTAMP()";
+const now_secs_sqlite = "(unixepoch())";
 
 /// The fragments that turn an `INSERT` into an ignore-on-conflict insert. Use
 /// `insertIgnore` to obtain one; `prefix` and `suffix` belong together.
