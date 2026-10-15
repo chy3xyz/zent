@@ -275,7 +275,11 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
         values: std.array_list.Managed(FieldValue),
         expr_values: std.array_list.Managed(FieldExpr),
         predicates: std.array_list.Managed(sql.Predicate),
-        json_strings: std.array_list.Managed([]const u8),
+        /// The strings this builder allocated and therefore owns: a JSON
+        /// document serialized for a `JSON` field, and a `field.Vector`'s
+        /// `[a,b,c]` text form. A `.string` value *not* on this list borrows
+        /// from the caller.
+        owned_strings: std.array_list.Managed([]const u8),
         edge_actions: std.array_list.Managed(EdgeAction),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
@@ -294,14 +298,14 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                 .values = std.array_list.Managed(FieldValue).init(allocator),
                 .expr_values = std.array_list.Managed(FieldExpr).init(allocator),
                 .predicates = std.array_list.Managed(sql.Predicate).init(allocator),
-                .json_strings = std.array_list.Managed([]const u8).init(allocator),
+                .owned_strings = std.array_list.Managed([]const u8).init(allocator),
                 .edge_actions = std.array_list.Managed(EdgeAction).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.json_strings.items) |s| self.allocator.free(s);
-            self.json_strings.deinit();
+            for (self.owned_strings.items) |s| self.allocator.free(s);
+            self.owned_strings.deinit();
             self.values.deinit();
             for (self.expr_values.items) |fe| {
                 self.allocator.free(fe.expr);
@@ -367,6 +371,11 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
         /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
+            // See `CreateBuilder.setFieldValue`: the field's *logical* type
+            // picks the `sql.Value` tag, and a `field.Vector` value is encoded
+            // (with its dimension check) rather than passed through.
+            comptime var logical_type: @TypeOf(info.fields[0].field_type) = undefined;
+            comptime var vector_dims: ?usize = null;
             comptime {
                 var found = false;
                 for (info.fields) |f| {
@@ -386,6 +395,8 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                             needs_json = true;
                         }
                         if (f.immutable) @compileError("Field is immutable: " ++ field_name);
+                        logical_type = f.field_type;
+                        vector_dims = f.vector_dims;
                         found = true;
                         break;
                     }
@@ -395,11 +406,28 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
 
             if (comptime needs_json) {
                 const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-                try self.json_strings.append(json_str);
+                // See `CreateBuilder.setFieldValue`: the guard covers the append
+                // only, and the block disarms it once ownership moved.
+                {
+                    errdefer self.allocator.free(json_str);
+                    try self.owned_strings.append(json_str);
+                }
                 return try self.set(field_name, .{ .string = json_str });
             }
 
-            return try self.set(field_name, field_value.toSqlValue(value));
+            if (comptime logical_type == .vector) {
+                const text = try field_value.vectorTextAlloc(self.allocator, value, vector_dims orelse 0);
+                if (text) |t| {
+                    {
+                        errdefer self.allocator.free(t);
+                        try self.owned_strings.append(t);
+                    }
+                    return try self.set(field_name, .{ .string = t });
+                }
+                return try self.set(field_name, .null);
+            }
+
+            return try self.set(field_name, field_value.toSqlValue(logical_type, value));
         }
 
         /// Add predicates for WHERE clause.
@@ -1327,7 +1355,8 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
         b: sql.BulkUpdateBuilder,
-        json_strings: std.array_list.Managed([]const u8),
+        /// See `UpdateBuilder.owned_strings`.
+        owned_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         /// Shared interceptor chain borrowed from the entity client.
@@ -1348,13 +1377,13 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                 .hooks = hooks,
                 .privacy_ctx = privacy_ctx,
                 .b = b,
-                .json_strings = std.array_list.Managed([]const u8).init(allocator),
+                .owned_strings = std.array_list.Managed([]const u8).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.json_strings.items) |s| self.allocator.free(s);
-            self.json_strings.deinit();
+            for (self.owned_strings.items) |s| self.allocator.free(s);
+            self.owned_strings.deinit();
             self.b.deinit();
         }
 
@@ -1394,6 +1423,11 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
         /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
+            // See `CreateBuilder.setFieldValue`: the field's *logical* type
+            // picks the `sql.Value` tag, and a `field.Vector` value is encoded
+            // (with its dimension check) rather than passed through.
+            comptime var logical_type: @TypeOf(info.fields[0].field_type) = undefined;
+            comptime var vector_dims: ?usize = null;
             comptime {
                 var found = false;
                 for (info.fields) |f| {
@@ -1413,6 +1447,8 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
                             needs_json = true;
                         }
                         if (f.immutable) @compileError("Field is immutable: " ++ field_name);
+                        logical_type = f.field_type;
+                        vector_dims = f.vector_dims;
                         found = true;
                         break;
                     }
@@ -1422,11 +1458,28 @@ pub fn BulkUpdateBuilder(comptime info: TypeInfo) type {
 
             if (comptime needs_json) {
                 const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-                try self.json_strings.append(json_str);
+                // See `CreateBuilder.setFieldValue`: the guard covers the append
+                // only, and the block disarms it once ownership moved.
+                {
+                    errdefer self.allocator.free(json_str);
+                    try self.owned_strings.append(json_str);
+                }
                 return try self.set(field_name, .{ .string = json_str });
             }
 
-            return try self.set(field_name, field_value.toSqlValue(value));
+            if (comptime logical_type == .vector) {
+                const text = try field_value.vectorTextAlloc(self.allocator, value, vector_dims orelse 0);
+                if (text) |t| {
+                    {
+                        errdefer self.allocator.free(t);
+                        try self.owned_strings.append(t);
+                    }
+                    return try self.set(field_name, .{ .string = t });
+                }
+                return try self.set(field_name, .null);
+            }
+
+            return try self.set(field_name, field_value.toSqlValue(logical_type, value));
         }
 
         /// Run the interceptor chain (`.update`). Interceptor errors

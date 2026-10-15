@@ -3,6 +3,7 @@ const field_mod = @import("../../core/field.zig");
 const TypeInfo = @import("../../codegen/graph.zig").TypeInfo;
 const FieldInfo = @import("../../codegen/graph.zig").FieldInfo;
 const EdgeInfo = @import("../../codegen/graph.zig").EdgeInfo;
+const IndexInfo = @import("../../codegen/graph.zig").IndexInfo;
 const Dialect = @import("../dialect.zig").Dialect;
 const sql_driver = @import("../driver.zig");
 const Value = @import("../builder.zig").Value;
@@ -577,6 +578,15 @@ pub const SchemaDrift = struct {
 /// separate kinds and separate conditions for exactly that reason — neither may
 /// suppress the other.
 ///
+/// The index's **access method and operator class** (`IndexDef.method` /
+/// `.opclass`) are deliberately *not* compared — see `IndexDef.method` for the
+/// reasoning. A declared `USING hnsw (embedding vector_cosine_ops)` therefore
+/// reports nothing here, in either direction: the declaration cannot produce a
+/// false `index_columns` drift either, because PostgreSQL's non-btree access
+/// methods already fail the `amname == 'btree'` gate that
+/// `getPostgresIndexes` sets `columns_comparable` from, so the key list of an
+/// hnsw index is never compared against a declaration.
+///
 /// **Column `UNIQUE`** (`.unique_constraint`) is a third, unrelated question:
 /// not "does the index we declare agree with the database's" but "does anything
 /// at all force this column to be unique". The declaration is inlined into
@@ -655,15 +665,11 @@ pub fn checkSchema(
                         // metadata there is. `normalizeSqlType` exists for
                         // exactly this comparison, and the ALTER TYPE branch of
                         // the plan runs it through the same
-                        // `normalizeTypeForCompare` — one comparison, so a plan
+                        // `columnTypesAgree` — one comparison, so a plan
                         // cannot disagree with the drift report it previews.
                         var schema_buf: [128]u8 = undefined;
                         var db_buf: [128]u8 = undefined;
-                        const schema_norm = try normalizeTypeForCompare(allocator, columnSQLType(col, dialect), &schema_buf, dialect);
-                        defer schema_norm.deinit(allocator);
-                        const db_norm = try normalizeTypeForCompare(allocator, db_col.sql_type, &db_buf, dialect);
-                        defer db_norm.deinit(allocator);
-                        if (!std.mem.eql(u8, schema_norm.text, db_norm.text)) {
+                        if (!try columnTypesAgree(allocator, columnSQLType(col, dialect), db_col, &schema_buf, &db_buf, dialect)) {
                             try drifts.append(.{
                                 .table = table.name,
                                 .column = col.name,
@@ -1616,6 +1622,21 @@ pub const MySqlTextError = error{
     MySQLTextColumnCannotBeIndexed,
 };
 
+/// The three ways a declared index method/opclass can be malformed. They are
+/// raised while the DDL is generated, so every entry point that builds tables
+/// carries them (`createTables` / `createAllTables` / the planner) and the
+/// codegen client re-states this set in `CreateTablesError`.
+pub const IndexDeclError = error{
+    /// The `method` (or its `opclass`) is not a bare identifier — the DDL
+    /// concatenates it verbatim, so anything else would be an injection hole.
+    InvalidIndexMethod,
+    InvalidIndexOpClass,
+    /// A PostgreSQL opclass describes *one* indexed column
+    /// (`(embedding vector_cosine_ops)`); declaring it over a multi-column
+    /// index has no legal rendering.
+    OpClassNeedsSingleColumn,
+};
+
 /// A restriction MySQL puts on a BLOB/TEXT/JSON column that the DDL about to
 /// be generated would trip.
 ///
@@ -2073,6 +2094,21 @@ pub const ColumnDef = struct {
     /// `.string` family already resolves to there. null for every column
     /// that declared no length.
     varchar_sql: ?[]const u8 = null,
+    /// DDL spelling for a `field.Vector` column — comptime-formatted
+    /// (`"vector(3)"`) for the same reason `varchar_sql` is:
+    /// `columnSQLType` is a runtime fn returning a borrowed slice it cannot
+    /// print into. `columnSQLType` uses it on a PostgreSQL dialect only;
+    /// MySQL and SQLite get the field kind's mapping (`TEXT`). null for every
+    /// column that declared no dimension.
+    vector_sql: ?[]const u8 = null,
+    /// Explicit SQL type declared by `.SqlType(s)` / `field.Other(name, s)`,
+    /// null when the schema declared none. `columnSQLType` emits it verbatim
+    /// and on a PostgreSQL dialect only; it wins over `varchar_sql`. Beside
+    /// `logical_type` rather than inside `sql_type` for the same reason
+    /// `varchar_sql` is: `sql_type` is the graph's comptime-resolved value for
+    /// the dialect the graph was built with, while the override has to be
+    /// resolved against the dialect the migration is actually running on.
+    sql_type_override: ?[]const u8 = null,
     primary_key: bool = false,
     not_null: bool = false,
     unique: bool = false,
@@ -2081,6 +2117,14 @@ pub const ColumnDef = struct {
 };
 
 fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
+    // A declared `.SqlType(s)` / `field.Other(name, s)` names the column's type
+    // outright, so it is resolved first — ahead of the kind's mapping and ahead
+    // of a declared `VarChar(n)`. PostgreSQL only: the strings this names are
+    // PostgreSQL's own extension/custom types and arrays, and a server that
+    // cannot parse the name would fail `CREATE TABLE` rather than fall back.
+    if (column.sql_type_override) |override| {
+        if (dialect.kind() == .postgres) return override;
+    }
     if (column.logical_type) |logical_type| {
         // A declared `VarChar(n)` replaces the default VARCHAR(255) on MySQL
         // only; every other dialect — and every undeclared column — resolves
@@ -2088,6 +2132,16 @@ fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
         if (logical_type == .string) {
             if (column.varchar_sql) |varchar| {
                 if (dialect.kind() == .mysql) return varchar;
+            }
+        }
+        // A `field.Vector`'s type is dimension-bearing (`vector(3)`), which the
+        // dimension-less `sqlType` cannot spell — the migration carries the
+        // declaration as the comptime-formatted string, exactly as `VarChar(n)`
+        // does. PostgreSQL only: MySQL and SQLite have no vector type, so they
+        // take the `TEXT` mapping below (pgvector's own text form, `[1,2,3]`).
+        if (logical_type == .vector) {
+            if (column.vector_sql) |vector| {
+                if (dialect.kind() == .postgres) return vector;
             }
         }
         return switch (logical_type) {
@@ -2180,7 +2234,42 @@ pub const IndexDef = struct {
     name: []const u8,
     columns: []const []const u8,
     unique: bool = false,
+    /// Access method (`USING <method>`), `null` when the schema declared none.
+    ///
+    /// **Not compared by `checkSchema`.** It could be — PostgreSQL's
+    /// `getPostgresIndexes` already joins `pg_am` (it uses `am.amname` to decide
+    /// whether the key list is comparable at all), and MySQL carries
+    /// `information_schema.statistics.INDEX_TYPE` — but a mismatch is a
+    /// performance fact, and every drift reported here is one `assertSchema`
+    /// turns into a blocked deploy. The comparison would also have to answer
+    /// "equivalent?" rather than "equal?" for a great many pairs (a `btree`
+    /// index and an undeclared method are the same thing; so are `USING BTREE`
+    /// and the default on MySQL), and a wrong answer on either side is worse
+    /// than no answer. So the method is written and never read: declaring it is
+    /// free of drift risk, and changing it on an index that already exists by
+    /// name is not repaired (an existing index is never re-created).
+    method: ?[]const u8 = null,
+    /// Operator class for the index's single key column (`"vector_cosine_ops"`,
+    /// …). PostgreSQL only; see `createIndexSQLAlloc` for what the other two
+    /// dialects do with a declaration they cannot express. Like `method`, it is
+    /// never compared by `checkSchema`.
+    opclass: ?[]const u8 = null,
 };
+
+/// `IndexInfo` → `IndexDef`: the one construction both migration paths use, so
+/// a declaration cannot reach `migrateSchema` and not `planMigrateStatements`
+/// (the dry run and the run it previews must agree), and so the test that pins
+/// a schema's `method`/`opclass` reaching the DDL does not restate the mapping
+/// it is testing.
+fn indexDefFromInfo(idx: IndexInfo) IndexDef {
+    return .{
+        .name = idx.name,
+        .columns = idx.columns,
+        .unique = idx.unique,
+        .method = idx.method,
+        .opclass = idx.opclass,
+    };
+}
 
 /// Table definition for CREATE TABLE.
 pub const TableDef = struct {
@@ -2208,6 +2297,8 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
                 .sql_type = f.sql_type,
                 .logical_type = f.field_type,
                 .varchar_sql = if (f.max_length) |n| field_mod.varCharSQL(n) else null,
+                .vector_sql = if (f.vector_dims) |n| field_mod.vectorSQL(n) else null,
+                .sql_type_override = f.sql_type_override,
                 .primary_key = f.is_id,
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
@@ -2510,29 +2601,165 @@ pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
 /// Unchecked: without the table's column types this cannot tell whether the
 /// dialect will accept the key list. `createIndexSQLForTableAlloc` is the
 /// entry point that can, and is what the migration paths use.
+///
+/// The access method and operator class are the one part of an index
+/// declaration the dialects genuinely disagree about, so each gets one spot:
+///
+/// | Dialect | `method` | `opclass` |
+/// |---|---|---|
+/// | PostgreSQL | `ON t USING <method> (…)`, verbatim | `<col> <opclass>` |
+/// | MySQL | `INDEX i USING BTREE\|HASH ON t (…)`; any other method is omitted with a warning | omitted with a warning |
+/// | SQLite (and an unknown dialect) | omitted with a warning | omitted with a warning |
+///
+/// Undeclared (the default) emits nothing new on any of them: the statement is
+/// byte-for-byte the one this function produced before either slot existed.
+/// Both values are validated against a bare-identifier shape before they are
+/// emitted (they are the only parts of this statement that are neither quoted
+/// nor a schema column), and a method/opclass pair the dialect cannot express is
+/// *reported*, never silently rewritten into one that means something else.
 pub fn createIndexSQLAlloc(allocator: std.mem.Allocator, index: IndexDef, table_name: []const u8, dialect: Dialect) ![]const u8 {
     var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
     defer buf.deinit();
 
+    const kind = dialect.kind();
+    // Resolved before anything is written: both helpers can report, and a
+    // statement half-emitted into `buf` would be discarded anyway.
+    const method = try indexMethodFor(index, kind, table_name);
+    const opclass = try indexOpClassFor(index, kind, table_name);
+
     try buf.appendSlice("CREATE ");
     if (index.unique) try buf.appendSlice("UNIQUE ");
-    if (dialect.kind() == .mysql) {
+    if (kind == .mysql) {
+        // MySQL's grammar puts the index type between the name and `ON`;
+        // PostgreSQL's puts `USING` after the table. Both were checked against
+        // a running server.
         try buf.appendSlice("INDEX ");
+        try quoteIdentToBuffer(dialect, &buf, index.name);
+        if (method) |m| {
+            try buf.appendSlice(" USING ");
+            try buf.appendSlice(m);
+        }
+        try buf.appendSlice(" ON ");
+        try quoteIdentToBuffer(dialect, &buf, table_name);
     } else {
+        // `INDEX IF NOT EXISTS` is not accepted by MySQL at all, which is why
+        // the two dialects need separate prefixes (the `CREATE INDEX` above is
+        // not idempotent on MySQL — the migration layer's existence check in
+        // front of it is what keeps a re-run from failing).
         try buf.appendSlice("INDEX IF NOT EXISTS ");
+        try quoteIdentToBuffer(dialect, &buf, index.name);
+        try buf.appendSlice(" ON ");
+        try quoteIdentToBuffer(dialect, &buf, table_name);
+        if (method) |m| {
+            try buf.appendSlice(" USING ");
+            try buf.appendSlice(m);
+        }
     }
-    try quoteIdentToBuffer(dialect, &buf, index.name);
-    try buf.appendSlice(" ON ");
-    try quoteIdentToBuffer(dialect, &buf, table_name);
     try buf.appendSlice(" (");
 
     for (index.columns, 0..) |col, i| {
         if (i > 0) try buf.appendSlice(", ");
         try quoteIdentToBuffer(dialect, &buf, col);
+        // `opclass` is non-null on PostgreSQL only (see `indexOpClassFor`),
+        // and only for a single-column key, so this is the one column it can
+        // belong to.
+        if (opclass) |o| {
+            if (i == 0) {
+                try buf.appendSlice(" ");
+                try buf.appendSlice(o);
+            }
+        }
     }
     try buf.appendSlice(")");
 
     return allocator.dupe(u8, buf.items);
+}
+
+/// Is `name` a bare SQL identifier, or a dotted chain of them
+/// (`[A-Za-z_][A-Za-z0-9_$]*`, joined by `.`)?
+///
+/// An access method and an operator class are the only two things this file
+/// emits *unquoted* and from outside the schema, and neither can be quoted
+/// instead: MySQL rejects a quoted `index_type` outright (errno 1064), and on
+/// PostgreSQL the unquoted spelling is what folds `HNSW` to `hnsw` the way every
+/// other identifier does. So the value goes out verbatim and this is what keeps
+/// "verbatim" from being an injection surface.
+fn isBareIdentifier(name: []const u8) bool {
+    if (name.len == 0) return false;
+    var part_start = true;
+    for (name) |c| {
+        if (c == '.') {
+            // An empty part means a leading, trailing or doubled dot.
+            if (part_start) return false;
+            part_start = true;
+            continue;
+        }
+        if (part_start) {
+            if (!std.ascii.isAlphabetic(c) and c != '_') return false;
+            part_start = false;
+        } else if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '$') {
+            return false;
+        }
+    }
+    return !part_start;
+}
+
+/// The access method as `kind` can express it, or `null` when it has to be
+/// omitted. See the table on `createIndexSQLAlloc`.
+fn indexMethodFor(index: IndexDef, kind: Dialect.Kind, table_name: []const u8) !?[]const u8 {
+    const declared = index.method orelse return null;
+    return switch (kind) {
+        .postgres => blk: {
+            if (!isBareIdentifier(declared)) return error.InvalidIndexMethod;
+            break :blk declared;
+        },
+        .mysql => blk: {
+            // MySQL's *grammar* has two values, so a third can only be a
+            // schema written for another database. Refusing the whole
+            // migration would make a shared schema unmigratable here for a
+            // performance-only declaration, so the index is created without
+            // one and the omission is said out loud.
+            if (std.ascii.eqlIgnoreCase(declared, "btree")) break :blk "BTREE";
+            if (std.ascii.eqlIgnoreCase(declared, "hash")) break :blk "HASH";
+            zent_log.warn(
+                "zent: MySQL has no `{s}` index access method (only BTREE and HASH), so {s} on {s} was created without one",
+                .{ declared, index.name, table_name },
+            );
+            break :blk null;
+        },
+        .sqlite, .unknown => blk: {
+            zent_log.warn(
+                "zent: this dialect has no index access methods, so `{s}` on {s} ({s}) was ignored",
+                .{ declared, index.name, table_name },
+            );
+            break :blk null;
+        },
+    };
+}
+
+/// The key column's operator class, or `null` when the dialect has none. See
+/// the table on `createIndexSQLAlloc`.
+fn indexOpClassFor(index: IndexDef, kind: Dialect.Kind, table_name: []const u8) !?[]const u8 {
+    const declared = index.opclass orelse return null;
+    return switch (kind) {
+        .postgres => blk: {
+            // An operator class belongs to exactly one key column. Attaching it
+            // to the first of several would build an index the schema did not
+            // ask for, and silently dropping it would build one that cannot
+            // answer the query it was declared for — so the declaration is
+            // refused instead.
+            if (index.columns.len != 1) return error.OpClassNeedsSingleColumn;
+            if (!isBareIdentifier(declared)) return error.InvalidIndexOpClass;
+            break :blk declared;
+        },
+        .mysql, .sqlite, .unknown => blk: {
+            zent_log.warn(
+                "zent: `{s}` is a PostgreSQL operator class and this dialect has none, so it was ignored on {s} ({s})",
+                .{ declared, index.name, table_name },
+            );
+            break :blk null;
+        },
+    };
 }
 
 /// Generate CREATE INDEX SQL for an IndexDef.
@@ -2763,11 +2990,7 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
 
         const table = comptime tableFromTypeInfoCrossRef(info, infos);
         inline for (info.indexes) |idx| {
-            const idx_def = IndexDef{
-                .name = idx.name,
-                .columns = idx.columns,
-                .unique = idx.unique,
-            };
+            const idx_def = indexDefFromInfo(idx);
             const already_exists = if (existing_mysql_indexes) |indexes|
                 indexExists(indexes.items, idx_def.name)
             else
@@ -2884,6 +3107,8 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
                 .sql_type = f.sql_type,
                 .logical_type = f.field_type,
                 .varchar_sql = if (f.max_length) |n| field_mod.varCharSQL(n) else null,
+                .vector_sql = if (f.vector_dims) |n| field_mod.vectorSQL(n) else null,
+                .sql_type_override = f.sql_type_override,
                 .primary_key = f.is_id,
                 .not_null = !f.optional and !f.nillable,
                 .unique = f.unique,
@@ -3054,11 +3279,22 @@ fn defaultValueStr(comptime f: FieldInfo) ?[]const u8 {
 const toSnakeCase = @import("../../codegen/graph.zig").toSnakeCase;
 const pkColumn = @import("../../codegen/graph.zig").pkColumn;
 
-/// A column as the *database* reports it. Owned: `name` and `sql_type` are
-/// allocated, release the list with `freeExistingColumns`.
+/// A column as the *database* reports it. Owned: `name`, `sql_type` and
+/// `udt_name` are allocated, release the list with `freeExistingColumns`.
 pub const ExistingColumn = struct {
     name: []const u8,
+    /// `information_schema.columns.data_type` — the driver's own type name for
+    /// the column (`text`, `integer`, `varchar`), lower-cased. On PostgreSQL a
+    /// type that is *not* one of its built-ins answers `user-defined` or
+    /// `array`, with the concrete name in `udt_name`.
     sql_type: []const u8,
+    /// PostgreSQL's `udt_name`, lower-cased; empty on every other dialect
+    /// (MySQL's and SQLite's catalogs have no such column). It holds the
+    /// concrete `pg_type.typname` — `vector` for a `vector(1536)` column,
+    /// `_int4` for an `integer[]` one — i.e. exactly the name
+    /// `information_schema.columns.data_type` replaces with `user-defined` /
+    /// `array`. See `columnTypesAgree`.
+    udt_name: []const u8 = "",
     not_null: bool,
     pk: bool,
 };
@@ -3125,6 +3361,18 @@ fn reportUnusableSqliteName(pragma: []const u8, table_name: []const u8) void {
     );
 }
 
+/// A lower-cased, owned copy of `text` — what `ExistingColumn` stores.
+///
+/// The comparison in `columnTypesAgree` is case-insensitive by construction,
+/// and both catalog answers (`data_type`, `udt_name`) arrive in the server's own
+/// spelling, so every string this struct owns is normalized once, here, rather
+/// than at each comparison.
+fn dupeLower(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const owned = try allocator.alloc(u8, text.len);
+    for (text, owned) |byte, *dest| dest.* = std.ascii.toLower(byte);
+    return owned;
+}
+
 /// Query existing columns for a table using dialect-specific metadata.
 ///
 /// The table name is **bound** on PostgreSQL (`$1`) and MySQL (`?`), never
@@ -3147,10 +3395,21 @@ pub fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.D
         return error.InvalidTableName;
     }
 
+    // PostgreSQL's `udt_name` is appended to the select list, not folded into
+    // the middle of it: it is the only place the concrete type of a column shows
+    // up when `data_type` answers `USER-DEFINED` (an extension or custom type:
+    // `vector`, `citext`, a domain) or `ARRAY` (any array: `_int4` for
+    // `integer[]`) — comparing `data_type` alone reported a `type_mismatch` for
+    // every such column — and keeping the first three columns exactly where they
+    // were keeps every model of this query that already exists honest (the
+    // allocation-failure sweep's catalog stub answers three). MySQL and SQLite
+    // have no such column (MySQL's `information_schema.columns` is its own
+    // catalog, not PostgreSQL's), so their query text is unchanged and their
+    // `udt_name` stays empty.
     const sql_text = if (is_sqlite)
         try allocator.print("PRAGMA table_info(\"{s}\")", .{table_name})
     else if (is_postgres)
-        try allocator.dupe(u8, "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()")
+        try allocator.dupe(u8, "SELECT column_name, data_type, is_nullable, column_default, udt_name FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema()")
     else if (is_mysql)
         try allocator.dupe(u8, "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = ? AND table_schema = DATABASE()")
     else
@@ -3166,6 +3425,10 @@ pub fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.D
     while (rows.next()) |row| {
         const name = row.getText(if (is_sqlite) 1 else 0) orelse continue;
         const sql_type = row.getText(if (is_sqlite) 2 else 1) orelse "";
+        // A driver that does not answer the trailing column reads as "no
+        // `udt_name`" rather than as an error, and `columnTypesAgree` has a
+        // fallback for exactly that.
+        const udt_name = if (is_postgres) (row.getText(4) orelse "") else "";
         const not_null = if (is_sqlite)
             (row.getInt(3) orelse 0) != 0
         else
@@ -3174,13 +3437,18 @@ pub fn getExistingColumns(allocator: std.mem.Allocator, driver_drv: sql_driver.D
 
         const owned_name = try allocator.dupe(u8, name);
         errdefer allocator.free(owned_name);
-        const owned_type = try allocator.alloc(u8, sql_type.len);
+        const owned_type = try dupeLower(allocator, sql_type);
         errdefer allocator.free(owned_type);
-        for (sql_type, owned_type) |byte, *dest| dest.* = std.ascii.toLower(byte);
+        // Not allocated when absent, so `udt_name` is never a slice
+        // `freeExistingColumns` would have to tell apart from the empty
+        // default the struct carries on the other dialects.
+        const owned_udt: []const u8 = if (udt_name.len == 0) "" else try dupeLower(allocator, udt_name);
+        errdefer if (owned_udt.len > 0) allocator.free(owned_udt);
 
         try result.append(.{
             .name = owned_name,
             .sql_type = owned_type,
+            .udt_name = owned_udt,
             .not_null = not_null,
             .pk = pk,
         });
@@ -3193,6 +3461,9 @@ pub fn freeExistingColumns(allocator: std.mem.Allocator, columns: *std.array_lis
     for (columns.items) |c| {
         allocator.free(c.name);
         allocator.free(c.sql_type);
+        // Only a PostgreSQL column carries one, and the empty default is not an
+        // allocation (see `getExistingColumns`).
+        if (c.udt_name.len > 0) allocator.free(c.udt_name);
     }
     columns.deinit();
 }
@@ -4047,6 +4318,8 @@ fn alterTableAddColumnSQL(
         .sql_type = col.sql_type,
         .logical_type = col.logical_type,
         .varchar_sql = col.varchar_sql,
+        .vector_sql = col.vector_sql,
+        .sql_type_override = col.sql_type_override,
         .not_null = col.not_null,
         .default_value = col.default_value,
     };
@@ -4194,6 +4467,137 @@ const NormalizedType = struct {
         if (self.owned) |buf| allocator.free(buf);
     }
 };
+
+/// Whether a declared column type and the type the database reports describe
+/// the same column — the **one** comparison `checkSchema` and the migration
+/// plan's ALTER TYPE branch share.
+///
+/// Two sides, two spellings. The declared side comes from `columnSQLType`
+/// (`TEXT`, `VARCHAR(120)`, `vector(1536)`, `integer[]`); the database side is
+/// whatever the catalog answers — MySQL's storage names, SQLite's declared
+/// type, and on PostgreSQL a name of its own for the columns that are neither
+/// one of its built-ins nor spellable in `data_type`:
+///
+///   - `data_type = 'USER-DEFINED'` (an extension type, a domain, an enum)
+///     with the real name in `udt_name` — `vector`, `citext`;
+///   - `data_type = 'ARRAY'` with the element type in `udt_name` — `_int4` for
+///     `integer[]`, `_citext` for `citext[]`.
+///
+/// Comparing `data_type` itself reported a `type_mismatch` for every such
+/// column, so a schema declaring one could never pass `assertSchema` — and
+/// `migrateSchema(allow_data_loss)` would then plan an `ALTER TYPE` to a type
+/// the column already is. Both answers are resolved here: the `udt_name` is
+/// what gets compared, the array marker is compared as a *marker*, and the
+/// declared side is stripped the same way (a `schema.` qualifier and any
+/// `(...)`/`[]` decoration), so `integer[]` matches `ARRAY`/`_int4` and
+/// `vector(1536)` matches `USER-DEFINED`/`vector`.
+///
+/// It is a **comparison**, not a relaxation: only the names the catalog says
+/// are the same type are unified (`text[]` against `_int4` is still reported,
+/// and so is a scalar declared where the database holds an array). Dialects
+/// other than PostgreSQL take the branch they always took, byte for byte —
+/// including MySQL's storage-name mapping, which is why this cannot be one flat
+/// `normalizeSqlType` call on a decorated name.
+fn columnTypesAgree(
+    allocator: std.mem.Allocator,
+    schema_type: []const u8,
+    db_col: ExistingColumn,
+    schema_buf: *[128]u8,
+    db_buf: *[128]u8,
+    dialect: Dialect,
+) error{OutOfMemory}!bool {
+    if (dialect.kind() == .postgres and db_col.udt_name.len > 0) {
+        // Case-insensitively: `getExistingColumns` lower-cases both answers, but
+        // `ExistingColumn` is a public shape a caller can hand-build with the
+        // server's own `USER-DEFINED`/`ARRAY` spelling, and taking the wrong
+        // branch there would be an unreported difference.
+        const db_is_array: ?bool = if (std.ascii.eqlIgnoreCase(db_col.sql_type, "user-defined"))
+            false
+        else if (std.ascii.eqlIgnoreCase(db_col.sql_type, "array"))
+            true
+        else
+            null;
+        if (db_is_array) |is_array| {
+            // The marker first: `integer` and `integer[]` are different
+            // columns, and only one of them is what `ARRAY` describes.
+            const declared = declaredPgType(schema_type);
+            if (declared.is_array != is_array) return false;
+
+            const declared_norm = try normalizeTypeForCompare(allocator, pgInternalSpelling(declared.name), schema_buf, dialect);
+            defer declared_norm.deinit(allocator);
+            const db_norm = try normalizeTypeForCompare(allocator, pgInternalSpelling(pgUdtBaseName(db_col.udt_name, is_array)), db_buf, dialect);
+            defer db_norm.deinit(allocator);
+            return std.mem.eql(u8, declared_norm.text, db_norm.text);
+        }
+    }
+
+    const schema_norm = try normalizeTypeForCompare(allocator, schema_type, schema_buf, dialect);
+    defer schema_norm.deinit(allocator);
+    const db_norm = try normalizeTypeForCompare(allocator, db_col.sql_type, db_buf, dialect);
+    defer db_norm.deinit(allocator);
+    return std.mem.eql(u8, schema_norm.text, db_norm.text);
+}
+
+/// A declared PostgreSQL type split into the name its element/own type is
+/// compared under, and whether the declaration is an array of it.
+const DeclaredPgType = struct {
+    name: []const u8,
+    is_array: bool,
+};
+
+/// Split a declared PostgreSQL type: drop every `[]` suffix and any `schema.`
+/// qualifier, and report whether the declaration was an array.
+///
+/// Every `[]` goes, not just one: PostgreSQL's catalog reports `integer[][]`
+/// and `integer[]` identically (`ARRAY` + `_int4`) — the dimensionality is not
+/// in `information_schema.columns` at all — so refusing the multi-dimensional
+/// spelling would be a drift report for a difference the server cannot express.
+/// The qualifier goes because `udt_name` is the bare `pg_type.typname` with no
+/// schema in it: a `public.vector(1536)` declaration has to compare equal to
+/// the `vector` the catalog answers, and `udt_schema` (which would tell them
+/// apart) is deliberately not read.
+fn declaredPgType(schema_type: []const u8) DeclaredPgType {
+    var name = std.mem.trim(u8, schema_type, " ");
+    var is_array = false;
+    while (std.mem.endsWith(u8, name, "[]")) {
+        name = std.mem.trimEnd(u8, name[0 .. name.len - 2], " ");
+        is_array = true;
+    }
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name = name[dot + 1 ..];
+    return .{ .name = name, .is_array = is_array };
+}
+
+/// The element type behind an `ARRAY` column's `udt_name`: PostgreSQL names
+/// every array type after its element with a leading `_` (`_int4`, `_citext`).
+/// A name without the prefix is returned as it is.
+fn pgUdtBaseName(udt_name: []const u8, is_array: bool) []const u8 {
+    if (is_array and udt_name.len > 1 and udt_name[0] == '_') return udt_name[1..];
+    return udt_name;
+}
+
+/// `udt_name`'s spellings for the built-in types that have one, mapped onto
+/// `information_schema`'s — `_float8` is a `double precision[]` column, so its
+/// element is compared as `double precision`, and `_int2` as `smallint`.
+///
+/// The shared alias table (`normalizeSqlType`) already carries `int4` →
+/// `integer`; this is the rest of the family. It is consulted from the
+/// `USER-DEFINED`/`ARRAY` branch only, so the built-in comparison keeps its
+/// exact behaviour, and every entry maps two spellings of *one* PostgreSQL
+/// type — it can turn a false drift into a match, never a difference into one.
+/// (`_bpchar` is `character`, whose element name would otherwise not match.)
+fn pgInternalSpelling(name: []const u8) []const u8 {
+    const aliases = [_]struct { udt: []const u8, info_schema: []const u8 }{
+        .{ .udt = "int2", .info_schema = "smallint" },
+        .{ .udt = "int8", .info_schema = "bigint" },
+        .{ .udt = "float4", .info_schema = "real" },
+        .{ .udt = "float8", .info_schema = "double precision" },
+        .{ .udt = "bpchar", .info_schema = "character" },
+    };
+    for (aliases) |alias| {
+        if (std.ascii.eqlIgnoreCase(name, alias.udt)) return alias.info_schema;
+    }
+    return name;
+}
 
 /// Generate ALTER COLUMN SQL to change a column's type.
 ///
@@ -4708,21 +5112,20 @@ pub fn planMigrateStatements(
             inline for (table.columns) |col| {
                 if (columnExists(existing_cols.items, col.name)) {
                     const existing_col = getExistingColumnByName(existing_cols.items, col.name) orelse unreachable;
-                    const schema_type_upper = columnSQLType(col, dialect);
+                    const schema_type = columnSQLType(col, dialect);
                     // The same comparison `checkSchema` makes, through the same
-                    // `normalizeTypeForCompare`: one implementation, so a plan
+                    // `columnTypesAgree`: one implementation, so a plan
                     // cannot disagree with the drift report it previews — and
                     // the heap fallback is why a declared type longer than the
                     // stack buffer is *compared* here instead of erroring
-                    // `NoSpaceLeft` out of the whole plan.
+                    // `NoSpaceLeft` out of the whole plan. The type comes from
+                    // `columnSQLType`, not from `col.sql_type` (the value the
+                    // graph resolved for the dialect it was built with): a
+                    // `.SqlType` / `VarChar(n)` column must be altered to the
+                    // type this dialect declares, the one just compared.
                     var schema_buf: [128]u8 = undefined;
                     var db_buf: [128]u8 = undefined;
-                    const schema_norm = try normalizeTypeForCompare(allocator, schema_type_upper, &schema_buf, dialect);
-                    defer schema_norm.deinit(allocator);
-                    const db_norm = try normalizeTypeForCompare(allocator, existing_col.sql_type, &db_buf, dialect);
-                    defer db_norm.deinit(allocator);
-
-                    if (!std.mem.eql(u8, schema_norm.text, db_norm.text)) {
+                    if (!try columnTypesAgree(allocator, schema_type, existing_col, &schema_buf, &db_buf, dialect)) {
                         // Skip ALTER TYPE on SQLite, which has no such statement
                         // (`alterColumnTypeSQL` refuses it); an unrecognised dialect
                         // is passed through so that function refuses it *by name*
@@ -4733,7 +5136,7 @@ pub fn planMigrateStatements(
                                 try appendPlanned(
                                     allocator,
                                     &plan,
-                                    try alterColumnTypeSQL(allocator, table.name, col.name, col.sql_type, dialect),
+                                    try alterColumnTypeSQL(allocator, table.name, col.name, schema_type, dialect),
                                     version,
                                 );
                             }
@@ -4766,11 +5169,7 @@ pub fn planMigrateStatements(
         defer freeExistingIndexes(allocator, &existing_idxs);
 
         inline for (info.indexes) |idx| {
-            const idx_def = IndexDef{
-                .name = idx.name,
-                .columns = idx.columns,
-                .unique = idx.unique,
-            };
+            const idx_def = indexDefFromInfo(idx);
             if (!indexExists(existing_idxs.items, idx_def.name)) {
                 const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
                 try appendPlanned(
@@ -5572,6 +5971,218 @@ test "a declared VarChar width compares drift-free against the database's varcha
     var pg_buf: [128]u8 = undefined;
     const pg_schema = try normalizeSqlType("TEXT", &pg_buf, Dialect.postgres);
     try std.testing.expectEqualStrings("text", pg_schema);
+}
+
+test "a declared Other/SqlType reaches the DDL, on PostgreSQL only" {
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const graph = @import("../../codegen/graph.zig");
+
+    const NgTypes = schema("MigratePgTypes", .{
+        .fields = &.{
+            field.Other("embedding", "vector(1536)"),
+            field.Other("tags", "integer[]"),
+            field.Other("addr", "inet"),
+            field.Other("plain", null),
+            field.Text("handle").SqlType("citext"),
+            field.String("short").VarChar(10),
+        },
+    });
+
+    // The graph resolves `sql_type` for the dialect it is built with, and this
+    // one is built for SQLite — the case the migration path has to survive:
+    // `checkSchema` runs against whatever driver it is handed, so the
+    // declaration has to travel beside `sql_type` (`ColumnDef.sql_type_override`)
+    // rather than only inside it.
+    const sqlite_info = comptime graph.fromSchemaDialect(NgTypes, Dialect.sqlite);
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[1].sql_type);
+    try std.testing.expectEqualStrings("vector(1536)", sqlite_info.fields[1].sql_type_override.?);
+
+    const table = comptime tableFromTypeInfo(sqlite_info);
+    try std.testing.expectEqualStrings("vector(1536)", table.columns[1].sql_type_override.?);
+
+    // PostgreSQL: every declaration verbatim; a field that declared none keeps
+    // the kind's mapping (`TEXT`), and `VarChar(10)` — which loses to an
+    // explicit `.SqlType` — is not part of this schema's PG output either way.
+    const pg_sql = try createTableSQL(table, Dialect.postgres);
+    defer std.heap.page_allocator.free(pg_sql);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"embedding\" vector(1536)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"tags\" integer[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"addr\" inet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"plain\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"handle\" citext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg_sql, "\"short\" TEXT") != null);
+
+    // MySQL: the field kinds' own mapping, byte for byte — including the
+    // declared `VarChar(10)` width, which the override would have replaced on
+    // PostgreSQL. A `vector(1536)` column cannot be created there at all, so
+    // emitting the declaration verbatim would be a schema that cannot migrate.
+    const mysql_sql = try createTableSQL(table, Dialect.mysql);
+    defer std.heap.page_allocator.free(mysql_sql);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`embedding` TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`tags` TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`addr` TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`handle` TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "`short` VARCHAR(10)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mysql_sql, "vector") == null);
+
+    // SQLite: same answer (`TEXT`), no `[]` either.
+    const sqlite_sql = try createTableSQL(table, Dialect.sqlite);
+    defer std.heap.page_allocator.free(sqlite_sql);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "\"tags\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "citext") == null);
+
+    // `checkSchema` reads its TableDef through the cross-referenced builder (it
+    // has to see the FK columns the To-edges add), so the override has to be
+    // there too — the two builders are one declaration each and this is the one
+    // drift reporting actually walks.
+    const cross = comptime tableFromTypeInfoCrossRef(sqlite_info, &.{sqlite_info});
+    try std.testing.expectEqualStrings("vector(1536)", cross.columns[1].sql_type_override.?);
+    try std.testing.expectEqualStrings("integer[]", cross.columns[2].sql_type_override.?);
+    try std.testing.expectEqualStrings("vector(1536)", columnSQLType(cross.columns[1], Dialect.postgres));
+    try std.testing.expectEqualStrings("integer[]", columnSQLType(cross.columns[2], Dialect.postgres));
+    // The override is PostgreSQL's; the other dialects keep the mapping even
+    // when the graph carrying it was built for one of them.
+    try std.testing.expectEqualStrings("TEXT", columnSQLType(cross.columns[1], Dialect.sqlite));
+    try std.testing.expectEqualStrings("TEXT", columnSQLType(cross.columns[1], Dialect.mysql));
+}
+
+test "PostgreSQL USER-DEFINED and ARRAY columns compare by udt_name, not data_type" {
+    // The shape PostgreSQL answers for a column whose type is not one of its
+    // own (`vector(1536)`, `citext`, any array) — `data_type` says
+    // `USER-DEFINED`/`ARRAY` and the concrete name is in `udt_name`. Comparing
+    // `data_type` reported a `type_mismatch` for every such column.
+    const Case = struct {
+        declared: []const u8,
+        data_type: []const u8,
+        udt_name: []const u8,
+        agree: bool,
+    };
+    const cases = [_]Case{
+        // USER-DEFINED: the extension/custom type by name. The `(...)` and a
+        // `schema.` qualifier are decoration, dropped on both sides — and so is
+        // the extension type's own modifier, deliberately: the catalog answer
+        // carries the type *name* only, so a `vector(3)` column and this
+        // `vector(1536)` declaration both read `USER-DEFINED`/`vector` and the
+        // dimension is not compared. Reading it would mean
+        // `pg_attribute.atttypmod` (a second introspection query, with a
+        // different answer shape for every built-in), which this branch does not
+        // do. Pinned here so the limitation is a decision, not a surprise.
+        .{ .declared = "vector(1536)", .data_type = "user-defined", .udt_name = "vector", .agree = true },
+        .{ .declared = "vector", .data_type = "user-defined", .udt_name = "vector", .agree = true },
+        .{ .declared = "public.vector(1536)", .data_type = "user-defined", .udt_name = "vector", .agree = true },
+        .{ .declared = "citext", .data_type = "user-defined", .udt_name = "citext", .agree = true },
+        // ...and a *different* type is still a mismatch.
+        .{ .declared = "vector(1536)", .data_type = "user-defined", .udt_name = "halfvec", .agree = false },
+        .{ .declared = "text", .data_type = "user-defined", .udt_name = "citext", .agree = false },
+        .{ .declared = "cidr", .data_type = "user-defined", .udt_name = "inet", .agree = false },
+        .{ .declared = "int4range", .data_type = "user-defined", .udt_name = "int8range", .agree = false },
+
+        // ARRAY: the element name out of `udt_name` (`_int4` → `int4`), through
+        // the same alias pass the built-ins get (`int4` → `integer`).
+        .{ .declared = "integer[]", .data_type = "array", .udt_name = "_int4", .agree = true },
+        .{ .declared = "int4[]", .data_type = "array", .udt_name = "_int4", .agree = true },
+        .{ .declared = "text[]", .data_type = "array", .udt_name = "_text", .agree = true },
+        .{ .declared = "citext[]", .data_type = "array", .udt_name = "_citext", .agree = true },
+        .{ .declared = "character varying[]", .data_type = "array", .udt_name = "_varchar", .agree = true },
+        // The spellings whose element name the shared alias table does not
+        // carry (`_float8` is a double precision, `_int2` a smallint).
+        .{ .declared = "double precision[]", .data_type = "array", .udt_name = "_float8", .agree = true },
+        .{ .declared = "float8[]", .data_type = "array", .udt_name = "_float8", .agree = true },
+        .{ .declared = "smallint[]", .data_type = "array", .udt_name = "_int2", .agree = true },
+        .{ .declared = "character[]", .data_type = "array", .udt_name = "_bpchar", .agree = true },
+        // An array of a different element type is not an agreement — this is
+        // the counterexample that keeps the branch a comparison: `text[]` and
+        // `integer[]` both answer `ARRAY`, and only the element tells them
+        // apart.
+        .{ .declared = "text[]", .data_type = "array", .udt_name = "_int4", .agree = false },
+        .{ .declared = "cidr[]", .data_type = "array", .udt_name = "_inet", .agree = false },
+        .{ .declared = "vector[]", .data_type = "array", .udt_name = "_citext", .agree = false },
+        // A scalar declared where the column is an array, and an array declared
+        // where the column is a scalar: the array marker itself is compared.
+        .{ .declared = "integer", .data_type = "array", .udt_name = "_int4", .agree = false },
+        .{ .declared = "integer[]", .data_type = "integer", .udt_name = "int4", .agree = false },
+
+        // A catalog answer with no `udt_name` cannot be resolved, so the
+        // comparison falls back to `data_type` and reports the difference
+        // rather than pretending to have checked.
+        .{ .declared = "vector(1536)", .data_type = "user-defined", .udt_name = "", .agree = false },
+        // The catalog's own spelling, which `getExistingColumns` lower-cases
+        // before it stores it — accepted here too, because `ExistingColumn` is
+        // public and a caller may build one from the server's answer.
+        .{ .declared = "vector(1536)", .data_type = "USER-DEFINED", .udt_name = "vector", .agree = true },
+        .{ .declared = "integer[]", .data_type = "ARRAY", .udt_name = "_int4", .agree = true },
+        .{ .declared = "integer[]", .data_type = "ARRAY", .udt_name = "_INT4", .agree = true },
+    };
+
+    for (cases) |case| {
+        var schema_buf: [128]u8 = undefined;
+        var db_buf: [128]u8 = undefined;
+        const got = try columnTypesAgree(
+            std.testing.allocator,
+            case.declared,
+            .{ .name = "c", .sql_type = case.data_type, .udt_name = case.udt_name, .not_null = false, .pk = false },
+            &schema_buf,
+            &db_buf,
+            Dialect.postgres,
+        );
+        if (got != case.agree) {
+            std.debug.print("declared={s} data_type={s} udt_name={s}: expected agree={} got={}\n", .{ case.declared, case.data_type, case.udt_name, case.agree, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "the built-in type comparison is unchanged, and udt_name is PostgreSQL-only" {
+    const Case = struct {
+        declared: []const u8,
+        sql_type: []const u8,
+        udt_name: []const u8,
+        dialect: Dialect,
+        agree: bool,
+    };
+    const cases = [_]Case{
+        // PostgreSQL's built-ins never answered `USER-DEFINED`/`ARRAY`, so they
+        // take the branch they always took.
+        .{ .declared = "TEXT", .sql_type = "text", .udt_name = "text", .dialect = Dialect.postgres, .agree = true },
+        .{ .declared = "INTEGER", .sql_type = "integer", .udt_name = "int4", .dialect = Dialect.postgres, .agree = true },
+        .{ .declared = "BIGINT", .sql_type = "bigint", .udt_name = "int8", .dialect = Dialect.postgres, .agree = true },
+        .{ .declared = "JSONB", .sql_type = "jsonb", .udt_name = "jsonb", .dialect = Dialect.postgres, .agree = true },
+        // `inet`, `cidr`, `tsvector`, `jsonpath` and the ranges are built-in
+        // PostgreSQL types (no extension): their own `data_type`, so a declared
+        // `inet` compares without any of the new branch.
+        .{ .declared = "inet", .sql_type = "inet", .udt_name = "inet", .dialect = Dialect.postgres, .agree = true },
+        .{ .declared = "int4range", .sql_type = "int4range", .udt_name = "int4range", .dialect = Dialect.postgres, .agree = true },
+        .{ .declared = "TEXT", .sql_type = "citext", .udt_name = "citext", .dialect = Dialect.postgres, .agree = false },
+
+        // MySQL and SQLite: byte-for-byte the old path, and the `udt_name` is
+        // deliberately invisible there — MySQL's `information_schema.columns`
+        // has no such column and `getExistingColumns` never fills it, so the
+        // branch cannot fire even on a hand-built answer that carries one.
+        .{ .declared = "BOOLEAN", .sql_type = "tinyint", .udt_name = "_int4", .dialect = Dialect.mysql, .agree = true },
+        .{ .declared = "REAL", .sql_type = "double", .udt_name = "", .dialect = Dialect.mysql, .agree = true },
+        .{ .declared = "VARCHAR(255)", .sql_type = "varchar", .udt_name = "", .dialect = Dialect.mysql, .agree = true },
+        .{ .declared = "TEXT", .sql_type = "text", .udt_name = "_int4", .dialect = Dialect.mysql, .agree = true },
+        .{ .declared = "INTEGER", .sql_type = "integer", .udt_name = "", .dialect = Dialect.sqlite, .agree = true },
+        .{ .declared = "TEXT", .sql_type = "varchar(20)", .udt_name = "", .dialect = Dialect.sqlite, .agree = false },
+    };
+
+    for (cases) |case| {
+        var schema_buf: [128]u8 = undefined;
+        var db_buf: [128]u8 = undefined;
+        const got = try columnTypesAgree(
+            std.testing.allocator,
+            case.declared,
+            .{ .name = "c", .sql_type = case.sql_type, .udt_name = case.udt_name, .not_null = false, .pk = false },
+            &schema_buf,
+            &db_buf,
+            case.dialect,
+        );
+        if (got != case.agree) {
+            std.debug.print("{s}: declared={s} db={s} udt_name={s}: expected agree={} got={}\n", .{ case.dialect.name, case.declared, case.sql_type, case.udt_name, case.agree, got });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "Create table SQL" {
@@ -6508,6 +7119,230 @@ test "MySQL CREATE INDEX refuses a BLOB/TEXT/JSON key column" {
         defer std.testing.allocator.free(sql);
         try std.testing.expect(std.mem.indexOf(u8, sql, "(\"body\")") != null);
     }
+}
+
+test "CREATE INDEX: an undeclared method/opclass is byte-for-byte the old statement" {
+    // The whole declaration surface this feature adds is opt-in: a schema that
+    // declares neither must produce exactly the SQL it produced before
+    // `IndexDef.method` existed, on every dialect, unique or not. These are the
+    // literals the surrounding tests already pin; if one of them ever changes,
+    // this says which half did it.
+    const table_name = "users";
+    const cases = [_]struct { dialect: Dialect, expected: []const u8 }{
+        .{ .dialect = Dialect.postgres, .expected = "CREATE INDEX IF NOT EXISTS \"idx_name\" ON \"users\" (\"name\")" },
+        .{ .dialect = Dialect.sqlite, .expected = "CREATE INDEX IF NOT EXISTS \"idx_name\" ON \"users\" (\"name\")" },
+        .{ .dialect = Dialect{ .name = "mysql" }, .expected = "CREATE INDEX `idx_name` ON `users` (`name`)" },
+    };
+    for (cases) |case| {
+        const plain = IndexDef{ .name = "idx_name", .columns = &.{"name"} };
+        const sql = try createIndexSQLAlloc(std.testing.allocator, plain, table_name, case.dialect);
+        defer std.testing.allocator.free(sql);
+        try std.testing.expectEqualStrings(case.expected, sql);
+    }
+
+    // Unique, multi-column, and a second key column: no `USING`, no opclass,
+    // and no `errno 1064`-triggering MySQL syntax change.
+    const unique_two = IndexDef{ .name = "idx_a_b", .columns = &.{ "a", "b" }, .unique = true };
+    const pg_sql = try createIndexSQLAlloc(std.testing.allocator, unique_two, table_name, Dialect.postgres);
+    defer std.testing.allocator.free(pg_sql);
+    try std.testing.expectEqualStrings(
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_a_b\" ON \"users\" (\"a\", \"b\")",
+        pg_sql,
+    );
+}
+
+test "CREATE INDEX: PostgreSQL renders USING and the key column's operator class" {
+    const table_name = "docs";
+
+    // The declaration this exists for: a pgvector nearest-neighbour index.
+    const hnsw = IndexDef{
+        .name = "idx_docs_embedding_hnsw",
+        .columns = &.{"embedding"},
+        .method = "hnsw",
+        .opclass = "vector_cosine_ops",
+    };
+    const sql = try createIndexSQLAlloc(std.testing.allocator, hnsw, table_name, Dialect.postgres);
+    defer std.testing.allocator.free(sql);
+    try std.testing.expectEqualStrings(
+        "CREATE INDEX IF NOT EXISTS \"idx_docs_embedding_hnsw\" ON \"docs\" USING hnsw (\"embedding\" vector_cosine_ops)",
+        sql,
+    );
+
+    // Method alone — `USING hnsw` with no operator class. `ivfflat` is the
+    // other pgvector method and goes out just as verbatim.
+    const ivfflat = IndexDef{ .name = "idx_docs_e_ivf", .columns = &.{"embedding"}, .method = "ivfflat" };
+    const ivf_sql = try createIndexSQLAlloc(std.testing.allocator, ivfflat, table_name, Dialect.postgres);
+    defer std.testing.allocator.free(ivf_sql);
+    try std.testing.expectEqualStrings(
+        "CREATE INDEX IF NOT EXISTS \"idx_docs_e_ivf\" ON \"docs\" USING ivfflat (\"embedding\")",
+        ivf_sql,
+    );
+
+    // A schema-qualified operator class is a dotted identifier, and a
+    // `UNIQUE` + `USING` combination keeps both slots.
+    const qualified = IndexDef{
+        .name = "idx_q",
+        .columns = &.{"embedding"},
+        .unique = true,
+        .method = "hnsw",
+        .opclass = "public.vector_l2_ops",
+    };
+    const q_sql = try createIndexSQLAlloc(std.testing.allocator, qualified, table_name, Dialect.postgres);
+    defer std.testing.allocator.free(q_sql);
+    try std.testing.expectEqualStrings(
+        "CREATE UNIQUE INDEX IF NOT EXISTS \"idx_q\" ON \"docs\" USING hnsw (\"embedding\" public.vector_l2_ops)",
+        q_sql,
+    );
+
+    // An operator class belongs to one key column, so a composite index has no
+    // answer to "which one"; the declaration is refused rather than guessed at.
+    const two_cols = IndexDef{
+        .name = "idx_two",
+        .columns = &.{ "embedding", "created_at" },
+        .opclass = "vector_cosine_ops",
+    };
+    try std.testing.expectError(
+        error.OpClassNeedsSingleColumn,
+        createIndexSQLAlloc(std.testing.allocator, two_cols, table_name, Dialect.postgres),
+    );
+
+    // These two are the only parts of a CREATE INDEX that go out unquoted and
+    // do not come from the schema, so a value that is not a bare identifier is
+    // an injection surface and is rejected — never escaped into something the
+    // server would accept as a different declaration.
+    const bad_method = IndexDef{ .name = "idx_bad", .columns = &.{"embedding"}, .method = "hnsw); DROP TABLE docs; --" };
+    try std.testing.expectError(
+        error.InvalidIndexMethod,
+        createIndexSQLAlloc(std.testing.allocator, bad_method, table_name, Dialect.postgres),
+    );
+    const bad_opclass = IndexDef{ .name = "idx_bad2", .columns = &.{"embedding"}, .opclass = "vector_cosine_ops)" };
+    try std.testing.expectError(
+        error.InvalidIndexOpClass,
+        createIndexSQLAlloc(std.testing.allocator, bad_opclass, table_name, Dialect.postgres),
+    );
+    const empty_part = IndexDef{ .name = "idx_bad3", .columns = &.{"embedding"}, .method = "hnsw." };
+    try std.testing.expectError(
+        error.InvalidIndexMethod,
+        createIndexSQLAlloc(std.testing.allocator, empty_part, table_name, Dialect.postgres),
+    );
+}
+
+test "CREATE INDEX: MySQL maps btree/hash onto USING and omits anything else" {
+    const mysql = Dialect{ .name = "mysql" };
+
+    // MySQL's grammar has exactly two index types, and the index type sits
+    // between the name and `ON` (`CREATE INDEX i USING BTREE ON t (…)`), not
+    // where PostgreSQL's `USING` goes. Both spellings were checked against a
+    // running server.
+    const btree = IndexDef{ .name = "idx_a", .columns = &.{"a"}, .method = "btree" };
+    const btree_sql = try createIndexSQLAlloc(std.testing.allocator, btree, "t", mysql);
+    defer std.testing.allocator.free(btree_sql);
+    try std.testing.expectEqualStrings("CREATE INDEX `idx_a` USING BTREE ON `t` (`a`)", btree_sql);
+
+    // Case-insensitive, and canonicalised on the way out.
+    const hash = IndexDef{ .name = "idx_a2", .columns = &.{"a"}, .method = "HASH" };
+    const hash_sql = try createIndexSQLAlloc(std.testing.allocator, hash, "t", mysql);
+    defer std.testing.allocator.free(hash_sql);
+    try std.testing.expectEqualStrings("CREATE INDEX `idx_a2` USING HASH ON `t` (`a`)", hash_sql);
+
+    // A pgvector method has no MySQL equivalent. The statement still has to be
+    // one the server accepts, so the method is dropped — the migration is not
+    // aborted over a declaration that can only be a performance hint here.
+    const hnsw = IndexDef{ .name = "idx_vec", .columns = &.{"e"}, .method = "hnsw" };
+    const hnsw_sql = try createIndexSQLAlloc(std.testing.allocator, hnsw, "t", mysql);
+    defer std.testing.allocator.free(hnsw_sql);
+    try std.testing.expectEqualStrings("CREATE INDEX `idx_vec` ON `t` (`e`)", hnsw_sql);
+
+    // Same for the operator class: MySQL does not have them at all. Note that
+    // a *quoted* index type is a syntax error on MySQL (errno 1064), which is
+    // why the method is validated instead of quoted — `` USING `BTREE` `` is
+    // not an alternative spelling.
+    const with_opclass = IndexDef{ .name = "idx_vec2", .columns = &.{"e"}, .opclass = "vector_l2_ops" };
+    const oc_sql = try createIndexSQLAlloc(std.testing.allocator, with_opclass, "t", mysql);
+    defer std.testing.allocator.free(oc_sql);
+    try std.testing.expectEqualStrings("CREATE INDEX `idx_vec2` ON `t` (`e`)", oc_sql);
+
+    // An opclass on a multi-column key is *not* an error here: the declaration
+    // is inexpressible on this dialect either way, so it is reported and
+    // dropped before the single-column rule could apply.
+    const two_cols = IndexDef{
+        .name = "idx_vec3",
+        .columns = &.{ "e", "created_at" },
+        .opclass = "vector_l2_ops",
+    };
+    const two_sql = try createIndexSQLAlloc(std.testing.allocator, two_cols, "t", mysql);
+    defer std.testing.allocator.free(two_sql);
+    try std.testing.expectEqualStrings("CREATE INDEX `idx_vec3` ON `t` (`e`, `created_at`)", two_sql);
+}
+
+test "CREATE INDEX: SQLite has no access methods or operator classes and drops both" {
+    // SQLite's `CREATE INDEX` grammar has no `USING` and no operator class, so
+    // a schema shared with PostgreSQL keeps migrating here — the index is
+    // simply not an accelerated one. (The `vector` queries themselves do not
+    // exist on SQLite; this is about the *index* declaration not blocking the
+    // rest of the schema's migration.)
+    const hnsw = IndexDef{
+        .name = "idx_e",
+        .columns = &.{"e"},
+        .method = "hnsw",
+        .opclass = "vector_cosine_ops",
+    };
+    const sql = try createIndexSQLAlloc(std.testing.allocator, hnsw, "docs", Dialect.sqlite);
+    defer std.testing.allocator.free(sql);
+    try std.testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS \"idx_e\" ON \"docs\" (\"e\")", sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "USING") == null);
+
+    // A `btree` declaration is dropped here too, not passed through as
+    // `USING btree` — SQLite would reject it, and `btree` is what an index
+    // with no declaration already is.
+    const btree = IndexDef{ .name = "idx_e2", .columns = &.{"e"}, .method = "btree" };
+    const btree_sql = try createIndexSQLAlloc(std.testing.allocator, btree, "docs", Dialect.sqlite);
+    defer std.testing.allocator.free(btree_sql);
+    try std.testing.expectEqualStrings("CREATE INDEX IF NOT EXISTS \"idx_e2\" ON \"docs\" (\"e\")", btree_sql);
+}
+
+test "an index declaration reaches the DDL, and the migration plans the hnsw statement" {
+    // The end-to-end half of the declaration: `index.Named(...).Using(...)` on
+    // a schema → `IndexInfo` → `IndexDef` → the statement `migrateSchema`
+    // would run. The unit above pins the DDL; this pins that a schema's
+    // declaration is what reaches it.
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const index = @import("../../core/index.zig");
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const allocator = std.testing.allocator;
+
+    const Doc = schema("Doc", .{
+        .fields = &.{
+            field.Int("id"),
+            field.Other("embedding", "vector(3)"),
+        },
+        .indexes = &.{
+            index.Named("idx_doc_embedding_hnsw", &.{"embedding"})
+                .Using("hnsw", "vector_cosine_ops"),
+            // Declared with field names, like every other index: `embedding`
+            // here, not the storage key.
+            index.Fields(&.{"embedding"}).Method("hnsw").OpClass("vector_l2_ops"),
+        },
+    });
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]TypeInfo{info};
+
+    const table = comptime tableFromTypeInfo(info);
+    // The same `IndexInfo` → `IndexDef` mapping the migration uses, so this is
+    // not a restatement of it.
+    const sql = try createIndexSQLForTableAlloc(allocator, indexDefFromInfo(info.indexes[0]), table, Dialect.postgres);
+    defer allocator.free(sql);
+    try std.testing.expectEqualStrings(
+        "CREATE INDEX IF NOT EXISTS \"idx_doc_embedding_hnsw\" ON \"doc\" USING hnsw (\"embedding\" vector_cosine_ops)",
+        sql,
+    );
+
+    // The `Fields(...)` form generates the index name and keeps the method.
+    try std.testing.expectEqualStrings("hnsw", info.indexes[1].method.?);
+    try std.testing.expectEqualStrings("vector_l2_ops", info.indexes[1].opclass.?);
+    try std.testing.expectEqualStrings("doc", info.table_name);
+    _ = infos;
 }
 
 test "MySQL ALTER ADD COLUMN refuses a BLOB/TEXT DEFAULT" {

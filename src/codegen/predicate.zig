@@ -384,6 +384,14 @@ fn hasWithPredOffender(comptime target: TypeInfo, pred: sql.Predicate) ?[]const 
         .like_escaped => |op| {
             if (!targetColumnKnown(target, op.column)) return op.column;
         },
+        // A distance predicate's column is a plain column name too, so it is
+        // checked like `.like_escaped` — not skipped like the fragments that
+        // carry their own SQL. Skipping it would let a `Has{Edge}With` scope a
+        // column the target does not have, which renders as a server error
+        // naming a column instead of the `UnknownField` the wrapper promises.
+        .vector_distance => |op| {
+            if (!targetColumnKnown(target, op.column)) return op.column;
+        },
         .is_null, .is_not_null => |column| {
             if (!targetColumnKnown(target, column)) return column;
         },
@@ -729,6 +737,26 @@ test "Predicates: Has{Edge}With rejects a column the target does not have" {
         var b = sql.Builder.init(allocator, Dialect.sqlite);
         defer b.deinit();
         try std.testing.expectError(error.UnknownField, nested.appendTo(&b));
+    }
+
+    // A pgvector distance predicate's column is a plain name, so it is checked
+    // like `.like_escaped` and not skipped like the fragments that carry their
+    // own SQL: a `Has{Edge}With` scope naming a column the target does not have
+    // must answer `error.UnknownField`, not reach the server as a missing
+    // column. (The operator itself is PostgreSQL-only; this walk is
+    // schema-shaped, dialect-blind.)
+    {
+        const ok_vec = user_preds.HasCarsWith(&.{sql.VectorL2Distance("model", .{ .string = "[1,2,3]" }, .lt, .{ .float = 0.5 })});
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try ok_vec.appendTo(&b);
+        try std.testing.expect(std.mem.indexOf(u8, b.query().sql, "\"model\" <-> ?") != null);
+    }
+    {
+        const bad_vec = user_preds.HasCarsWith(&.{sql.VectorCosineDistance("owner_id", .{ .string = "[1,2,3]" }, .lt, .{ .float = 0.5 })});
+        var b = sql.Builder.init(allocator, Dialect.sqlite);
+        defer b.deinit();
+        try std.testing.expectError(error.UnknownField, bad_vec.appendTo(&b));
     }
 
     // `raw` carries its own SQL by convention and is not second-guessed.

@@ -165,11 +165,20 @@ fn FreeField(comptime FieldType: type, field_ptr: *FieldType, allocator: std.mem
     const T = @typeInfo(FieldType);
     switch (T) {
         .pointer => |p| {
-            if (p.size == .slice and p.child == u8) {
-                allocator.free(field_ptr.*);
-            } else if (p.size == .slice) {
-                for (field_ptr.*) |item| {
-                    FreeField(p.child, &item, allocator);
+            if (p.size == .slice) {
+                // The per-item pass is for a slice whose *elements* own memory
+                // (`[]const []const u8` and friends). A leaf slice needs only
+                // its buffer released, and the old spelling tested for exactly
+                // one leaf — `u8` — so everything else was walked: `f32` (a
+                // `field.Vector`'s `[]const f32`) did not even compile, because
+                // `&item` on a const element is a `*const f32`, and a `u16`
+                // slice would have been a no-op loop that happened to work.
+                // Keying on `isOwningField` says what was meant and covers the
+                // leaf cases the `== u8` test was standing in for.
+                if (comptime isOwningField(p.child)) {
+                    for (field_ptr.*) |item| {
+                        FreeField(p.child, &item, allocator);
+                    }
                 }
                 allocator.free(field_ptr.*);
             }

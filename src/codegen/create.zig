@@ -62,7 +62,11 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         driver: sql_driver.Driver,
         values: std.array_list.Managed(FieldValue),
         edge_values: std.array_list.Managed(EdgeValue),
-        json_strings: std.array_list.Managed([]const u8),
+        /// The strings this builder allocated and therefore owns: a JSON
+        /// document serialized for a `JSON` field, and a `field.Vector`'s
+        /// `[a,b,c]` text form. Every `.string` value *not* on this list
+        /// borrows from the caller, which is why the list exists at all.
+        owned_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         logger: Logger = .{},
@@ -85,13 +89,13 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 .privacy_ctx = privacy_ctx,
                 .values = std.array_list.Managed(FieldValue).init(allocator),
                 .edge_values = std.array_list.Managed(EdgeValue).init(allocator),
-                .json_strings = std.array_list.Managed([]const u8).init(allocator),
+                .owned_strings = std.array_list.Managed([]const u8).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.json_strings.items) |s| self.allocator.free(s);
-            self.json_strings.deinit();
+            for (self.owned_strings.items) |s| self.allocator.free(s);
+            self.owned_strings.deinit();
             self.values.deinit();
             self.edge_values.deinit();
         }
@@ -126,6 +130,14 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
         /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
+            // The field's **logical** type, which is what picks the `sql.Value`
+            // tag a `[]const u8` travels under (`field_value.toSqlValue`) — the
+            // Zig type cannot tell a `Bytes` column from a `String` one.
+            comptime var logical_type: @TypeOf(info.fields[0].field_type) = undefined;
+            // A `field.Vector` value is `[]const f32` and reaches the driver as
+            // its text form, so it is encoded (and dimension-checked) here:
+            // `toSqlValue` has no allocator and no schema to check against.
+            comptime var vector_dims: ?usize = null;
             comptime {
                 var found = false;
                 for (info.fields) |f| {
@@ -140,6 +152,8 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                         {
                             needs_json = true;
                         }
+                        logical_type = f.field_type;
+                        vector_dims = f.vector_dims;
                         found = true;
                         break;
                     }
@@ -149,11 +163,30 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
 
             if (comptime needs_json) {
                 const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-                try self.json_strings.append(json_str);
+                // The owned-string list is what releases this on the way out, so
+                // the guard only covers the append: disarmed by the block once
+                // ownership has moved (a bare `errdefer` around both statements
+                // would free the string the list is holding).
+                {
+                    errdefer self.allocator.free(json_str);
+                    try self.owned_strings.append(json_str);
+                }
                 return try self.setValue(field_name, .{ .string = json_str });
             }
 
-            return try self.setValue(field_name, field_value.toSqlValue(value));
+            if (comptime logical_type == .vector) {
+                const text = try field_value.vectorTextAlloc(self.allocator, value, vector_dims orelse 0);
+                if (text) |t| {
+                    {
+                        errdefer self.allocator.free(t);
+                        try self.owned_strings.append(t);
+                    }
+                    return try self.setValue(field_name, .{ .string = t });
+                }
+                return try self.setValue(field_name, .null);
+            }
+
+            return try self.setValue(field_name, field_value.toSqlValue(logical_type, value));
         }
 
         /// Add target IDs for an M2M edge.
@@ -672,7 +705,32 @@ pub fn CreateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, 
                 .float => @floatCast(value.float),
                 else => {
                     if (T == []const u8) {
-                        return try allocator.dupe(u8, value.string);
+                        // A `[]const u8` field is built from whichever of the
+                        // two byte-shaped tags the write carried: `field.Bytes`
+                        // produces `Value.bytes` (the column's binary format)
+                        // and every other string-kind field `Value.string`.
+                        // Both mean the same bytes *here* — the entity field is
+                        // a `[]const u8` either way — so reading only
+                        // `value.string` made `Save()` on a `field.Bytes` entity
+                        // an illegal union access.
+                        return try allocator.dupe(u8, switch (value) {
+                            .string => |s| s,
+                            .bytes => |b| b,
+                            else => return error.TypeMismatch,
+                        });
+                    }
+                    if (T == []const f32) {
+                        // `field.Vector`: the column carries pgvector's text
+                        // form, and the returned entity owns the parsed slice
+                        // (`deinitEntity` frees it, like any other slice field).
+                        const text = switch (value) {
+                            .string => |s| s,
+                            else => return error.TypeMismatch,
+                        };
+                        return @import("../core/field.zig").parseVectorAlloc(allocator, text, null) catch |err| switch (err) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            error.TypeMismatch => error.TypeMismatch,
+                        };
                     }
                     // Struct/JSON: parse into a per-entity arena so deinitEntity can free it.
                     if (comptime @hasField(Entity, "json_arena")) {
@@ -1058,7 +1116,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         allocator: std.mem.Allocator,
         driver: sql_driver.Driver,
         rows: std.array_list.Managed(std.array_list.Managed(FieldValue)),
-        json_strings: std.array_list.Managed([]const u8),
+        /// See `CreateBuilder.owned_strings`.
+        owned_strings: std.array_list.Managed([]const u8),
         hooks: []const Hook,
         privacy_ctx: ?privacy.PrivacyContext = null,
         timeout_ms: ?u32 = null,
@@ -1077,15 +1136,15 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                 .hooks = hooks,
                 .privacy_ctx = privacy_ctx,
                 .rows = std.array_list.Managed(std.array_list.Managed(FieldValue)).init(allocator),
-                .json_strings = std.array_list.Managed([]const u8).init(allocator),
+                .owned_strings = std.array_list.Managed([]const u8).init(allocator),
             };
             try self.rows.append(std.array_list.Managed(FieldValue).init(allocator));
             return self;
         }
 
         pub fn deinit(self: *Self) void {
-            for (self.json_strings.items) |s| self.allocator.free(s);
-            self.json_strings.deinit();
+            for (self.owned_strings.items) |s| self.allocator.free(s);
+            self.owned_strings.deinit();
             for (self.rows.items) |*row| row.deinit();
             self.rows.deinit();
         }
@@ -1135,6 +1194,14 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
         /// naming the field and both types.
         pub fn setFieldValue(self: *Self, comptime field_name: []const u8, value: anytype) !*Self {
             comptime var needs_json = false;
+            // The field's **logical** type, which is what picks the `sql.Value`
+            // tag a `[]const u8` travels under (`field_value.toSqlValue`) — the
+            // Zig type cannot tell a `Bytes` column from a `String` one.
+            comptime var logical_type: @TypeOf(info.fields[0].field_type) = undefined;
+            // A `field.Vector` value is `[]const f32` and reaches the driver as
+            // its text form, so it is encoded (and dimension-checked) here:
+            // `toSqlValue` has no allocator and no schema to check against.
+            comptime var vector_dims: ?usize = null;
             comptime {
                 var found = false;
                 for (info.fields) |f| {
@@ -1149,6 +1216,8 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
                         {
                             needs_json = true;
                         }
+                        logical_type = f.field_type;
+                        vector_dims = f.vector_dims;
                         found = true;
                         break;
                     }
@@ -1158,11 +1227,30 @@ pub fn BulkInsertBuilder(comptime infos: []const TypeInfo, comptime info: TypeIn
 
             if (comptime needs_json) {
                 const json_str = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-                try self.json_strings.append(json_str);
+                // The owned-string list is what releases this on the way out, so
+                // the guard only covers the append: disarmed by the block once
+                // ownership has moved (a bare `errdefer` around both statements
+                // would free the string the list is holding).
+                {
+                    errdefer self.allocator.free(json_str);
+                    try self.owned_strings.append(json_str);
+                }
                 return try self.setValue(field_name, .{ .string = json_str });
             }
 
-            return try self.setValue(field_name, field_value.toSqlValue(value));
+            if (comptime logical_type == .vector) {
+                const text = try field_value.vectorTextAlloc(self.allocator, value, vector_dims orelse 0);
+                if (text) |t| {
+                    {
+                        errdefer self.allocator.free(t);
+                        try self.owned_strings.append(t);
+                    }
+                    return try self.setValue(field_name, .{ .string = t });
+                }
+                return try self.setValue(field_name, .null);
+            }
+
+            return try self.setValue(field_name, field_value.toSqlValue(logical_type, value));
         }
 
         const SaveError = sql_driver.Error || HookError || error{ PrivacyDenied, TypeMismatch, ColumnCountMismatch, ValidationFailed, InterceptFailed, MissingLastInsertId, InconsistentRowFields };
@@ -1510,6 +1598,66 @@ test "BulkInsert builder basic" {
     try std.testing.expectEqual(@as(usize, 2), b.rows.items.len);
     try std.testing.expectEqualStrings("alice", b.rows.items[0].items[0].value.string);
     try std.testing.expectEqual(@as(i64, 25), b.rows.items[1].items[1].value.int);
+}
+
+test "setFieldValue: a Bytes column gets the byte tag and a Vector column its text form" {
+    // The two shapes whose `sql.Value` tag is decided by the *field* rather than
+    // by `@TypeOf(value)`. Pinned at the builder, because that is where the
+    // field's logical type is in hand and where a regression would be invisible
+    // until the server rejected (or silently mangled) the value.
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const EntityGen = @import("entity.zig").Entity;
+
+    const Doc = schema("ZtDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Bytes("payload"),
+            field.Vector("embedding", 3),
+            field.Vector("maybe", 2).Optional(),
+        },
+    });
+
+    const info = comptime fromSchema(Doc);
+    const infos = &[_]TypeInfo{info};
+    const DocEntity = comptime EntityGen(infos, info);
+    const Builder = CreateBuilder(infos, info, DocEntity);
+
+    var b = Builder.init(std.testing.allocator, undefined, &.{}, null);
+    defer b.deinit();
+
+    // A text column keeps the text tag...
+    _ = try b.setFieldValue("name", "n");
+    try std.testing.expect(b.values.items[0].value == .string);
+
+    // ...and a byte column does not, for the same Zig type. This is the write
+    // half of the BYTEA defect: `.string` here would hand PostgreSQL's
+    // `byteain` the value, which NUL-truncates it.
+    const payload = [_]u8{ 0x00, 0xDE, 0xAD, 0xFF, 0x5C };
+    _ = try b.setFieldValue("payload", &payload);
+    try std.testing.expect(b.values.items[1].value == .bytes);
+    try std.testing.expectEqualSlices(u8, &payload, b.values.items[1].value.bytes);
+
+    // A vector is encoded to pgvector's text form, not passed as a slice — the
+    // encoder's buffer is owned by the builder and freed by `deinit`.
+    _ = try b.setFieldValue("embedding", &[_]f32{ 1, 2.5, -3 });
+    try std.testing.expectEqualStrings("[1,2.5,-3]", b.values.items[2].value.string);
+
+    // The dimension is checked here, so a wrong count never reaches the server:
+    // PostgreSQL would answer `expected 3 dimensions, not 2`.
+    try std.testing.expectError(error.ValidationFailed, b.setFieldValue("embedding", &[_]f32{ 1, 2 }));
+    try std.testing.expectError(error.ValidationFailed, b.setFieldValue("embedding", &[_]f32{ 1, 2, 3, 4 }));
+    // Nothing was appended for the rejected calls.
+    try std.testing.expectEqual(@as(usize, 3), b.values.items.len);
+
+    // A NULL vector is a NULL column — not an empty `[]`, which is a different
+    // value entirely.
+    _ = try b.setFieldValue("maybe", null);
+    try std.testing.expect(b.values.items[3].value == .null);
+    _ = try b.setFieldValue("maybe", @as(?[]const f32, &.{ 1, 2 }));
+    try std.testing.expectEqualStrings("[1,2]", b.values.items[4].value.string);
+    try std.testing.expectError(error.ValidationFailed, b.setFieldValue("maybe", @as(?[]const f32, &.{1})));
 }
 
 test "validateSqlValue positive" {

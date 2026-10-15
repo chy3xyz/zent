@@ -339,6 +339,217 @@ test "Postgres: PG-specific types (TIMESTAMPTZ, JSONB, UUID, BYTEA)" {
     }
 }
 
+test "Postgres: a BYTEA column reads back the bytes it was written with" {
+    // The bug this pins: `.bytes` binds in the *binary* format — the server
+    // receives the raw bytes — while every read asked for **text** results, and
+    // a `bytea`'s text form is an *encoding* of the value (`\xdeadbeef` for four
+    // bytes). `getBlob` handed that text back verbatim, so four bytes in came
+    // out as ten characters. The payloads below hold what a text round trip
+    // loses first: a NUL, non-UTF-8 bytes, and a backslash (which escape form
+    // writes as `\\`, the byte the hex form hides as plain hex).
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS pg_bytea_test", &.{});
+    _ = try drv.exec("CREATE TABLE pg_bytea_test (id SERIAL PRIMARY KEY, payload BYTEA)", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_bytea_test", &.{}) catch {};
+
+    const payloads = [_][]const u8{
+        &.{ 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0xFF },
+        &.{ 0x5C, 0x00, 0xFF, 0x61 },
+        &.{},
+    };
+    var ids: [payloads.len]i64 = undefined;
+    for (payloads, 0..) |payload, i| {
+        const res = try drv.exec(
+            "INSERT INTO pg_bytea_test (payload) VALUES ($1) RETURNING id",
+            &.{.{ .bytes = payload }},
+        );
+        try testing.expectEqual(@as(usize, 1), res.rows_affected);
+        ids[i] = res.last_insert_id orelse return error.MissingLastInsertId;
+    }
+
+    {
+        // The wire form really is the encoded text — this is the string the bug
+        // returned as if it were the value. `payload::text` runs the output
+        // function and arrives as a `text` column, so it is passed through
+        // rather than decoded.
+        var raw = try drv.query(
+            "SELECT payload::text FROM pg_bytea_test WHERE id = $1",
+            &.{.{ .int = ids[0] }},
+        );
+        defer raw.deinit();
+        const r = raw.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("\\x00deadbeefff", r.getText(0).?);
+    }
+
+    const readBack = struct {
+        fn f(d: *PostgresDriver, id: i64, payload: []const u8) !void {
+            var rows = try d.query(
+                // A NULL `bytea` and the empty one alongside the value: null
+                // must stay null, and empty must be empty rather than the two
+                // characters `\x`.
+                "SELECT payload, NULL::bytea, ''::bytea FROM pg_bytea_test WHERE id = $1",
+                &.{.{ .int = id }},
+            );
+            defer rows.deinit();
+            const row = rows.next() orelse return error.NoRow;
+            try testing.expectEqualSlices(u8, payload, row.getBlob(0).?);
+            // `getText` decodes too: a `bytea`'s text form is never its value,
+            // and which getter a consumer reached for must not change that.
+            try testing.expectEqualSlices(u8, payload, row.getText(0).?);
+            try testing.expect(row.getBlob(1) == null);
+            try testing.expect(row.isNull(1));
+            try testing.expectEqual(@as(usize, 0), row.getBlob(2).?.len);
+        }
+    }.f;
+
+    // Both `bytea_output` forms on the plain `PQexecParams` path ...
+    for ([_]bool{ false, true }) |escape| {
+        _ = try drv.exec(if (escape) "SET bytea_output = 'escape'" else "SET bytea_output = 'hex'", &.{});
+        for (payloads, ids) |payload, id| try readBack(&drv, id, payload);
+    }
+    // ... and again through cached prepared statements, which take
+    // `PQexecPrepared` instead. Each of the three result-format arguments in
+    // the driver is a text result, and the decode is what makes that OK.
+    drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
+    for ([_]bool{ false, true }) |escape| {
+        _ = try drv.exec(if (escape) "SET bytea_output = 'escape'" else "SET bytea_output = 'hex'", &.{});
+        for (payloads, ids) |payload, id| try readBack(&drv, id, payload);
+    }
+    _ = try drv.exec("SET bytea_output = 'hex'", &.{});
+
+    {
+        // One `Rows`, several values on the *same* column, smallest first: the
+        // second value needs a bigger buffer than the first, which is where the
+        // scratch allocation, the reuse of it and the retirement of the old one
+        // are exercised — and where a leak or a double free shows up, since
+        // every allocation here is counted by the test allocator.
+        var ordered = try drv.query("SELECT payload FROM pg_bytea_test ORDER BY length(payload)", &.{});
+        defer ordered.deinit();
+        var seen: usize = 0;
+        while (ordered.next()) |row| {
+            try testing.expectEqual(payloads[2 - seen].len, row.getBlob(0).?.len);
+            try testing.expectEqualSlices(u8, payloads[2 - seen], row.getBlob(0).?);
+            seen += 1;
+        }
+        try testing.expectEqual(payloads.len, seen);
+
+        // Two bytea columns of one row, read one after the other: the value read
+        // first must survive the second read, which is only true while each
+        // column decodes into its own buffer.
+        var pair = try drv.query(
+            "SELECT payload, ''::bytea FROM pg_bytea_test WHERE id = $1",
+            &.{.{ .int = ids[1] }},
+        );
+        defer pair.deinit();
+        const r = pair.next() orelse return error.NoRow;
+        const first = r.getBlob(0).?;
+        try testing.expectEqual(@as(usize, 0), r.getBlob(1).?.len);
+        try testing.expectEqualSlices(u8, payloads[1], first);
+    }
+}
+
+test "Postgres: field.Bytes round-trips through the client, and the schema reads clean" {
+    // The entity-level half of the BYTEA fix: a `field.Bytes` column is a
+    // `[]const u8` field like `field.String`, so the scanner reads both with
+    // `getText` (`src/sql/scan.zig` says why it cannot tell them apart) — which
+    // is exactly why the driver has to decode `bytea` in both getters. Nothing
+    // in the tree covered `field.Bytes` before this.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const BlobBase = schema("PgBlob", .{
+        .fields = &.{ field.String("name"), field.Bytes("payload") },
+    });
+    const Blob = struct {
+        pub const schema_name = BlobBase.schema_name;
+        pub const fields = BlobBase.fields;
+        pub const edges = BlobBase.edges;
+        pub const indexes = BlobBase.indexes;
+        pub const policy = BlobBase.policy;
+        pub const is_view = BlobBase.is_view;
+        pub const view_sql = BlobBase.view_sql;
+        pub const soft_delete = BlobBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{Blob});
+    const infos = graph.types;
+    try Client.createAllTables(testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS pg_blob", &.{}) catch {};
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Every payload below goes out through `Create`, i.e. through
+    // `setFieldValue`, which now produces `Value.bytes` for a `field.Bytes`
+    // column. That is the write half of this test: the same bytes used to
+    // travel as a *text* parameter (`Value.string`, the tag a `String` field
+    // gets), and PostgreSQL parses a text-format parameter for `bytea` with its
+    // text input function — validated against `client_encoding`, parsed as a C
+    // string, backslashes read as escape sequences. So a NUL truncated the
+    // value, non-UTF-8 bytes were refused outright
+    // (`invalid byte sequence for encoding "UTF8"`), and `\nnn` was silently
+    // decoded into a different byte. Each payload below is one of those cases,
+    // and each is read back through the *entity* — which is the read half: the
+    // stored bytes used to come back as the `\x…` text form of the value.
+    const payloads = [_]struct { name: []const u8, payload: []const u8 }{
+        // A NUL in the middle, plus non-UTF-8 bytes: the byte string `byteain`
+        // cannot carry in text format at all.
+        .{ .name = "nul-and-binary", .payload = &.{ 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0xFF, 0x5C, 0x61 } },
+        // A lone backslash and a backslash-escape lookalike: escape format
+        // doubles the first, text format decodes the second as `\n`.
+        .{ .name = "backslashes", .payload = &.{ 0x5C, 0x5C, 0x6E, 0x5C, 0x78, 0x34, 0x31 } },
+        // Valid UTF-8 through the binary path: the shape that worked before
+        // must keep working, byte for byte.
+        .{ .name = "utf8", .payload = "bytes \u{e9} \u{2713}" },
+        // The empty payload, which text format turned into `\x`.
+        .{ .name = "empty", .payload = &[_]u8{} },
+        // PostgreSQL's own text-format prefix, so a `\x` that is really part of
+        // the value cannot be mistaken for an encoding.
+        .{ .name = "literal-x-prefix", .payload = &.{ 0x5C, 0x78, 0x30, 0x30 } },
+    };
+
+    for (payloads) |case| {
+        var b = try client.pg_blob.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", case.name);
+        _ = try b.setFieldValue("payload", case.payload);
+        var saved = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+        try testing.expectEqualSlices(u8, case.payload, saved.payload);
+    }
+
+    var q = client.pg_blob.Query();
+    defer q.deinit();
+    const rows = try q.All();
+    defer {
+        for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+        rows.deinit();
+    }
+    try testing.expectEqual(payloads.len, rows.items.len);
+    for (payloads) |case| {
+        var found = false;
+        for (rows.items) |e| {
+            if (!std.mem.eql(u8, e.name, case.name)) continue;
+            found = true;
+            try testing.expectEqualSlices(u8, case.payload, e.payload);
+            // The length is asserted separately: `expectEqualSlices` would call
+            // two empty slices equal, and the NUL truncation this test is about
+            // showed up first as a *short* value.
+            try testing.expectEqual(case.payload.len, e.payload.len);
+        }
+        try testing.expect(found);
+    }
+
+    // `BYTEA` is the right DDL for the field, so the migrated database agrees
+    // with the schema: no drift at all, and no read-breaking one in particular.
+    const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, drifts);
+    try testing.expectEqual(@as(usize, 0), drifts.len);
+    try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+}
+
 test "Postgres: prepared statement cache hit" {
     const allocator = testing.allocator;
     var drv = connect(allocator) catch |err| return skipIfNoServer(err);
@@ -4361,4 +4572,715 @@ test "Postgres: exec reports a count only for the commands that published one" {
     var rows = try drv.query("SELECT COUNT(*) FROM pg_rowcount", &.{});
     defer rows.deinit();
     try testing.expectEqual(@as(i64, 0), (rows.next() orelse return error.NoRow).getInt(0).?);
+}
+
+// ------------------------------------------------------------------
+// Extension, custom and array column types (`field.Other` / `.SqlType`)
+// ------------------------------------------------------------------
+
+/// What PostgreSQL's catalog answers for a column, straight from the server —
+/// the raw shape `checkSchema`'s comparison resolves, read here without going
+/// through the introspection code under test.
+const PgCatalogType = struct {
+    data_type: []const u8,
+    udt_name: []const u8,
+};
+
+fn pgCatalogType(allocator: std.mem.Allocator, drv: *PostgresDriver, table: []const u8, column: []const u8) !PgCatalogType {
+    var rows = try drv.query(
+        "SELECT data_type, udt_name FROM information_schema.columns WHERE table_name = $1 AND column_name = $2 AND table_schema = current_schema()",
+        &.{ .{ .string = table }, .{ .string = column } },
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    const out: PgCatalogType = .{
+        .data_type = try allocator.dupe(u8, row.getText(0) orelse ""),
+        .udt_name = try allocator.dupe(u8, row.getText(1) orelse ""),
+    };
+    errdefer {
+        allocator.free(out.data_type);
+        allocator.free(out.udt_name);
+    }
+    if (rows.nextError()) |err| return err;
+    return out;
+}
+
+fn freePgCatalogType(allocator: std.mem.Allocator, t: PgCatalogType) void {
+    allocator.free(t.data_type);
+    allocator.free(t.udt_name);
+}
+
+/// Whether a type name exists in the server's catalog at all — for the shapes an
+/// extension only provides from a certain version on (`halfvec` is pgvector
+/// 0.7+), where the case that needs it is skipped rather than failed.
+fn pgTypeExists(drv: *PostgresDriver, type_name: []const u8) !bool {
+    var rows = try drv.query("SELECT 1 FROM pg_type WHERE typname = $1", &.{.{ .string = type_name }});
+    defer rows.deinit();
+    const found = rows.next() != null;
+    if (rows.nextError()) |err| return err;
+    return found;
+}
+
+test "Postgres: declared array columns are created and drift-free, and a wrong element type is still reported" {
+    // `field.Other(name, "integer[]")` is the declaration side of this feature:
+    // without it a declared array cannot be expressed at all, and once it can,
+    // `checkSchema` has to compare it against what the catalog answers —
+    // `ARRAY` + `_int4`, not the `integer[]` the schema wrote. Comparing
+    // `data_type` reported a `type_mismatch` for the column zent itself had just
+    // created.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_pg_custom_type CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_pg_custom_type CASCADE", &.{}) catch {};
+
+    const ZentPgCustomType = schema("ZentPgCustomType", .{
+        .fields = &.{
+            field.Other("tags", "integer[]"),
+            field.Other("labels", "text[]").Optional(),
+            field.Other("addr", "inet"),
+            // Built into PostgreSQL (no extension), and *not* `USER-DEFINED`:
+            // they take the comparison the schema always used.
+            field.Other("span", "int4range").Optional(),
+            field.Other("search", "tsvector").Optional(),
+        },
+    });
+    const graph = comptime buildGraph(&.{ZentPgCustomType});
+    const infos = graph.types;
+
+    // The real migration creates the table, so the declaration reaches the
+    // server's DDL (a verbatim `integer[]`, or `CREATE TABLE` fails here).
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    {
+        const tags = try pgCatalogType(allocator, &drv, "zent_pg_custom_type", "tags");
+        defer freePgCatalogType(allocator, tags);
+        try testing.expectEqualStrings("ARRAY", tags.data_type);
+        try testing.expectEqualStrings("_int4", tags.udt_name);
+
+        const labels = try pgCatalogType(allocator, &drv, "zent_pg_custom_type", "labels");
+        defer freePgCatalogType(allocator, labels);
+        try testing.expectEqualStrings("ARRAY", labels.data_type);
+        try testing.expectEqualStrings("_text", labels.udt_name);
+
+        // A built-in type whose name is its own answer on both sides.
+        const addr = try pgCatalogType(allocator, &drv, "zent_pg_custom_type", "addr");
+        defer freePgCatalogType(allocator, addr);
+        try testing.expectEqualStrings("inet", addr.data_type);
+        try testing.expectEqualStrings("inet", addr.udt_name);
+    }
+
+    // Zero drift, and the read-breaking gate — which is what a consumer's
+    // startup check runs.
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        for (drifts) |d| {
+            std.debug.print("unexpected drift: {s}.{s} {s}\n", .{ d.table, d.column, @tagName(d.kind) });
+        }
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // The column is usable through the generated client, not merely declarable:
+    // an array value travels as its text form (`{1,2,3}`) and reads back.
+    {
+        var client = Client.makeClient(infos, allocator, drv.asDriver());
+        var cb = try client.zent_pg_custom_type.Create();
+        defer cb.deinit();
+        _ = try cb.setFieldValue("tags", "{1,2,3}");
+        _ = try cb.setFieldValue("addr", "127.0.0.1");
+        var created = try cb.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &created, allocator);
+        try testing.expectEqualStrings("{1,2,3}", created.tags);
+        try testing.expectEqualStrings("127.0.0.1", created.addr);
+
+        var q = client.zent_pg_custom_type.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("{1,2,3}", rows.items[0].tags);
+        try testing.expectEqualStrings("127.0.0.1", rows.items[0].addr);
+    }
+
+    // The counterexample the comparison must keep: the *same* table, declared
+    // with `text[]` and `cidr` where the database really holds `integer[]` and
+    // `inet`. Both sides answer `ARRAY`/`USER-DEFINED`-shaped names, so a
+    // branch that matched on that alone would call this clean.
+    const ZentPgCustomTypeWrong = schema("ZentPgCustomType", .{
+        .fields = &.{
+            field.Other("tags", "text[]"),
+            field.Other("labels", "text[]").Optional(),
+            field.Other("addr", "cidr"),
+            field.Other("span", "int4range").Optional(),
+            field.Other("search", "tsvector").Optional(),
+        },
+    });
+    const wrong_graph = comptime buildGraph(&.{ZentPgCustomTypeWrong});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), wrong_graph.types);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        var mismatches: usize = 0;
+        for (drifts) |d| {
+            if (d.kind == .type_mismatch) {
+                mismatches += 1;
+                try testing.expect(std.mem.eql(u8, d.column, "tags") or std.mem.eql(u8, d.column, "addr"));
+            }
+        }
+        try testing.expectEqual(@as(usize, 2), mismatches);
+        try testing.expectError(error.SchemaDrift, migrate.assertSchema(allocator, drv.asDriver(), wrong_graph.types, .any));
+    }
+}
+
+test "Postgres: a declared vector(1536) column is drift-free when pgvector is installed" {
+    // The extension type: `data_type` is `USER-DEFINED` for it (the name is not
+    // PostgreSQL's own) and the real name is in `udt_name`. pgvector is a
+    // `CREATE EXTENSION`, so a server may not have it — CI's may not — and the
+    // case skips there rather than failing: the array half above is the part
+    // that runs everywhere.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    {
+        var rows = drv.query("SELECT 1 FROM pg_available_extensions WHERE name = 'vector'", &.{}) catch |err| return skipIfNoServer(err);
+        defer rows.deinit();
+        if (rows.next() == null) {
+            if (rows.nextError()) |err| return err;
+            return error.SkipZigTest;
+        }
+        if (rows.nextError()) |err| return err;
+    }
+    _ = drv.exec("CREATE EXTENSION IF NOT EXISTS vector", &.{}) catch return error.SkipZigTest;
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_pg_vector_type CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_pg_vector_type CASCADE", &.{}) catch {};
+
+    const ZentPgVectorType = schema("ZentPgVectorType", .{
+        .fields = &.{
+            field.Other("embedding", "vector(1536)"),
+            // An array of an extension type as well: `_vector`.
+            field.Other("extra", "vector[]").Optional(),
+        },
+    });
+    const graph = comptime buildGraph(&.{ZentPgVectorType});
+    const infos = graph.types;
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    {
+        const embedding = try pgCatalogType(allocator, &drv, "zent_pg_vector_type", "embedding");
+        defer freePgCatalogType(allocator, embedding);
+        try testing.expectEqualStrings("USER-DEFINED", embedding.data_type);
+        try testing.expectEqualStrings("vector", embedding.udt_name);
+
+        const extra = try pgCatalogType(allocator, &drv, "zent_pg_vector_type", "extra");
+        defer freePgCatalogType(allocator, extra);
+        try testing.expectEqualStrings("ARRAY", extra.data_type);
+        try testing.expectEqualStrings("_vector", extra.udt_name);
+    }
+
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        for (drifts) |d| {
+            std.debug.print("unexpected drift: {s}.{s} {s}\n", .{ d.table, d.column, @tagName(d.kind) });
+        }
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    // The dimension is *not* compared, and cannot be from this answer: the
+    // catalog reports the type name only (`vector` for a `vector(3)` column as
+    // well), so a declaration of a different dimension reads as an agreement.
+    // Reading `pg_attribute.atttypmod` would be a second introspection query
+    // with a per-built-in answer shape; this branch deliberately does not, and
+    // the boundary is pinned rather than left to be rediscovered.
+    _ = try drv.exec("ALTER TABLE zent_pg_vector_type ALTER COLUMN embedding TYPE vector(3) USING embedding::vector(3)", &.{});
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+
+    // A genuinely different type is still reported — `vector` is not `halfvec`.
+    // (`halfvec` arrives with pgvector 0.7; a server whose extension predates it
+    // skips this half rather than failing, like the extension check above.)
+    if (try pgTypeExists(&drv, "halfvec")) {
+        _ = try drv.exec("ALTER TABLE zent_pg_vector_type ALTER COLUMN embedding TYPE halfvec(3) USING embedding::halfvec(3)", &.{});
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        var mismatches: usize = 0;
+        for (drifts) |d| {
+            if (d.kind == .type_mismatch) {
+                mismatches += 1;
+                try testing.expectEqualStrings("embedding", d.column);
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), mismatches);
+    }
+}
+
+test "Postgres: the ALTER TYPE plan names the dialect's declared type, not the graph's SQLite spelling" {
+    // `buildGraph` resolves `FieldInfo.sql_type` through `fromSchema`, which is
+    // SQLite's mapping — `TEXT` for an `.other`/`.SqlType` column even when the
+    // migration runs on PostgreSQL. The plan's ALTER TYPE used to hand that field
+    // to `alterColumnTypeSQL`, so the "repair" would have renamed the column's
+    // type to the one it already had on this dialect (and a declared
+    // `VarChar(n)` never reached the ALTER at all). The type now comes from
+    // `columnSQLType` — the same resolution the drift report and the CREATE
+    // TABLE use — and the planned statement is run here against the server.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_pg_alter_type CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_pg_alter_type CASCADE", &.{}) catch {};
+    // The drifted shape, with a row whose value has to survive the conversion.
+    _ = try drv.exec("CREATE TABLE zent_pg_alter_type (id SERIAL PRIMARY KEY, tags TEXT NOT NULL)", &.{});
+    _ = try drv.exec("INSERT INTO zent_pg_alter_type (tags) VALUES ('{1,2}')", &.{});
+
+    const ZentPgAlterType = schema("ZentPgAlterType", .{
+        .fields = &.{field.Other("tags", "integer[]")},
+    });
+    const graph = comptime buildGraph(&.{ZentPgAlterType});
+    const infos = graph.types;
+    // The graph's own spelling is the SQLite one; only `columnSQLType` knows the
+    // dialect this run is on.
+    try testing.expectEqualStrings("TEXT", infos[0].fields[1].sql_type);
+
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 1), drifts.len);
+        try testing.expectEqual(migrate.SchemaDrift.Kind.type_mismatch, drifts[0].kind);
+    }
+
+    // An empty history snapshot, so the plan is what would run next on this
+    // database state however many times this test has run before.
+    var plan = try migrate.planMigrateStatements(allocator, drv.asDriver(), infos, .{ .allow_data_loss = true }, &.{});
+    defer migrate.freePlannedStatements(allocator, &plan);
+
+    var alter: ?[]const u8 = null;
+    for (plan.items) |st| {
+        if (std.mem.indexOf(u8, st.sql, "ALTER COLUMN \"tags\"") != null) alter = st.sql;
+    }
+    const stmt = alter orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(
+        "ALTER TABLE \"zent_pg_alter_type\" ALTER COLUMN \"tags\" TYPE integer[] USING \"tags\"::integer[]",
+        stmt,
+    );
+    _ = try drv.exec(stmt, &.{});
+
+    // The server took it, the row converted with the column, and the schema now
+    // agrees — which is the whole point of the repair.
+    {
+        const tags = try pgCatalogType(allocator, &drv, "zent_pg_alter_type", "tags");
+        defer freePgCatalogType(allocator, tags);
+        try testing.expectEqualStrings("ARRAY", tags.data_type);
+        try testing.expectEqualStrings("_int4", tags.udt_name);
+    }
+    {
+        var rows = try drv.query("SELECT tags FROM zent_pg_alter_type", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("{1,2}", row.getText(0).?);
+        if (rows.nextError()) |err| return err;
+    }
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+}
+
+test "Postgres: field.Vector is a real pgvector column and round-trips through the client" {
+    // `field.Vector("embedding", 3)` is the first-class field kind: PostgreSQL
+    // gets pgvector's `vector(3)` (not a `TEXT` column that merely holds a
+    // vector), the Zig field is an owned `[]const f32`, and the value travels
+    // in pgvector's own text form. The three halves this pins are the DDL, the
+    // write path (dimension-checked here, not by the server) and the read path
+    // (parsed back into `[]f32`).
+    //
+    // pgvector is a `CREATE EXTENSION`, so a server may not have it — CI's may
+    // not — and the case skips there rather than failing, like the
+    // `vector(1536)` declaration test above and for the same reason.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    {
+        var rows = drv.query("SELECT 1 FROM pg_available_extensions WHERE name = 'vector'", &.{}) catch |err| return skipIfNoServer(err);
+        defer rows.deinit();
+        if (rows.next() == null) {
+            if (rows.nextError()) |err| return err;
+            return error.SkipZigTest;
+        }
+        if (rows.nextError()) |err| return err;
+    }
+    _ = drv.exec("CREATE EXTENSION IF NOT EXISTS vector", &.{}) catch return error.SkipZigTest;
+
+    const EmbedBase = schema("ZtVecDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Vector("embedding", 3),
+            // A nullable vector: NULL stays null, which is the contract every
+            // other optional field already has.
+            field.Vector("spare", 2).Optional(),
+        },
+    });
+    const Embed = struct {
+        pub const schema_name = EmbedBase.schema_name;
+        pub const fields = EmbedBase.fields;
+        pub const edges = EmbedBase.edges;
+        pub const indexes = EmbedBase.indexes;
+        pub const policy = EmbedBase.policy;
+        pub const is_view = EmbedBase.is_view;
+        pub const view_sql = EmbedBase.view_sql;
+        pub const soft_delete = EmbedBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{Embed});
+    const infos = graph.types;
+
+    try Client.createAllTables(testing.allocator, infos, drv.asDriver());
+    defer _ = drv.exec("DROP TABLE IF EXISTS zt_vec_doc", &.{}) catch {};
+
+    // The column really is pgvector's type on the server, not the `TEXT`
+    // mapping MySQL/SQLite get.
+    {
+        const embedding = try pgCatalogType(allocator, &drv, "zt_vec_doc", "embedding");
+        defer freePgCatalogType(allocator, embedding);
+        try testing.expectEqualStrings("USER-DEFINED", embedding.data_type);
+        try testing.expectEqualStrings("vector", embedding.udt_name);
+        const spare = try pgCatalogType(allocator, &drv, "zt_vec_doc", "spare");
+        defer freePgCatalogType(allocator, spare);
+        try testing.expectEqualStrings("vector", spare.udt_name);
+    }
+
+    // The declaration and the catalog agree: `vector(3)` against
+    // `USER-DEFINED`/`vector` is zero drift, including the read-breaking gate a
+    // consumer's startup check runs.
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        for (drifts) |d| {
+            std.debug.print("unexpected drift: {s}.{s} {s}\n", .{ d.table, d.column, @tagName(d.kind) });
+        }
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+        try migrate.assertSchema(allocator, drv.asDriver(), infos, .any);
+    }
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // The write path: a `[]const f32` is encoded to `[1,2.5,-3]` and the value
+    // comes back through the entity's own scan.
+    const exact = [_]f32{ 1, 2.5, -3 };
+    {
+        var b = try client.zt_vec_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "exact");
+        _ = try b.setFieldValue("embedding", &exact);
+        var saved = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+        try testing.expectEqualSlices(f32, &exact, saved.embedding);
+        try testing.expect(saved.spare == null);
+    }
+
+    // The element count is the schema's business, checked before the statement
+    // leaves: the server would answer `expected 3 dimensions, not 2`, which is
+    // neither a named error nor one a caller can act on.
+    {
+        var b = try client.zt_vec_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "wrong");
+        try testing.expectError(error.ValidationFailed, b.setFieldValue("embedding", &[_]f32{ 1, 2 }));
+        try testing.expectError(error.ValidationFailed, b.setFieldValue("embedding", &[_]f32{ 1, 2, 3, 4 }));
+        // The declared dimension of the other column, through the same check.
+        try testing.expectError(error.ValidationFailed, b.setFieldValue("spare", @as(?[]const f32, &.{ 1, 2, 3 })));
+    }
+
+    // A second row, so the read path reads a page rather than one RETURNING.
+    const approximate = [_]f32{ 0.1, -0.25, 1.0 / 3.0 };
+    {
+        var b = try client.zt_vec_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "approx");
+        _ = try b.setFieldValue("embedding", &approximate);
+        _ = try b.setFieldValue("spare", @as(?[]const f32, &.{ -7, 7 }));
+        var saved = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+        // pgvector's element type is `float4` and so is the Zig type, so the
+        // round trip is exact — the tolerance below is what a `f64` input
+        // would need, asserted as equality here to pin that no widening
+        // happens anywhere on the path.
+        try testing.expectEqualSlices(f32, &approximate, saved.embedding);
+        try testing.expectEqualSlices(f32, &[_]f32{ -7, 7 }, saved.spare.?);
+    }
+
+    {
+        var q = client.zt_vec_doc.Query();
+        defer q.deinit();
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+        for (rows.items) |e| {
+            if (std.mem.eql(u8, e.name, "exact")) {
+                try testing.expectEqualSlices(f32, &exact, e.embedding);
+                try testing.expect(e.spare == null);
+            } else {
+                try testing.expectEqualSlices(f32, &approximate, e.embedding);
+                try testing.expectEqualSlices(f32, &[_]f32{ -7, 7 }, e.spare.?);
+            }
+        }
+    }
+
+    // The column is a *vector* column as far as the server is concerned: its
+    // text form is the string the codec produced, and the distance operators
+    // work on it. That is what `TEXT` could not have done.
+    {
+        var rows = try drv.query(
+            "SELECT embedding::text, embedding <-> '[1,2.5,-3]'::vector FROM zt_vec_doc WHERE name = 'exact'",
+            &.{},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqualStrings("[1,2.5,-3]", row.getText(0).?);
+        try testing.expectEqual(@as(f64, 0), row.getFloat(1).?);
+        if (rows.nextError()) |err| return err;
+    }
+}
+
+test "Postgres: pgvector nearest-neighbour search through the fluent API" {
+    // The end-to-end half of the distance predicates: a `field.Vector` column
+    // with an `hnsw` index, rows written through the client, then the two
+    // query shapes the fluent API now builds —
+    //
+    //   * `OrderByVectorDistance` (`ORDER BY "embedding" <=> $1`) for the
+    //     nearest neighbours, and
+    //   * `VectorL2Distance` (`WHERE "embedding" <-> $1 < $2`) for a radius.
+    //
+    // The expected order is **hand-computed cosine distance from `[1,0,0]`**,
+    // hardcoded below rather than asked of SQL — a test that computes its
+    // expectation with the same operator it is testing proves only that the
+    // server is deterministic.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    {
+        var rows = drv.query("SELECT 1 FROM pg_available_extensions WHERE name = 'vector'", &.{}) catch |err| return skipIfNoServer(err);
+        defer rows.deinit();
+        if (rows.next() == null) {
+            if (rows.nextError()) |err| return err;
+            return error.SkipZigTest;
+        }
+        if (rows.nextError()) |err| return err;
+    }
+    _ = drv.exec("CREATE EXTENSION IF NOT EXISTS vector", &.{}) catch return error.SkipZigTest;
+
+    const SearchBase = schema("ZtVecSearchDoc", .{
+        .fields = &.{
+            field.String("name"),
+            field.Vector("embedding", 3),
+        },
+        .indexes = &.{
+            // `vector_cosine_ops` because the search below orders by `<=>`:
+            // pgvector picks the operator class from the operator, and an
+            // `hnsw` index with the wrong opclass is silently unused.
+            index.Named("idx_zt_vec_search_doc_emb_hnsw", &.{"embedding"})
+                .Using("hnsw", "vector_cosine_ops"),
+        },
+    });
+    const SearchDoc = struct {
+        pub const schema_name = SearchBase.schema_name;
+        pub const fields = SearchBase.fields;
+        pub const edges = SearchBase.edges;
+        pub const indexes = SearchBase.indexes;
+        pub const policy = SearchBase.policy;
+        pub const is_view = SearchBase.is_view;
+        pub const view_sql = SearchBase.view_sql;
+        pub const soft_delete = SearchBase.soft_delete;
+    };
+    const graph = comptime buildGraph(&.{SearchDoc});
+    const infos = graph.types;
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zt_vec_search_doc CASCADE", &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zt_vec_search_doc CASCADE", &.{}) catch {};
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // The index is a real `hnsw` index on the server, not a btree the
+    // declaration happened to name "hnsw": `pg_class.relam` is the access
+    // method the planner reads.
+    {
+        var rows = try drv.query(
+            "SELECT am.amname FROM pg_class c JOIN pg_am am ON am.oid = c.relam WHERE c.relname = $1",
+            &.{.{ .string = "idx_zt_vec_search_doc_emb_hnsw" }},
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoIndex;
+        try testing.expectEqualStrings("hnsw", row.getText(0).?);
+        if (rows.nextError()) |err| return err;
+    }
+    {
+        var rows = try drv.query(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1 AND indexname = $2",
+            &.{ .{ .string = "zt_vec_search_doc" }, .{ .string = "idx_zt_vec_search_doc_emb_hnsw" } },
+        );
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoIndex;
+        const def = row.getText(0) orelse return error.NoIndex;
+        try testing.expect(std.mem.indexOf(u8, def, "USING hnsw") != null);
+        try testing.expect(std.mem.indexOf(u8, def, "vector_cosine_ops") != null);
+        if (rows.nextError()) |err| return err;
+    }
+
+    // A declared `hnsw` index is not a false drift: `checkSchema` is clean on
+    // the table it just created, which is what a consumer's startup gate runs.
+    {
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        for (drifts) |d| {
+            std.debug.print("unexpected drift: {s}.{s} {s}\n", .{ d.table, d.column, @tagName(d.kind) });
+        }
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+
+    // Rows: unit-length directions around `[1,0,0]`, so the cosine distances
+    // are exact and hand-checkable. `same` is the query vector itself, `near`
+    // is 45° off it, `orthogonal` is 90°, `opposite` is 180°.
+    //
+    // `var` and a runtime `for`: `setFieldValue` writes `[]const f32`
+    // **through the pointer it is handed**, so the vectors have to be runtime
+    // storage, not comptime values a pointer cannot reach.
+    var rows_spec = [4]struct { name: []const u8, vec: [3]f32 }{
+        .{ .name = "same", .vec = .{ 1, 0, 0 } },
+        .{ .name = "near", .vec = .{ 1, 1, 0 } },
+        .{ .name = "orthogonal", .vec = .{ 0, 1, 0 } },
+        .{ .name = "opposite", .vec = .{ -1, 0, 0 } },
+    };
+    for (&rows_spec) |spec| {
+        var b = try client.zt_vec_search_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", spec.name);
+        _ = try b.setFieldValue("embedding", &spec.vec);
+        var saved = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+    }
+
+    const query_vec = [_]f32{ 1, 0, 0 };
+    const query_text = try field.encodeVector(allocator, &query_vec);
+    defer allocator.free(query_text);
+
+    // Hand-computed, from `cos(q, v) = dot / (|q||v|)` on `q = [1,0,0]`:
+    //   same       [1,0,0]  dot 1, |v| 1        → cos 1      → distance 0
+    //   near       [1,1,0]  dot 1, |v| sqrt(2)  → cos 0.7071 → distance 0.2929
+    //   orthogonal [0,1,0]  dot 0, |v| 1        → cos 0      → distance 1
+    //   opposite   [-1,0,0] dot -1, |v| 1       → cos -1     → distance 2
+    const expected_order = [_][]const u8{ "same", "near", "orthogonal", "opposite" };
+
+    {
+        var q = client.zt_vec_search_doc.Query();
+        defer q.deinit();
+        // `desc = false` is ASC — nearest first, for `<#>` too, since it is
+        // already the negative inner product.
+        _ = try q.OrderBy(&.{sql.OrderByVectorDistance("embedding", .cosine, .{ .string = query_text }, false)});
+        _ = q.Limit(4);
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, expected_order.len), rows.items.len);
+        for (rows.items, expected_order) |e, want| {
+            try testing.expectEqualStrings(want, e.name);
+        }
+        // The page is a real entity page, not just names: the vector round
+        // trips through the same scan the storage test pins.
+        try testing.expectEqualSlices(f32, &[_]f32{ 1, 0, 0 }, rows.items[0].embedding);
+    }
+
+    // The same order with `DESC` — farthest first.
+    {
+        var q = client.zt_vec_search_doc.Query();
+        defer q.deinit();
+        _ = try q.OrderBy(&.{sql.OrderByVectorDistance("embedding", .cosine, .{ .string = query_text }, true)});
+        _ = q.Limit(2);
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+        try testing.expectEqualStrings("opposite", rows.items[0].name);
+        try testing.expectEqualStrings("orthogonal", rows.items[1].name);
+    }
+
+    // A WHERE radius, inclusive: L2 from `[1,0,0]` is 0 for `same`, 1 for
+    // `near`, sqrt(2) ≈ 1.4142 for `orthogonal` and 2 for `opposite`, so
+    // `<= 1` picks exactly the first two — and it does so *inclusively*
+    // (`near` sits exactly on the boundary).
+    {
+        var q = client.zt_vec_search_doc.Query();
+        defer q.deinit();
+        _ = try q.Where(&.{sql.VectorL2Distance("embedding", .{ .string = query_text }, .lte, .{ .float = 1.0 })});
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 2), rows.items.len);
+        var seen_same = false;
+        var seen_near = false;
+        for (rows.items) |e| {
+            if (std.mem.eql(u8, e.name, "same")) seen_same = true;
+            if (std.mem.eql(u8, e.name, "near")) seen_near = true;
+        }
+        try testing.expect(seen_same and seen_near);
+    }
+
+    // The exclusive spelling of the same boundary drops `near`: `< 1` is only
+    // `same`. Without this the inclusive case above is not evidence that the
+    // comparison operator reached the statement at all.
+    {
+        var q = client.zt_vec_search_doc.Query();
+        defer q.deinit();
+        _ = try q.Where(&.{sql.VectorL2Distance("embedding", .{ .string = query_text }, .lt, .{ .float = 1.0 })});
+        var rows = try q.All();
+        defer {
+            for (rows.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            rows.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), rows.items.len);
+        try testing.expectEqualStrings("same", rows.items[0].name);
+    }
+
+    // The SQL the fluent path actually built. The order assertions above would
+    // also pass if the planner chose the index for some other reason; this is
+    // the statement text, with the placeholder numbering the WHERE wrote before
+    // the ORDER BY (the fluent builder's `$1`/`$2`/`$3`), so an operator the
+    // builders rendered differently from the hand-written one is visible rather
+    // than inferred.
+    {
+        var q = client.zt_vec_search_doc.Query();
+        defer q.deinit();
+        _ = try q.Where(&.{sql.VectorL2Distance("embedding", .{ .string = query_text }, .lte, .{ .float = 1.0 })});
+        _ = try q.OrderBy(&.{sql.OrderByVectorDistance("embedding", .cosine, .{ .string = query_text }, false)});
+        _ = q.Limit(4);
+        var explained = try q.Explain(allocator, .text);
+        defer explained.deinit(allocator);
+        try testing.expect(std.mem.indexOf(u8, explained.sql, "\"embedding\" <-> $1 <= $2") != null);
+        try testing.expect(std.mem.indexOf(u8, explained.sql, "ORDER BY \"embedding\" <=> $3") != null);
+        try testing.expect(std.mem.indexOf(u8, explained.sql, "LIMIT 4") != null);
+    }
 }

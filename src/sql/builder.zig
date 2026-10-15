@@ -260,6 +260,46 @@ pub fn SelectExpr(expr: []const u8, alias: ?[]const u8) ColumnRef {
 }
 
 // ------------------------------------------------------------------
+// pgvector distance operators
+// ------------------------------------------------------------------
+
+/// Which distance a pgvector `<op>` computes. One variant per operator
+/// pgvector defines, with the symbol it defines it under:
+///
+/// | variant | symbol | distance | nearest = |
+/// |---|---|---|---|
+/// | `.l2` | `<->` | Euclidean (L2) | smallest |
+/// | `.cosine` | `<=>` | cosine distance, `1 - cos` | smallest |
+/// | `.inner_product` | `<#>` | **negative** inner product | smallest |
+/// | `.l1` | `<+>` | taxicab (L1) | smallest |
+///
+/// The symbols are pgvector's own, verified against the extension
+/// (`SELECT '[1,2,3]'::vector <-> '[1,2,4]'::vector` and its three siblings).
+/// `<#>` is the negative inner product, so "most similar" is still the
+/// *smallest* value and an `ORDER BY … ASC` is the nearest-neighbour order for
+/// all four — which is why `OrderByVectorDistance`'s `desc = false` is the
+/// default-ish spelling for a similarity search.
+///
+/// **PostgreSQL with the `vector` extension only.** See
+/// `Predicate.vector_distance` for why the builders do not gate on the
+/// dialect.
+pub const VectorDistance = enum {
+    l2,
+    cosine,
+    inner_product,
+    l1,
+
+    pub fn symbol(self: VectorDistance) []const u8 {
+        return switch (self) {
+            .l2 => "<->",
+            .cosine => "<=>",
+            .inner_product => "<#>",
+            .l1 => "<+>",
+        };
+    }
+};
+
+// ------------------------------------------------------------------
 // Predicate
 // ------------------------------------------------------------------
 
@@ -309,6 +349,29 @@ pub const Predicate = union(enum) {
     has_edge: struct { edge_name: []const u8, fk_col: []const u8, pred: ?*const Predicate },
     not_has_edge: struct { edge_name: []const u8, fk_col: []const u8 },
     like_escaped: LikeEscapedOp,
+    /// A pgvector distance threshold: `"col" <-> $n < $m`.
+    ///
+    /// **PostgreSQL with the `vector` extension only.** pgvector owns the four
+    /// operator symbols and nothing on this side knows the dialect at
+    /// construction time, so the predicate is built the same way everywhere and
+    /// a MySQL/SQLite statement renders `<->` too — where the server rejects it
+    /// (verified: SQLite answers `near "->": syntax error`, MySQL errno 1064).
+    /// That is deliberate: the operators are `pg_operator` entries, not SQL
+    /// syntax this library can emulate, and a construction-time gate would need
+    /// a dialect the builders deliberately do not carry.
+    ///
+    /// The column is a plain column of the statement's own table, emitted **as
+    /// written** — `Query.Where` takes a hand-built `sql.Predicate` verbatim,
+    /// so pass the physical column (`StorageKey`) when it differs from the API
+    /// field name, exactly as a hand-written `sql.EQ` already has to. The
+    /// generated `preds.<field>…()` helpers are the spelling that carries the
+    /// schema's own name mapping.
+    ///
+    /// The value and the threshold are both bound parameters, so PostgreSQL
+    /// infers the vector type for the first one from the operator's left
+    /// operand and the placeholder numbering stays in the order the fragment is
+    /// written.
+    vector_distance: VectorDistanceOp,
     and_: struct { left: *const Predicate, right: *const Predicate },
     or_: struct { left: *const Predicate, right: *const Predicate },
     not_: *const Predicate,
@@ -329,6 +392,39 @@ pub const Predicate = union(enum) {
     /// Wildcard placement for the escaped-LIKE family.
     pub const LikeMode = enum { contains, prefix, suffix };
     pub const RawArgsOp = struct { sql: []const u8, args: []const Value };
+
+    /// A distance threshold on a pgvector column: which operator, the query
+    /// vector, and the comparison against the threshold.
+    ///
+    /// Both `value` and `threshold` are **borrowed** `Value`s, like every other
+    /// bound value in this file: the query vector is whatever the caller keeps
+    /// alive for the build (see `VectorL2Distance` for the `[]const f32` →
+    /// text step), and nothing here allocates or owns bytes.
+    pub const VectorDistanceOp = struct {
+        column: []const u8,
+        op: VectorDistance,
+        value: Value,
+        cmp: VectorCmp,
+        threshold: Value,
+    };
+
+    /// The comparison applied to the computed distance. `lt` is the usual
+    /// "within a radius" query; `gt` is "farther than".
+    pub const VectorCmp = enum {
+        lt,
+        lte,
+        gt,
+        gte,
+
+        pub fn symbol(self: VectorCmp) []const u8 {
+            return switch (self) {
+                .lt => "<",
+                .lte => "<=",
+                .gt => ">",
+                .gte => ">=",
+            };
+        }
+    };
 
     /// `anyerror` on purpose: `.exists_fn` / `.not_exists_fn` carry a
     /// caller-supplied generator, so the set is not this module's to know. It is
@@ -396,6 +492,25 @@ pub const Predicate = union(enum) {
                 try b.writeString(" ESCAPE '");
                 try b.writeByte(escape);
                 try b.writeByte('\'');
+            },
+            // `"col" <-> $1 < $2`. No parentheses: PostgreSQL gives a
+            // user-defined operator like `<->` higher precedence than a
+            // comparison, so this parses as `(col <-> $1) < $2` — verified
+            // against a real server rather than assumed, since the alternative
+            // reading (`col <-> ($1 < $2)`) is a type error and would make the
+            // parenthesis-free form fail loudly instead of silently.
+            //
+            // Deliberately ungated by dialect: see the union member's doc.
+            .vector_distance => |p| {
+                try b.qualifiedIdent(p.column);
+                try b.writeByte(' ');
+                try b.writeString(p.op.symbol());
+                try b.writeByte(' ');
+                try b.arg(p.value);
+                try b.writeByte(' ');
+                try b.writeString(p.cmp.symbol());
+                try b.writeByte(' ');
+                try b.arg(p.threshold);
             },
             .in => |p| {
                 try b.qualifiedIdent(p.column);
@@ -880,6 +995,84 @@ pub fn NotHasEdge(edge_name: []const u8, fk_col: []const u8) Predicate {
 }
 
 // ------------------------------------------------------------------
+// pgvector distance predicates — PostgreSQL + pgvector only
+// ------------------------------------------------------------------
+//
+// The four constructors below differ only in the distance operator, so they
+// all funnel into `VectorDistancePred`'s struct; the union's rendering is one
+// arm, one place. Each returns a *boolean* condition — a WHERE needs one, so
+// the comparison and its threshold are part of the predicate rather than
+// something the caller bolts on afterwards (nothing in this builder can wrap
+// an expression in `LT(...)`: `BinOp.column` is a name, not a fragment).
+//
+// The **value shape** is `sql.Value`, the same shape every other constructor
+// here accepts. Both the query vector and the threshold are bound parameters,
+// so the vector travels in pgvector's text form and PostgreSQL infers its type
+// from the operator's left operand:
+//
+//     const text = try zent.core.field.encodeVector(allocator, &query_vec);
+//     defer allocator.free(text);
+//     _ = try q.Where(&.{sql.VectorCosineDistance("embedding", .{ .string = text }, .lt, .{ .float = 0.2 })});
+//
+// A `[]const f32` parameter was deliberately not taken: a `Predicate` is
+// copied by value all over the codebase (`appendPredicates`, the selector and
+// builder lists, the interceptor sinks) and owns no memory — `entql`'s
+// `deinitPred` frees exactly the four allocating members and nothing else — so
+// an encoding done here would have to be owned somewhere, and every existing
+// copy path would then need an owner added to it. Encoding at the call site
+// keeps the borrow semantics every other `Value` in this file already has.
+//
+// The **column** is emitted as written, like every other hand-built `sql.*`
+// value: `Query.Where` does not rewrite column names, so pass the physical
+// column (`StorageKey`) when the API field name differs from it. The generated
+// per-field predicates (`preds.<field>EQ()`) are the spelling that carries the
+// schema's own mapping.
+
+/// `"<column>" <op> <value> <cmp> <threshold>` against a pgvector column —
+/// the generic spelling, for a caller that has the operator as data.
+pub fn VectorDistancePred(
+    column: []const u8,
+    op: VectorDistance,
+    value: Value,
+    cmp: Predicate.VectorCmp,
+    threshold: Value,
+) Predicate {
+    return .{ .vector_distance = .{
+        .column = column,
+        .op = op,
+        .value = value,
+        .cmp = cmp,
+        .threshold = threshold,
+    } };
+}
+
+/// `"<column>" <-> $n < $m` — rows within an L2 (Euclidean) distance of the
+/// query vector. **PostgreSQL with pgvector only.**
+pub fn VectorL2Distance(column: []const u8, value: Value, cmp: Predicate.VectorCmp, threshold: Value) Predicate {
+    return VectorDistancePred(column, .l2, value, cmp, threshold);
+}
+
+/// `"<column>" <=> $n < $m` — rows within a cosine distance (`1 - cos`) of the
+/// query vector: the same order as cosine *similarity*, reversed. **PostgreSQL
+/// with pgvector only.**
+pub fn VectorCosineDistance(column: []const u8, value: Value, cmp: Predicate.VectorCmp, threshold: Value) Predicate {
+    return VectorDistancePred(column, .cosine, value, cmp, threshold);
+}
+
+/// `"<column>" <#> $n < $m` — pgvector's `<#>` is the **negative** inner
+/// product, so a threshold here is a bound on `-dot`, not on the similarity
+/// itself. **PostgreSQL with pgvector only.**
+pub fn VectorInnerProduct(column: []const u8, value: Value, cmp: Predicate.VectorCmp, threshold: Value) Predicate {
+    return VectorDistancePred(column, .inner_product, value, cmp, threshold);
+}
+
+/// `"<column>" <+> $n < $m` — rows within an L1 (taxicab) distance of the
+/// query vector. **PostgreSQL with pgvector only.**
+pub fn VectorL1Distance(column: []const u8, value: Value, cmp: Predicate.VectorCmp, threshold: Value) Predicate {
+    return VectorDistancePred(column, .l1, value, cmp, threshold);
+}
+
+// ------------------------------------------------------------------
 // Order
 // ------------------------------------------------------------------
 
@@ -894,6 +1087,27 @@ pub const Order = union(enum) {
     /// Order by a raw SQL snippet, emitted verbatim. Never interpolate
     /// user input into it.
     raw: struct { sql: []const u8, desc: bool = false },
+    /// Nearest-neighbour order by a pgvector distance: `ORDER BY "col" <-> $n`.
+    ///
+    /// **PostgreSQL with the `vector` extension only** — see
+    /// `Predicate.vector_distance` for why the builders do not gate on the
+    /// dialect.
+    ///
+    /// A variant of its own rather than `.expr`, because `.expr.gen` is a
+    /// **comptime function pointer**: it captures nothing, so it cannot carry
+    /// the query vector, which is a runtime value. `.raw` cannot either — its
+    /// SQL is emitted verbatim, with no binding site. So this is the one Order
+    /// shape that owns a `Value` (borrowed, like every other bound value) and
+    /// binds it through `Builder.arg`, which is what keeps the `$n` numbering
+    /// aligned with the WHERE clause written before it.
+    vector_distance: struct {
+        column: []const u8,
+        op: VectorDistance,
+        value: Value,
+        /// `false` (the default) is `ASC` — nearest first, for all four
+        /// operators, since `<#>` is already the negative inner product.
+        desc: bool = false,
+    },
 
     pub fn appendTo(self: Order, b: *Builder) !void {
         switch (self) {
@@ -907,6 +1121,17 @@ pub const Order = union(enum) {
             },
             .raw => |o| {
                 try b.writeString(o.sql);
+                if (o.desc) try b.writeString(" DESC");
+            },
+            // `"col" <-> $1`, one bound value and nothing else — an ORDER BY
+            // expression has no comparison, so there is no precedence question
+            // here (unlike the predicate's threshold form).
+            .vector_distance => |o| {
+                try b.qualifiedIdent(o.column);
+                try b.writeByte(' ');
+                try b.writeString(o.op.symbol());
+                try b.writeByte(' ');
+                try b.arg(o.value);
                 if (o.desc) try b.writeString(" DESC");
             },
         }
@@ -930,6 +1155,37 @@ pub fn OrderExpr(comptime gen: anytype, desc: bool) Order {
 /// never interpolate user input into it.
 pub fn OrderExprSql(sql: []const u8, desc: bool) Order {
     return .{ .raw = .{ .sql = sql, .desc = desc } };
+}
+
+/// Nearest-neighbour order by a pgvector distance:
+/// `ORDER BY "embedding" <=> $1` (`desc = false`, the usual similarity
+/// search) or `… DESC`.
+///
+/// The value is a `sql.Value` for the same reason the distance predicates take
+/// one; a `[]const f32` goes through `zent.core.field.encodeVector` first:
+///
+///     const text = try zent.core.field.encodeVector(allocator, &query_vec);
+///     defer allocator.free(text);
+///     _ = try q.OrderBy(&.{sql.OrderByVectorDistance("embedding", .cosine, .{ .string = text }, false)});
+///
+/// **PostgreSQL with pgvector only** — the operator is pgvector's, and on
+/// MySQL/SQLite the statement renders the same text and the server rejects it.
+/// All four operators order nearest-first with `desc = false` (see
+/// `VectorDistance`).
+///
+/// `column` is emitted **as written**, like every other hand-built `sql.*`
+/// value. That is not quite `OrderAsc`'s contract: `Query.OrderBy` rewrites a
+/// `.column` term through `columnName` (API field name → physical column), and
+/// this term is not rewritten — so pass the physical column (`StorageKey`)
+/// when the two differ, exactly as a hand-written `sql.EQ` in `Query.Where`
+/// already has to.
+pub fn OrderByVectorDistance(column: []const u8, op: VectorDistance, value: Value, desc: bool) Order {
+    return .{ .vector_distance = .{
+        .column = column,
+        .op = op,
+        .value = value,
+        .desc = desc,
+    } };
 }
 
 // ------------------------------------------------------------------
@@ -2513,6 +2769,194 @@ test "OrderBy column escapes an injected quote" {
     const q = try s.query();
     try std.testing.expectEqualStrings(
         "SELECT \"id\" FROM \"users\" ORDER BY \"name\"\"; DROP TABLE users; --\"",
+        q.sql,
+    );
+}
+
+test "pgvector distance predicates render all four operators with bound args" {
+    const allocator = std.testing.allocator;
+    const vec = Value{ .string = "[1,2,3]" };
+    const threshold = Value{ .float = 0.5 };
+
+    const cases = .{
+        .{ VectorL2Distance("embedding", vec, .lt, threshold), "<->" },
+        .{ VectorCosineDistance("embedding", vec, .lt, threshold), "<=>" },
+        .{ VectorInnerProduct("embedding", vec, .lt, threshold), "<#>" },
+        .{ VectorL1Distance("embedding", vec, .lt, threshold), "<+>" },
+    };
+
+    inline for (cases) |c| {
+        var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(Table("docs"));
+        _ = try s.where(c[0]);
+        const q = try s.query();
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "SELECT \"id\" FROM \"docs\" WHERE \"embedding\" {s} $1 < $2",
+            .{c[1]},
+        );
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, q.sql);
+        // Both operands are bound, in written order: the vector, then the
+        // threshold. Nothing is inlined, so the text form never reaches the
+        // parser as SQL.
+        try std.testing.expectEqual(@as(usize, 2), q.args.len);
+        try std.testing.expectEqualStrings("[1,2,3]", q.args[0].string);
+        try std.testing.expectEqual(@as(f64, 0.5), q.args[1].float);
+    }
+}
+
+test "pgvector distance predicate compares with each comparison operator" {
+    const allocator = std.testing.allocator;
+    const vec = Value{ .string = "[1,2,3]" };
+
+    const cases = .{
+        .{ Predicate.VectorCmp.lt, "<" },
+        .{ Predicate.VectorCmp.lte, "<=" },
+        .{ Predicate.VectorCmp.gt, ">" },
+        .{ Predicate.VectorCmp.gte, ">=" },
+    };
+
+    inline for (cases) |c| {
+        var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(Table("docs"));
+        _ = try s.where(VectorDistancePred("embedding", .l2, vec, c[0], .{ .int = 1 }));
+        const q = try s.query();
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "SELECT \"id\" FROM \"docs\" WHERE \"embedding\" <-> $1 {s} $2",
+            .{c[1]},
+        );
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, q.sql);
+    }
+}
+
+test "OrderByVectorDistance renders ASC and DESC" {
+    const allocator = std.testing.allocator;
+    const vec = Value{ .string = "[1,2,3]" };
+
+    // `desc = false` is the nearest-first order and the one a similarity
+    // search wants; `<#>` is already the negative inner product, so the same
+    // ASC spelling is nearest-first for all four operators.
+    {
+        var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(Table("docs"));
+        _ = try s.orderBy(OrderByVectorDistance("embedding", .cosine, vec, false));
+        const q = try s.query();
+        try std.testing.expectEqualStrings("SELECT \"id\" FROM \"docs\" ORDER BY \"embedding\" <=> $1", q.sql);
+        try std.testing.expectEqual(@as(usize, 1), q.args.len);
+        try std.testing.expectEqualStrings("[1,2,3]", q.args[0].string);
+    }
+    {
+        var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(Table("docs"));
+        _ = try s.orderBy(OrderByVectorDistance("embedding", .cosine, vec, true));
+        const q = try s.query();
+        try std.testing.expectEqualStrings("SELECT \"id\" FROM \"docs\" ORDER BY \"embedding\" <=> $1 DESC", q.sql);
+    }
+}
+
+test "pgvector WHERE and ORDER BY keep PostgreSQL placeholder numbering in written order" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("docs"));
+    // The WHERE clause is written first, so its two args are `$1`/`$2` and the
+    // ORDER BY's query vector is `$3` — the order the args travel in, and the
+    // thing a hand-rolled `$n` would get wrong.
+    _ = try s.where(EQ("tenant_id", .{ .int = 7 }));
+    _ = try s.where(VectorL2Distance("embedding", .{ .string = "[1,2,3]" }, .lt, .{ .float = 0.9 }));
+    _ = try s.orderBy(OrderByVectorDistance("embedding", .l2, .{ .string = "[9,9,9]" }, false));
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "SELECT \"id\" FROM \"docs\" WHERE \"tenant_id\" = $1 AND \"embedding\" <-> $2 < $3 ORDER BY \"embedding\" <-> $4",
+        q.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 4), q.args.len);
+    try std.testing.expectEqual(@as(i64, 7), q.args[0].int);
+    try std.testing.expectEqualStrings("[1,2,3]", q.args[1].string);
+    try std.testing.expectEqual(@as(f64, 0.9), q.args[2].float);
+    try std.testing.expectEqualStrings("[9,9,9]", q.args[3].string);
+}
+
+test "pgvector distance predicate composes inside AND" {
+    const allocator = std.testing.allocator;
+    const tenant = EQ("tenant_id", .{ .int = 7 });
+    const near = VectorCosineDistance("embedding", .{ .string = "[1,2,3]" }, .lt, .{ .float = 0.2 });
+
+    var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("docs"));
+    _ = try s.where(And(&tenant, &near));
+    const q = try s.query();
+    // The distance fragment needs no parentheses of its own: PostgreSQL binds
+    // `<->` tighter than `<`, so `("tenant_id" = $1 AND "embedding" <=> $2 < $3)`
+    // is the only reading.
+    try std.testing.expectEqualStrings(
+        "SELECT \"id\" FROM \"docs\" WHERE (\"tenant_id\" = $1 AND \"embedding\" <=> $2 < $3)",
+        q.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 3), q.args.len);
+}
+
+test "pgvector distance SQL is dialect-blind: MySQL and SQLite render the same operators" {
+    // The operators are pgvector's, and only PostgreSQL has pgvector. The
+    // builders carry no dialect at construction time, so the same statement is
+    // built for every dialect and the *server* is what rejects it — SQLite
+    // with a token error, MySQL with a syntax error. That is deliberate (see
+    // `Predicate.vector_distance`); this test pins that no dialect silently
+    // rewrites the operator into something else, and that the placeholder
+    // style is still the dialect's.
+    const allocator = std.testing.allocator;
+    const vec = Value{ .string = "[1,2,3]" };
+
+    {
+        var s = try Select(allocator, Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(Table("docs"));
+        _ = try s.where(VectorL2Distance("embedding", vec, .lt, .{ .float = 0.5 }));
+        _ = try s.orderBy(OrderByVectorDistance("embedding", .l2, vec, false));
+        const q = try s.query();
+        try std.testing.expectEqualStrings(
+            "SELECT \"id\" FROM \"docs\" WHERE \"embedding\" <-> ? < ? ORDER BY \"embedding\" <-> ?",
+            q.sql,
+        );
+    }
+    {
+        var s = try Select(allocator, Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        defer s.deinit();
+        _ = s.from(Table("docs"));
+        _ = try s.where(VectorL2Distance("embedding", vec, .lt, .{ .float = 0.5 }));
+        _ = try s.orderBy(OrderByVectorDistance("embedding", .l2, vec, false));
+        const q = try s.query();
+        try std.testing.expectEqualStrings(
+            "SELECT `id` FROM `docs` WHERE `embedding` <-> ? < ? ORDER BY `embedding` <-> ?",
+            q.sql,
+        );
+    }
+}
+
+test "pgvector distance column is quoted, never interpolated" {
+    const allocator = std.testing.allocator;
+    var s = try Select(allocator, Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+    defer s.deinit();
+    _ = s.from(Table("docs"));
+    _ = try s.where(VectorL2Distance(
+        "embedding\"; DROP TABLE docs; --",
+        .{ .string = "[1]" },
+        .lt,
+        .{ .float = 0.5 },
+    ));
+    _ = try s.orderBy(OrderByVectorDistance("embedding\"; DROP TABLE docs; --", .l1, .{ .string = "[1]" }, false));
+    const q = try s.query();
+    try std.testing.expectEqualStrings(
+        "SELECT \"id\" FROM \"docs\" WHERE \"embedding\"\"; DROP TABLE docs; --\" <-> $1 < $2 " ++
+            "ORDER BY \"embedding\"\"; DROP TABLE docs; --\" <+> $3",
         q.sql,
     );
 }

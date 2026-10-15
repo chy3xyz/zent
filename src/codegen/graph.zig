@@ -24,6 +24,12 @@ pub const FieldInfo = struct {
     /// Legacy SQLite-oriented type string retained for API compatibility.
     /// Migration SQL must call `sqlType` with the active dialect.
     sql_type: []const u8,
+    /// Explicit type declared by `.SqlType(s)` / `field.Other(name, s)`, null
+    /// when the schema declared none. Carried beside `sql_type` because the
+    /// override applies on PostgreSQL only and `sql_type` is resolved once, for
+    /// the dialect the graph was built with — `migrate.columnSQLType` needs the
+    /// declaration itself to resolve it against the *run-time* dialect.
+    sql_type_override: ?[]const u8 = null,
     optional: bool,
     nillable: bool,
     unique: bool,
@@ -39,9 +45,14 @@ pub const FieldInfo = struct {
     /// write-path ceiling and by the DDL resolution below (`VARCHAR(n)` on
     /// MySQL instead of the default `VARCHAR(255)`).
     max_length: ?usize = null,
+    /// Declared dimension of a `field.Vector` column (`vector(n)`), null on
+    /// every other kind. Consumed by `sqlType` below (PostgreSQL's
+    /// `vector(n)`), by the migration's `ColumnDef.vector_sql`, and by the
+    /// write path's element-count check.
+    vector_dims: ?usize = null,
 
     pub fn sqlType(comptime self: FieldInfo, dialect: Dialect) []const u8 {
-        return field_mod.sqlTypeMax(self.field_type, self.max_length, dialect);
+        return field_mod.sqlTypeResolved(self.field_type, self.max_length, self.vector_dims, self.sql_type_override, dialect);
     }
 };
 
@@ -69,6 +80,13 @@ pub const IndexInfo = struct {
     name: []const u8,
     columns: []const []const u8,
     unique: bool,
+    /// `Index.method` / `Index.opclass` carried through verbatim — the DDL
+    /// layer is the one that decides which dialect renders them, and it runs
+    /// against a driver whose dialect need not be the one this graph was built
+    /// with (see `migrate.IndexDef.method`). `null` keeps the `CREATE INDEX`
+    /// byte-for-byte what it was before the declaration existed.
+    method: ?[]const u8 = null,
+    opclass: ?[]const u8 = null,
 };
 
 pub const TypeInfo = struct {
@@ -215,7 +233,8 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, co
             .column_name = f.storage_key orelse f.name,
             .field_type = f.field_type,
             .zig_type = field_mod.zigType(f.field_type, f.zig_type),
-            .sql_type = field_mod.sqlTypeMax(f.field_type, f.max_length, dialect),
+            .sql_type = field_mod.sqlTypeResolved(f.field_type, f.max_length, f.vector_dims, f.sql_type, dialect),
+            .sql_type_override = f.sql_type,
             .optional = f.optional,
             .nillable = f.nillable,
             .unique = f.unique,
@@ -227,6 +246,7 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, co
             .is_version = f.is_version,
             .sensitive = f.sensitive,
             .max_length = f.max_length,
+            .vector_dims = f.vector_dims,
         };
     }
 }
@@ -352,6 +372,8 @@ fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8, comp
             .name = name,
             .columns = mapped,
             .unique = i.unique,
+            .method = i.method,
+            .opclass = i.opclass,
         };
     }
 }
@@ -948,6 +970,91 @@ test "VarChar carries the declared length into FieldInfo and its DDL types" {
     try std.testing.expectEqualStrings("TEXT", info.fields[1].sql_type);
     try std.testing.expectEqualStrings("VARCHAR(120)", info.fields[1].sqlType(Dialect{ .name = "mysql" }));
     try std.testing.expectEqualStrings("VARCHAR(255)", info.fields[2].sqlType(Dialect{ .name = "mysql" }));
+}
+
+test "Other/SqlType carries the declaration beside sql_type, and resolves per dialect" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+
+    const Doc = schema("Doc", .{
+        .fields = &.{
+            field.Other("embedding", "vector(1536)"),
+            field.Other("tags", "integer[]"),
+            field.Text("handle").SqlType("citext"),
+            field.Text("body"),
+        },
+    });
+
+    // A PostgreSQL build resolves the declaration into both `sql_type` and
+    // `sql_type_override` — the field the migration layer needs, because it runs
+    // against a driver whose dialect need not be the one the graph was built
+    // with.
+    const pg_info = comptime fromSchemaDialect(Doc, Dialect.postgres);
+    try std.testing.expectEqualStrings("vector(1536)", pg_info.fields[1].sql_type);
+    try std.testing.expectEqualStrings("vector(1536)", pg_info.fields[1].sql_type_override.?);
+    try std.testing.expectEqualStrings("integer[]", pg_info.fields[2].sql_type);
+    try std.testing.expectEqualStrings("citext", pg_info.fields[3].sql_type);
+    try std.testing.expectEqual(@as(?[]const u8, null), pg_info.fields[4].sql_type_override);
+    // The Zig type is the string family on every dialect, for `.other` and
+    // `.text` alike.
+    try std.testing.expectEqual([]const u8, pg_info.fields[1].zig_type);
+
+    // A SQLite build: the kind's mapping in `sql_type` (so a `doc_export`
+    // reading that field stays truthful about the dialect it was built for) and
+    // the declaration still carried — `sqlType(pg)` resolves it.
+    const sqlite_info = comptime fromSchema(Doc);
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[1].sql_type);
+    try std.testing.expectEqualStrings("vector(1536)", sqlite_info.fields[1].sql_type_override.?);
+    try std.testing.expectEqualStrings("vector(1536)", sqlite_info.fields[1].sqlType(Dialect.postgres));
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[1].sqlType(Dialect.sqlite));
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[1].sqlType(Dialect.mysql));
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[4].sqlType(Dialect.postgres));
+}
+
+test "field.Vector carries its dimension into FieldInfo and resolves per dialect" {
+    const field = @import("../core/field.zig");
+    const schema = @import("../core/schema.zig").Schema;
+
+    const Doc = schema("Doc", .{
+        .fields = &.{
+            field.Vector("embedding", 1536),
+            field.Vector("thumb", 3).Optional(),
+            field.Vector("overridden", 3).SqlType("halfvec(3)"),
+            field.Bytes("payload"),
+        },
+    });
+
+    // A PostgreSQL build resolves the dimension into the DDL type.
+    const pg_info = comptime fromSchemaDialect(Doc, Dialect.postgres);
+    try std.testing.expectEqual(@as(?usize, 1536), pg_info.fields[1].vector_dims);
+    try std.testing.expectEqualStrings("vector(1536)", pg_info.fields[1].sql_type);
+    try std.testing.expectEqual(@as(?[]const u8, null), pg_info.fields[1].sql_type_override);
+    try std.testing.expectEqual(@as(?usize, 3), pg_info.fields[2].vector_dims);
+    try std.testing.expectEqualStrings("vector(3)", pg_info.fields[2].sql_type);
+    // The Zig type is the owned slice, on every dialect — the anchor the write
+    // path's `accepts` and the scan's dispatch both key off.
+    try std.testing.expectEqual([]const f32, pg_info.fields[1].zig_type);
+    // `.SqlType` still wins over the declared dimension on PostgreSQL.
+    try std.testing.expectEqualStrings("halfvec(3)", pg_info.fields[3].sql_type);
+    // A `.bytes` neighbour is unchanged: the vector work does not move the byte
+    // column's type or its Zig type.
+    try std.testing.expectEqualStrings("BYTEA", pg_info.fields[4].sql_type);
+    try std.testing.expectEqual([]const u8, pg_info.fields[4].zig_type);
+    try std.testing.expectEqual(@as(?usize, null), pg_info.fields[4].vector_dims);
+
+    // A SQLite build (the `fromSchema` default) gets the text-form mapping in
+    // `sql_type`, and the dimension is still carried so `sqlType(pg)` resolves
+    // it — the migration layer runs against a driver whose dialect need not be
+    // the one the graph was built with.
+    const sqlite_info = comptime fromSchema(Doc);
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[1].sql_type);
+    try std.testing.expectEqualStrings("vector(1536)", sqlite_info.fields[1].sqlType(Dialect.postgres));
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[1].sqlType(Dialect.sqlite));
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[1].sqlType(Dialect.mysql));
+    // MySQL and SQLite never see the declared dimension — not even through an
+    // explicit override, which is PostgreSQL-only.
+    try std.testing.expectEqualStrings("TEXT", sqlite_info.fields[3].sqlType(Dialect.mysql));
+    try std.testing.expectEqualStrings("halfvec(3)", sqlite_info.fields[3].sqlType(Dialect.postgres));
 }
 
 test "From edge with explicit FK field does not duplicate declared columns" {

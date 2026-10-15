@@ -659,6 +659,8 @@ pub const PostgresDriver = struct {
                 .row_index = 0,
                 .num_rows = @intCast(c.PQntuples(res)),
                 .num_fields = @intCast(c.PQnfields(res)),
+                .bytea_bufs = .empty,
+                .bytea_retired = .empty,
             };
             // result ownership transferred to PostgresRows
             _ = &res;
@@ -710,6 +712,8 @@ pub const PostgresDriver = struct {
             .row_index = 0,
             .num_rows = @intCast(c.PQntuples(res)),
             .num_fields = @intCast(c.PQnfields(res)),
+            .bytea_bufs = .empty,
+            .bytea_retired = .empty,
         };
         // result ownership transferred to PostgresRows
         _ = &res;
@@ -1056,12 +1060,122 @@ const PostgresTx = struct {
     }
 };
 
+/// `bytea`'s OID in `pg_type` (PostgreSQL's `catalog/pg_type_d.h` spells it
+/// `BYTEAOID`). libpq's public headers carry no catalog OIDs, so the number is
+/// written here, at its single comparison, rather than pulled from a header the
+/// build cannot promise.
+const BYTEA_OID: c.Oid = 17;
+
+/// The raw-byte length of a `bytea` in PostgreSQL's **hex** text form — `\x`
+/// followed by two hex digits per byte — or null when `text` is not that form.
+///
+/// The escape form can never be mistaken for it: there a backslash is always
+/// doubled (`\\`) and `x` is an ordinary character, so `\x` at the start
+/// identifies the hex form unambiguously. A `\x` that is not followed by hex is
+/// therefore not a `bytea` output at all (the server never produces one) and
+/// answers null, which leaves the text undecoded rather than fabricating bytes.
+fn byteaHexLen(text: []const u8) ?usize {
+    if (text.len < 2 or text[0] != '\\' or text[1] != 'x') return null;
+    const digits = text.len - 2;
+    if (digits % 2 != 0) return null;
+    for (text[2..]) |ch| {
+        if (!std.ascii.isHex(ch)) return null;
+    }
+    return digits / 2;
+}
+
+/// The raw-byte length of a `bytea` in PostgreSQL's **escape** text form: every
+/// character stands for itself, except `\nnn` (three octal digits) and `\\`,
+/// which are one byte each.
+fn byteaEscapeLen(text: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (n += 1) {
+        if (text[i] != '\\') {
+            i += 1;
+        } else if (i + 4 <= text.len and isOctal3(text[i + 1 .. i + 4])) {
+            i += 4;
+        } else if (i + 1 < text.len) {
+            i += 2; // `\\`: the only other escape the output routine emits
+        } else {
+            i += 1; // a trailing backslash, which output never produces
+        }
+    }
+    return n;
+}
+
+fn isOctal3(triple: []const u8) bool {
+    for (triple) |ch| {
+        if (ch < '0' or ch > '7') return false;
+    }
+    return true;
+}
+
+fn hexVal(ch: u8) u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        // Unreachable: `byteaHexLen` rejected any text holding another digit.
+        else => 0,
+    };
+}
+
+/// Decode `text` into `out` — whose length must be exactly what `byteaHexLen`
+/// or `byteaEscapeLen` answered for the same text — and return the filled part.
+fn byteaDecodeInto(out: []u8, text: []const u8, hex: bool) []u8 {
+    var n: usize = 0;
+    if (hex) {
+        var i: usize = 2;
+        while (i + 1 < text.len) : (i += 2) {
+            out[n] = (hexVal(text[i]) << 4) | hexVal(text[i + 1]);
+            n += 1;
+        }
+        return out[0..n];
+    }
+    var i: usize = 0;
+    while (i < text.len) : (n += 1) {
+        if (text[i] != '\\') {
+            out[n] = text[i];
+            i += 1;
+        } else if (i + 4 <= text.len and isOctal3(text[i + 1 .. i + 4])) {
+            out[n] = (text[i + 1] - '0') * 64 + (text[i + 2] - '0') * 8 + (text[i + 3] - '0');
+            i += 4;
+        } else if (i + 1 < text.len) {
+            out[n] = '\\';
+            i += 2;
+        } else {
+            out[n] = '\\';
+            i += 1;
+        }
+    }
+    return out[0..n];
+}
+
 const PostgresRows = struct {
     result: *c.PGresult,
     allocator: std.mem.Allocator,
     row_index: c_int,
     num_rows: c_int,
     num_fields: c_int,
+    /// Decode buffers for `bytea` columns, indexed by column, and the buffers a
+    /// growth retired. Both are released by `deinit`.
+    ///
+    /// A `bytea` is the one type whose *text* form is not its value: the server
+    /// sends `\xdeadbeef` for four bytes (see `byteaHexLen`), so reading it
+    /// needs a decode and the decoded bytes need an owner. libpq's value buffer
+    /// is not ours to write into, so the owner is here.
+    ///
+    /// One buffer **per column**, not one shared scratch: reading column 2 must
+    /// not overwrite what column 1 of the same row just handed back — a caller
+    /// may hold both, and `explainScanFailure` does. Growth allocates a *new*
+    /// buffer and retires the old one instead of `realloc`ing it, so a slice
+    /// already handed to a caller never moves: what a later read of the same
+    /// column changes is its bytes, not its address. The retired buffers are
+    /// freed wholesale at `deinit`, which bounds the waste at one geometric
+    /// series per column over the life of the result set.
+    bytea_bufs: std.ArrayListUnmanaged([]u8) = .empty,
+    bytea_retired: std.ArrayListUnmanaged([]u8) = .empty,
 
     const vtable = driver.Rows.VTable{
         .next = next,
@@ -1084,6 +1198,10 @@ const PostgresRows = struct {
         const self: *PostgresRows = @ptrCast(@alignCast(ptr));
         c.PQclear(self.result);
         const alloc = self.allocator;
+        for (self.bytea_bufs.items) |buf| alloc.free(buf);
+        for (self.bytea_retired.items) |buf| alloc.free(buf);
+        self.bytea_bufs.deinit(alloc);
+        self.bytea_retired.deinit(alloc);
         alloc.destroy(self);
     }
 
@@ -1104,8 +1222,9 @@ const PostgresRows = struct {
 
     /// The column's text value, or null when the cell is NULL (or libpq has
     /// no value for it). getInt/getFloat/getText/getBool parse from this one
-    /// copy; getBlob cannot share it — it slices by `PQgetlength`, not by the
-    /// span, so its length source stays its own.
+    /// copy; getBlob slices by `PQgetlength` instead of by the span, so its
+    /// length source stays its own. A `bytea` reaches either one as its text
+    /// form and is decoded on top of it (`decodedBytea`).
     fn textOf(self: *PostgresRows, index: usize) ?[]const u8 {
         if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
         const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
@@ -1136,20 +1255,78 @@ const PostgresRows = struct {
         return std.fmt.parseFloat(f64, text) catch null;
     }
 
+    /// The column's value as text.
+    ///
+    /// A `bytea` column is decoded to its raw bytes here as well, so that
+    /// `getText` and `getBlob` mean the same thing for it: a `bytea`'s text form
+    /// is an *encoding* of the value (`\xdeadbeef` for four bytes), never the
+    /// value, and which getter a consumer reached for must not change that. A
+    /// caller who wants the encoded text asks the server for it
+    /// (`encode(col,'hex')`), which arrives as `text` and is passed through.
     fn getText(ptr: *anyopaque, index: usize) ?[]const u8 {
         const self: *PostgresRows = @ptrCast(@alignCast(ptr));
-        return self.textOf(index);
+        const text = self.textOf(index) orelse return null;
+        if (!self.isByteaColumn(index)) return text;
+        return self.decodedBytea(index, text);
     }
 
+    /// The column's bytes: a `bytea` decoded from its text form, everything else
+    /// the text libpq delivered — which for a non-`bytea` column is what a blob
+    /// reader has always been handed, so nothing else moves.
     fn getBlob(ptr: *anyopaque, index: usize) ?[]const u8 {
         const self: *PostgresRows = @ptrCast(@alignCast(ptr));
         if (c.PQgetisnull(self.result, self.currentRow(), @intCast(index)) != 0) return null;
-        var length: c_int = 0;
         const val = c.PQgetvalue(self.result, self.currentRow(), @intCast(index));
         if (val == null) return null;
-        // For binary format, PQgetlength gives the byte length
-        length = c.PQgetlength(self.result, self.currentRow(), @intCast(index));
-        return val[0..@intCast(length)];
+        // PQgetlength, not the span: a text result is sliced by its length.
+        const length = c.PQgetlength(self.result, self.currentRow(), @intCast(index));
+        const raw = val[0..@intCast(length)];
+        if (!self.isByteaColumn(index)) return raw;
+        return self.decodedBytea(index, raw);
+    }
+
+    /// Whether column `index` arrived as `bytea` — the one case where the text
+    /// value has to be decoded before it is the value.
+    ///
+    /// `PQftype` is the only place the type can come from: a text result carries
+    /// no per-value type, and the driver does not parse the caller's SQL.
+    fn isByteaColumn(self: *PostgresRows, index: usize) bool {
+        return c.PQftype(self.result, @intCast(index)) == BYTEA_OID;
+    }
+
+    /// Column `index` decoded from its `bytea` text form, in that column's
+    /// buffer (`bytea_bufs` documents the reuse and lifetime contract).
+    ///
+    /// Null when the buffer cannot be grown. `Row.getText`/`Row.getBlob` answer
+    /// `?[]const u8` with no error channel, so an allocation failure is logged
+    /// and answered as no value; handing back the still-encoded text instead
+    /// would be a silently wrong *value*, which is the shape of the bug this
+    /// decoding exists to fix.
+    fn decodedBytea(self: *PostgresRows, index: usize, text: []const u8) ?[]const u8 {
+        const hex_len = byteaHexLen(text);
+        const need = hex_len orelse byteaEscapeLen(text);
+        const buf = self.byteaScratch(index, need) catch |err| {
+            zent_log.warn("postgres: cannot decode a {d}-byte bytea column: {s}", .{ need, @errorName(err) });
+            return null;
+        };
+        return byteaDecodeInto(buf[0..need], text, hex_len != null);
+    }
+
+    /// A buffer of at least `need` bytes for column `index`, reused across rows.
+    fn byteaScratch(self: *PostgresRows, index: usize, need: usize) error{OutOfMemory}![]u8 {
+        while (self.bytea_bufs.items.len <= index) {
+            try self.bytea_bufs.append(self.allocator, &.{});
+        }
+        const current = self.bytea_bufs.items[index];
+        if (current.len >= need) return current;
+        // A new allocation rather than `realloc`: a slice already handed to a
+        // caller must not move under it. The old buffer is retired to be freed
+        // by `deinit`.
+        const grown = try self.allocator.alloc(u8, need);
+        errdefer self.allocator.free(grown);
+        try self.bytea_retired.append(self.allocator, current);
+        self.bytea_bufs.items[index] = grown;
+        return grown;
     }
 
     fn getBool(ptr: *anyopaque, index: usize) ?bool {
@@ -1519,4 +1696,60 @@ test "connectDb passes each argument to libpq as one intact keyword value" {
     // The two defaults the previous conninfo string carried are intact.
     try std.testing.expectEqualStrings("prefer", std.mem.span(@as([*:0]const u8, @ptrCast(params.values[5]))));
     try std.testing.expectEqualStrings("10", std.mem.span(@as([*:0]const u8, @ptrCast(params.values[6]))));
+}
+
+/// Decode `text` the way `PostgresRows.decodedBytea` does and compare with
+/// `expected`: the length is measured first (that is what sizes the buffer) and
+/// the fill must then match it exactly.
+fn expectByteaDecoded(text: []const u8, expected: []const u8) !void {
+    const hex_len = byteaHexLen(text);
+    const need = hex_len orelse byteaEscapeLen(text);
+    const out = try std.testing.allocator.alloc(u8, need);
+    defer std.testing.allocator.free(out);
+    const decoded = byteaDecodeInto(out, text, hex_len != null);
+    try std.testing.expectEqual(need, decoded.len);
+    try std.testing.expectEqualSlices(u8, expected, decoded);
+}
+
+test "Postgres: a bytea's text form decodes to the bytes it stands for" {
+    // A `bytea` never travels as raw bytes in a text result: PostgreSQL sends
+    // `\xdeadbeef` for four bytes, or — under `bytea_output = 'escape'`, which
+    // is what pre-9.0 servers and any session that set the GUC back use —
+    // `\000\336\255\276\357`. Both were being handed to consumers *as the
+    // value*, so `field.Bytes` read back 10 characters for a 4-byte write.
+    // Measured against PostgreSQL 17.10: `SELECT '\xdeadbeef'::bytea` answers
+    // `\xdeadbeef`, and the same value under `bytea_output = 'escape'` answers
+    // `\000\336\255\276\357`; `SELECT '\x00ff'` answers `\000\377` there and
+    // `\x00ff` under hex.
+    //
+    // Hex form — the default since 9.0, and the one `bytea_output = 'hex'`
+    // (this machine's default) produces.
+    try expectByteaDecoded("\\xdeadbeef", &.{ 0xde, 0xad, 0xbe, 0xef });
+    try expectByteaDecoded("\\xDEADBEEF", &.{ 0xde, 0xad, 0xbe, 0xef });
+    // The empty bytea: `\x` with no digits.
+    try expectByteaDecoded("\\x", &.{});
+    // A NUL byte, the value a text round trip loses first.
+    try expectByteaDecoded("\\x00ff", &.{ 0x00, 0xff });
+
+    // Escape form: `\nnn` octal escapes, `\\` for a backslash, everything else
+    // literal.
+    try expectByteaDecoded("\\000\\336\\255\\276\\357", &.{ 0x00, 0xde, 0xad, 0xbe, 0xef });
+    try expectByteaDecoded("hello world", "hello world");
+    // `\\` is one backslash and the octal escapes around it are two more bytes.
+    try expectByteaDecoded("\\\\\\000\\377", &.{ 0x5c, 0x00, 0xff });
+    // A leading backslash does not make it hex: escape form doubles it, so the
+    // four bytes below are `\`, `x`, `1`, `1` and the text is not `\x`-prefixed.
+    try expectByteaDecoded("\\\\x11", &.{ 0x5c, 0x78, 0x31, 0x31 });
+    try expectByteaDecoded("", &.{});
+
+    // A `\x` prefix whose tail is not hex is not a `bytea` output at all, so it
+    // is left undecoded rather than turned into fabricated bytes.
+    try std.testing.expectEqual(@as(?usize, null), byteaHexLen("\\xzz"));
+    try std.testing.expectEqual(@as(?usize, null), byteaHexLen("\\xabc")); // odd digit count
+    try std.testing.expectEqual(@as(?usize, null), byteaHexLen("hello"));
+    try std.testing.expectEqual(@as(?usize, null), byteaHexLen("xdead"));
+    // ... while the same prefix over valid digits is the hex form, including
+    // the empty value.
+    try std.testing.expectEqual(@as(?usize, 0), byteaHexLen("\\x"));
+    try std.testing.expectEqual(@as(?usize, 4), byteaHexLen("\\xdeadbeef"));
 }

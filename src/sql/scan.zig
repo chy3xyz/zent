@@ -1,4 +1,5 @@
 const std = @import("std");
+const field_mod = @import("../core/field.zig");
 const driver_mod = @import("driver.zig");
 const Row = driver_mod.Row;
 const Rows = driver_mod.Rows;
@@ -73,6 +74,9 @@ pub fn scanRowWithArena(comptime T: type, allocator: std.mem.Allocator, row: Row
             return v != 0;
         },
         .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == f32) {
+                return try scanVectorColumn(allocator, row, 0);
+            }
             if (ptr.size == .slice and ptr.child == u8) {
                 const text = row.getText(0) orelse {
                     @branchHint(.cold);
@@ -312,15 +316,21 @@ inline fn requireColumns(row: Row, index: usize, need: usize) error{ColumnCountM
     if (row.columnCount() < index + need) return error.ColumnCountMismatch;
 }
 
-/// Hand back a string-shaped default as owned memory, so a lenient scan's
-/// caller can free every string field without knowing whether the scanner
-/// allocated it. Empty slices are returned as-is: `std.mem.Allocator.free`
-/// treats a zero-length slice as a no-op, so there is nothing to own.
+/// Hand back a slice-shaped default as owned memory, so a lenient scan's caller
+/// can free every slice field without knowing whether the scanner allocated it.
+/// Empty slices are returned as-is: `std.mem.Allocator.free` treats a
+/// zero-length slice as a no-op, so there is nothing to own.
+///
+/// Every slice child, not just `u8`, and a **shallow** copy — the exact mirror
+/// of `freeDtoValue`, which frees every slice child shallowly. The two must
+/// agree on which fields are owned, and on `field.Vector`'s `[]const f32` they
+/// did not: `freeDtoValue` would have released a caller's literal while
+/// `ownDefault` had handed it back unchanged.
 fn ownDefault(comptime T: type, allocator: std.mem.Allocator, value: T) error{OutOfMemory}!T {
     switch (@typeInfo(T)) {
         .pointer => |ptr| {
-            if (ptr.size == .slice and ptr.child == u8 and value.len > 0) {
-                return try allocator.dupe(u8, value);
+            if (ptr.size == .slice and value.len > 0) {
+                return try allocator.dupe(ptr.child, value);
             }
         },
         .optional => |opt| {
@@ -622,7 +632,18 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
             return v;
         },
         .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == f32) {
+                return try scanVectorColumn(allocator, row, index);
+            }
             if (ptr.size == .slice and ptr.child == u8) {
+                // Every `[]const u8` field comes through here, and `field.Bytes`
+                // is one of them: `zigType` maps `.string` and `.bytes` to the
+                // same Zig type, so this layer cannot tell them apart and reads
+                // both with `getText`. A driver whose binary column's text form
+                // is an encoding of the value therefore has to decode it in
+                // `getText` — PostgreSQL's `bytea` (`\xdeadbeef` for four
+                // bytes) is exactly that case, and the read path's only pin is
+                // the round-trip test in tests/integration/postgres.zig.
                 const text = row.getText(index) orelse {
                     @branchHint(.cold);
                     return error.TypeMismatch;
@@ -689,6 +710,39 @@ pub fn scanColumn(comptime T: type, allocator: std.mem.Allocator, row: Row, inde
         },
         else => @compileError("Unsupported column type for scanning: " ++ @typeName(T)),
     }
+}
+
+/// Decode one `field.Vector` column into owned `[]f32`.
+///
+/// The column holds pgvector's text form (`[1,2,3]`), whichever dialect it is:
+/// PostgreSQL stores a real `vector(n)`, MySQL and SQLite the `TEXT` mapping
+/// (`field.sqlType`), and all three reach the driver as text to parse. Malformed
+/// text is the value problem `TypeMismatch` already names; an allocation failure
+/// stays `OutOfMemory` rather than being folded into it — the same split the
+/// JSON branch below makes, and for the same reason (an OOM that reads as a bad
+/// value is an OOM nothing reports).
+///
+/// The declared dimension is deliberately **not** re-checked here
+/// (`expected_dims` is null): this scanner dispatches on the Zig type alone, and
+/// a `[]const f32` carries no dimension — the schema's `FieldInfo` is not among
+/// this layer's inputs. The dimension is a **write-path** invariant instead
+/// (`codegen.field_value.vectorTextAlloc`, which every typed write reaches), so
+/// a value zent wrote always has the declared length; a column populated
+/// outside zent with a different dimension reads back as the elements the server
+/// really holds, which is the truthful answer, and is also the only one
+/// `checkSchema` can form (the catalog reports `vector`, never the dimension).
+///
+/// Ownership is the ordinary one for the scan layer: `allocator`-owned, released
+/// by `deinitEntity` / `freeDto` like any other slice field.
+fn scanVectorColumn(allocator: std.mem.Allocator, row: Row, index: usize) ![]f32 {
+    const text = row.getText(index) orelse {
+        @branchHint(.cold);
+        return error.TypeMismatch;
+    };
+    return field_mod.parseVectorAlloc(allocator, text, null) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TypeMismatch => error.TypeMismatch,
+    };
 }
 
 /// Run `sql_text` on `driver` and scan every row into the DTO type `T`,
@@ -816,7 +870,13 @@ fn freeDtoValue(comptime T: type, allocator: std.mem.Allocator, value: T) void {
             // `zeroInit`) is harmless to release; a *non-empty* default is
             // the scanner's responsibility to hand back owned memory (see
             // `ownDefault`).
-            if (ptr.size == .slice and ptr.child == u8 and value.len > 0) allocator.free(value);
+            //
+            // Every slice child, not just `u8`: `field.Vector` is a
+            // `[]const f32` and `scanVectorColumn` hands it back owned, so a
+            // `u8`-only free here leaked one allocation per vector field per
+            // scanned row. The guard is unchanged, and a zero-length slice
+            // frees as a no-op either way.
+            if (ptr.size == .slice and value.len > 0) allocator.free(value);
         },
         .optional => |opt| {
             if (value) |v| freeDtoValue(opt.child, allocator, v);
@@ -933,6 +993,85 @@ test "scan optional null" {
     const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
     const v = try scanRow(?i32, std.testing.allocator, row);
     try std.testing.expectEqual(@as(?i32, null), v);
+}
+
+test "scan a field.Vector column out of pgvector's text form" {
+    // The read half of `field.Vector`, pinned without a server: the column
+    // carries pgvector's text form on every dialect (PostgreSQL a real
+    // `vector(n)`, MySQL/SQLite the `TEXT` mapping), and the scan parses it
+    // into an owned `[]f32`. The MockRow's `getBlob` answers null, so this is
+    // purely the `getText` path.
+    const allocator = std.testing.allocator;
+    {
+        const data = MockRowData{
+            .ints = &.{null},
+            .floats = &.{null},
+            .texts = &.{"[1,2.5,-3]"},
+            .bools = &.{null},
+            .nulls = &.{false},
+        };
+        const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+        const v = try scanRow([]const f32, allocator, row);
+        defer allocator.free(v);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2.5, -3 }, v);
+    }
+    {
+        // A NULL vector is null (the optional contract every other field has).
+        const data = MockRowData{
+            .ints = &.{null},
+            .floats = &.{null},
+            .texts = &.{null},
+            .bools = &.{null},
+            .nulls = &.{true},
+        };
+        const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+        try std.testing.expectEqual(@as(?[]const f32, null), try scanRow(?[]const f32, allocator, row));
+    }
+    {
+        // Malformed text is a `TypeMismatch`, not a silent zero vector: a
+        // column written by something other than zent must not read as data.
+        const bad = [_][]const u8{ "[1,2,]", "1,2", "[1,a]", "[]]" };
+        for (bad) |text| {
+            const data = MockRowData{
+                .ints = &.{null},
+                .floats = &.{null},
+                .texts = &.{text},
+                .bools = &.{null},
+                .nulls = &.{false},
+            };
+            const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+            try std.testing.expectError(error.TypeMismatch, scanRow([]const f32, allocator, row));
+        }
+    }
+    {
+        // An empty vector round-trips as an empty slice, and `freeDto` releases
+        // every slice child — `[]const f32` included. The testing allocator is
+        // the ledger: a `u8`-only free would report the leak here.
+        const Dto = struct { id: i64, embedding: []const f32 };
+        const data = MockRowData{
+            .ints = &.{ 7, null },
+            .floats = &.{ null, null },
+            .texts = &.{ null, "[]" },
+            .bools = &.{ null, null },
+            .nulls = &.{ false, false },
+        };
+        const row = Row{ .ptr = @ptrCast(@constCast(&data)), .vtable = &mock_vtable };
+        const dto = try scanRow(Dto, allocator, row);
+        try std.testing.expectEqual(@as(usize, 0), dto.embedding.len);
+        freeDto(Dto, allocator, &dto);
+        // And a non-empty one, through the same release.
+        const data2 = MockRowData{
+            .ints = &.{ 7, null },
+            .floats = &.{ null, null },
+            .texts = &.{ null, "[1,2,3]" },
+            .bools = &.{ null, null },
+            .nulls = &.{ false, false },
+        };
+        const row2 = Row{ .ptr = @ptrCast(@constCast(&data2)), .vtable = &mock_vtable };
+        const dto2 = try scanRow(Dto, allocator, row2);
+        try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 3 }, dto2.embedding);
+        freeDto(Dto, allocator, &dto2);
+    }
 }
 
 test "scanRowLenient leaves NULL fields at their default instead of failing" {

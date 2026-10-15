@@ -543,6 +543,12 @@ fn joinEdgePredOffender(comptime target: TypeInfo, pred: sql.Predicate) ?[]const
         .like_escaped => |op| {
             if (!joinEdgeColumnKnown(target, op.column)) return op.column;
         },
+        // Checked like `.like_escaped`: a distance predicate's column is a
+        // plain name, so it gets the same validation the other name-bearing
+        // prongs do (the twin of `hasWithPredOffender`'s arm).
+        .vector_distance => |op| {
+            if (!joinEdgeColumnKnown(target, op.column)) return op.column;
+        },
         .is_null, .is_not_null => |column| {
             if (!joinEdgeColumnKnown(target, column)) return column;
         },
@@ -767,13 +773,20 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
         }
 
         /// Append ORDER BY terms. A plain `.column` term is treated as a
-        /// field name and mapped to its physical column; `.expr`/`.raw` are
-        /// emitted verbatim.
+        /// field name and mapped to its physical column, and so is a
+        /// `.vector_distance` term's column; `.expr`/`.raw` are emitted
+        /// verbatim.
         pub fn OrderBy(self: *Self, terms: []const sql.Order) !*Self {
             for (terms) |t| {
                 switch (t) {
                     .column => |o| try self.order_terms.append(.{ .column = .{
                         .name = columnName(info, o.name),
+                        .desc = o.desc,
+                    } }),
+                    .vector_distance => |o| try self.order_terms.append(.{ .vector_distance = .{
+                        .column = columnName(info, o.column),
+                        .op = o.op,
+                        .value = o.value,
                         .desc = o.desc,
                     } }),
                     else => try self.order_terms.append(t),
@@ -2251,7 +2264,14 @@ pub fn QueryBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo, c
                                 } });
                                 continue;
                             },
-                            .expr, .raw => {},
+                            // `.expr` / `.raw` carry their own SQL and a
+                            // `.vector_distance` term carries a bound value,
+                            // which a `.raw` rewrite has no binding site for —
+                            // so a distance term is emitted unqualified under a
+                            // join. A column both sides own then fails as an
+                            // ambiguous reference (loud), never as a wrong
+                            // table's values.
+                            .expr, .raw, .vector_distance => {},
                         }
                     }
                     _ = try selector.orderBy(term);
@@ -2929,6 +2949,16 @@ fn validateEntqlFields(comptime infos: []const TypeInfo, comptime scoped: TypeIn
             op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
         },
         .like_escaped => |*op| {
+            op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
+        },
+        // The EntQL grammar has no vector literal and no distance operator, so
+        // the current parser cannot produce this shape. It is validated
+        // anyway, exactly like `.like_escaped` next to it, so the three walks
+        // over `sql.Predicate` (`hasWithPredOffender`,
+        // `joinEdgePredOffender`, this one) stay shape-for-shape — the
+        // alternative is a prong that silently skips a name-bearing predicate
+        // the day the grammar grows one.
+        .vector_distance => |*op| {
             op.column = entqlColumnFor(scoped, op.column) orelse return error.UnknownField;
         },
         .is_null, .is_not_null => |*column| {

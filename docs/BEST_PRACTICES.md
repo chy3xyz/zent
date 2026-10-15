@@ -1322,6 +1322,99 @@ try zent.sql_schema.assertNullability(alloc, drv.asDriver(), infos, .read_breaki
 declares NOT NULL fails a NULL *insert* loudly, so it is usually not worth
 blocking a deploy over).
 
+## 5i. PostgreSQL types that need saying out loud (jsonb, bytea, arrays, pgvector)
+
+`field.JSON`/`JSONValue` (→ `JSONB`), `field.UUID` (→ `UUID`), `field.Decimal`
+(→ `NUMERIC`) and `field.Bytes` (→ `BYTEA`) map to native PostgreSQL types out
+of the box. Three things are worth knowing before you reach for the rest.
+
+**`field.Bytes` is a byte column, not a text column.** The write path sends it
+as a *binary* parameter and the read path decodes the server's representation,
+so NUL bytes, backslashes and non-UTF-8 payloads survive a round trip
+(v0.92.0 — before that, writes went out as text and `byteain` rejected or
+truncated them, and reads handed back the escaped `\x…` text). Do not strip a
+`\x` prefix in your own code; that was a workaround, and it is now wrong.
+
+**A type the library does not model: declare it.** `.SqlType("…")` on any field
+(or `field.Other(name, "…")`, which is the same thing for a field whose Zig
+type is `[]const u8`) puts your spelling into the DDL verbatim:
+
+```zig
+field.Text("slug").SqlType("citext"),
+field.Other("tags", "integer[]"),
+field.Other("search", "tsvector"),
+field.Other("addr", "inet"),
+```
+
+`checkSchema` still compares: PostgreSQL's `information_schema` answers
+`USER-DEFINED` for an extension type (the real name lives in `udt_name`) and
+`ARRAY` for an array (`udt_name` is `_int4` for `integer[]`), and the
+comparison resolves both against your declaration — so a matching column is
+drift-free while a genuinely different type is still reported. `.SqlType` wins
+over `VarChar(n)` when both are present.
+
+**Vectors: `field.Vector(name, dims)`.** PostgreSQL with
+[pgvector](https://github.com/pgvector/pgvector) is the only dialect that can
+search them; on MySQL and SQLite the column is `TEXT` holding the same
+`[1,2,3]` text, which stores and reads fine but cannot compute distances. The
+extension has to exist before the first migration:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+```zig
+const Doc = schema("Doc", .{
+    .fields = &.{
+        field.Text("title"),
+        field.Vector("embedding", 1536),      // → vector(1536) on PostgreSQL
+    },
+    .indexes = &.{
+        index.Named("idx_doc_embedding_hnsw", &.{"embedding"})
+            .Using("hnsw", "vector_cosine_ops"),   // USING hnsw (embedding vector_cosine_ops)
+    },
+});
+```
+
+The entity field is `[]const f32` (owned, released by `deinitRows` like every
+other owning field); a write whose length is not `dims` fails with
+`error.ValidationFailed` instead of reaching the server. To bind a query
+vector, encode it once with `zent.field.encodeVector(allocator, &values)` and
+pass the text form:
+
+```zig
+const q = try zent.field.encodeVector(allocator, &query_vector);
+defer allocator.free(q);
+
+// WHERE: distance below a threshold  →  "embedding" <-> $1 < $2
+_ = try qb.Where(.{sql.VectorL2Distance("embedding",
+    .{ .string = q }, .lt, .{ .float = 0.5 })});
+
+// ORDER BY nearest neighbour (cosine)  →  ORDER BY "embedding" <=> $1
+_ = try qb.OrderBy(&.{sql.OrderByVectorDistance("embedding", .cosine, .{ .string = q }, false)});
+_ = qb.Limit(10);
+```
+
+The four operators are `VectorL2Distance` (`<->`), `VectorCosineDistance`
+(`<=>`), `VectorInnerProduct` (`<#>`, negative inner product) and
+`VectorL1Distance` (`<+>`); each takes the column, the bound value, a
+comparison (`.lt`/`.lte`/`.gt`/`.gte`) and the threshold, because a bare
+`"col" <-> $1` is not a boolean. **They are PostgreSQL/pgvector-only**: the
+fluent `QueryBuilder` has no dialect at construction time, so on MySQL and
+SQLite the statement is built and the server rejects it (SQLite: syntax error;
+MySQL: errno 1064). Keep the query itself behind a dialect check, or keep it in
+`zent.scope`-wrapped raw SQL.
+
+Index methods and opclasses go through the same index declaration used
+everywhere else — `.Method("hnsw")`, `.OpClass("vector_cosine_ops")`, or
+`.Using(method, opclass)` for both. An opclass covers exactly one column, so a
+multi-column index declaring one is a compile-time-shaped error
+(`error.OpClassNeedsSingleColumn`); a non-identifier method or opclass is
+refused (`InvalidIndexMethod`/`InvalidIndexOpClass`) because the DDL
+concatenates it. MySQL renders `method` as its `USING BTREE|HASH` clause and
+has no opclass; SQLite ignores both. `checkSchema` does not compare index
+methods, so a declared `hnsw` index stays drift-free.
+
 ## 6. Transactions
 
 ```zig

@@ -4,6 +4,68 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`field.Vector(name, dims)` — pgvector columns, searchable end to end.**
+  PostgreSQL gets `vector(dims)`; MySQL and SQLite get `TEXT` holding the same
+  `[1,2,3]` form (they store and read it, they cannot compute distances). The
+  entity field is `[]const f32`, owned and released by `deinitRows` like every
+  other owning field; a write whose length differs from `dims` is refused with
+  `error.ValidationFailed` instead of reaching the server; the text
+  encoding/decoding is a pair of pure functions (`field.encodeVector` and its
+  parser) so it is unit-testable without a server, and a malformed text or a
+  wrong element count reads as `error.TypeMismatch`. `checkSchema` is
+  drift-free over the column (the declared `vector(n)` meets the server's
+  `udt_name`).
+- **Distance predicates and ordering.**
+  `sql.VectorL2Distance/VectorCosineDistance/VectorInnerProduct/VectorL1Distance(col, value, cmp, threshold)`
+  render `"col" <-> $1 < $2` (`<=>`, `<#>`, `<+>` for the other three) and
+  `sql.OrderByVectorDistance(col, op, value, desc)` renders `ORDER BY "col" <=>
+  $1`. Each carries the comparison because a bare `"col" <-> $1` is not a
+  boolean. They are PostgreSQL/pgvector-only by construction — the query
+  builder has no dialect at construction time, so the other servers reject the
+  statement (documented, and asserted: SQLite answers a syntax error, MySQL
+  errno 1064).
+- **Any PostgreSQL type the library does not model can be declared**:
+  `field.Other(name, "vector(1536)")`, or `.SqlType("citext")` on any field.
+  The spelling goes into the DDL verbatim, and `checkSchema` compares it
+  through the server's answers for extension types (`USER-DEFINED` + `udt_name`)
+  and arrays (`ARRAY` + the `_element` name), so a matching column is
+  drift-free while a genuinely different type is still reported. `.SqlType`
+  wins over `VarChar(n)`; a non-empty type name is enforced at comptime.
+- **Index methods and opclasses**: `index.….Using("hnsw", "vector_cosine_ops")`,
+  or `.Method(…)`/`.OpClass(…)` separately, render `CREATE INDEX … USING hnsw
+  (embedding vector_cosine_ops)`. MySQL renders `method` as its `USING
+  BTREE|HASH` clause and has no opclass; SQLite ignores both; an opclass over a
+  multi-column index is refused (`error.OpClassNeedsSingleColumn`) and a
+  non-identifier method or opclass is refused (`InvalidIndexMethod`/
+  `InvalidIndexOpClass` — the DDL concatenates it). Declaring neither keeps the
+  DDL byte-identical to before.
+
+### Fixed
+
+- **`field.Bytes` was broken on PostgreSQL in both directions** (and had zero
+  test coverage). *Writes* travelled as a text parameter, so `byteain` parsed
+  them: non-UTF-8 payloads failed, a NUL byte silently truncated the value, a
+  lone backslash was a syntax error, and `\\nnn` sequences were re-decoded into
+  other bytes. *Reads* returned the server's escaped text (`\\xdeadbeef` for a
+  4-byte value) because `bytea` arrives hex-escaped in the text protocol. The
+  write path now picks the `Value.bytes` (binary) tag from the field's declared
+  type, and the read path decodes both the hex and the legacy `escape`
+  representations — no session setting can surprise it — with a per-column
+  decoded buffer whose lifetime is documented and whose growth never moves a
+  slice already handed to a caller. Round-trip tests carry NUL, non-UTF-8 and
+  backslash bytes through the driver, the client and `checkSchema`.
+
+### Documented
+
+- `BEST_PRACTICES` §5i collects the PostgreSQL-type guidance: `field.Bytes` as a
+  byte column (and the warning that stripping `\x` is now wrong), declaring
+  unmodelled types, and a pgvector walkthrough (extension, column, hnsw index,
+  distance predicates, ordering) with the portability limits stated.
+- `UPGRADING` §13.5 covers the two bytea fixes and the five new declarations for
+  consumers moving from v0.91, including the `CreateTablesError` growth.
+
 ## [0.91.0] - 2026-10-10
 
 ### Added

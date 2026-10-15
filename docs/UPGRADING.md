@@ -323,7 +323,44 @@ exception is opt-in, below).
 | `SQLiteDriver.openWithOptions(…, .{ .strict_numeric_text = true })` | v0.90.0 | SQLite parses text numerics instead of coercing, so an integer field over a `Decimal`(TEXT) column fails loudly as it already did on PG/MySQL. Off by default |
 | `MigrateOptions.add_missing_foreign_keys` | v0.91.0 | Adds declared-but-absent foreign keys to **existing** tables (MySQL one statement; PostgreSQL `NOT VALID` + `VALIDATE`). Off by default; a violating row fails the migration loudly. SQLite is a documented no-op (it has no `ADD CONSTRAINT`) |
 
-### 13.5 If you are chasing raw SQL: declare the edges first
+### 13.5 PostgreSQL types: two fixes and the new declarations (v0.92.0)
+
+**`field.Bytes` was wrong on PostgreSQL in both directions.**
+
+- *Writing* sent the value as a text parameter, so `byteain` parsed it:
+  non-UTF-8 bytes failed (`invalid byte sequence for encoding "UTF8"`), a NUL
+  byte silently truncated the value, a lone backslash was a syntax error, and
+  any `\nnn` sequence in the payload was decoded into different bytes. Payloads
+  with none of those happened to work, which is why this survived. The write
+  path now sends a **binary** parameter (the `Value.bytes` tag, chosen from the
+  field's declared type rather than the Zig type).
+- *Reading* handed back the server's **escaped text** — `\xdeadbeef` for a
+  4-byte value — because PostgreSQL answers `bytea` as hex-escaped text in the
+  text protocol. `getText`/`getBlob` now decode it (both the hex and the legacy
+  `escape` output, so no session setting can surprise you).
+
+  If you worked around either by stripping `\x` or avoiding binary payloads,
+  remove the workaround — it will now corrupt the value.
+
+**New declarations** (all additive):
+
+| API | What it gives you |
+|---|---|
+| `field.Other(name, "vector(1536)")` / `.SqlType("citext")` on any field | Any PostgreSQL type the library does not model — extension types, arrays (`integer[]`), `tsvector`, `inet`, `jsonpath`, ranges. `checkSchema` compares them through the server's `udt_name`, so a matching column is drift-free while a different type is still reported |
+| `field.Vector(name, dims)` | A pgvector column: `vector(dims)` on PostgreSQL, `TEXT` (same text form) on MySQL/SQLite. The entity field is `[]const f32`; a wrong-length write is refused with `error.ValidationFailed` |
+| `sql.VectorL2Distance/CosineDistance/InnerProduct/L1Distance(col, value, cmp, threshold)` | `WHERE "col" <-> $1 < $2` and friends — PostgreSQL/pgvector only, rejected by the other servers |
+| `sql.OrderByVectorDistance(col, op, value, desc)` | `ORDER BY "col" <=> $1` for nearest-neighbour pages |
+| `index.…Using(method, opclass)` / `.Method(…)` / `.OpClass(…)` | `CREATE INDEX … USING hnsw (embedding vector_cosine_ops)`. MySQL renders `USING BTREE\|HASH`, SQLite ignores both; an opclass over a multi-column index is refused |
+
+pgvector must be installed before the first migration
+(`CREATE EXTENSION IF NOT EXISTS vector;`); zent does not create extensions.
+
+**Error set growth.** `Client.createAllTables`'s error set now also carries
+`InvalidIndexMethod`, `InvalidIndexOpClass` and `OpClassNeedsSingleColumn` (a
+malformed index declaration in your schema). A `switch` over it needs its
+`else =>` arm, as always.
+
+### 13.6 If you are chasing raw SQL: declare the edges first
 
 A measured example, from a consumer with ~180 schemas and ~543 raw-SQL call
 sites (153 of them JOIN-shaped): **62% of its JOINs are single-hop m2o lookups
