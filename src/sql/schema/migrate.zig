@@ -1637,6 +1637,21 @@ pub const IndexDeclError = error{
     OpClassNeedsSingleColumn,
 };
 
+/// The named error a migration returns when a declared column type needs a
+/// PostgreSQL extension this database does not have installed.
+///
+/// One name rather than one per extension: the fix is the same statement in
+/// every case (`CREATE EXTENSION IF NOT EXISTS <name>`), and which extension is
+/// missing is what the log line the check emits before returning carries — an
+/// error tag cannot.
+pub const PostgresExtensionError = error{
+    /// The schema declares a column type provided by an extension
+    /// (`vector(n)`, `citext`, `hstore`, `ltree`, PostGIS's `geometry` /
+    /// `geography`) and `pg_extension` does not list that extension. Raised
+    /// *before* any DDL, so the run leaves the database exactly as it was.
+    MissingPostgresExtension,
+};
+
 /// A restriction MySQL puts on a BLOB/TEXT/JSON column that the DDL about to
 /// be generated would trip.
 ///
@@ -1822,6 +1837,155 @@ fn graphHasMySqlTextDefault(comptime infos: []const TypeInfo) bool {
         }
     }
     return false;
+}
+
+/// A PostgreSQL column type whose *provider is an extension*, and the extension
+/// that provides it.
+///
+/// Deliberately small and exact. `zent` cannot ask a server "which extension
+/// owns this type?" before the type exists, so the only safe default is silence:
+/// a name this table does not know is not an extension type as far as the check
+/// is concerned, and the migration proceeds exactly as it did before the check
+/// existed. Guessing the other way would refuse a migration that would have
+/// worked.
+const PostgresExtensionType = struct {
+    /// The declared type's bare name, lower case.
+    declared_type: []const u8,
+    /// The extension that provides it — also the name `CREATE EXTENSION` takes
+    /// (pgvector's extension is `vector`, PostGIS's is `postgis`).
+    extension: []const u8,
+};
+
+/// The known type → extension pairs: PostgreSQL's own types are all built in,
+/// so what is left is the extension types a schema realistically declares.
+///
+/// `vector` is the one a `field.Vector` reaches (its spelling is `vector(n)`,
+/// and the dimension is stripped before the lookup); the rest arrive through
+/// `.SqlType(s)` / `field.Other(name, s)`, which on PostgreSQL is emitted
+/// verbatim and can therefore name anything.
+const postgres_extension_types = [_]PostgresExtensionType{
+    .{ .declared_type = "vector", .extension = "vector" }, // pgvector
+    .{ .declared_type = "citext", .extension = "citext" },
+    .{ .declared_type = "hstore", .extension = "hstore" },
+    .{ .declared_type = "ltree", .extension = "ltree" },
+    .{ .declared_type = "geometry", .extension = "postgis" },
+    .{ .declared_type = "geography", .extension = "postgis" },
+    // Not a type PostGIS defines (`geometry` and `geography` are), but a
+    // declaration that says `postgis` is asking for the same extension and
+    // deserves the same diagnosis rather than silence.
+    .{ .declared_type = "postgis", .extension = "postgis" },
+};
+
+/// The bare type name a declaration starts with: `vector(1536)` → `vector`,
+/// `public.citext` → `citext`, `hstore[]` → `hstore`.
+///
+/// The declaration is what the schema wrote, so it carries everything a type
+/// reference may: a schema qualifier, a dimension/scale, an array marker. Only
+/// the bare name is comparable to the table above. Pure, so the decision can be
+/// pinned without a server.
+fn bareDeclaredType(declared: []const u8) []const u8 {
+    var name = std.mem.trim(u8, declared, " \t");
+    // A schema qualifier. The *last* dot, because a quoted qualifier may itself
+    // contain one.
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name = name[dot + 1 ..];
+    var end = name.len;
+    if (std.mem.indexOfScalar(u8, name, '(')) |paren| end = @min(end, paren);
+    if (std.mem.indexOfScalar(u8, name, '[')) |bracket| end = @min(end, bracket);
+    return std.mem.trim(u8, name[0..end], " \t");
+}
+
+/// The extension a declared column type needs, or `null` when the name is not
+/// one this module knows — the common answer, since it covers every type
+/// PostgreSQL itself provides.
+fn postgresExtensionForDeclaredType(declared: []const u8) ?[]const u8 {
+    const bare = bareDeclaredType(declared);
+    if (bare.len == 0) return null;
+    for (postgres_extension_types) |entry| {
+        if (std.ascii.eqlIgnoreCase(bare, entry.declared_type)) return entry.extension;
+    }
+    return null;
+}
+
+/// Every PostgreSQL extension this graph's *declarations* need, deduplicated,
+/// in first-seen order.
+///
+/// Pure and comptime, so a schema that needs none answers with an empty list and
+/// the catalog is never asked. That is the same rule `graphHasMySqlTextDefault`
+/// follows and for the same reason: the statement-modelling stubs in
+/// `src/test/allocation_failures_plan.zig` claim every statement the planner
+/// issues, so a probe a schema did not warrant must not be issued at all.
+///
+/// Two declarations can need one. A `field.Vector` column always needs pgvector
+/// (its `vector(n)` type is the extension's), and an explicit `.SqlType(s)` /
+/// `field.Other(name, s)` override may name an extension type — it is emitted
+/// verbatim on PostgreSQL. The built-in field kinds cannot: `field.Json` is
+/// `JSONB`, `field.Bytes` is `BYTEA`, and every other kind maps to a type
+/// PostgreSQL owns.
+fn requiredPostgresExtensions(comptime infos: []const TypeInfo) []const []const u8 {
+    comptime {
+        var needed: []const []const u8 = &.{};
+        for (infos) |info| {
+            if (info.is_view) continue;
+            for (info.fields) |f| {
+                const extension: ?[]const u8 = blk: {
+                    if (f.field_type == .vector) break :blk "vector";
+                    if (f.sql_type_override) |override| break :blk postgresExtensionForDeclaredType(override);
+                    break :blk null;
+                };
+                const name = extension orelse continue;
+                var seen = false;
+                for (needed) |existing| {
+                    if (std.mem.eql(u8, existing, name)) seen = true;
+                }
+                if (!seen) needed = needed ++ &[_][]const u8{name};
+            }
+        }
+        return needed;
+    }
+}
+
+/// Refuse a PostgreSQL migration whose schema declares a type this database has
+/// no extension for — **before any DDL**, so the caller gets one named error
+/// instead of `ERROR: type "vector" does not exist` from the middle of a
+/// `CREATE TABLE`, with no way to tell a missing extension from a typo.
+///
+/// Never probed unless the schema needs something (`requiredPostgresExtensions`
+/// is empty for a graph built from the built-in field kinds), and never on
+/// another dialect — `pg_extension` is PostgreSQL's own catalog.
+///
+/// Only *installed* extensions count. An extension that is merely available
+/// still needs a `CREATE EXTENSION` the caller has to run, and doing it here
+/// would be a schema change outside the plan, with privileges the migration has
+/// no business assuming — so the fix is stated and the decision stays with the
+/// caller.
+fn checkPostgresExtensions(drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
+    if (drv.dialect().kind() != .postgres) return;
+    const required = comptime requiredPostgresExtensions(infos);
+    if (required.len == 0) return;
+
+    // One bit per required extension. Every member of `required` came out of
+    // `postgres_extension_types`, so the table's length bounds the index.
+    var installed: [postgres_extension_types.len]bool = @splat(false);
+    var rows = try drv.query("SELECT extname FROM pg_extension", &.{});
+    defer rows.deinit();
+    while (rows.next()) |row| {
+        const name = row.getText(0) orelse continue;
+        for (required, 0..) |want, i| {
+            if (std.ascii.eqlIgnoreCase(name, want)) installed[i] = true;
+        }
+    }
+    // A fetch that broke is not "the extension is missing": a reader that skips
+    // this reports a short result set as a successful one.
+    if (rows.nextError()) |err| return err;
+
+    for (required, 0..) |want, i| {
+        if (installed[i]) continue;
+        zent_log.warn(
+            "zent: the schema declares a column type provided by the PostgreSQL extension '{s}', which this database does not have installed; run `CREATE EXTENSION IF NOT EXISTS {s};` and migrate again",
+            .{ want, want },
+        );
+        return error.MissingPostgresExtension;
+    }
 }
 
 /// Log what the error name cannot carry — which table, which column, which
@@ -2149,6 +2313,98 @@ fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
         };
     }
     return column.sql_type;
+}
+
+/// What a column declared, and what this dialect will actually emit, when the
+/// two differ because the declaration names a type the dialect does not have.
+const DeclaredTypeRewrite = struct {
+    /// The type the schema declared (`vector(1536)`, `citext`).
+    declared: []const u8,
+    /// The type `columnSQLType` resolves it to on this dialect (`TEXT`).
+    emitted: []const u8,
+};
+
+/// The rewrite a column's declaration is about to suffer, or `null` when the
+/// declaration is what gets emitted.
+///
+/// Two declarations can be rewritten, because only they name a type the schema
+/// chose rather than a kind the dialect mapping owns:
+///
+///   - a `field.Vector` column: PostgreSQL gets `vector(n)` (pgvector),
+///     MySQL/SQLite get the kind's `TEXT` (`field.sqlType`'s `.vector` arm),
+///     which is a column of a different type, not a different spelling of the
+///     same one;
+///   - a `.SqlType(s)` / `field.Other(name, s)` override: `columnSQLType`
+///     emits it verbatim on PostgreSQL **only**, so every other dialect falls
+///     back to the field kind's mapping.
+///
+/// Everything else is a *mapping*, not a rewrite: `field.String` is `TEXT` on
+/// PostgreSQL/SQLite and `VARCHAR(255)` on MySQL, `field.Json` is `JSONB` or
+/// `TEXT` — the schema declared a kind and the dialect rendered it, which is
+/// the dialect support working as documented. Those must stay silent, or every
+/// schema warns.
+///
+/// Decided by comparing the declaration with `columnSQLType`'s own answer
+/// rather than by re-deriving which arm fires, so the warning cannot disagree
+/// with the SQL it accompanies (a hand-built `ColumnDef` whose `sql_type`
+/// already *is* its override, for instance, is emitted as declared and stays
+/// silent). Pure, so both dialects can be pinned without a server.
+fn declaredTypeRewrite(col: ColumnDef, dialect: Dialect) ?DeclaredTypeRewrite {
+    const declared: ?[]const u8 = if (col.sql_type_override) |override|
+        override
+    else if (col.logical_type != null and col.logical_type.? == .vector)
+        (col.vector_sql orelse "vector")
+    else
+        null;
+    const declared_type = declared orelse return null;
+    const emitted = columnSQLType(col, dialect);
+    if (std.mem.eql(u8, declared_type, emitted)) return null;
+    return .{ .declared = declared_type, .emitted = emitted };
+}
+
+/// The dialect's name as the person reading the log says it.
+fn dialectDisplayName(kind: Dialect.Kind) []const u8 {
+    return switch (kind) {
+        .sqlite => "SQLite",
+        .postgres => "PostgreSQL",
+        .mysql => "MySQL",
+        .unknown => "this dialect",
+    };
+}
+
+/// Say out loud that a declared column type has no column type on this dialect
+/// and was emitted as something else.
+///
+/// The mirror image of the index-method/opclass warnings (`indexMethodFor`,
+/// `indexOpClassFor`), and deliberately the same shape — declared here, dropped
+/// with a line that names what was dropped. The *column* is the one that
+/// matters: an index on a vector column that is stored as `TEXT` still indexes
+/// the text, while the column itself is the whole loss (pgvector's operators
+/// and its `vector` type are gone, and the value is a `[1,2,3]` string).
+///
+/// Once per (table, column) per migration is structural, not tracked: both
+/// migration entry points call this once per entity, next to
+/// `warnOutOfGraphEdgeRefs`, and a table's column list names a column once — so
+/// the two DDL statements the planner can produce for one column (a `CREATE
+/// TABLE` and, when the table already existed, an `ALTER TABLE ADD COLUMN`)
+/// still produce one line.
+fn warnDegradedColumnTypes(table: TableDef, dialect: Dialect) void {
+    for (table.columns) |col| {
+        const rewrite = declaredTypeRewrite(col, dialect) orelse continue;
+        zent_log.warn(
+            "zent: {s}.{s} declares the {s} type, which {s} has no column type for, so the column is emitted as {s}; it is stored and read as text and none of {s}'s operators or indexes for {s} apply — migrate this schema on PostgreSQL, or declare a type {s} can create",
+            .{
+                table.name,
+                col.name,
+                rewrite.declared,
+                dialectDisplayName(dialect.kind()),
+                rewrite.emitted,
+                dialectDisplayName(dialect.kind()),
+                rewrite.declared,
+                dialectDisplayName(dialect.kind()),
+            },
+        );
+    }
 }
 
 /// Dialect-aware epoch default for the conventional audit timestamp columns
@@ -2907,6 +3163,7 @@ fn createTables(
         } else {
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
             warnOutOfGraphEdgeRefs(info, infos);
+            warnDegradedColumnTypes(table, dialect);
             const sql = try createTableSQLAllocWithServer(allocator, table, dialect, server);
             defer allocator.free(sql);
             _ = try driver_drv.exec(sql, &.{});
@@ -2941,6 +3198,10 @@ fn createTables(
 /// automatic column/index additions on re-run.
 pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     const dialect = driver_drv.dialect();
+    // Before any DDL: a declared extension type this server has no extension
+    // for is refused here rather than by the server in the middle of a
+    // `CREATE TABLE` (see `checkPostgresExtensions`).
+    try checkPostgresExtensions(driver_drv, infos);
     // One probe per entry point, shared by the table and index statements so
     // both classify a text `DEFAULT` the same way, and skipped entirely when
     // the schema declares none (see `graphHasMySqlTextDefault`).
@@ -4980,6 +5241,7 @@ pub fn planMigrateStatements(
         } else {
             const table = comptime tableFromTypeInfoCrossRef(info, infos);
             warnOutOfGraphEdgeRefs(info, infos);
+            warnDegradedColumnTypes(table, dialect);
             const version = computeMigrationVersion(info.table_name, "create_table", "");
             // `created` is true only when the table is genuinely absent
             // before this run: only then does the CREATE build a fresh table
@@ -5388,6 +5650,17 @@ fn planMissingForeignKeys(
 /// deploying at once cannot both pass the "table missing" checks and race on
 /// DDL. Checksums are not verified here because schema-diff migrations record
 /// NULL; files are verified by `migrateFromFilesWithOptions`.
+///
+/// **One call is one transaction, and that transaction is this function's.**
+/// The boundary is the call, not the schema: a caller that migrates several
+/// groups in a loop —
+/// `inline for (groups) |g| try migrateSchema(allocator, driver, g)` — gets one
+/// committed transaction *per group*, so group 1 is already durable when group
+/// 3 fails and the database holds a schema that matches none of the groups.
+/// There is no way to tell that from the outside afterwards, which is the whole
+/// hazard. For all-or-nothing across several groups, open the transaction
+/// yourself and use `migrateSchemaInTx` (see its doc comment for the boundary
+/// it documents in turn).
 pub fn migrateSchemaWithOptions(
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
@@ -5399,30 +5672,11 @@ pub fn migrateSchemaWithOptions(
     // and print it without executing anything. Everything here is read-only:
     // no migration lock (it can only race a real deploy, and holding one
     // would make the preview fail with MigrationLockTimeout instead of
-    // answering), no history bootstrap, no transaction.
-    if (opts.dry_run) {
-        // The version gates read the same history snapshot a real run would.
-        // A database that has never been migrated has no history table at
-        // all — that means "nothing applied". Probing with the same read-only
-        // existence check `checkSchema` uses keeps this branch a pure read.
-        var applied: []AppliedMigration = &.{};
-        var history_cols = try getExistingColumns(allocator, driver, "zent_schema_migrations");
-        const has_history = history_cols.items.len > 0;
-        freeExistingColumns(allocator, &history_cols);
-        if (has_history) {
-            applied = try appliedMigrations(allocator, driver);
-        }
-        defer if (has_history) freeAppliedMigrations(allocator, applied);
-
-        var plan = try planMigrateStatements(allocator, driver, infos, opts, applied);
-        defer freePlannedStatements(allocator, &plan);
-
-        // Print collected SQL.
-        for (plan.items) |st| {
-            std.debug.print("{s};\n", .{st.sql});
-        }
-        return;
-    }
+    // answering), no history bootstrap, and no extension probe (the migration
+    // it previews is refused by `checkPostgresExtensions` before it reaches
+    // this point, but a preview that cannot print the DDL it was asked about
+    // is worth less than the diagnosis the run itself gives).
+    if (opts.dry_run) return printMigrationPlan(allocator, driver, infos, opts);
 
     // Cross-process mutual exclusion: without it, two instances starting at
     // once both see a table/column as missing (TOCTOU on the introspection
@@ -5430,6 +5684,11 @@ pub fn migrateSchemaWithOptions(
     // path the `defer` still releases it.
     const lock_held = try lockMigration(driver, opts.lock_timeout_ms);
     defer if (lock_held) unlockMigration(driver);
+
+    // A declared extension type the database has no extension for, refused
+    // before any DDL — including the history table, which is DDL too: the run
+    // then leaves the database exactly as it was.
+    try checkPostgresExtensions(driver, infos);
 
     // Bootstrap the history table outside the transaction; the SQL is
     // already idempotent (CREATE TABLE IF NOT EXISTS) and there's no
@@ -5450,22 +5709,154 @@ pub fn migrateSchemaWithOptions(
     // can run inside the transaction unchanged.
     const tx_drv = tx.inner;
 
-    // The statement list this run executes is planned up front — the same
-    // `planMigrateStatements` call the dry-run previews — and then applied in
-    // order. Planning introspects through `tx_drv`, exactly where the old
-    // interleaved path performed its checks, against the same `applied`
-    // snapshot read above, so the executed set is unchanged: one shared diff,
-    // not two copies that can drift apart.
-    //
-    // Step 1+2 shape the plan: create tables/views/junction tables first
-    // (CREATE TABLE IF NOT EXISTS keeps this safe even on a partial previous
-    // run), then per-entity column/index diffs. The schema state
-    // (table/column/index existence) is the authoritative gate — we always
-    // re-check the database before planning each change.
-    // `zent_schema_migrations` is an audit trail: `recordMigration` uses
-    // `ON CONFLICT DO NOTHING` / `ON DUPLICATE KEY UPDATE`, so re-recording
-    // a version (e.g. after a table was dropped out-of-band) never produces
-    // duplicates.
+    try applyMigrationPlan(allocator, tx_drv, infos, opts, applied);
+
+    try tx.commit();
+    tx.deinit();
+
+    try reportNullability(allocator, driver, infos, opts);
+}
+
+/// `migrateSchemaWithOptions` **inside a transaction the caller owns**.
+///
+/// The boundary, explicitly: **one call is one run inside the caller's
+/// transaction.** This function never begins, commits or rolls back — the DDL,
+/// the history rows and the `zent_schema_migrations` bootstrap all happen on
+/// `tx`'s connection, so the caller's `commit` is what makes them durable and
+/// the caller's `rollback` is what makes them vanish (SQLite and PostgreSQL have
+/// transactional DDL; MySQL does not — see the file header). A failed call
+/// returns the error to the caller, and *nothing this call wrote is undone
+/// here*, because undoing it would mean rolling back the caller's transaction,
+/// which is the caller's decision and may already carry work of its own.
+///
+/// That is the point of the entry point: several calls on the same `tx` are one
+/// atomic unit —
+///
+/// ```zig
+/// var tx = try driver.beginTx();
+/// errdefer tx.deinit();
+/// try migrateSchemaInTx(allocator, tx, infos, .{});        // group A
+/// try migrateSchemaInTx(allocator, tx, more_infos, .{});   // group B
+/// try tx.commit();                                         // both, or neither
+/// ```
+///
+/// — where two `migrateSchema` calls would have been two independent
+/// transactions with group A committed before group B was even attempted.
+/// The rule in one sentence: **one call = one transaction; N calls = N
+/// transactions, and the earlier ones are already committed; for all-or-nothing,
+/// open the transaction yourself and use this function.**
+///
+/// The handle is **borrowed**: `tx` is not consumed and its lifetime stays the
+/// caller's (`deinit` exactly once, after `commit`/`rollback` as usual). A
+/// `dry_run` prints the plan through this connection and touches nothing, as it
+/// does on the self-managing path.
+///
+/// Two consequences worth stating rather than discovering:
+///
+///   - **The migration lock covers this call, not the caller's transaction.**
+///     The advisory lock is still taken (on `tx`'s connection) and released
+///     before returning, so two `migrateSchemaInTx` calls cannot interleave
+///     their DDL — but a second process can start migrating in the window
+///     between this call's return and the caller's `commit`, while this
+///     caller's DDL is still uncommitted and therefore invisible to that
+///     process's introspection. A caller that needs cross-process exclusion for
+///     the whole unit has to hold the lock itself for that whole unit.
+///   - **The post-run nullability report reads inside the transaction**, since
+///     that is the state this call just produced. On a caller that rolls back,
+///     the report described a schema that was never committed.
+pub fn migrateSchemaInTx(
+    allocator: std.mem.Allocator,
+    tx: sql_driver.Tx,
+    comptime infos: []const TypeInfo,
+    opts: MigrateOptions,
+) !void {
+    // `Tx.inner` is a Driver value type, so every helper that accepts a Driver
+    // runs on the transaction's connection unchanged — the same driver
+    // `migrateSchemaWithOptions` hands to the plan once it owns the tx.
+    const tx_drv = tx.inner;
+
+    if (opts.dry_run) return printMigrationPlan(allocator, tx_drv, infos, opts);
+
+    const lock_held = try lockMigration(tx_drv, opts.lock_timeout_ms);
+    defer if (lock_held) unlockMigration(tx_drv);
+
+    try checkPostgresExtensions(tx_drv, infos);
+
+    // Inside the caller's transaction, deliberately: a rollback has to take the
+    // history table with it, or "this run was undone" would leave a trace that
+    // says otherwise.
+    try ensureMigrationsTable(tx_drv);
+
+    const applied = try appliedMigrations(allocator, tx_drv);
+    defer freeAppliedMigrations(allocator, applied);
+
+    try applyMigrationPlan(allocator, tx_drv, infos, opts, applied);
+
+    try reportNullability(allocator, tx_drv, infos, opts);
+}
+
+/// The dry-run body: plan the exact statement list a real run would execute —
+/// same introspection, same history snapshot, same opt-in gates, same order —
+/// and print it without executing anything.
+///
+/// It reads through `drv`, which is whatever connection the caller's entry
+/// point would migrate on (the driver, or a caller-owned transaction's), so a
+/// preview seen from inside a transaction previews that transaction's view.
+fn printMigrationPlan(
+    allocator: std.mem.Allocator,
+    drv: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    opts: MigrateOptions,
+) !void {
+    // The version gates read the same history snapshot a real run would.
+    // A database that has never been migrated has no history table at
+    // all — that means "nothing applied". Probing with the same read-only
+    // existence check `checkSchema` uses keeps this branch a pure read.
+    var applied: []AppliedMigration = &.{};
+    var history_cols = try getExistingColumns(allocator, drv, "zent_schema_migrations");
+    const has_history = history_cols.items.len > 0;
+    freeExistingColumns(allocator, &history_cols);
+    if (has_history) {
+        applied = try appliedMigrations(allocator, drv);
+    }
+    defer if (has_history) freeAppliedMigrations(allocator, applied);
+
+    var plan = try planMigrateStatements(allocator, drv, infos, opts, applied);
+    defer freePlannedStatements(allocator, &plan);
+
+    // Print collected SQL.
+    for (plan.items) |st| {
+        std.debug.print("{s};\n", .{st.sql});
+    }
+}
+
+/// The plan-and-execute half of a real run, on the connection the DDL goes
+/// through: this function owns neither the boundary nor the locking, so the
+/// two entry points that do (`migrateSchemaWithOptions`'s own transaction,
+/// `migrateSchemaInTx`'s caller's) cannot drift apart in what they execute.
+///
+/// The statement list is planned up front — the same `planMigrateStatements`
+/// call the dry-run previews — and then applied in order. Planning introspects
+/// through `tx_drv`, exactly where the old interleaved path performed its
+/// checks, against the `applied` snapshot the caller read, so the executed set
+/// is unchanged: one shared diff, not two copies that can drift apart.
+///
+/// Step 1+2 shape the plan: create tables/views/junction tables first
+/// (CREATE TABLE IF NOT EXISTS keeps this safe even on a partial previous
+/// run), then per-entity column/index diffs. The schema state
+/// (table/column/index existence) is the authoritative gate — we always
+/// re-check the database before planning each change.
+/// `zent_schema_migrations` is an audit trail: `recordMigration` uses
+/// `ON CONFLICT DO NOTHING` / `ON DUPLICATE KEY UPDATE`, so re-recording
+/// a version (e.g. after a table was dropped out-of-band) never produces
+/// duplicates.
+fn applyMigrationPlan(
+    allocator: std.mem.Allocator,
+    tx_drv: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    opts: MigrateOptions,
+    applied: []const AppliedMigration,
+) !void {
     var plan = try planMigrateStatements(allocator, tx_drv, infos, opts, applied);
     defer freePlannedStatements(allocator, &plan);
 
@@ -5473,20 +5864,33 @@ pub fn migrateSchemaWithOptions(
         _ = try tx_drv.exec(st.sql, &.{});
         if (st.version) |version| try recordMigration(tx_drv, version, null);
     }
+}
 
-    try tx.commit();
-    tx.deinit();
-
-    if (opts.check_nullability) {
-        const drifts = try checkNullability(allocator, driver, infos);
-        defer freeNullabilityDrift(allocator, drifts);
-        reportNullabilityDrift(drifts);
-    }
+/// Compare every column's nullability between the schema and the database and
+/// warn per difference — `opts.check_nullability`. No-op when it is off.
+///
+/// Runs on the connection whose schema is the one to report on: the driver
+/// after `migrateSchemaWithOptions` committed, or the caller's transaction
+/// while `migrateSchemaInTx` is still inside it.
+fn reportNullability(
+    allocator: std.mem.Allocator,
+    drv: sql_driver.Driver,
+    comptime infos: []const TypeInfo,
+    opts: MigrateOptions,
+) !void {
+    if (!opts.check_nullability) return;
+    const drifts = try checkNullability(allocator, drv, infos);
+    defer freeNullabilityDrift(allocator, drifts);
+    reportNullabilityDrift(drifts);
 }
 
 /// Backward-compatible entry point: calls `migrateSchemaWithOptions` with
 /// default `MigrateOptions{}` (no drops, no type changes, no foreign keys added
 /// by `ALTER`). All existing callers continue to work without modification.
+///
+/// **One call is one transaction** — this function opens it and commits it, so
+/// N calls are N committed transactions. For all-or-nothing across several
+/// schema groups, use `migrateSchemaInTx` on a transaction you opened yourself.
 pub fn migrateSchema(
     allocator: std.mem.Allocator,
     driver: sql_driver.Driver,
@@ -9588,4 +9992,545 @@ test "migrateSchema warns once about an edge that crosses the graph (SQLite)" {
     defer meta.deinit();
     const row = meta.next() orelse return error.NoTableRow;
     try std.testing.expect(std.mem.indexOf(u8, row.getText(0).?, "REFERENCES \"upload_file\" (\"id\")") != null);
+}
+
+// ------------------------------------------------------------------
+// Declared extension types: the PostgreSQL pre-check
+// ------------------------------------------------------------------
+
+test "a declared PostgreSQL extension type maps to its extension, and an unknown name maps to nothing" {
+    // The known pairs, in the spellings a declaration can carry: a dimension
+    // (`vector(1536)` is what `field.Vector` emits), a schema qualifier, an
+    // array marker, and case.
+    for ([_][]const u8{ "vector", "vector(1536)", "vector[]", "VECTOR(3)", "public.vector" }) |declared| {
+        try std.testing.expectEqualStrings("vector", postgresExtensionForDeclaredType(declared).?);
+    }
+    try std.testing.expectEqualStrings("citext", postgresExtensionForDeclaredType("public.citext").?);
+    try std.testing.expectEqualStrings("hstore", postgresExtensionForDeclaredType("hstore").?);
+    try std.testing.expectEqualStrings("ltree", postgresExtensionForDeclaredType("ltree").?);
+    try std.testing.expectEqualStrings("postgis", postgresExtensionForDeclaredType("geometry").?);
+    // PostGIS's own spelling of a type with a modifier: the bare name is what
+    // the table is keyed on.
+    try std.testing.expectEqualStrings("postgis", postgresExtensionForDeclaredType("geography(Point, 4326)").?);
+
+    // Everything else is silence, including the two shapes that must never be
+    // guessed at: a name that merely *starts* like a known type, and
+    // PostgreSQL's own built-ins (a wrong extension here would refuse a
+    // migration that had nothing to do with extensions).
+    try std.testing.expect(postgresExtensionForDeclaredType("tsvector") == null);
+    try std.testing.expect(postgresExtensionForDeclaredType("int4range") == null);
+    try std.testing.expect(postgresExtensionForDeclaredType("inet") == null);
+    try std.testing.expect(postgresExtensionForDeclaredType("text") == null);
+    try std.testing.expect(postgresExtensionForDeclaredType("varchar(120)") == null);
+    try std.testing.expect(postgresExtensionForDeclaredType("vectorize") == null);
+    try std.testing.expect(postgresExtensionForDeclaredType("") == null);
+    try std.testing.expect(postgresExtensionForDeclaredType("  ") == null);
+}
+
+test "requiredPostgresExtensions lists a graph's declared extension types, once each" {
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    // Three declaration shapes: the `field.Vector` kind, an explicit
+    // `.SqlType(…)` override (`field.Other` is the same field underneath), and
+    // a second column declaring the same extension again.
+    const Doc = schema("ExtProbeDoc", .{
+        .fields = &.{
+            field.Int("id"),
+            field.Vector("embedding", 1536),
+            field.Text("handle").SqlType("citext"),
+            field.Other("tags", "int4range").Optional(),
+        },
+    });
+    const Second = schema("ExtProbeSecond", .{
+        .fields = &.{ field.Int("id"), field.Other("alias", "citext").Optional() },
+    });
+    // A graph whose declarations are all built-in types: the answer that keeps
+    // the catalog unasked.
+    const Plain = schema("ExtProbePlain", .{
+        .fields = &.{ field.Int("id"), field.String("name"), field.JSONValue("doc").Optional() },
+    });
+
+    const needed = comptime requiredPostgresExtensions(buildGraph(&.{ Doc, Second }).types);
+    // Deduplicated in first-seen order, and `int4range` is not an extension
+    // type at all.
+    try std.testing.expectEqual(@as(usize, 2), needed.len);
+    try std.testing.expectEqualStrings("vector", needed[0]);
+    try std.testing.expectEqualStrings("citext", needed[1]);
+
+    const none = comptime requiredPostgresExtensions(buildGraph(&.{Plain}).types);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+/// A driver whose whole catalog is "which extensions are installed".
+///
+/// The check is a read by contract, so `exec` fails outright — and counts the
+/// call, so an entry point can assert "not one statement reached the server"
+/// instead of inferring it from which error came back. Any statement that is
+/// not the `pg_extension` one is counted in `unmatched`, so a probe the stub
+/// never modelled cannot come back as "nothing is installed" and be mistaken
+/// for the check working.
+const ExtensionStub = struct {
+    dialect_value: Dialect = Dialect.postgres,
+    installed: []const []const u8 = &.{},
+    queries: usize = 0,
+    exec_calls: usize = 0,
+    unmatched: usize = 0,
+    /// The answer the live cursor walks, and how far along it is.
+    current: []const []const u8 = &.{},
+    pos: usize = 0,
+    /// What the live row's `getText(0)` reads — borrowed exactly as a driver's
+    /// row buffer is, so the check cannot keep a name past `next()`.
+    row_text: ?[]const u8 = null,
+
+    fn asDriver(self: *ExtensionStub) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &driver_vtable };
+    }
+
+    fn answering(self: *ExtensionStub, names: []const []const u8) sql_driver.Rows {
+        self.current = names;
+        self.pos = 0;
+        return .{ .ptr = self, .vtable = &rows_vtable };
+    }
+
+    const driver_vtable = sql_driver.Driver.VTable{
+        .exec = stubExec,
+        .query = stubQuery,
+        .beginTx = stubBeginTx,
+        .close = stubClose,
+        .dialect = stubDialect,
+        .ping = stubPing,
+        .inTransaction = stubInTransaction,
+        .beginSavepoint = stubBeginSavepoint,
+    };
+
+    const rows_vtable = sql_driver.Rows.VTable{
+        .next = rowsNext,
+        .deinit = rowsDeinit,
+    };
+
+    const row_vtable = sql_driver.Row.VTable{
+        .columnCount = rowColumnCount,
+        .columnName = rowColumnName,
+        .getBool = rowGetBool,
+        .getInt = rowGetInt,
+        .getFloat = rowGetFloat,
+        .getText = rowGetText,
+        .getBlob = rowGetBlob,
+        .isNull = rowIsNull,
+    };
+
+    fn stubExec(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const Value) sql_driver.Error!sql_driver.Result {
+        // The check must never execute anything; reaching here means it did —
+        // and the call is counted, so an entry point can assert "not one DDL
+        // statement" rather than infer it from what the returned error was.
+        const self: *ExtensionStub = @ptrCast(@alignCast(ptr));
+        self.exec_calls += 1;
+        return error.ExecFailed;
+    }
+
+    fn stubQuery(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const Value) sql_driver.Error!sql_driver.Rows {
+        const self: *ExtensionStub = @ptrCast(@alignCast(ptr));
+        self.queries += 1;
+        if (std.mem.indexOf(u8, query_sql, "pg_extension") != null) return self.answering(self.installed);
+        self.unmatched += 1;
+        return self.answering(&.{});
+    }
+
+    fn rowsNext(ptr: *anyopaque) ?sql_driver.Row {
+        const self: *ExtensionStub = @ptrCast(@alignCast(ptr));
+        if (self.pos >= self.current.len) return null;
+        self.row_text = self.current[self.pos];
+        self.pos += 1;
+        return .{ .ptr = self, .vtable = &row_vtable };
+    }
+
+    fn rowsDeinit(_: *anyopaque) void {}
+
+    fn rowColumnCount(_: *anyopaque) usize {
+        return 1;
+    }
+
+    fn rowColumnName(_: *anyopaque, _: usize) []const u8 {
+        return "extname";
+    }
+
+    fn rowGetBool(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+
+    fn rowGetInt(_: *anyopaque, _: usize) ?i64 {
+        return null;
+    }
+
+    fn rowGetFloat(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+
+    fn rowGetText(ptr: *anyopaque, index: usize) ?[]const u8 {
+        if (index != 0) return null;
+        const self: *ExtensionStub = @ptrCast(@alignCast(ptr));
+        return self.row_text;
+    }
+
+    fn rowGetBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+
+    fn rowIsNull(ptr: *anyopaque, index: usize) bool {
+        return rowGetText(ptr, index) == null;
+    }
+
+    fn stubBeginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn stubBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn stubClose(_: *anyopaque) void {}
+
+    fn stubDialect(ptr: *anyopaque) Dialect {
+        const self: *ExtensionStub = @ptrCast(@alignCast(ptr));
+        return self.dialect_value;
+    }
+
+    fn stubPing(_: *anyopaque) sql_driver.Error!void {}
+
+    fn stubInTransaction(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+test "the PostgreSQL extension check refuses a missing extension, and asks nothing when nothing is needed" {
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const Doc = schema("ExtCheckDoc", .{ .fields = &.{ field.Int("id"), field.Vector("embedding", 3) } });
+    const Plain = schema("ExtCheckPlain", .{ .fields = &.{ field.Int("id"), field.String("name") } });
+    const with_vector = comptime buildGraph(&.{Doc}).types;
+    const without = comptime buildGraph(&.{Plain}).types;
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    // Installed: the check passes, and the catalog was asked exactly once.
+    var present = ExtensionStub{ .installed = &.{ "plpgsql", "vector" } };
+    try checkPostgresExtensions(present.asDriver(), with_vector);
+    try std.testing.expectEqual(@as(usize, 1), present.queries);
+    try std.testing.expectEqual(@as(usize, 0), present.unmatched);
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("CREATE EXTENSION"));
+
+    // Missing: a named error, and a line that names the extension *and* the
+    // statement that fixes it — which is the whole deliverable, since the
+    // server's own `type "vector" does not exist` says neither.
+    WarnCapture.reset();
+    var missing = ExtensionStub{ .installed = &.{"plpgsql"} };
+    try std.testing.expectError(error.MissingPostgresExtension, checkPostgresExtensions(missing.asDriver(), with_vector));
+    try std.testing.expectEqual(@as(usize, 1), missing.queries);
+    try std.testing.expectEqual(@as(usize, 0), missing.unmatched);
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("PostgreSQL extension 'vector'"));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("`CREATE EXTENSION IF NOT EXISTS vector;`"));
+
+    // A case-insensitive comparison: the catalog stores the extension's name in
+    // the case `CREATE EXTENSION` was given, not in the one the schema wrote.
+    var upper = ExtensionStub{ .installed = &.{"VECTOR"} };
+    try checkPostgresExtensions(upper.asDriver(), with_vector);
+    try std.testing.expectEqual(@as(usize, 1), upper.queries);
+
+    // No declared extension type: not one statement. The probe is conditional,
+    // the same rule `graphHasMySqlTextDefault` follows, and the reason a
+    // statement-modelling stub never has to claim a query the schema did not
+    // warrant.
+    WarnCapture.reset();
+    var plain = ExtensionStub{ .installed = &.{} };
+    try checkPostgresExtensions(plain.asDriver(), without);
+    try std.testing.expectEqual(@as(usize, 0), plain.queries);
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("extension"));
+
+    // And another dialect is not this check's business at all — `pg_extension`
+    // is PostgreSQL's own catalog.
+    var sqlite_stub = ExtensionStub{ .dialect_value = Dialect.sqlite, .installed = &.{} };
+    try checkPostgresExtensions(sqlite_stub.asDriver(), with_vector);
+    try std.testing.expectEqual(@as(usize, 0), sqlite_stub.queries);
+}
+
+/// A transaction handle over a stub driver, counting the three calls a
+/// migration entry point must *not* make when it is handed a caller's
+/// transaction.
+///
+/// The statics are the point: a `Tx` is three function pointers plus an opaque
+/// pointer, so a hand-built one records what a real driver's would, without a
+/// connection.
+const TxProbe = struct {
+    var commits: usize = 0;
+    var rollbacks: usize = 0;
+    var deinits: usize = 0;
+
+    fn reset() void {
+        commits = 0;
+        rollbacks = 0;
+        deinits = 0;
+    }
+
+    fn commitFn(_: *anyopaque) sql_driver.Error!void {
+        commits += 1;
+    }
+
+    fn rollbackFn(_: *anyopaque) sql_driver.Error!void {
+        rollbacks += 1;
+    }
+
+    fn deinitFn(_: *anyopaque) void {
+        deinits += 1;
+    }
+};
+
+test "every migration entry point refuses a missing extension before its first statement" {
+    // The claim is stronger than "an error came back": `exec` returns
+    // `error.ExecFailed` on this stub, so a run that had reached any DDL would
+    // fail with that instead — and `exec_calls` pins it a second time. The
+    // entry points are checked one by one because each is a separate place the
+    // check has to be wired, and only `migrateSchemaWithOptions` is exercised by
+    // the PG integration case.
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const Doc = schema("ExtEntryDoc", .{ .fields = &.{ field.Int("id"), field.Vector("embedding", 3) } });
+    const infos = comptime buildGraph(&.{Doc}).types;
+
+    // `createAllTables` — the legacy entry point, before its MySQL server probe
+    // and before `createTables`' first statement.
+    var for_create = ExtensionStub{ .installed = &.{"plpgsql"} };
+    try std.testing.expectError(
+        error.MissingPostgresExtension,
+        createAllTables(std.testing.allocator, for_create.asDriver(), infos),
+    );
+    try std.testing.expectEqual(@as(usize, 0), for_create.exec_calls);
+    try std.testing.expectEqual(@as(usize, 1), for_create.queries);
+    try std.testing.expectEqual(@as(usize, 0), for_create.unmatched);
+
+    // `migrateSchemaWithOptions` — after the migration lock, before the history
+    // table (which is DDL too, and is why a refused run leaves no trace at all).
+    // Locking is off so the stub is not asked for a `pg_try_advisory_lock` it
+    // has no answer to; that statement is not DDL either way.
+    var for_migrate = ExtensionStub{ .installed = &.{"plpgsql"} };
+    try std.testing.expectError(
+        error.MissingPostgresExtension,
+        migrateSchemaWithOptions(std.testing.allocator, for_migrate.asDriver(), infos, .{ .lock_timeout_ms = 0 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), for_migrate.exec_calls);
+    try std.testing.expectEqual(@as(usize, 1), for_migrate.queries);
+    try std.testing.expectEqual(@as(usize, 0), for_migrate.unmatched);
+
+    // `migrateSchemaInTx` — and the caller's transaction is untouched: the
+    // refused call neither commits, rolls back nor deinitialises it, which is
+    // the boundary the entry point exists to hand back.
+    TxProbe.reset();
+    var for_tx = ExtensionStub{ .installed = &.{"plpgsql"} };
+    const tx = sql_driver.Tx{
+        .inner = for_tx.asDriver(),
+        .commitFn = TxProbe.commitFn,
+        .rollbackFn = TxProbe.rollbackFn,
+        .deinitFn = TxProbe.deinitFn,
+        .ptr = @ptrCast(&for_tx),
+    };
+    try std.testing.expectError(
+        error.MissingPostgresExtension,
+        migrateSchemaInTx(std.testing.allocator, tx, infos, .{ .lock_timeout_ms = 0 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), for_tx.exec_calls);
+    try std.testing.expectEqual(@as(usize, 1), for_tx.queries);
+    try std.testing.expectEqual(@as(usize, 0), for_tx.unmatched);
+    try std.testing.expectEqual(@as(usize, 0), TxProbe.commits);
+    try std.testing.expectEqual(@as(usize, 0), TxProbe.rollbacks);
+    try std.testing.expectEqual(@as(usize, 0), TxProbe.deinits);
+}
+
+// ------------------------------------------------------------------
+// Column-level type degradation: warning where the index path already did
+// ------------------------------------------------------------------
+
+test "declaredTypeRewrite answers only for a declaration this dialect cannot emit" {
+    const vector = ColumnDef{
+        .name = "embedding",
+        .sql_type = "TEXT",
+        .logical_type = .vector,
+        .vector_sql = field_mod.vectorSQL(3),
+    };
+    // PostgreSQL gets the declared type, so nothing is rewritten there.
+    try std.testing.expect(declaredTypeRewrite(vector, Dialect.postgres) == null);
+    const on_sqlite = declaredTypeRewrite(vector, Dialect.sqlite).?;
+    try std.testing.expectEqualStrings("vector(3)", on_sqlite.declared);
+    try std.testing.expectEqualStrings("TEXT", on_sqlite.emitted);
+    const on_mysql = declaredTypeRewrite(vector, Dialect.mysql).?;
+    try std.testing.expectEqualStrings("vector(3)", on_mysql.declared);
+    try std.testing.expectEqualStrings("TEXT", on_mysql.emitted);
+
+    // `.SqlType(s)` / `field.Other(name, s)`: emitted verbatim on PostgreSQL,
+    // dropped for the field kind's mapping everywhere else — so it is a
+    // rewrite on two dialects and none on the third.
+    const override = ColumnDef{
+        .name = "handle",
+        .sql_type = "TEXT",
+        .logical_type = .text,
+        .sql_type_override = "citext",
+    };
+    try std.testing.expect(declaredTypeRewrite(override, Dialect.postgres) == null);
+    try std.testing.expectEqualStrings("citext", declaredTypeRewrite(override, Dialect.mysql).?.declared);
+    try std.testing.expectEqualStrings("citext", declaredTypeRewrite(override, Dialect.sqlite).?.declared);
+
+    // A kind mapping is *not* a rewrite: `field.String` is TEXT on
+    // PostgreSQL/SQLite and VARCHAR(255) on MySQL, `field.Json` is JSONB or
+    // TEXT — the schema declared a kind and the dialect rendered it. Warning
+    // here would warn on every schema.
+    const plain = ColumnDef{ .name = "name", .sql_type = "TEXT", .logical_type = .string };
+    try std.testing.expect(declaredTypeRewrite(plain, Dialect.postgres) == null);
+    try std.testing.expect(declaredTypeRewrite(plain, Dialect.mysql) == null);
+    try std.testing.expect(declaredTypeRewrite(plain, Dialect.sqlite) == null);
+    const json_col = ColumnDef{ .name = "doc", .sql_type = "TEXT", .logical_type = .json };
+    try std.testing.expect(declaredTypeRewrite(json_col, Dialect.postgres) == null);
+    try std.testing.expect(declaredTypeRewrite(json_col, Dialect.sqlite) == null);
+    const bytes = ColumnDef{ .name = "payload", .sql_type = "BLOB", .logical_type = .bytes };
+    try std.testing.expect(declaredTypeRewrite(bytes, Dialect.postgres) == null);
+    // A hand-built descriptor with neither an override nor a vector kind has
+    // nothing declared *as a type*, so there is nothing to report either.
+    const synthetic = ColumnDef{ .name = "id", .sql_type = "INTEGER", .logical_type = .int };
+    try std.testing.expect(declaredTypeRewrite(synthetic, Dialect.sqlite) == null);
+
+    // A `field.Vector` whose dimension was not declared is still a declared
+    // vector type: `field.sqlType`'s `.vector` arm spells it `TEXT`, and the
+    // warning should say `vector` rather than stay silent about it.
+    const dimless = ColumnDef{ .name = "v", .sql_type = "TEXT", .logical_type = .vector };
+    try std.testing.expectEqualStrings("vector", declaredTypeRewrite(dimless, Dialect.sqlite).?.declared);
+
+    // A declaration that *is* what gets emitted stays silent even when the kind
+    // could not have been: a hand-built `sql_type` equal to the override.
+    const equal = ColumnDef{ .name = "x", .sql_type = "citext", .sql_type_override = "citext" };
+    try std.testing.expect(declaredTypeRewrite(equal, Dialect.sqlite) == null);
+}
+
+test "warnDegradedColumnTypes names table, column and both types, once per column" {
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const Doc = schema("ZentDegradedDoc", .{
+        .fields = &.{
+            field.Int("id"),
+            field.Vector("embedding", 1536),
+            field.Text("handle").SqlType("citext"),
+            // The control: a plain string is a mapping, not a degradation, and
+            // must not be reported beside the two that are.
+            field.String("title"),
+        },
+    });
+    const graph = comptime buildGraph(&.{Doc});
+    const table = comptime tableFromTypeInfo(graph.types[0]);
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    // MySQL: two declared types it has no column type for.
+    warnDegradedColumnTypes(table, Dialect.mysql);
+    try std.testing.expectEqual(@as(usize, 2), WarnCapture.occurrences(" declares the "));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences(
+        "zent_degraded_doc.embedding declares the vector(1536) type, which MySQL has no column type for, so the column is emitted as TEXT",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences(
+        "zent_degraded_doc.handle declares the citext type, which MySQL has no column type for, so the column is emitted as TEXT",
+    ));
+    // The consequence is stated, not just the difference.
+    try std.testing.expectEqual(@as(usize, 2), WarnCapture.occurrences("stored and read as text"));
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("zent_degraded_doc.title"));
+
+    // SQLite: the same two, spelled with the dialect it is — and each line
+    // still names its own column, so the two are told apart rather than
+    // counted together.
+    WarnCapture.reset();
+    warnDegradedColumnTypes(table, Dialect.sqlite);
+    try std.testing.expectEqual(@as(usize, 2), WarnCapture.occurrences(" declares the "));
+    try std.testing.expectEqual(@as(usize, 2), WarnCapture.occurrences("which SQLite has no column type for"));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences(
+        "zent_degraded_doc.embedding declares the vector(1536) type, which SQLite has no column type for, so the column is emitted as TEXT",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences(
+        "zent_degraded_doc.handle declares the citext type, which SQLite has no column type for, so the column is emitted as TEXT",
+    ));
+
+    // PostgreSQL: the declared types are what it creates, so it says nothing.
+    WarnCapture.reset();
+    warnDegradedColumnTypes(table, Dialect.postgres);
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences(" declares the "));
+}
+
+test "migrateSchema warns once per degraded column, vector and .SqlType override alike (SQLite)" {
+    // The wiring, end to end: the warn is emitted by the migration entry point
+    // once per table (structurally, like `warnOutOfGraphEdgeRefs`), even though
+    // the planner rebuilds the table definition in both of its steps — and the
+    // DDL that results really is the type the line describes, for both shapes a
+    // declaration can take: `field.Vector`'s kind and a `.SqlType(…)` override.
+    const allocator = std.testing.allocator;
+    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const Doc = schema("ZentVectorDoc", .{
+        .fields = &.{
+            field.Int("id"),
+            field.Vector("embedding", 3),
+            field.Text("handle").SqlType("citext"),
+            field.String("title"),
+        },
+    });
+    const graph = comptime buildGraph(&.{Doc});
+    const infos = graph.types;
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences(
+        "zent_vector_doc.embedding declares the vector(3) type, which SQLite has no column type for, so the column is emitted as TEXT",
+    ));
+    // The override is rewritten on this dialect too — `citext` becomes the
+    // kind's `TEXT` — and that rewrite is reported the same way, which is the
+    // half `columnSQLType` documents as "PostgreSQL only".
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences(
+        "zent_vector_doc.handle declares the citext type, which SQLite has no column type for, so the column is emitted as TEXT",
+    ));
+    // Exactly the two: the plain string column beside them is a kind mapping,
+    // not a degradation, and the migration's other warnings have nothing to say.
+    try std.testing.expectEqual(@as(usize, 2), WarnCapture.occurrences(" declares the "));
+
+    // What the warnings claim is what the table got — `citext` is *not* the
+    // column's type here, and would not have been even before this warning
+    // existed.
+    var meta = try drv.query(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'zent_vector_doc'",
+        &.{},
+    );
+    defer meta.deinit();
+    const row = meta.next() orelse return error.NoTableRow;
+    const ddl = row.getText(0).?;
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "\"embedding\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "\"handle\" TEXT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "citext") == null);
+
+    // Re-running is a no-op for the schema and still exactly two lines — the
+    // dedup is per migration run, not tracked state that could drift.
+    WarnCapture.reset();
+    try migrateSchema(allocator, drv.asDriver(), infos);
+    try std.testing.expectEqual(@as(usize, 2), WarnCapture.occurrences(" declares the "));
 }

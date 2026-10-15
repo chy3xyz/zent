@@ -16,6 +16,7 @@ const privacy = @import("../privacy/policy.zig");
 const EntityGen = @import("entity.zig").Entity;
 const deinitEntity = @import("entity.zig").deinitEntity;
 const deinitEntityList = @import("entity.zig").deinitEntityList;
+const entityOwnedCopy = @import("entity.zig").ownedCopy;
 const CreateGen = @import("create.zig").CreateBuilder;
 const BulkInsertGen = @import("create.zig").BulkInsertBuilder;
 const QueryGen = @import("query.zig").QueryBuilder;
@@ -250,7 +251,8 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
 
         /// Free one entity a client did **not** allocate, with the allocator
         /// that did — the release for rows that carry their own allocator, such
-        /// as `CrudService.getOwned(allocator, …)`.
+        /// as `CrudService.getOwned(allocator, …)` and `ownedCopy(allocator, …)`
+        /// below.
         ///
         /// The allocator is a parameter here precisely because it is not this
         /// client's: `deinitRow` would free the same struct with a different
@@ -261,6 +263,33 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
         pub fn deinitRowWith(self: Self, allocator: std.mem.Allocator, entity: *Entity) void {
             _ = self;
             deinitEntity(infos, info, entity, allocator);
+        }
+
+        /// Copy a row into `allocator`, so it outlives the query and the page
+        /// it came from: every string/slice field is duplicated there, the JSON
+        /// payloads are re-homed into the copy's own arena, and eager-loaded
+        /// edges are left empty. The result is an ordinary owned row, released
+        /// by `deinitRowWith(allocator, &copy)` (or `deinitRow(&copy)` when
+        /// `allocator` is this client's own).
+        ///
+        /// This is the one call that replaces the hand-written per-field `dupe`
+        /// loop a call site keeping a row (a response body, a cache entry, a
+        /// job payload) used to spell out. `dupeEntityTo` is the other contract:
+        /// it copies into an arena and the result must *not* be handed to
+        /// `deinitEntity`.
+        ///
+        /// ```zig
+        /// var row = (try client.user.Query().First()) orelse return error.NotFound;
+        /// defer client.user.deinitRow(&row);
+        /// var kept = try client.user.ownedCopy(allocator, &row);
+        /// defer client.user.deinitRowWith(allocator, &kept);
+        /// ```
+        ///
+        /// Errors: `error.OutOfMemory` only, and on a failure nothing is
+        /// transferred — the caller owns only the error.
+        pub fn ownedCopy(self: Self, allocator: std.mem.Allocator, row: *const Entity) std.mem.Allocator.Error!Entity {
+            _ = self;
+            return entityOwnedCopy(infos, info, allocator, row.*);
         }
 
         /// Free every entity in a page this client produced (`Query().All()`),
@@ -670,7 +699,7 @@ pub fn beginTxFromDriverCtx(comptime infos: []const TypeInfo, driver: sql_driver
     };
 }
 
-const CreateTablesError = sql_driver.Error || migrate.MySqlTextError || migrate.IndexDeclError || error{MissingViewSQL};
+const CreateTablesError = sql_driver.Error || migrate.MySqlTextError || migrate.PostgresExtensionError || migrate.IndexDeclError || error{MissingViewSQL};
 
 /// Create all database tables (create-only migration).
 /// Creates entity tables and junction tables for M2M edges.
@@ -1779,6 +1808,61 @@ test "deinitRow / deinitRows / deinitEdgeRows free a page in one call" {
         client.dr_user.deinitEdgeRows("cars", &rows);
         try std.testing.expectEqual(@as(usize, 0), rows.items.len);
     }
+}
+
+test "client ownedCopy hands back a row the caller's allocator owns" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+    const sqlite_driver = @import("../sql/sqlite.zig");
+
+    const Settings = struct { theme: []const u8 };
+    const Kept = Schema("OwnedCopyKept", .{
+        .fields = &.{ field.String("name"), field.String("note").Optional(), field.JSON("settings", Settings) },
+    });
+    const graph = comptime buildGraph(&.{Kept});
+    const infos = graph.types;
+    const KeptEntity = EntityGen(infos, infos[0]);
+
+    var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
+    defer driver.close();
+    try migrate.migrateSchema(allocator, driver.asDriver(), infos);
+    const client = makeClient(infos, allocator, driver.asDriver());
+
+    {
+        var b = try client.owned_copy_kept.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "kept-alpha");
+        _ = try b.setFieldValue("note", "note-bravo");
+        _ = try b.setFieldValue("settings", Settings{ .theme = "dark" });
+        var row = try b.Save();
+        defer client.owned_copy_kept.deinitRow(&row);
+    }
+
+    // One call, no graph and no per-field `dupe` loop: the copy carries its own
+    // strings and its own JSON arena, so the scanned row can be released first.
+    var kept: KeptEntity = undefined;
+    {
+        var q = client.owned_copy_kept.Query();
+        defer q.deinit();
+        var row = (try q.First()) orelse return error.TestUnexpectedResult;
+        defer client.owned_copy_kept.deinitRow(&row);
+        kept = try client.owned_copy_kept.ownedCopy(allocator, &row);
+        try std.testing.expectEqualStrings("kept-alpha", kept.name);
+        try std.testing.expectEqualStrings("note-bravo", kept.note.?);
+        try std.testing.expectEqualStrings("dark", kept.settings.theme);
+        try std.testing.expect(kept.name.ptr != row.name.ptr);
+        try std.testing.expect(kept.settings.theme.ptr != row.settings.theme.ptr);
+    }
+    // The row and its arena are gone above; the copy still reads. `deinitRowWith`
+    // is the matching release (freeing it with `deinitRow` would use the wrong
+    // allocator), and `std.testing.allocator` fails the run on a leak or a
+    // double free.
+    defer client.owned_copy_kept.deinitRowWith(allocator, &kept);
+    try std.testing.expectEqualStrings("kept-alpha", kept.name);
+    try std.testing.expectEqualStrings("note-bravo", kept.note.?);
+    try std.testing.expectEqualStrings("dark", kept.settings.theme);
 }
 
 test "client AllOwned owns rows and list; deinit twice is a no-op" {

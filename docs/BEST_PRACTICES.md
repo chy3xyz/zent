@@ -1366,7 +1366,25 @@ blocking a deploy over).
 
 `field.JSON`/`JSONValue` (→ `JSONB`), `field.UUID` (→ `UUID`), `field.Decimal`
 (→ `NUMERIC`) and `field.Bytes` (→ `BYTEA`) map to native PostgreSQL types out
-of the box. Three things are worth knowing before you reach for the rest.
+of the box. Four things are worth knowing before you reach for the rest.
+
+**`field.JSON` is `jsonb`, so the stored bytes are not the bytes you wrote.**
+The server parses the serialized text and stores its own form: whitespace
+disappears (`{"k":1}` reads back as `{"k": 1}`), numbers are canonicalized,
+duplicate keys are dropped, and **key order is not preserved**. Never match on
+that text — no `LIKE '%"k":1%'` / `strstr` substring scans, no whole-text `=`
+comparison, no hash over the raw string, no length check. Use `jsonb`
+operators instead. The trap is dialect skew: SQLite and MySQL map the field to
+`TEXT` and keep the exact bytes, so a substring scan works in a local/in-memory
+test and fails against production PostgreSQL. And if what you need is the
+exact text, do not reach for `json` by accident — declare the escape hatch
+explicitly: `field.Text("payload").SqlType("json")` keeps the input verbatim on
+PostgreSQL (no GIN index, no key dedup, textual comparison), or `field.Bytes`
+holds raw bytes. Otherwise keep `jsonb`: it is indexable (GIN), deduplicates
+keys, and parses once at write time. Ownership: the parsed document hangs off
+the entity's `json_arena` and is released by `deinitEntity`/`deinitRows`, like
+any other owning field — and for `JSONValue` a shallow copy (e.g.
+`dupeEntityTo`) keeps its strings in the source's arena.
 
 **`field.Bytes` is a byte column, not a text column.** The write path sends it
 as a *binary* parameter and the read path decodes the server's representation,
@@ -1505,21 +1523,37 @@ try tx.commit();
 ## 8a. Multi-graph strategy
 
 zent assumes one graph spans all tables of an application; edges resolve
-across it at comptime. When the schema grows beyond ~80 tables and comptime
-evaluation becomes a bottleneck, you have two options:
+across it at comptime. **You do not need to split the graph for quota
+reasons.** Since v0.83.0 every hot path carries its own comptime budget —
+`buildGraph` and its `addEdgeFields`/`buildIncomingTable` subtrees,
+`codegen/entity.zig`'s `@Struct` constructors, the `Client`/`EntityClient`
+entry points, `predicate.zig`'s `lowerHasEdge`, `graph.zig`'s
+`buildEdgeStep`/`fieldColumns`/`getEdgeFKColumn`, the migrate
+`tableFromTypeInfo*` pair and `core/schema.zig`'s mixin merges — so a
+mid-sized schema no longer hits a random "quota exceeded" in an unbudgeted
+subtree. The "Graph stress" tests pin a single `buildGraph` at 400 minimal
+tables, 400 realistic 8-field tables with an index each, and 300 hub-and-spoke
+tables with one edge each, and a 300-entity graph is instantiated through
+`Client` + `Entity` + predicates (UPGRADING §7a).
 
-**Option A: Raise quotas (recommended)**
-- `@setEvalBranchQuota` is already set to 1M in `src/codegen/graph.zig` and
-  `src/codegen/predicate.zig`.
-- If compilation still fails, raise the quota locally and report the measured
-  limit so we can tune the default.
+Each budget is a **large fixed value, not infinity** — 1M branches on the
+codegen entry paths, 10M on the two O(n²) graph subtrees named above, and
+smaller pins (50k for the migrate table builders, 10k for the mixin merges)
+where the work is bounded. A schema large enough to exhaust one is possible in
+principle; if that happens, the fix is to raise the quota inside the function
+that holds it and report the measured limit — **not** to split the graph. The
+`src/core/schema.zig` mixin-merge comment shows the same "a comptime subtree
+must not inherit the caller's budget" wrapping applied one level up.
 
-**Option B: Split graphs (not yet first-class)**
-- Consumer apps (zapi, ~114 tables) have split into three graphs.
-- **Limitation:** cross-graph edges do not resolve; `Client` types are not
-  interchangeable; transactions across graphs need Driver-first APIs (Z9).
-- If you must split, keep each graph self-contained and use raw `Driver`
-  calls for cross-graph queries.
+**If you still split, say why — and quota is no longer one of the reasons.**
+Splitting remains the right call when the pieces belong to different
+databases/services, when compilation time is genuinely the bottleneck, or when
+memory at comptime is the constraint. The cost is unchanged and real:
+cross-graph edges do not resolve, `Client` types are not interchangeable, and
+transactions across graphs need Driver-first APIs (Z9). Keep each graph
+self-contained and use raw `Driver` calls to cross graphs. The zapi app
+(~114 tables, ~20 ms/entity ⇒ ~2.5 s comptime) split under the older guidance;
+at that size a single graph compiles fine, and merging back is the cheaper fix.
 
 **Driver-first transactions (Z9, v0.31.0):** when several graphs share one
 `pool.asDriver()`, open a typed transaction for any graph without building

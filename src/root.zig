@@ -56,6 +56,10 @@ pub const codegen = struct {
     pub const ManagedEntity = @import("codegen/entity.zig").ManagedEntity;
     pub const managedEntity = @import("codegen/entity.zig").managedEntity;
     pub const dupeEntityTo = @import("codegen/entity.zig").dupeEntityTo;
+    /// The `deinitEntity`-compatible copy of a scanned row: strings and slices
+    /// re-homed to `allocator`, JSON to the copy's own arena. The generated
+    /// `client.<entity>.ownedCopy(allocator, &row)` wraps it.
+    pub const ownedCopy = @import("codegen/entity.zig").ownedCopy;
     pub const toMaskedJson = @import("codegen/entity.zig").toMaskedJson;
     pub const meta = @import("codegen/meta.zig").Meta;
     pub const predicate = @import("codegen/predicate.zig");

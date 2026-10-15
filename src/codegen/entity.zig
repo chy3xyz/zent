@@ -594,8 +594,8 @@ pub fn dupeEntityTo(
 /// later `deinitEntity(infos, info, &copy, allocator)` frees the strings with
 /// the allocator and the JSON with the copy's own arena.
 ///
-/// `crud.ownedCopy` needs exactly that: it starts from a shallow struct copy
-/// whose JSON fields still point into the scanned source row's arena, which
+/// `ownedCopy` needs exactly that: it starts from a shallow struct copy whose
+/// JSON fields still point into the scanned source row's arena, which
 /// `CrudService.getOwned` releases before it returns.
 ///
 /// A no-op (`null`) when the entity has no `json_arena` member, or when that
@@ -622,6 +622,112 @@ pub fn dupeJsonInto(
         return arena;
     }
     return null;
+}
+
+/// The value an owning field holds once it has been cleared: an empty slice, or
+/// `null` for an optional one. `deinitEntity` releases both as a no-op, which
+/// is what lets a half-built copy be handed to it.
+fn emptyOwnedValue(comptime T: type) T {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| if (p.attrs.@"const") &[_]p.child{} else @constCast(&[_]p.child{}),
+        .optional => null,
+        else => @compileError("zent: emptyOwnedValue expects an owning slice or an optional slice, got " ++ @typeName(T)),
+    };
+}
+
+/// Duplicate one owning field into `allocator` — the inverse of `FreeField`, so
+/// the result is releasable by `deinitEntity(infos, info, &copy, allocator)`.
+/// The buffer and every owning element inside it are allocated with `allocator`
+/// and duplicated recursively; a value that owns nothing is returned as-is.
+///
+/// `dupeDeep` cannot be reused here: it assumes an arena that is freed as a
+/// unit, and leaks what it already made when a later allocation fails, while
+/// this copy is released field by field through a plain allocator's `free`.
+fn dupeOwned(comptime T: type, value: T, allocator: std.mem.Allocator) std.mem.Allocator.Error!T {
+    switch (@typeInfo(T)) {
+        .pointer => |p| {
+            if (p.size != .slice) return value;
+            const copy = try allocator.alloc(p.child, value.len);
+            // Only the elements already written can own anything, so the
+            // teardown walks that prefix, releasing each one exactly the way
+            // `deinitEntity` later would (a partially duplicated element is
+            // cleaned by its own frame before the error reaches here).
+            var filled: usize = 0;
+            errdefer {
+                for (copy[0..filled]) |*item| FreeField(p.child, item, allocator);
+                allocator.free(copy);
+            }
+            for (value, 0..) |item, i| {
+                copy[i] = try dupeOwned(p.child, item, allocator);
+                filled += 1;
+            }
+            return copy;
+        },
+        .optional => |opt| {
+            if (value) |inner| return @as(T, try dupeOwned(opt.child, inner, allocator));
+            return null;
+        },
+        else => return value,
+    }
+}
+
+/// Owned copy of a row: every owning field is duplicated into `allocator`, the
+/// JSON payloads are re-duped into the copy's own `json_arena`, and what comes
+/// back is releasable with `deinitEntity(infos, info, &copy, allocator)` — on a
+/// generated client, `client.<entity>.deinitRowWith(allocator, &copy)`.
+///
+/// That is the whole difference from `dupeEntityTo`: the arena form hands back
+/// a value that must *not* be passed to `deinitEntity`, so a call site keeping
+/// a row past its query (a response body, a cache entry, a job payload) had to
+/// spell out the per-field `dupe` loop to get this contract.
+///
+/// Eager-loaded edges (`WithEdge`) are **not** carried over: the copy's `edges`
+/// is left empty. A shallow edge array would be freed twice — once through the
+/// copy, once through the source — and no deinit-compatible deep copy of an
+/// edge page exists here, so copy the graph with the arena form
+/// (`dupeEntityTo`) while the source is still alive if you need its edges.
+///
+/// `error.OutOfMemory` is the only error, and on it nothing is leaked and
+/// nothing is transferred: what has been copied by then is released before the
+/// error is returned, so the caller owns only the error.
+pub fn ownedCopy(
+    comptime infos: []const TypeInfo,
+    comptime info: TypeInfo,
+    allocator: std.mem.Allocator,
+    src: anytype,
+) std.mem.Allocator.Error!@TypeOf(src) {
+    const T = @TypeOf(src);
+    var out = src;
+
+    // JSON first, while `out` is still a plain shallow copy: `dupeJsonInto` is
+    // the step that replaces the source's arena with the copy's own, and it
+    // cleans up after itself. It must therefore run *outside* the errdefer
+    // below, which would otherwise mistake the source's arena for one this copy
+    // owns and free it.
+    _ = try dupeJsonInto(info, &out, allocator);
+
+    // Everything else `out` points at is still the source's. Clearing it first
+    // leaves the copy owning nothing but the arena above, so the failure path
+    // can be the single `deinitEntity` below instead of a ledger of the
+    // allocations made so far: `deinitEntity` frees a cleared field as a no-op.
+    if (comptime @hasField(T, "edges")) out.edges = .{};
+    inline for (info.fields) |f| {
+        // `.json` payloads are arena-owned and were re-homed above —
+        // `deinitEntity` releases them through the arena, never here.
+        if (f.field_type == .json) continue;
+        const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
+        if (comptime isOwningField(FieldType)) @field(out, f.name) = emptyOwnedValue(FieldType);
+    }
+
+    errdefer deinitEntity(infos, info, &out, allocator);
+
+    inline for (info.fields) |f| {
+        if (f.field_type == .json) continue;
+        const FieldType = if (f.optional) ?f.zig_type else f.zig_type;
+        if (comptime !isOwningField(FieldType)) continue;
+        @field(out, f.name) = try dupeOwned(FieldType, @field(src, f.name), allocator);
+    }
+    return out;
 }
 
 // ------------------------------------------------------------------
@@ -786,6 +892,179 @@ test "dupeEntityTo re-homes a JSONValue document out of the source arena" {
     try std.testing.expectEqualStrings("alpha", items2.items[0].string);
     try std.testing.expectEqualStrings("日本語", items2.items[1].string);
     // `copy` must NOT be deinitEntity'd — the arena owns it.
+}
+
+test "ownedCopy round-trips a row and survives the source's release" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Settings = struct { theme: []const u8 };
+    const Note = Schema("OwnedCopyNote", .{
+        .fields = &.{
+            field.String("title"),
+            field.String("body").Optional(),
+            field.JSON("settings", Settings),
+            field.JSONValue("doc"),
+        },
+    });
+    const graph = comptime buildGraph(&.{Note});
+    const infos = graph.types;
+    const info = infos[0];
+    const NoteEntity = Entity(infos, info);
+
+    // A real row's storage: strings in the allocator, JSON payloads in the
+    // row's own arena (which `CrudService.getOwned` releases before it returns
+    // the copy).
+    const src_arena = try allocator.create(std.heap.ArenaAllocator);
+    src_arena.* = std.heap.ArenaAllocator.init(allocator);
+    var src = NoteEntity{
+        .id = 7,
+        .title = try allocator.dupe(u8, "title-alpha"),
+        .body = try allocator.dupe(u8, "body-bravo"),
+        .settings = .{ .theme = try src_arena.allocator().dupe(u8, "dark") },
+        .doc = try std.json.parseFromSliceLeaky(std.json.Value, src_arena.allocator(), "{\"items\":[\"alpha\"]}", .{}),
+        .json_arena = src_arena,
+    };
+
+    var copy = try ownedCopy(infos, info, allocator, src);
+    try std.testing.expectEqualStrings("title-alpha", copy.title);
+    try std.testing.expectEqualStrings("body-bravo", copy.body.?);
+    try std.testing.expectEqualStrings("dark", copy.settings.theme);
+    try std.testing.expectEqualStrings("alpha", copy.doc.object.get("items").?.array.items[0].string);
+    // Contents equal, storage independent — including the JSON, which the copy
+    // holds in its own arena rather than in the source's.
+    try std.testing.expect(copy.title.ptr != src.title.ptr);
+    try std.testing.expect(copy.settings.theme.ptr != src.settings.theme.ptr);
+    try std.testing.expect(copy.json_arena != null);
+    try std.testing.expect(copy.json_arena.? != src.json_arena.?);
+
+    // Scuffing the source's own buffers must not show through the copy.
+    @memset(@constCast(src.title), 'X');
+    @memset(@constCast(src.body.?), 'B');
+    @memset(@constCast(src.settings.theme), 'Y');
+    @memset(@constCast(src.doc.object.get("items").?.array.items[0].string), 'Z');
+    try std.testing.expectEqualStrings("title-alpha", copy.title);
+    try std.testing.expectEqualStrings("body-bravo", copy.body.?);
+    try std.testing.expectEqualStrings("dark", copy.settings.theme);
+    try std.testing.expectEqualStrings("alpha", copy.doc.object.get("items").?.array.items[0].string);
+
+    // Release the source first, then read the copy: a JSON field left shallow
+    // would be a dangling read here.
+    deinitEntity(infos, info, &src, allocator);
+    try std.testing.expectEqualStrings("title-alpha", copy.title);
+    try std.testing.expectEqualStrings("dark", copy.settings.theme);
+    try std.testing.expectEqualStrings("alpha", copy.doc.object.get("items").?.array.items[0].string);
+
+    // One call frees both halves of the copy — strings with the allocator, JSON
+    // with the copy's own arena. `std.testing.allocator` fails the run on a leak
+    // or a double free.
+    deinitEntity(infos, info, &copy, allocator);
+}
+
+test "ownedCopy drops eager-loaded edges instead of aliasing them" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const edge = @import("../core/edge.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("graph.zig").buildGraph;
+
+    const Post = Schema("OwnedCopyPost", .{ .fields = &.{field.String("title")} });
+    const Blog = Schema("OwnedCopyBlog", .{
+        .fields = &.{field.String("name")},
+        .edges = &.{edge.To("posts", Post)},
+    });
+    const graph = comptime buildGraph(&.{ Blog, Post });
+    const infos = graph.types;
+    const blog_info = infos[0];
+    const post_info = infos[1];
+    const BlogEntity = Entity(infos, blog_info);
+    const PostLight = LightEntity(infos, post_info);
+
+    const posts = try allocator.alloc(PostLight, 1);
+    // The o2m FK column the graph injects into the target, named off the
+    // source entity.
+    posts[0] = .{ .id = 7, .owned_copy_blog_id = 1, .title = try allocator.dupe(u8, "hello"), .json_arena = null, .edges = .{} };
+    var src = BlogEntity{
+        .id = 1,
+        .name = try allocator.dupe(u8, "tech"),
+        .edges = .{ .posts = posts },
+    };
+
+    var copy = try ownedCopy(infos, blog_info, allocator, src);
+    try std.testing.expectEqualStrings("tech", copy.name);
+    try std.testing.expect(copy.name.ptr != src.name.ptr);
+    // A shallow edge array would be freed twice — once through the copy's
+    // `deinitEntity`, once through the source's — so the copy carries none.
+    try std.testing.expect(copy.edges.posts == null);
+
+    // Both rows release cleanly, in either order.
+    deinitEntity(infos, blog_info, &src, allocator);
+    deinitEntity(infos, blog_info, &copy, allocator);
+}
+
+test "ownedCopy re-homes a slice field that is not a string" {
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Embedding = Schema("OwnedCopyEmbedding", .{
+        .fields = &.{ field.String("name"), field.Vector("vec", 3) },
+    });
+    const info = comptime fromSchema(Embedding);
+    const infos = &[_]TypeInfo{info};
+    const EmbeddingEntity = Entity(infos, info);
+
+    var src = EmbeddingEntity{
+        .id = 1,
+        .name = try allocator.dupe(u8, "e1"),
+        .vec = try allocator.dupe(f32, &[_]f32{ 1.5, 2.5, 3.5 }),
+    };
+
+    var copy = try ownedCopy(infos, info, allocator, src);
+    try std.testing.expectEqualSlices(f32, &.{ 1.5, 2.5, 3.5 }, copy.vec);
+    try std.testing.expect(copy.vec.ptr != src.vec.ptr);
+
+    @memset(@constCast(src.vec), 9.0);
+    try std.testing.expectEqualSlices(f32, &.{ 1.5, 2.5, 3.5 }, copy.vec);
+
+    // `deinitEntity` frees the copy's buffer — the allocator's, not the
+    // source's — so the two teardowns do not collide.
+    deinitEntity(infos, info, &src, allocator);
+    deinitEntity(infos, info, &copy, allocator);
+}
+
+test "ownedCopy releases the strings it already duplicated when a later dupe fails" {
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+
+    const Row = Schema("OwnedCopyRow", .{ .fields = &.{
+        field.String("a"),
+        field.String("b"),
+        field.String("c"),
+        field.String("opt").Optional(),
+    } });
+    const info = comptime fromSchema(Row);
+    const infos = &[_]TypeInfo{info};
+    const RowEntity = Entity(infos, info);
+    // Every string field non-empty, and the optional present, so the copy is
+    // exactly four allocations and `fail_index = i` means "the first i dupes
+    // landed, the (i+1)-th failed".
+    const src = RowEntity{ .id = 7, .a = "alpha", .b = "bravo", .opt = "delta", .c = "charlie" };
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
+        try std.testing.expectError(error.OutOfMemory, ownedCopy(infos, info, failing.allocator(), src));
+        // i dupes succeeded and all i must have been released again: without
+        // the errdefer this is `deallocations == 0`, and the leaked slices are
+        // also reported by `std.testing.allocator` at test exit.
+        try std.testing.expectEqual(i, failing.allocations);
+        try std.testing.expectEqual(i, failing.deallocations);
+    }
 }
 
 test "toMaskedJson on JSON-field entity never emits json_arena" {

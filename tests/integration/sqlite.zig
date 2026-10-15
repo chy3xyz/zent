@@ -6090,3 +6090,96 @@ test "SQLite: the column type does not enforce VarChar(n), the write path does" 
     defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
     try testing.expectEqualStrings("short", saved.code);
 }
+
+/// Whether `name` is a table on this connection. `sqlite_master` is the only
+/// catalog that answers before any user table exists, which is exactly the
+/// question a rollback test asks.
+fn tableExists(drv: *SQLiteDriver, name: []const u8) !bool {
+    var rows = try drv.query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        &.{.{ .string = name }},
+    );
+    defer rows.deinit();
+    const found = rows.next() != null;
+    if (rows.nextError()) |err| return err;
+    return found;
+}
+
+test "SQLite: migrateSchemaInTx leaves the transaction boundary with the caller" {
+    // The reported shape: a caller that migrates several schema groups in a
+    // loop gets one transaction *per group* from `migrateSchema`, so group 1 is
+    // already durable when group 3 fails and the database holds a schema that
+    // matches none of the groups — with nothing afterwards to say which groups
+    // landed. `migrateSchemaInTx` reuses the caller's transaction instead, so
+    // several calls become one unit. This test is that unit: two calls, one
+    // rollback, nothing left; then two calls, one commit, both there.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const GroupOne = schema("TxGroupOne", .{
+        .fields = &.{ field.Int("id"), field.String("name") },
+    });
+    const GroupTwo = schema("TxGroupTwo", .{
+        .fields = &.{ field.Int("id"), field.String("label") },
+    });
+    const one = comptime buildGraph(&.{GroupOne});
+    const two = comptime buildGraph(&.{GroupTwo});
+
+    // Rollback path: the DDL is visible on this connection's transaction while
+    // it is open (same connection, so the same transaction sees it) ...
+    {
+        var tx = try drv.beginTx();
+        defer tx.deinit();
+        try migrate.migrateSchemaInTx(allocator, tx, one.types, .{});
+        try migrate.migrateSchemaInTx(allocator, tx, two.types, .{});
+        try testing.expect(try tableExists(&drv, "tx_group_one"));
+        try testing.expect(try tableExists(&drv, "tx_group_two"));
+        try tx.rollback();
+    }
+    // ... and gone when the caller rolls the whole unit back. The history table
+    // goes with it, because `migrateSchemaInTx` bootstraps it inside the
+    // transaction: a run that was undone leaves no trace that says otherwise.
+    try testing.expect(!try tableExists(&drv, "tx_group_one"));
+    try testing.expect(!try tableExists(&drv, "tx_group_two"));
+    try testing.expect(!try tableExists(&drv, "zent_schema_migrations"));
+
+    // Commit path: the same two calls, committed by the caller, both survive.
+    {
+        var tx = try drv.beginTx();
+        defer tx.deinit();
+        try migrate.migrateSchemaInTx(allocator, tx, one.types, .{});
+        try migrate.migrateSchemaInTx(allocator, tx, two.types, .{});
+        try tx.commit();
+    }
+    try testing.expect(try tableExists(&drv, "tx_group_one"));
+    try testing.expect(try tableExists(&drv, "tx_group_two"));
+
+    // The second call read the first call's history table — the same
+    // transaction — so both groups are recorded, which is what makes a re-run
+    // of either one a no-op.
+    const recorded = try migrationRowCount(&drv);
+    try testing.expect(recorded >= 2);
+
+    // And a third call in a *new* transaction sees both, so its plan is empty
+    // rather than re-issued: the count does not move.
+    {
+        var tx = try drv.beginTx();
+        defer tx.deinit();
+        try migrate.migrateSchemaInTx(allocator, tx, one.types, .{});
+        try migrate.migrateSchemaInTx(allocator, tx, two.types, .{});
+        try tx.commit();
+    }
+    try testing.expectEqual(recorded, try migrationRowCount(&drv));
+}
+
+/// How many versions `zent_schema_migrations` holds — the observation that says
+/// whether a migration recorded work or found it already done.
+fn migrationRowCount(drv: *SQLiteDriver) !i64 {
+    var rows = try drv.query("SELECT COUNT(*) FROM zent_schema_migrations", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    const count = row.getInt(0) orelse return error.NoRow;
+    if (rows.nextError()) |err| return err;
+    return count;
+}

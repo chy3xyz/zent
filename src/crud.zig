@@ -95,7 +95,7 @@ pub fn CrudService(
                 }
                 found.deinit();
             }
-            return if (found.items.len > 0) try ownedCopy(info, allocator, found.items[0]) else null;
+            return if (found.items.len > 0) try ownedCopy(infos, info, allocator, found.items[0]) else null;
         }
 
         /// Create from a scalar-field entity; publishes CrudEvent.created.
@@ -235,86 +235,10 @@ pub fn CrudService(
 }
 
 const zent_deinit = @import("codegen/entity.zig").deinitEntity;
-const dupeJsonInto = @import("codegen/entity.zig").dupeJsonInto;
-
-/// Owned copy of a scanned entity: struct fields are copied, string fields are
-/// duplicated into `allocator`, and JSON payloads are re-duped into a fresh
-/// arena (also created with `allocator`) attached as the copy's `json_arena`.
-/// Both halves then have the owner a later `deinitEntity(infos, info, &copy,
-/// allocator)` expects — strings freed with the allocator, JSON with the
-/// arena — so the source row can be released first (which is what `getOwned`
-/// does) without invalidating the copy.
-///
-/// On error nothing is leaked and nothing is transferred: the copies made
-/// before the failing one are freed before the error is returned, so the
-/// caller owns nothing but the error.
-fn ownedCopy(comptime info: graph_mod.TypeInfo, allocator: std.mem.Allocator, src: anytype) !@TypeOf(src) {
-    const T = @TypeOf(src);
-    var out: T = src;
-    const fields = @typeInfo(T).@"struct".field_names;
-    const types = @typeInfo(T).@"struct".field_types;
-    // One `dupe` per string field, so a failure part-way through leaves the
-    // earlier copies owned by nobody: the struct that would own them is never
-    // returned. Track them as they are made and release exactly that count
-    // (the same shape as `ShardedEnv.open`'s partial-open teardown).
-    var duped: [fields.len][]const u8 = undefined;
-    var n: usize = 0;
-    errdefer {
-        for (duped[0..n]) |s| allocator.free(s);
-    }
-    inline for (fields, types) |fname, ftype| {
-        if (ftype == []const u8) {
-            const copy = try allocator.dupe(u8, @field(src, fname));
-            duped[n] = copy;
-            n += 1;
-            @field(out, fname) = copy;
-        } else if (ftype == ?[]const u8) {
-            if (@field(src, fname)) |s| {
-                const copy = try allocator.dupe(u8, s);
-                duped[n] = copy;
-                n += 1;
-                @field(out, fname) = copy;
-            }
-        }
-    }
-    // The scan row's JSON arena is owned by `getOwned` and released there, so
-    // the copy's payload must be re-homed before it is returned — a shallow
-    // `out = src` leaves it pointing at memory about to be freed.
-    _ = try dupeJsonInto(info, &out, allocator);
-    return out;
-}
-
-test "ownedCopy releases the strings it already duplicated when a later dupe fails" {
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const entity_mod = @import("codegen/entity.zig");
-
-    const Row = Schema("OwnedCopyRow", .{ .fields = &.{
-        field.String("a"),
-        field.String("b"),
-        field.String("c"),
-        field.String("opt").Optional(),
-    } });
-    const info = comptime fromSchema(Row);
-    const infos = &[_]graph_mod.TypeInfo{info};
-    const RowEntity = entity_mod.Entity(infos, info);
-    // Every string field non-empty, and the optional present, so the copy is
-    // exactly four allocations and `fail_index = i` means "the first i dupes
-    // landed, the (i+1)-th failed".
-    const src = RowEntity{ .id = 7, .a = "alpha", .b = "bravo", .opt = "delta", .c = "charlie" };
-
-    var i: usize = 0;
-    while (i < 4) : (i += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = i });
-        try std.testing.expectError(error.OutOfMemory, ownedCopy(info, failing.allocator(), src));
-        // i dupes succeeded and all i must have been released again: without
-        // the errdefer this is `deallocations == 0`, and the leaked slices are
-        // also reported by `std.testing.allocator` at test exit.
-        try std.testing.expectEqual(i, failing.allocations);
-        try std.testing.expectEqual(i, failing.deallocations);
-    }
-}
+/// The owned copy `getOwned` hands back now lives with the entity module's
+/// other ownership helpers: `entity.ownedCopy` is the `deinitEntity`-compatible
+/// counterpart of `dupeEntityTo`, and this is the CRUD path into it.
+const ownedCopy = @import("codegen/entity.zig").ownedCopy;
 
 test "CrudService list/get/create/update/delete with events and tenant isolation" {
     const allocator = std.testing.allocator;

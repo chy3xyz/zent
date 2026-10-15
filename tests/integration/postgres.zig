@@ -5284,3 +5284,182 @@ test "Postgres: pgvector nearest-neighbour search through the fluent API" {
         try testing.expect(std.mem.indexOf(u8, explained.sql, "LIMIT 4") != null);
     }
 }
+
+/// The library's own diagnostics (`zent.runtime.log`), captured so a test can
+/// assert the line an error name cannot carry — the same sink `migrate.zig`'s
+/// own tests install, local here because the PG cases that assert a warning are
+/// in this file.
+const LogCapture = struct {
+    var buf: [2048]u8 = undefined;
+    var len: usize = 0;
+
+    fn sink(_: zent.runtime.log.Level, message: []const u8) void {
+        const n = @min(message.len, buf.len - len);
+        if (n == 0) return;
+        @memcpy(buf[len..][0..n], message[0..n]);
+        len += n;
+        if (len < buf.len) {
+            buf[len] = '\n';
+            len += 1;
+        }
+    }
+
+    fn reset() void {
+        len = 0;
+    }
+
+    fn occurrences(needle: []const u8) usize {
+        return std.mem.count(u8, buf[0..len], needle);
+    }
+};
+
+/// Whether a relation of this name exists in the current schema. Asked of
+/// `information_schema` rather than `to_regclass`, whose `regclass` answer is
+/// not a value the row readers convert.
+fn pgRelationExists(drv: *PostgresDriver, name: []const u8) !bool {
+    var rows = try drv.query(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = $1 AND table_schema = current_schema()",
+        &.{.{ .string = name }},
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    const count = row.getInt(0) orelse return error.NoRow;
+    if (rows.nextError()) |err| return err;
+    return count > 0;
+}
+
+/// How many versions `zent_schema_migrations` holds, or `-1` when the table is
+/// not there at all. The distinction matters: other tests in this file migrate
+/// against the same database, so the table usually exists and its *absence* is
+/// not something a run can be blamed for — but a run that wrote no row cannot
+/// hide behind that.
+fn migrationHistoryRows(drv: *PostgresDriver) !i64 {
+    if (!try pgRelationExists(drv, "zent_schema_migrations")) return -1;
+    var rows = try drv.query("SELECT count(*) FROM zent_schema_migrations", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    const count = row.getInt(0) orelse return error.NoRow;
+    if (rows.nextError()) |err| return err;
+    return count;
+}
+
+test "Postgres: a schema that needs a missing extension is refused before any DDL, and migrates once it is installed" {
+    // Without this pre-check the only thing a user sees is
+    // `ERROR: type "vector" does not exist` from inside the first CREATE TABLE:
+    // it does not say that a *database extension* is missing, and it arrives
+    // after whatever DDL of the run had already been issued.
+    //
+    // Which extension is exercised is chosen at runtime, because the case worth
+    // testing is "not installed" and a server may have any of them: the first
+    // candidate this database lacks is the one that runs. On a database that has
+    // all four there is nothing to assert and the case skips — the deterministic
+    // coverage of the missing branch is the stub test in `migrate.zig`, which
+    // answers `pg_extension` itself.
+    const allocator = testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    const VecDoc = schema("ZentPgMissingExtVector", .{
+        .fields = &.{ field.Int("id"), field.Vector("embedding", 3) },
+    });
+    const LtreeDoc = schema("ZentPgMissingExtLtree", .{
+        .fields = &.{ field.Int("id"), field.Other("path", "ltree") },
+    });
+    const HstoreDoc = schema("ZentPgMissingExtHstore", .{
+        .fields = &.{ field.Int("id"), field.Other("props", "hstore").Optional() },
+    });
+    const GeomDoc = schema("ZentPgMissingExtGeom", .{
+        .fields = &.{ field.Int("id"), field.Text("geom").SqlType("geometry").Optional() },
+    });
+
+    // Four declaration shapes on purpose (`field.Vector`, `field.Other`,
+    // `.SqlType(…)`), since which one a schema reaches for is not what decides
+    // whether the catalog is asked.
+    const candidates = .{
+        .{ .table = "zent_pg_missing_ext_vector", .column = "embedding", .extension = "vector", .udt = "vector", .infos = comptime buildGraph(&.{VecDoc}).types },
+        .{ .table = "zent_pg_missing_ext_ltree", .column = "path", .extension = "ltree", .udt = "ltree", .infos = comptime buildGraph(&.{LtreeDoc}).types },
+        .{ .table = "zent_pg_missing_ext_hstore", .column = "props", .extension = "hstore", .udt = "hstore", .infos = comptime buildGraph(&.{HstoreDoc}).types },
+        .{ .table = "zent_pg_missing_ext_geom", .column = "geom", .extension = "postgis", .udt = "geometry", .infos = comptime buildGraph(&.{GeomDoc}).types },
+    };
+
+    LogCapture.reset();
+    zent.runtime.log.setSink(LogCapture.sink);
+    defer zent.runtime.log.setSink(null);
+
+    var exercised: ?[]const u8 = null;
+
+    inline for (candidates) |case| {
+        // Only the first missing one runs; `inline for` still compiles the
+        // others, which is what keeps each declaration shape typechecked.
+        if (exercised == null) {
+            var rows = try drv.query(
+                "SELECT 1 FROM pg_extension WHERE extname = $1",
+                &.{.{ .string = case.extension }},
+            );
+            defer rows.deinit();
+            const installed = rows.next() != null;
+            if (rows.nextError()) |err| return err;
+
+            if (!installed) {
+                exercised = case.extension;
+
+                // A table of that name may be left over from an earlier run of
+                // this test; the check that matters is that *this* run does not
+                // create it.
+                _ = try drv.exec("DROP TABLE IF EXISTS " ++ case.table ++ " CASCADE", &.{});
+                // Cleanup, registered so the `defer`s run table-then-extension:
+                // an extension a column still references cannot be dropped, so
+                // the reverse order would leak it into the shared test database
+                // and quietly turn a later run into a skip.
+                defer _ = drv.exec("DROP EXTENSION IF EXISTS " ++ case.extension, &.{}) catch {};
+                defer _ = drv.exec("DROP TABLE IF EXISTS " ++ case.table ++ " CASCADE", &.{}) catch {};
+
+                const history_before = try migrationHistoryRows(&drv);
+
+                // The refused run: a named error (not the server's own, which
+                // says neither "extension" nor which one), and nothing written —
+                // the target table stays absent and the history table gains no
+                // row, so a fixed environment can simply re-run it.
+                try testing.expectError(
+                    error.MissingPostgresExtension,
+                    migrate.migrateSchema(allocator, drv.asDriver(), case.infos),
+                );
+                try testing.expect(!try pgRelationExists(&drv, case.table));
+                try testing.expectEqual(history_before, try migrationHistoryRows(&drv));
+
+                // The line names the extension *and* the statement that fixes
+                // it, which is the whole deliverable.
+                try testing.expectEqual(@as(usize, 1), LogCapture.occurrences("PostgreSQL extension '" ++ case.extension ++ "'"));
+                try testing.expectEqual(@as(usize, 1), LogCapture.occurrences("CREATE EXTENSION IF NOT EXISTS " ++ case.extension ++ ";"));
+
+                // Now the fix the line named. A server whose extension files are
+                // not installed, or a role without the privilege, skips the rest:
+                // the refused half above is the part that holds everywhere.
+                const create_ext = try allocator.print("CREATE EXTENSION IF NOT EXISTS {s}", .{case.extension});
+                defer allocator.free(create_ext);
+                _ = drv.exec(create_ext, &.{}) catch return error.SkipZigTest;
+
+                // The same migration now goes through — so what stopped it was
+                // the extension, not the schema — and the column really is the
+                // extension's type.
+                try migrate.migrateSchema(allocator, drv.asDriver(), case.infos);
+                try testing.expect(try pgRelationExists(&drv, case.table));
+
+                const col = try pgCatalogType(allocator, &drv, case.table, case.column);
+                defer freePgCatalogType(allocator, col);
+                try testing.expectEqualStrings("USER-DEFINED", col.data_type);
+                try testing.expectEqualStrings(case.udt, col.udt_name);
+            }
+        }
+    }
+
+    // Every candidate is installed on this database, so there is no missing
+    // extension to refuse on. Said out loud rather than passed over: the
+    // deterministic coverage of that branch is the stub test in `migrate.zig`,
+    // which answers `pg_extension` itself, and this case is the one that
+    // exercises a real server.
+    if (exercised == null) {
+        std.log.warn("zent: every candidate extension is installed on this server; the missing-extension case is covered by the stub test in migrate.zig", .{});
+        return error.SkipZigTest;
+    }
+}

@@ -403,6 +403,18 @@ path the v0.85.0 fix introduced (a slot evicted while its statement was lent
 out). It is per connection by design: a pool-wide figure is the sum over the
 connections you hold.
 
+**Comptime quotas are per-path since v0.83.0 — a graph split done to dodge a
+quota can be merged back.** `buildGraph` and every hot codegen consumer
+(`codegen/entity.zig`'s `@Struct` constructors, the `Client`/`EntityClient`
+entry points, `predicate.zig`'s `lowerHasEdge`, `graph.zig`'s
+`buildEdgeStep`/`fieldColumns`, the migrate table builders, `core/schema.zig`'s
+mixin merges) now size their own `@setEvalBranchQuota` instead of inheriting a
+caller's, and a 300-entity graph is exercised end-to-end by a stress test, so a
+mid-sized schema no longer fails with a random "quota exceeded". The value is a
+large fixed budget, not unlimited: a schema large enough to exhaust it should
+raise the quota in the relevant `src/codegen/*.zig` file, not split the graph —
+see BEST_PRACTICES §8a and `src/core/schema.zig`.
+
 ### 13.7 If you are chasing raw SQL: declare the edges first
 
 A measured example, from a consumer with ~180 schemas and ~543 raw-SQL call

@@ -306,14 +306,64 @@ pub fn Time(name: []const u8) Field {
     return .{ .name = name, .field_type = .time };
 }
 
+/// JSON document column, typed as `T`: a struct (serialized with `std.json`
+/// on the write path, parsed back into `T` on the read path) or
+/// `std.json.Value` for a dynamic document — use `field.JSONValue` for the
+/// latter spelling.
+///
+/// ```zig
+/// field.JSON("settings", Settings)
+/// field.JSONValue("spec")            // == field.JSON("spec", std.json.Value)
+/// ```
+///
+/// **Ownership.** The parsed value hangs off the entity's injected
+/// `json_arena`, so `deinitEntity`/`deinitRows` (and every wrapper that
+/// funnels into `deinitEntityList`) releases it with the rest of the row —
+/// including every string inside a `std.json.Value` document. Do not free
+/// members by hand, and mind the copy semantics: `dupeEntityTo` deep-copies a
+/// typed JSON struct, but an untyped `std.json.Value` is copied shallowly
+/// (its payload stays in the source's arena) — dupe those by hand if the
+/// source must die first (BEST_PRACTICES §2).
+///
+/// **PostgreSQL maps this to `jsonb`, which normalizes.** The text the write
+/// path serializes is parsed by the server and stored in its own form:
+/// insignificant whitespace disappears (`{"k":1}` reads back as `{"k": 1}`),
+/// numbers are canonicalized, duplicate keys are dropped (last one wins), and
+/// **key order is not preserved**. So never make byte-level assumptions about
+/// what you stored — a substring scan (`LIKE '%"k":1%'`, `strstr`), a
+/// whole-text `=` comparison, a hash/signature over the raw text, or a
+/// length check. Query the document with PostgreSQL's `jsonb` operators
+/// instead. This bites hardest when the same code runs against SQLite or
+/// MySQL first: they map the field to `TEXT` and keep the exact bytes, so a
+/// substring scan passes there and fails on production PostgreSQL.
+///
+/// The normalization is also the point: `jsonb` is indexable (GIN, including
+/// containment and path operators), deduplicates keys, and parses once at
+/// write time rather than per read.
+///
+/// **Escape hatch when the exact text is the value:** declare the column as
+/// `field.Text("x").SqlType("json")` — PostgreSQL's `json` type retains the
+/// input text verbatim (SQLite/MySQL already store `TEXT`) — or use
+/// `field.Bytes` for raw bytes. The cost is real: `json` has no GIN index, no
+/// key deduplication, and compares textually rather than structurally, so
+/// prefer `jsonb` unless the bytes are genuinely the contract.
 pub fn JSON(name: []const u8, comptime T: type) Field {
     return .{ .name = name, .field_type = .json, .zig_type = T };
 }
 
 /// JSON field with an untyped document value (`std.json.Value`) — for
 /// dynamic-shape data (product specs, config blobs) where a fixed struct
-/// type is unknown at schema time. The parsed value lives in the entity's
-/// json_arena and is freed by deinitEntity, same as typed JSON fields.
+/// type is unknown at schema time. Equivalent to
+/// `field.JSON(name, std.json.Value)`.
+///
+/// The parsed value lives in the entity's json_arena and is freed by
+/// deinitEntity, same as typed JSON fields — but a shallow copy (e.g.
+/// `dupeEntityTo`) leaves the document's strings in the source's arena, so
+/// dupe it by hand when the source is released first.
+///
+/// Same PostgreSQL caveat as `field.JSON`: the column is `jsonb` and the
+/// server normalizes the document (whitespace, numbers, key order, duplicate
+/// keys), so do not compare or match on the stored text byte-for-byte.
 pub fn JSONValue(name: []const u8) Field {
     return JSON(name, std.json.Value);
 }

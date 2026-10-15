@@ -8,9 +8,13 @@ pub const Annotation = struct {
 /// Merge field arrays from mixins into a single array.
 fn mergeMixinFields(comptime base: []const @import("field.zig").Field, comptime mixins: []const type) []const @import("field.zig").Field {
     comptime {
-        // Every `Schema()` call merges its mixins; a many-mixin/many-field
-        // schema must not depend on the default 1000 quota of whatever
-        // comptime scope evaluates it.
+        // Every `Schema()` call merges its mixins, so this work grows with the
+        // schema and must not inherit whatever branch budget the caller's
+        // comptime scope happens to set. Since v0.83.0 `buildGraph` and every
+        // hot codegen consumer pin their own budget the same way, so a large
+        // graph does not have to be split into smaller schema files to compile
+        // (BEST_PRACTICES.md §8a). 10_000 is a fixed ceiling, not a promise it
+        // cannot be hit — raise it here if a schema ever does.
         @setEvalBranchQuota(10_000);
         var result: []const @import("field.zig").Field = base;
         for (mixins) |M| {

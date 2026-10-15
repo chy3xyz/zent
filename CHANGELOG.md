@@ -4,6 +4,63 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A migration checks its PostgreSQL extensions before it touches anything.**
+  A schema whose declared types need an extension (`vector` → pgvector, plus
+  `citext`, `hstore`, `ltree`, `geometry`/`geography` → postgis) is now
+  verified against `pg_extension` **before the first DDL statement**: if one is
+  missing the migration warns with the exact fix
+  (``CREATE EXTENSION IF NOT EXISTS vector;``) and answers the new
+  `error.MissingPostgresExtension`, with nothing executed — the case a
+  `postgres:16-alpine` image used to report as a bare `type "vector" does not
+  exist`. Schemas that need no extension are not probed at all (the same
+  "only ask when the schema demands it" rule the MariaDB text-default probe
+  follows), and no other dialect probes anything.
+- **`migrateSchemaInTx(allocator, tx, infos, opts)`** — run a migration inside
+  a **caller-owned** transaction. This is the answer to the boundary that bit a
+  consumer: one `migrateSchema` call is one transaction, so a caller looping
+  over schema groups got N of them and a failure halfway left the earlier
+  groups committed (73 tables and 79 history rows, with nothing marking the run
+  incomplete). With the new entry point the caller decides all-or-nothing. The
+  doc comment states the boundary on all three entry points, and the shared
+  implementation means the two paths cannot drift.
+- **`entity.ownedCopy` / `client.<entity>.ownedCopy(allocator, &row)`** — the
+  one-call "make this scanned row mine": strings and slices re-homed to the
+  allocator, JSON to the copy's own `json_arena`, releasable with
+  `deinitRowWith`/`deinitEntity`. `CrudService.getOwned` now calls it (one
+  implementation instead of two), and `zent.codegen.ownedCopy` exports it.
+  It exists because a consumer had hand-rolled this copy **14 times**; the
+  arena-based `dupeEntityTo` cannot replace it (it forbids `deinitEntity`).
+  Eager edges are deliberately not part of the copy — documented and tested.
+
+### Changed
+
+- **A column whose declared type the dialect cannot honour now warns.** On
+  SQLite/MySQL a `field.Vector` column was silently emitted as `TEXT` while the
+  *index* degradations warned — exactly backwards, since the column is the
+  fatal one. One warn per (table, column) per migration now names the declared
+  type, the type actually emitted and the consequence; PostgreSQL, which
+  honours them, stays silent. A `.SqlType(…)` override follows the same rule.
+- **`CreateTablesError` gains `error.MissingPostgresExtension`** (re-stated in
+  `codegen/client.zig`) — a `switch` over it needs its `else =>` arm, as always.
+
+### Documented
+
+- `field.JSON`/`field.JSONValue` finally have doc comments, including what
+  PostgreSQL's `jsonb` does to the bytes (whitespace, number formatting and key
+  order are not preserved, so substring scanning, whole-text comparison and
+  hashing are all unsafe; SQLite/MySQL store exact `TEXT`, which is why such
+  code passes locally and fails in production) and the byte-fidelity escape
+  hatch (`.SqlType("json")`, at the cost of GIN indexing and key dedup).
+- `BEST_PRACTICES` §8a no longer tells readers to split a graph to avoid the
+  comptime budget: `buildGraph` and every hot consumer carry their own quota
+  since v0.83.0, with stress tests over 400-table graphs (and a 300-entity
+  `Client` instantiation). The remaining budget is a large fixed value, not
+  infinity, so the fix for a genuine overrun is to raise it, not to split;
+  splitting is now documented as a decision about databases, build time or
+  memory instead.
+
 ## [0.93.1] - 2026-10-15
 
 ### Added
