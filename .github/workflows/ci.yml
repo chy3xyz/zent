@@ -87,7 +87,13 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:14
+        # `pgvector/pgvector:pg17` is the official PostgreSQL image with the
+        # `vector` extension baked in, so the three pgvector integration cases
+        # (vector column, distance ordering, hnsw index) run here instead of
+        # skipping — they would otherwise only ever be exercised on a machine
+        # that installed pgvector by hand. Plain `postgres:<tag>` images skip
+        # them by design (the tests check `pg_available_extensions`).
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
