@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.93.1] - 2026-10-15
+
 ### Added
 
 - **`sql_dialect_expr.nowSecsParenthesized(dialect)`** — the same epoch-seconds
