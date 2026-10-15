@@ -12,7 +12,7 @@
 ## Commands
 
 - `zig build` — build the library and example executables
-- `zig build test` — run unit tests (602 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
+- `zig build test` — run unit tests (621 tests, 0 leaks; leaks fail the run; count grows when libpq/libmariadb headers are present)
 - `zig build test-integration` — run integration tests (SQLite always; PostgreSQL/MySQL too when their headers were found, otherwise those files are not compiled in. `SKIP_PG`/`SKIP_MYSQL` skip them at runtime; the 3 MySQL TLS cases need `MYSQL_SSL_CA`/`MYSQL_SSL_CERT`/`MYSQL_SSL_KEY` or they skip)
 - `zig build benchmark` — run performance benchmarks (builder/scan/pool/cache/eager/upsert)
 - `zig build run-start` — run the `examples/start` smoke test
@@ -52,7 +52,7 @@ keep a meaningful assertion on *both* branches — do not weaken it into
 something both happen to satisfy, and do not delete the case. If a case cannot
 be set up at all on one server, create it only there and say why in a comment.
 
-`baseline` counts move with this: unit 602, integration 251 passed + 3 skipped
+`baseline` counts move with this: unit 621, integration 254 passed + 3 skipped
 (the 3 are MySQL TLS cases needing `MYSQL_SSL_CA`/`CERT`/`KEY`).
 
 ## Repository conventions
@@ -101,7 +101,7 @@ be set up at all on one server, create it only there and say why in a comment.
 | unused fn params | `_`-prefix them (0.17 errors otherwise) |
 | query rows | `All()` returns `std.array_list.Managed(Entity)`: `deinitEntity` per item, then `users.deinit()` (never pair a per-item free with a slice free) |
 | `std.array_list.Managed` (204 sites) | **Not** deprecated in 0.17 — it is the owning-list wrapper, while `std.ArrayList` is the unmanaged shape. Do not mass-migrate for style |
-| `std.time.Instant` / `std.time.timestamp()` | Gone in 0.17 (clocks live under `std.Io.Clock`). The clock sources are libc (`std.c.clock_gettime` / `gettimeofday`) with a documented fallback in `sql/driver.zig` and `sql/logger.zig` — not a defect to "fix" into `std.time` |
+| `std.time.Instant` / `std.time.timestamp()` | Gone in 0.17 (clocks live under `std.Io.Clock`). Wall-clock reads are one definition — `src/sql/walltime.zig` (exported as `zent.walltime`), which `outbox`, `pool`, `migrate` and `driver`'s REALTIME fallback all call — and durations use `sql/logger.zig`'s monotonic `nowUs`. Not a defect to "fix" into `std.time` |
 | keyword tables | `std.StaticStringMapWithEql(T, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{…})` — comptime-built and allocation-free. Plain `StaticStringMap` is **exact-match**: switching a case-insensitive table to it is a silent behaviour change (it fails six tests today, which is what pins the case-insensitivity) |
 | field type | `@FieldType(T, "f")`, not `@TypeOf(@field(v, "f"))` — and never fabricate a value (`zeroInit`, `@as(T, undefined)`) just to ask for a field's type |
 | name derivation (`OrderProduct` → `order_product`) | One definition: `codegen/graph.zig`'s `pub fn toSnakeCase`, which the codegen, the DDL layer and the client alias. Four layers must agree on derived names; v0.78.1's From-edge defect was two of them disagreeing |

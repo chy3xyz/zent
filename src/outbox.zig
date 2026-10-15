@@ -29,6 +29,7 @@ const TypeInfo = @import("codegen/graph.zig").TypeInfo;
 const deinitEntity = @import("codegen/entity.zig").deinitEntity;
 const sql_driver = @import("sql/driver.zig");
 const sql = @import("sql/builder.zig");
+const walltime = @import("sql/walltime.zig");
 const zent_log = @import("runtime/log.zig");
 
 /// Outbox table schema - include this type in your schema list so the
@@ -90,13 +91,12 @@ pub const Publisher = struct {
 
 /// Wall-clock milliseconds since the Unix epoch (the unit used for
 /// `created_at` / `claimed_at`). `claim` and `requeueStale` read the same
-/// clock, so claim stamps and the staleness cutoff stay comparable. Falls
-/// back to 0 if the syscall fails.
+/// clock, so claim stamps and the staleness cutoff stay comparable. The read
+/// itself is `zent.walltime.nowMilli` — one implementation for the whole
+/// library, which answers 0 and warns if the syscall fails (kept here as a
+/// same-named wrapper so this file's call sites and their fallback stay put).
 fn nowMs() i64 {
-    var tv: std.c.timeval = undefined;
-    if (std.c.gettimeofday(&tv, null) != 0) return 0;
-    return @as(i64, @intCast(tv.sec)) * std.time.ms_per_s +
-        @divTrunc(@as(i64, @intCast(tv.usec)), std.time.us_per_ms);
+    return walltime.nowMilli();
 }
 
 /// The `claimed_at` cutoff (epoch ms) for a positive `older_than_secs`: a row

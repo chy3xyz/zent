@@ -11,13 +11,15 @@ const driver = @import("driver.zig");
 const Dialect = @import("dialect.zig").Dialect;
 const Value = @import("builder.zig").Value;
 const zent_log = @import("../runtime/log.zig");
+const walltime = @import("walltime.zig");
 
-extern fn time(time_t: [*c]c_long) c_long;
-
-/// Current Unix timestamp in seconds. Uses libc `time()` because Zig 0.17
-/// removed `unixTimestamp()`.
+/// Current Unix timestamp in seconds. Zig 0.17 removed the timestamp helpers
+/// from `std.time`, and the read is `zent.walltime.nowSecs` — one
+/// implementation for the library, which answers 0 and warns if the syscall
+/// fails. Kept as a same-named seconds-granularity wrapper because the pool's
+/// age/idle arithmetic and its tests are written in whole seconds.
 fn unixTimestamp() i64 {
-    return @as(i64, @intCast(time(null)));
+    return walltime.nowSecs();
 }
 
 /// Errors returned by the connection pool.

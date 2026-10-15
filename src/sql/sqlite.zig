@@ -164,6 +164,22 @@ pub const SQLiteDriver = struct {
         _ = c.sqlite3_close(self.db);
     }
 
+    /// A read-only snapshot of the prepared-statement cache's counters, taken
+    /// under the connection mutex (the same lock every cache operation runs
+    /// behind, so a snapshot can never catch one mid-update).
+    ///
+    /// `null` when no cache is attached — the default, since `cache` is null
+    /// until a caller opts in — and that is the honest answer rather than a
+    /// zeroed snapshot: no cache means no lookups, not a cache that missed
+    /// everything. See `cache.PreparedCacheSized.Stats` for what each counter
+    /// means.
+    pub fn cacheStats(self: *SQLiteDriver) ?cache.PreparedCache(16, *c.sqlite3_stmt).Stats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.cache) |*cached| return cached.stats();
+        return null;
+    }
+
     fn logSqliteError(db: *c.sqlite3, context: []const u8) void {
         const msg = c.sqlite3_errmsg(db);
         // `warn`, not `err`: a failed statement is the caller's to handle (a
@@ -1188,6 +1204,45 @@ test "SQLite: a failed bind returns the taken cache slot instead of stranding it
         try std.testing.expect(!e.taken);
     }
     try std.testing.expect(drv.cache.?.entries[0].stmt == cached_handle);
+}
+
+test "SQLite: cacheStats reports the prepared-statement cache's counters" {
+    const allocator = std.testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // No cache attached — the default. `null` is the honest answer: no cache
+    // means no lookups, not a cache that missed everything.
+    try std.testing.expect(drv.cacheStats() == null);
+
+    drv.cache = cache.PreparedCache(16, *c.sqlite3_stmt){};
+    _ = try drv.exec("SELECT 1", &.{}); // cold miss, one prepare
+    var st = drv.cacheStats().?;
+    try std.testing.expectEqual(@as(usize, 0), st.hits);
+    try std.testing.expectEqual(@as(usize, 1), st.misses);
+    try std.testing.expectEqual(@as(usize, 1), st.prepares);
+
+    _ = try drv.exec("SELECT 1", &.{}); // the same SQL: a hit
+    st = drv.cacheStats().?;
+    try std.testing.expectEqual(@as(usize, 1), st.hits);
+    try std.testing.expectEqual(@as(usize, 1), st.prepares);
+
+    // The query path checks the entry out (a hit) and `Rows.deinit` returns
+    // it — the take and its return are visible from outside the driver, which
+    // is the whole point of the accessor.
+    {
+        var rows = try drv.query("SELECT 1", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try std.testing.expectEqual(@as(i64, 1), row.getInt(0).?);
+        try std.testing.expectEqual(@as(usize, 2), drv.cacheStats().?.hits);
+    }
+    st = drv.cacheStats().?;
+    try std.testing.expectEqual(@as(usize, 2), st.hits);
+    try std.testing.expectEqual(@as(usize, 1), st.returned);
+    try std.testing.expectEqual(@as(usize, 0), st.stale_returns);
+    // The snapshot is the cache's own numbers, not a second tally.
+    try std.testing.expectEqual(drv.cache.?.stats(), st);
 }
 
 test "SQLite statements that take no parameters still run with no bindings" {

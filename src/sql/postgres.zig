@@ -234,6 +234,22 @@ pub const PostgresDriver = struct {
         c.PQfinish(self.conn);
     }
 
+    /// A read-only snapshot of the prepared-statement cache's counters.
+    ///
+    /// `null` when no cache is attached (the default: `cache` is null until a
+    /// caller opts in) — no cache means no lookups, not a cache that missed
+    /// everything. See `cache_mod.PreparedCacheSized.Stats` for what each
+    /// counter means, including `evictions`/`invalidations`, which for
+    /// PostgreSQL count entries whose server-side statement was deallocated.
+    ///
+    /// The driver has no lock of its own (one connection, one user), so this
+    /// is a plain read; a caller driving one connection from several threads
+    /// needs its own synchronization, exactly as it does for `exec`/`query`.
+    pub fn cacheStats(self: *PostgresDriver) ?PreparedCache(16, *PgStmt).Stats {
+        if (self.cache) |*cch| return cch.stats();
+        return null;
+    }
+
     fn logPgError(conn: *c.PGconn, context: []const u8) void {
         const msg = c.PQerrorMessage(conn);
         // `warn`, not `err`: a failed statement is the caller's to handle (a
@@ -1368,6 +1384,36 @@ test "PostgresDriver cache field is optional" {
 
     drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
     try std.testing.expect(drv.cache != null);
+}
+
+test "PostgresDriver cacheStats is null without a cache and reads the counters with one" {
+    // No server needed: the accessor only reads the cache field, and the
+    // counters are driven here by the cache's own entry points. The cache
+    // never dereferences a handle, so a stack dummy stands in for a prepared
+    // statement (the same shape the tests below use).
+    var drv: PostgresDriver = .{ .conn = undefined, .allocator = undefined };
+    try std.testing.expect(drv.cacheStats() == null);
+
+    drv.cache = PreparedCache(16, *PostgresDriver.PgStmt){};
+    var dummy_stmt = PostgresDriver.PgStmt{
+        .name_buf = std.mem.zeroes([20]u8),
+        .name_len = 0,
+        .prep = @ptrFromInt(0x1),
+    };
+    const dummy: *PostgresDriver.PgStmt = &dummy_stmt;
+    _ = try drv.cache.?.getOrPrepare("SELECT 1", dummy, struct {
+        fn f(ctx: *PostgresDriver.PgStmt, _: []const u8) !*PostgresDriver.PgStmt {
+            return ctx;
+        }
+    }.f, dummy, struct {
+        fn f(_: *PostgresDriver.PgStmt, _: *PostgresDriver.PgStmt) void {}
+    }.f);
+
+    const st = drv.cacheStats().?;
+    try std.testing.expectEqual(@as(usize, 1), st.misses);
+    try std.testing.expectEqual(@as(usize, 1), st.prepares);
+    try std.testing.expectEqual(@as(usize, 0), st.hits);
+    try std.testing.expectEqual(@as(usize, 1), drv.cache.?.len);
 }
 
 test "PostgresDriver cache DDL eviction" {

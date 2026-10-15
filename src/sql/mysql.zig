@@ -279,6 +279,22 @@ pub const MySQLDriver = struct {
         c.mysql_close(self.conn);
     }
 
+    /// A read-only snapshot of the prepared-statement cache's counters.
+    ///
+    /// `null` when no cache is attached (the default: `cache` is null until a
+    /// caller opts in) — no cache means no lookups, not a cache that missed
+    /// everything. See `cache.PreparedCacheSized.Stats` for what each counter
+    /// means.
+    ///
+    /// The driver has no lock of its own (one connection, one user — the pool
+    /// is what makes connections shareable), so this is a plain read; a caller
+    /// that drives a single connection from several threads needs its own
+    /// synchronization, exactly as it does for `exec`/`query`.
+    pub fn cacheStats(self: *MySQLDriver) ?cache.PreparedCache(16, *c.MYSQL_STMT).Stats {
+        if (self.cache) |*cached| return cached.stats();
+        return null;
+    }
+
     /// Prepare `sql` and read its parameter list back, then close the statement
     /// without executing it (`mysql_stmt_prepare` is the whole of it — the row
     /// count of a checked `INSERT` is where it was before).
@@ -1369,6 +1385,30 @@ test "MySQL: a lost connection keeps its classification instead of collapsing" {
     try std.testing.expect(drv2.classifyFailure(1142) == null); // ER_TABLEACCESS_DENIED_ERROR -> ExecFailed
     try std.testing.expect(!drv2.dead);
     try std.testing.expectEqual(driver.Error.UniqueViolation, drv2.classifyFailure(1062).?); // ER_DUP_ENTRY
+}
+
+test "MySQL: cacheStats is null without a cache and reads the counters with one" {
+    // No server needed: the accessor only reads the cache field, and the
+    // counters are driven here by the cache's own entry points.
+    var drv: MySQLDriver = .{ .conn = undefined, .allocator = undefined };
+    try std.testing.expect(drv.cacheStats() == null);
+
+    drv.cache = cache.PreparedCache(16, *c.MYSQL_STMT){};
+    try std.testing.expectEqual(cache.PreparedCache(16, *c.MYSQL_STMT).Stats{}, drv.cacheStats().?);
+
+    const sql = "SELECT 1";
+    var prepared: c.MYSQL_STMT = undefined;
+    _ = try drv.cache.?.getOrPrepare(sql, &prepared, struct {
+        fn f(ctx: *c.MYSQL_STMT, _: []const u8) !*c.MYSQL_STMT {
+            return ctx;
+        }
+    }.f, {}, struct {
+        fn f(_: void, _: *c.MYSQL_STMT) void {}
+    }.f);
+    const st = drv.cacheStats().?;
+    try std.testing.expectEqual(@as(usize, 1), st.misses);
+    try std.testing.expectEqual(@as(usize, 1), st.prepares);
+    try std.testing.expectEqual(@as(usize, 0), st.hits);
 }
 
 test "MySQL: prepare failure on a lost connection marks the driver dead and reports ConnectionFailed" {

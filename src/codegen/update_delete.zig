@@ -22,6 +22,8 @@ const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;
+const dialect_expr = @import("../sql/dialect_expr.zig");
+const walltime = @import("../sql/walltime.zig");
 
 fn mapBuildError(err: anyerror) sql_driver.Error {
     return switch (err) {
@@ -32,21 +34,8 @@ fn mapBuildError(err: anyerror) sql_driver.Error {
 
 const FieldValue = @import("create.zig").FieldValue;
 
-// C time() — libc is linked via build.zig
-extern "c" fn time(tloc: ?*anyopaque) c_long;
 const validateSqlValue = @import("create.zig").validateSqlValue;
 const fillAuditUser = @import("create.zig").fillAuditUser;
-
-/// Dialect SQL expression producing the current Unix epoch (seconds) as an
-/// integer, matching zent's i64 Time representation.
-fn epochExpr(dialect: anytype) []const u8 {
-    return switch (dialect.kind()) {
-        .postgres => "EXTRACT(EPOCH FROM now())::bigint",
-        .mysql => "UNIX_TIMESTAMP()",
-        // SQLite and anything unnamed fall back to `unixepoch()`, the old `else`.
-        .sqlite, .unknown => "(unixepoch())",
-    };
-}
 
 /// Copy `args` and mask values that came from `sensitive` fields (matched by
 /// field name against `values`), so exec/query logs never leak secrets.
@@ -817,7 +806,7 @@ pub fn UpdateBuilder(comptime infos: []const TypeInfo, comptime info: TypeInfo) 
                     }
                 }
                 if (!explicit_updated_at) {
-                    _ = try builder.setExpr("updated_at", epochExpr(self.driver.dialect()));
+                    _ = try builder.setExpr("updated_at", dialect_expr.nowSecs(self.driver.dialect()));
                 }
             }
 
@@ -1175,8 +1164,9 @@ pub fn DeleteBuilder(comptime info: TypeInfo) type {
             };
             const version_locked = version_field != null and self.version_value != null;
 
-            // Get current timestamp (seconds since epoch)
-            const now: i64 = @intCast(time(null));
+            // Get current timestamp (seconds since epoch), from the library's
+            // one wall-clock reader — this path had its own libc `time()`.
+            const now: i64 = walltime.nowSecs();
             var builder = try sql.UpdateBuilder.initCapacity(self.allocator, self.driver.dialect(), info.table_name);
             defer builder.deinit();
             _ = try builder.set("deleted_at", .{ .int = now });
@@ -1742,7 +1732,7 @@ pub fn BulkDeleteBuilder(comptime info: TypeInfo) type {
                 if (g.items.len == 0) continue;
                 var builder = try sql.UpdateBuilder.initCapacity(self.allocator, self.driver.dialect(), info.table_name);
                 defer builder.deinit();
-                _ = try builder.setExpr("deleted_at", epochExpr(self.driver.dialect()));
+                _ = try builder.setExpr("deleted_at", dialect_expr.nowSecs(self.driver.dialect()));
                 for (g.items) |p| {
                     _ = try builder.where(p);
                 }
@@ -3609,4 +3599,117 @@ test "a soft delete counts only the rows it trashes, like the hard path" {
             try std.testing.expectEqual(@as(usize, 0), try d.Exec());
         }
     }
+}
+
+// ------------------------------------------------------------------
+// The epoch expression the soft-delete statement is built from
+// ------------------------------------------------------------------
+
+/// A driver that copies the last statement `exec` saw and answers one affected
+/// row. `QueryResult.sql` borrows from the builder, which is deinit'd by the
+/// time a test can look at it, so the statement has to be captured here — and
+/// the statement text is the thing under test, which is why `UncountedDriver`'s
+/// eight-byte prefix is not enough.
+const SqlCaptureDriver = struct {
+    last_sql_owned: ?[]u8 = null,
+
+    const vtable = sql_driver.Driver.VTable{
+        .exec = captureExecFn,
+        .query = captureQueryFn,
+        .beginTx = captureBegcaptureInTxFn,
+        .close = captureCloseFn,
+        .dialect = captureDialectFn,
+        .ping = capturePingFn,
+        .inTransaction = captureInTxFn,
+        .beginSavepoint = captureSavepointFn,
+    };
+
+    fn asDriver(self: *SqlCaptureDriver) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *SqlCaptureDriver) void {
+        if (self.last_sql_owned) |s| std.testing.allocator.free(s);
+        self.last_sql_owned = null;
+    }
+
+    fn captureExecFn(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Result {
+        const self: *SqlCaptureDriver = @ptrCast(@alignCast(ptr));
+        self.deinit();
+        self.last_sql_owned = std.testing.allocator.dupe(u8, query_sql) catch null;
+        return .{ .rows_affected = 1, .last_insert_id = null };
+    }
+
+    fn captureQueryFn(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const sql.Value) sql_driver.Error!sql_driver.Rows {
+        return error.QueryFailed;
+    }
+
+    fn captureBegcaptureInTxFn(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn captureSavepointFn(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn captureCloseFn(_: *anyopaque) void {}
+
+    fn captureDialectFn(_: *anyopaque) Dialect {
+        return Dialect.sqlite;
+    }
+
+    fn capturePingFn(_: *anyopaque) sql_driver.Error!void {}
+
+    fn captureInTxFn(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+test "the soft-delete statement carries sql_dialect_expr.nowSecs, the shared implementation" {
+    // This module used to keep a private `epochExpr` (PostgreSQL `EXTRACT(EPOCH
+    // FROM now())::bigint`, MySQL `UNIX_TIMESTAMP()`, SQLite `(unixepoch())`)
+    // that a consumer writing the same audit stamp in raw SQL had to re-derive
+    // — and SQLite is the one whose spelling is not guessable, because it is
+    // the only one carrying parentheses. The path now calls
+    // `zent.sql_dialect_expr.nowSecs`, and this pins the *rendered statement*
+    // to that function's output: a private copy reappearing, or the helper's
+    // SQLite spelling changing, fails here instead of shipping two answers.
+    const allocator = std.testing.allocator;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("graph.zig").fromSchema;
+    const client_mod = @import("client.zig");
+    const SoftDeleteMixin = @import("../core/mixin.zig").SoftDeleteMixin;
+
+    const Row = Schema("EpochExprRow", .{
+        .table_name = "epoch_expr_row",
+        .fields = &.{field.String("title")},
+        .mixins = &.{SoftDeleteMixin},
+        .soft_delete = true,
+    });
+    const info = comptime fromSchema(Row);
+    const infos = &[_]TypeInfo{info};
+
+    var capture = SqlCaptureDriver{};
+    defer capture.deinit();
+
+    const Client = client_mod.EntityClient(infos, info);
+    const client = Client.init(allocator, capture.asDriver());
+
+    var d = try client.BulkDelete();
+    defer d.deinit();
+    _ = try d.Where(.{sql.Raw("1 = 1")});
+    try std.testing.expectEqual(@as(usize, 1), try d.Exec());
+
+    const text = capture.last_sql_owned orelse return error.MissingCapture;
+    var expected_buf: [192]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "UPDATE \"epoch_expr_row\" SET \"deleted_at\" = {s} WHERE (1 = 1) AND \"deleted_at\" IS NULL",
+        .{dialect_expr.nowSecs(Dialect.sqlite)},
+    );
+    try std.testing.expectEqualStrings(expected, text);
+    // And that spelling is the one the helper documents — written out here, so
+    // this test and the helper's own cannot pass on two different strings.
+    try std.testing.expect(std.mem.indexOf(u8, text, "= (unixepoch()) WHERE") != null);
 }

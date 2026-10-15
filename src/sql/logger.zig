@@ -79,6 +79,12 @@ pub fn debugLogger() Logger {
 /// Shares `driver.monotonicNs`'s clock and its documented fallback chain
 /// (wall clock, then 0) rather than keeping a second copy that can drift
 /// from it.
+///
+/// **Monotonic — for durations only.** A wall-clock timestamp (a `created_at`
+/// value, a claim stamp, anything a second process will compare against) comes
+/// from `zent.walltime.nowSecs()` / `nowMilli()` / `nowMicros()`; calling this
+/// for one stores microseconds since boot, which is what v0.83 changed without
+/// a public replacement.
 pub fn nowUs() u64 {
     return @intCast(@divTrunc(driver.monotonicNs(), std.time.ns_per_us));
 }

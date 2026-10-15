@@ -3,6 +3,13 @@ const std = @import("std");
 pub const sql = @import("sql/builder.zig");
 pub const sql_cache = @import("sql/cache.zig");
 pub const sql_dialect = @import("sql/dialect.zig");
+/// Per-dialect SQL expression fragments for raw SQL the fluent builders do not
+/// cover: `nowSecs` (current epoch seconds), `insertIgnore` (the prefix *and*
+/// suffix that spell an ignore-on-conflict insert) and `numericTextAsNumber`
+/// (a TEXT column read as a number, which SQLite needs and the others do not).
+/// See `sql/dialect_expr.zig` for the mappings, and for what is deliberately
+/// left to `sql.InsertOrIgnore`. `zent.sql_dialect_expr`.
+pub const sql_dialect_expr = @import("sql/dialect_expr.zig");
 pub const sql_driver = @import("sql/driver.zig");
 pub const sql_scan = @import("sql/scan.zig");
 /// The package version, readable at comptime (`zent.version`). Mirrors
@@ -24,6 +31,13 @@ pub const sql_explain = @import("sql/explain.zig");
 /// dialect can and cannot see at that stage.
 pub const sql_statement = @import("sql/statement.zig");
 pub const sql_logger = @import("sql/logger.zig");
+/// Wall-clock readings: `nowSecs` / `nowMilli` / `nowMicros` / `nowNanos`.
+/// Zig 0.17 removed the wall-clock readers from `std.time`, and the library's
+/// three private ones (driver REALTIME fallback, `outbox.nowMs`,
+/// `pool.unixTimestamp`) now delegate here. **Wall clock**, so it can be
+/// stepped or rolled back — measure durations with the monotonic
+/// `sql_logger.nowUs()` / `sql_driver.monotonicNs()` instead. `zent.walltime`.
+pub const walltime = @import("sql/walltime.zig");
 pub const sql_diagnostics = @import("sql/diagnostics.zig");
 
 pub const core = struct {

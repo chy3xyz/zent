@@ -360,7 +360,50 @@ pgvector must be installed before the first migration
 malformed index declaration in your schema). A `switch` over it needs its
 `else =>` arm, as always.
 
-### 13.6 If you are chasing raw SQL: declare the edges first
+### 13.6 Time, borrowed rows, and the rest of the re-implemented helpers (v0.93.0)
+
+**If you were calling `sql_logger.nowUs()` for timestamps, that was broken by
+v0.83.0** — the function measures **durations** and now reads a monotonic
+clock, so a timestamp taken with it becomes process uptime (and Zig 0.17
+removed the `std.time` getters that would have been the obvious replacement).
+v0.93.0 closes that hole with a public wall clock:
+
+```zig
+const now_s = zent.walltime.nowSecs();      // also nowMilli/nowMicros/nowNanos
+```
+
+It is one implementation (libc `CLOCK_REALTIME`, warning and answering `0` on
+failure) that `outbox`, the pool's eviction timestamps, the migration's
+`applied_at` and the driver's own fallback all use. Use it for stored
+timestamps; keep `sql_logger.nowUs()` for how long something took.
+
+**`Row`'s borrowed-slice contract is now written down**, and the copy step has
+an API: `row.textDup(allocator, index)` / `row.blobDup(allocator, index)`
+answer an owned copy (or `null`, with no allocation, when the column is NULL).
+The rule they exist for: a text or blob slice lives only until the next
+`Rows.next()` or `Rows.deinit()`, whichever comes first — the intersection of
+the three drivers, and the only lifetime portable consumer code may rely on.
+Where you wrote `allocator.dupe(u8, row.getText(i).?)`, `textDup` says the same
+thing without re-stating the rule.
+
+**Three helpers nobody should write a fourth time:**
+
+| Helper | Replaces |
+|---|---|
+| `zent.sql_dialect_expr.nowSecs(dialect)` | A hand-rolled "current epoch seconds" expression to match the audit defaults (`UNIX_TIMESTAMP()`, `EXTRACT(EPOCH FROM now())::bigint`, `(unixepoch())`) |
+| `zent.sql_dialect_expr.insertIgnore(dialect)` | The `INSERT IGNORE` / `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` switch — returned as `{prefix, suffix}` because PostgreSQL's form is a suffix |
+| `zent.sql_dialect_expr.numericTextAsNumber(dialect, buf, expr)` | `CAST(… AS NUMERIC/DECIMAL)` for `Decimal` columns (which are `TEXT` on SQLite) |
+
+**Prepared-statement cache counters** are readable per connection:
+`sqlite_driver.cacheStats()`, `mysql_driver.cacheStats()`,
+`postgres_driver.cacheStats()` (each `null` when no cache is attached), with
+`hits`/`misses`/`taken_misses`/`prepares`/`evictions`/`invalidations`/… —
+`hits + misses + taken_misses` is every lookup, and `stale_returns` is the
+path the v0.85.0 fix introduced (a slot evicted while its statement was lent
+out). It is per connection by design: a pool-wide figure is the sum over the
+connections you hold.
+
+### 13.7 If you are chasing raw SQL: declare the edges first
 
 A measured example, from a consumer with ~180 schemas and ~543 raw-SQL call
 sites (153 of them JOIN-shaped): **62% of its JOINs are single-hop m2o lookups

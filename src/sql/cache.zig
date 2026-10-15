@@ -28,6 +28,88 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
         /// statement is not cached; the caller owns it and must release it.
         pub const Taken = struct { stmt: Handle, slot: ?usize };
 
+        /// A read-only snapshot of the cache's counters, for a metrics scrape
+        /// or a health endpoint. Reach it through `stats()`, or through a
+        /// driver's `cacheStats()` accessor, which also takes that driver's
+        /// connection lock.
+        ///
+        /// **What each counter counts (and what it does not).** A *lookup* is
+        /// one `getOrPrepare` or `takeOrPrepare` call — the two entry points
+        /// are counted together, so a statement the exec path cached and the
+        /// query path later takes is a `hits`, not a second kind of anything.
+        /// A lookup lands in exactly one of `hits`, `misses` or
+        /// `taken_misses`:
+        ///
+        ///  * `hits` — the SQL matched an entry that was live (not checked
+        ///    out), and that entry's handle is what the caller got back. The
+        ///    entry was moved to the MRU position.
+        ///  * `misses` — no live entry matched: the SQL is not in the cache at
+        ///    all. Includes SQL too long for `max_sql_len`, which can never be
+        ///    cached (see `oversized_bypass`, the subset).
+        ///  * `taken_misses` — the SQL *is* in the cache, but every matching
+        ///    entry is checked out by a `Rows` iterator, so the lookup could
+        ///    not use it and the caller got a freshly prepared statement.
+        ///    Rare (one per in-flight iterator for the same SQL) and the one
+        ///    miss a bigger cache cannot fix; keeping it out of `misses` is
+        ///    what makes "cold" and "contended" distinguishable.
+        ///
+        /// The other counters are not lookup outcomes:
+        ///
+        ///  * `prepares` — statements the cache successfully prepared on a
+        ///    lookup that missed. Equal to `misses + taken_misses` on a run
+        ///    with no prepare failure; a failed `prepareFn` is counted in the
+        ///    lookup but not here, which is how the two can disagree.
+        ///  * `evictions` — entries dropped by `insert` to make room for a new
+        ///    one (the LRU tail). One per insert that had to evict; the entry
+        ///    that was replaced had its handle released through `deinitFn`.
+        ///  * `invalidations` — entries dropped by `evictAll` (DDL, connection
+        ///    close). Counts *entries*, not calls, and never the checked-out
+        ///    ones: those belong to their iterator and keep their handle.
+        ///  * `oversized_bypass` — a missed lookup whose SQL exceeds
+        ///    `max_sql_len`, so the prepared statement is handed back
+        ///    caller-owned instead of being inserted. A subset of `misses`,
+        ///    and the answer to "why does this statement never hit?".
+        ///  * `uncached_inserts` — a missed lookup that wanted to cache its
+        ///    statement but found no evictable slot (every entry checked out);
+        ///    the caller owns the handle. A subset of `misses`, and the only
+        ///    miss caused by `capacity`.
+        ///  * `returned` — a taken entry handed back through `returnStmt` (or
+        ///    `releaseTaken`) whose slot was still valid: the entry is live
+        ///    and MRU again. The success path for a `takeOrPrepare`.
+        ///  * `stale_returns` — a return whose slot could not be re-armed
+        ///    because `evictAll` dropped it while the statement was checked
+        ///    out (or the handle did not match the slot); the handle was
+        ///    released through `deinitFn` instead of being re-cached. Before
+        ///    v0.85 this shape lost the statement; it is counted so the
+        ///    loss is visible rather than silent.
+        ///  * `released_uncached` — `releaseTaken` on a `takeOrPrepare` that
+        ///    missed (no slot): the caller-owned handle was released, as it
+        ///    must be. Not a cache loss — nothing was cached to lose.
+        pub const Stats = struct {
+            /// Lookups answered from a live entry.
+            hits: usize = 0,
+            /// Lookups that found no entry for the SQL (cold miss).
+            misses: usize = 0,
+            /// Lookups whose SQL was present but checked out (contended miss).
+            taken_misses: usize = 0,
+            /// Statements the cache prepared on a missed lookup.
+            prepares: usize = 0,
+            /// Entries dropped by `insert` to make room (LRU eviction).
+            evictions: usize = 0,
+            /// Entries dropped by `evictAll` (DDL / close).
+            invalidations: usize = 0,
+            /// Missed lookups whose SQL can never be cached (too long).
+            oversized_bypass: usize = 0,
+            /// Missed lookups that found no evictable slot — caller-owned.
+            uncached_inserts: usize = 0,
+            /// Taken entries successfully returned to their slot.
+            returned: usize = 0,
+            /// Returns whose slot was invalidated while checked out.
+            stale_returns: usize = 0,
+            /// `releaseTaken` calls with no cache-owned slot.
+            released_uncached: usize = 0,
+        };
+
         const Entry = struct {
             sql_len: usize,
             sql_buf: [max_sql_len]u8,
@@ -42,6 +124,20 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
         len: usize = 0,
         /// LRU order: index 0 is MRU, index len-1 is LRU.
         order: [capacity]usize = undefined,
+        /// The counters behind `stats()`. Plain fields, no atomics: a cache is
+        /// driven by one thread at a time (the drivers serialize their calls —
+        /// the SQLite driver behind its `mutex`), and an atomic here would
+        /// claim a thread-safety the cache does not otherwise have.
+        counts: Stats = .{},
+
+        /// A snapshot of the counters as of this call. See `Stats` for what
+        /// each one means and when it is incremented. This is a plain read: it
+        /// does not lock, so a caller racing a cache operation needs its own
+        /// synchronization (the drivers' `cacheStats()` accessors take the
+        /// connection lock for you).
+        pub fn stats(self: *const Self) Stats {
+            return self.counts;
+        }
 
         inline fn sqlEql(e: *const Entry, sql: []const u8) bool {
             return e.sql_len == sql.len and std.mem.eql(u8, e.sql_buf[0..e.sql_len], sql);
@@ -74,6 +170,27 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
             return null;
         }
 
+        /// True when a *checked-out* entry's SQL byte-matches `sql`. Only
+        /// consulted on the miss path (to tell a contended miss from a cold
+        /// one), so its second scan costs nothing on the hit path.
+        fn hasTakenEntry(self: *Self, sql: []const u8) bool {
+            for (self.entries[0..self.len]) |*e| {
+                if (e.taken and sqlEql(e, sql)) return true;
+            }
+            return false;
+        }
+
+        /// Record which kind of miss this lookup was: the SQL is in the cache
+        /// but unavailable (`taken_misses`), or it is not there at all
+        /// (`misses`).
+        inline fn countMiss(self: *Self, sql: []const u8) void {
+            if (self.hasTakenEntry(sql)) {
+                self.counts.taken_misses += 1;
+            } else {
+                self.counts.misses += 1;
+            }
+        }
+
         /// Insert a fresh entry, evicting the LRU non-taken entry when full.
         /// Returns false when no slot is available (all entries taken).
         fn insert(self: *Self, sql: []const u8, stmt: Handle, deinitCtx: anytype, deinitFn: anytype) bool {
@@ -97,8 +214,10 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
                 deinitFn(deinitCtx, self.entries[idx].stmt);
                 self.writeEntry(idx, sql, stmt);
                 self.moveToFront(idx);
+                self.counts.evictions += 1;
                 return true;
             }
+            self.counts.uncached_inserts += 1;
             return false;
         }
 
@@ -119,13 +238,19 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
         ) !Prepared {
             if (self.findEntry(sql)) |i| {
                 @branchHint(.likely);
+                self.counts.hits += 1;
                 self.moveToFront(i);
                 return .{ .stmt = self.entries[i].stmt, .cached = true };
             } else {
                 @branchHint(.cold);
+                self.countMiss(sql);
                 // Cache miss — prepare.
                 const stmt = try prepareFn(prepareCtx, sql);
-                if (!cacheable(sql)) return .{ .stmt = stmt, .cached = false };
+                self.counts.prepares += 1;
+                if (!cacheable(sql)) {
+                    self.counts.oversized_bypass += 1;
+                    return .{ .stmt = stmt, .cached = false };
+                }
                 const inserted = self.insert(sql, stmt, deinitCtx, deinitFn);
                 return .{ .stmt = stmt, .cached = inserted };
             }
@@ -143,11 +268,15 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
         ) !Taken {
             if (self.findEntry(sql)) |i| {
                 @branchHint(.likely);
+                self.counts.hits += 1;
                 self.entries[i].taken = true;
                 return .{ .stmt = self.entries[i].stmt, .slot = i };
             } else {
                 @branchHint(.cold);
-                return .{ .stmt = try prepareFn(ctx, sql), .slot = null };
+                self.countMiss(sql);
+                const stmt = try prepareFn(ctx, sql);
+                self.counts.prepares += 1;
+                return .{ .stmt = stmt, .slot = null };
             }
         }
 
@@ -160,8 +289,10 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
             if (slot < self.len and self.entries[slot].taken and self.entries[slot].stmt == stmt) {
                 self.entries[slot].taken = false;
                 self.moveToFront(slot);
+                self.counts.returned += 1;
             } else {
                 deinitFn(deinitCtx, stmt);
+                self.counts.stale_returns += 1;
             }
         }
 
@@ -180,6 +311,7 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
                 self.returnStmt(s, stmt, deinitCtx, deinitFn);
             } else {
                 deinitFn(deinitCtx, stmt);
+                self.counts.released_uncached += 1;
             }
         }
 
@@ -189,7 +321,10 @@ pub fn PreparedCacheSized(comptime capacity: usize, comptime Handle: type, compt
         /// the stale slot and releases the handle instead of re-caching it.
         pub fn evictAll(self: *Self, deinitCtx: anytype, deinitFn: anytype) void {
             for (self.entries[0..self.len]) |*e| {
-                if (!e.taken) deinitFn(deinitCtx, e.stmt);
+                if (!e.taken) {
+                    deinitFn(deinitCtx, e.stmt);
+                    self.counts.invalidations += 1;
+                }
             }
             self.len = 0;
         }
@@ -472,6 +607,201 @@ test "PreparedCache: default-null integration pattern" {
 
     maybe = PreparedCache(2, *anyopaque){};
     try std.testing.expect(maybe != null);
+}
+
+// Counters (`stats()`)
+// -----------------------------------------------------------------------
+//
+// The counters are the only way a consumer can tell "the cache is working"
+// from "the cache is being bypassed" or "the cache is thrashing", so each
+// increment point is pinned here against the operation that causes it.
+
+/// All-zero counters, for asserting on a single field without repeating the
+/// other ten.
+fn expectFreshStats(st: PreparedCacheSized(4, *anyopaque, 2048).Stats) !void {
+    try std.testing.expectEqual(PreparedCacheSized(4, *anyopaque, 2048).Stats{}, st);
+}
+
+test "PreparedCache: stats counts hits, cold misses and prepares" {
+    var cch: PreparedCache(4, *anyopaque) = .{};
+    var ctx = TestCtx{};
+    try expectFreshStats(cch.stats());
+
+    // Two distinct SQL: two cold misses, two prepares, no hits.
+    _ = try cch.getOrPrepare("A", &ctx, testPrepare, &ctx, testDeinitCount);
+    _ = try cch.getOrPrepare("B", &ctx, testPrepare, &ctx, testDeinitCount);
+    var st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 0), st.hits);
+    try std.testing.expectEqual(@as(usize, 2), st.misses);
+    try std.testing.expectEqual(@as(usize, 2), st.prepares);
+    try std.testing.expectEqual(@as(usize, 0), st.taken_misses);
+
+    // A repeat of each is a hit, whichever entry point asks. The exec path
+    // and the query path share one counter: a statement cached by one and
+    // taken by the other is a hit, not a second kind of anything.
+    _ = try cch.getOrPrepare("A", &ctx, testPrepare, &ctx, testDeinitCount);
+    const t = try cch.takeOrPrepare("B", &ctx, testPrepare);
+    st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 2), st.hits);
+    try std.testing.expectEqual(@as(usize, 2), st.misses);
+    try std.testing.expectEqual(@as(usize, 2), st.prepares);
+    // A take is not a return: the entry is checked out until `returnStmt`.
+    try std.testing.expectEqual(@as(usize, 0), st.returned);
+    cch.returnStmt(t.slot.?, t.stmt, &ctx, testDeinitCount);
+    try std.testing.expectEqual(@as(usize, 1), cch.stats().returned);
+}
+
+test "PreparedCache: stats separates a contended miss from a cold one" {
+    var cch: PreparedCache(4, *anyopaque) = .{};
+    var ctx = TestCtx{};
+
+    _ = try cch.getOrPrepare("A", &ctx, testPrepare, &ctx, testDeinitCount);
+    const t = try cch.takeOrPrepare("A", &ctx, testPrepare);
+    const before = cch.stats();
+
+    // The SQL *is* in the cache, but its entry is checked out: a fresh
+    // statement is prepared, and `len` grows (the taken entry keeps its slot,
+    // so this is a second entry under the same key).
+    const p = try cch.getOrPrepare("A", &ctx, testPrepare, &ctx, testDeinitCount);
+    try std.testing.expect(p.cached);
+    try std.testing.expect(p.stmt != t.stmt);
+    try std.testing.expectEqual(@as(usize, 2), cch.len);
+
+    const after = cch.stats();
+    try std.testing.expectEqual(before.taken_misses + 1, after.taken_misses);
+    try std.testing.expectEqual(before.misses, after.misses); // not a cold miss
+    try std.testing.expectEqual(before.prepares + 1, after.prepares);
+    try std.testing.expectEqual(before.hits, after.hits); // no hit was served
+
+    cch.releaseTaken(t.slot, t.stmt, &ctx, testDeinitCount);
+    try std.testing.expectEqual(@as(usize, 1), cch.stats().returned);
+}
+
+test "PreparedCache: stats counts an LRU eviction and an entry no slot could take" {
+    var cch: PreparedCache(2, *anyopaque) = .{};
+    var ctx = TestCtx{};
+
+    _ = try cch.getOrPrepare("A", &ctx, testPrepare, &ctx, testDeinitCount);
+    _ = try cch.getOrPrepare("B", &ctx, testPrepare, &ctx, testDeinitCount);
+    try std.testing.expectEqual(@as(usize, 0), cch.stats().evictions);
+
+    // Third entry into a 2-entry cache: one LRU eviction (A is the tail).
+    _ = try cch.getOrPrepare("C", &ctx, testPrepare, &ctx, testDeinitCount);
+    var st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 1), st.evictions);
+    try std.testing.expectEqual(@as(usize, 0), st.uncached_inserts);
+    try std.testing.expectEqual(@as(usize, 3), st.misses + st.taken_misses);
+    try std.testing.expectEqual(@as(usize, 3), st.prepares);
+
+    // Every slot checked out (C and B survived the eviction): the next miss
+    // prepares a statement the cache cannot keep, which is its own counter —
+    // and it is not an eviction (no cache-owned handle was released).
+    const tc = try cch.takeOrPrepare("C", &ctx, testPrepare);
+    const tb = try cch.takeOrPrepare("B", &ctx, testPrepare);
+    try std.testing.expect(tc.slot != null and tb.slot != null);
+    const p = try cch.getOrPrepare("D", &ctx, testPrepare, &ctx, testDeinitCount);
+    try std.testing.expect(!p.cached);
+    st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 1), st.uncached_inserts);
+    try std.testing.expectEqual(@as(usize, 1), st.evictions);
+
+    cch.releaseTaken(tc.slot, tc.stmt, &ctx, testDeinitCount);
+    cch.releaseTaken(tb.slot, tb.stmt, &ctx, testDeinitCount);
+}
+
+test "PreparedCache: stats counts evictAll by entry, and the stale return it causes" {
+    var cch: PreparedCache(4, *anyopaque) = .{};
+    var ctx = TestCtx{};
+
+    _ = try cch.getOrPrepare("A", &ctx, testPrepare, &ctx, testDeinitCount);
+    _ = try cch.getOrPrepare("B", &ctx, testPrepare, &ctx, testDeinitCount);
+    const t = try cch.takeOrPrepare("A", &ctx, testPrepare);
+
+    // DDL invalidation drops the one non-taken entry (B) and leaves A's slot
+    // to the iterator that owns it — counted by entry, so the checked-out one
+    // is not in the number.
+    cch.evictAll(&ctx, testDeinitCount);
+    try std.testing.expectEqual(@as(usize, 1), cch.stats().invalidations);
+
+    // The return finds its slot gone: the handle is released rather than
+    // re-cached, and that loss is visible instead of silent (the v0.85 shape).
+    cch.returnStmt(t.slot.?, t.stmt, &ctx, testDeinitCount);
+    const st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 1), st.stale_returns);
+    try std.testing.expectEqual(@as(usize, 0), st.returned);
+    try std.testing.expectEqual(@as(usize, 0), st.released_uncached);
+}
+
+test "PreparedCache: stats counts a failed-take release, cached or not" {
+    var cch: PreparedCache(4, *anyopaque) = .{};
+    var ctx = TestCtx{};
+
+    _ = try cch.getOrPrepare("A", &ctx, testPrepare, &ctx, testDeinitCount);
+
+    // The v0.85 shape: the query path checked A out, then failed before a Rows
+    // iterator took ownership. The slot goes back — a `returned`, never a
+    // `released_uncached`, because the handle is still the cache's.
+    const hit_take = try cch.takeOrPrepare("A", &ctx, testPrepare);
+    cch.releaseTaken(hit_take.slot, hit_take.stmt, &ctx, testDeinitCount);
+    var st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 1), st.returned);
+    try std.testing.expectEqual(@as(usize, 0), st.released_uncached);
+    try std.testing.expectEqual(@as(usize, 0), st.stale_returns);
+
+    // A take that missed: the handle is the caller's, and releasing it is not
+    // a cache event — nothing was cached to lose.
+    const miss_take = try cch.takeOrPrepare("B", &ctx, testPrepare);
+    try std.testing.expect(miss_take.slot == null);
+    cch.releaseTaken(miss_take.slot, miss_take.stmt, &ctx, testDeinitCount);
+    st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 1), st.released_uncached);
+    try std.testing.expectEqual(@as(usize, 1), st.returned);
+    // The take itself was a cold miss and a prepare, like any other.
+    try std.testing.expectEqual(@as(usize, 2), st.misses);
+    try std.testing.expectEqual(@as(usize, 2), st.prepares);
+}
+
+test "PreparedCache: stats counts the oversized-SQL bypass" {
+    var cch: PreparedCacheSized(2, *anyopaque, 4) = .{};
+    var ctx = TestCtx{};
+
+    _ = try cch.getOrPrepare("SELECT 1", &ctx, testPrepare, &ctx, testDeinitCount);
+    _ = try cch.getOrPrepare("SELECT 1", &ctx, testPrepare, &ctx, testDeinitCount);
+    var st = cch.stats();
+    // It misses every time, by construction: nothing is ever stored. The
+    // subset counter is what answers "why does this statement never hit?".
+    try std.testing.expectEqual(@as(usize, 2), st.oversized_bypass);
+    try std.testing.expectEqual(@as(usize, 2), st.misses);
+    try std.testing.expectEqual(@as(usize, 2), st.prepares);
+    try std.testing.expectEqual(@as(usize, 0), st.evictions);
+    try std.testing.expectEqual(@as(usize, 0), st.uncached_inserts);
+
+    // Short SQL takes the ordinary path and is not counted as oversized.
+    _ = try cch.getOrPrepare("SEL", &ctx, testPrepare, &ctx, testDeinitCount);
+    st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 2), st.oversized_bypass);
+    try std.testing.expectEqual(@as(usize, 3), st.misses);
+    try std.testing.expectEqual(@as(usize, 1), cch.len);
+}
+
+test "PreparedCache: a failed prepare is a miss but not a prepare" {
+    // `prepares` counts statements the cache really prepared; the lookup that
+    // asked for one is counted either way. A failing `prepareFn` is the only
+    // way the two numbers can disagree, and the docs say so.
+    var cch: PreparedCache(4, *anyopaque) = .{};
+    var ctx = TestCtx{};
+    try std.testing.expectError(
+        error.PrepareFailed,
+        cch.getOrPrepare("A", &ctx, struct {
+            fn f(_: *TestCtx, _: []const u8) !*anyopaque {
+                return error.PrepareFailed;
+            }
+        }.f, &ctx, testDeinitCount),
+    );
+    const st = cch.stats();
+    try std.testing.expectEqual(@as(usize, 1), st.misses);
+    try std.testing.expectEqual(@as(usize, 0), st.prepares);
+    try std.testing.expectEqual(@as(usize, 0), cch.len);
 }
 
 test "isDDL detection" {

@@ -477,7 +477,47 @@ splice it in.
 | `entql` (`Parse`) | **yes** | it lowers to builder predicates |
 | `PreparedCache` | n/a | keyed on the final SQL text, byte-compared — two tenants produce two entries, never a shared statement |
 
-### Validating a raw statement before you run it (`checkStatement`)
+### Row values are borrowed — the lifetime rule to write down once
+
+`Row.getText`, `getBlob` and `columnName` hand back a **view into memory the
+driver owns**, never a copy. The portable rule (the intersection of all three
+drivers — each keeps its bytes at least this long, and SQLite exactly this
+long):
+
+> A text or blob value is valid until the next `Rows.next()` on the rows that
+> produced it, or `Rows.deinit()` — whichever comes first.
+
+Anything that outlives its row must be copied **while the row is current**.
+Two ways, and the first is now in the API:
+
+```zig
+while (rows.next()) |row| {
+    const name = try row.textDup(allocator, 1) orelse continue;  // owned; free it
+    defer allocator.free(name);
+    try list.append(allocator, name);   // safe: this copy is yours
+}
+```
+
+`row.blobDup(allocator, i)` is the same for blobs; both answer `null` exactly
+when the getter answers `null` (and allocate nothing in that case). The
+hand-rolled `allocator.dupe(u8, row.getText(i).?)` remains fine but re-states
+the lifetime rule at every call site — which is how a program ends up correct
+on PostgreSQL (whose pointer lasts as long as the result) and dangling on
+SQLite (where the next step invalidates it). Two more details that only matter
+once they bite: MySQL overwrites each column's buffer on the next fetch, and
+the bytea decoder reuses one buffer per column, so re-reading the *same*
+column overwrites the bytes an earlier read of that column returned.
+
+### Public helpers for the things everyone re-implements
+
+| Helper | Why it exists |
+|---|---|
+| `zent.walltime.nowSecs()/nowMilli()/nowMicros()/nowNanos()` | Wall-clock reads. Zig 0.17 removed the `std.time` getters, and zent's own wall-clock reads used to be private — consumers were each writing their own module. A failure answers `0` and warns (the same policy the drivers use); for **durations** use `sql_logger.nowUs()`, which is monotonic — a wall clock can step or jump backwards |
+| `zent.sql_dialect_expr.nowSecs(dialect)` | The dialect's "current epoch seconds" SQL expression (`UNIX_TIMESTAMP()`, `EXTRACT(EPOCH FROM now())::bigint`, `(unixepoch())`) — the same one the audit defaults use, so a raw statement can match them |
+| `zent.sql_dialect_expr.insertIgnore(dialect)` | `{prefix, suffix}` for a raw ignore-insert: `INSERT IGNORE ` / `INSERT OR IGNORE ` / `INSERT ` + ` ON CONFLICT DO NOTHING`. It is a pair because PostgreSQL's form is a suffix — a prefix-only helper would silently produce a non-ignoring statement. Builder-level callers should use `sql.InsertOrIgnore` / `SaveIgnore` instead |
+| `zent.sql_dialect_expr.numericTextAsNumber(dialect, buf, expr)` | `CAST(expr AS …)` for the `Decimal`-as-text columns (SQLite has no native numeric type). It converts; it does not make SQLite arithmetic exact |
+| `driver.cacheStats()` on each driver | Prepared-statement cache counters (`hits`, `misses`, `taken_misses`, `prepares`, `evictions`, …) — per connection, so a pool-wide number is a sum over the connections you hold |
+
 
 Raw SQL is written by hand, and until v0.58.0 there was no way to ask "will this
 even run?" other than running it:

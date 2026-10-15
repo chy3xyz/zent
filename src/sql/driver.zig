@@ -2,6 +2,7 @@ const std = @import("std");
 const Value = @import("builder.zig").Value;
 const OwnedQuery = @import("builder.zig").OwnedQuery;
 const Dialect = @import("dialect.zig").Dialect;
+const walltime = @import("walltime.zig");
 const zent_log = @import("../runtime/log.zig");
 
 pub const Result = struct {
@@ -250,17 +251,67 @@ pub const RetryOpts = struct {
 };
 
 /// A single database row exposed for scanning.
+///
+/// **Every getter that answers a slice *borrows* it.** `getText`, `getBlob` and
+/// `columnName` return a view into memory the driver owns, never a copy, so a
+/// row value does not stay readable for as long as the `Row` value itself does.
+/// The scalar getters (`getBool`, `getInt`, `getFloat`) answer by value and have
+/// no lifetime to observe.
+///
+/// **A text or blob value is guaranteed valid until the next `Rows.next()` on
+/// the `Rows` that produced the row, or `Rows.deinit()`, whichever comes
+/// first.** That is the intersection of the three drivers, and the only lifetime
+/// a portable consumer may build on. Anything that has to outlive its row — a
+/// value compared against the previous loop iteration's, a struct field, a
+/// return value — must be copied while the row is still current: `textDup` /
+/// `blobDup`, or `allocator.dupe` on the slice.
+///
+/// Each driver keeps the bytes alive for *at least* that long, and two of them
+/// keep them longer. The guarantee above is what may be relied on; the extra time
+/// is an implementation detail, and leaning on it is how a program works on one
+/// dialect and dangles on another:
+///
+///   * SQLite — `sqlite3_column_text` / `sqlite3_column_blob` answer a pointer
+///     into SQLite's per-statement value buffer. SQLite's own documentation
+///     invalidates it at the next `sqlite3_step`, `sqlite3_reset` or
+///     `sqlite3_finalize` (and at a read that converts the type of that same
+///     column), which is exactly the next `next()` / `deinit()`
+///     (`sql/sqlite.zig`, `getText` / `getBlob`).
+///   * MySQL — the slice points into the per-column buffer that
+///     `mysql_stmt_fetch` filled, owned by `MySQLRows` (`sql/mysql.zig`,
+///     `textOf`). The buffer's *address* survives until `Rows.deinit()`, but the
+///     next fetch overwrites its bytes.
+///   * PostgreSQL — `PQgetvalue` answers a pointer into the `PGresult`, which
+///     stays valid until `Rows.deinit()` clears it (`sql/postgres.zig`, `textOf`),
+///     so a text value really does outlive the next `next()` there. **A `bytea`
+///     column is the exception**: it is decoded into a per-column buffer of this
+///     driver's own, and reading that same column again overwrites the bytes an
+///     earlier read of it handed back. The address does not move; the value does.
+///
+/// `columnName` is the different case: it reads the statement's metadata, not the
+/// row, and no fetch overwrites it. It is therefore good for as long as the
+/// `Rows` object lives — MySQL's `MYSQL_FIELD` array and PostgreSQL's `PQfname`
+/// both live in the result the driver frees in `deinit`. SQLite's C API is
+/// narrower: a later `sqlite3_column_name` for the *same* column may invalidate an
+/// earlier pointer, so a SQLite name is reliably valid only until the next such
+/// call (fetching rows does not invalidate it).
 pub const Row = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         columnCount: *const fn (ptr: *anyopaque) usize,
+        /// Name of column `index`, from the statement's metadata. Borrowed;
+        /// see the lifetime contract on `Row` (a fetch does not overwrite a
+        /// name, so it lasts as long as the `Rows` object).
         columnName: *const fn (ptr: *anyopaque, index: usize) []const u8,
         getBool: *const fn (ptr: *anyopaque, index: usize) ?bool,
         getInt: *const fn (ptr: *anyopaque, index: usize) ?i64,
         getFloat: *const fn (ptr: *anyopaque, index: usize) ?f64,
+        /// Column `index` as text. Borrowed: valid only until the next
+        /// `Rows.next()` / `Rows.deinit()` — see the lifetime contract on `Row`.
         getText: *const fn (ptr: *anyopaque, index: usize) ?[]const u8,
+        /// Column `index` as bytes; same borrow and lifetime as `getText`.
         getBlob: *const fn (ptr: *anyopaque, index: usize) ?[]const u8,
         isNull: *const fn (ptr: *anyopaque, index: usize) bool,
     };
@@ -269,6 +320,9 @@ pub const Row = struct {
         return self.vtable.columnCount(self.ptr);
     }
 
+    /// The column's name, from the statement's metadata rather than from the
+    /// row. Borrowed — see the lifetime contract on `Row`; a fetch does not
+    /// overwrite a name, so it stays valid for as long as the `Rows` object.
     pub fn columnName(self: Row, index: usize) []const u8 {
         return self.vtable.columnName(self.ptr, index);
     }
@@ -285,10 +339,15 @@ pub const Row = struct {
         return self.vtable.getFloat(self.ptr, index);
     }
 
+    /// The column's value as text. **Borrowed** — valid only until the next
+    /// `Rows.next()` on the producing `Rows`, or its `deinit()`; see the
+    /// lifetime contract on `Row`. Use `textDup` to keep it past the row.
     pub fn getText(self: Row, index: usize) ?[]const u8 {
         return self.vtable.getText(self.ptr, index);
     }
 
+    /// The column's value as bytes; same borrow and lifetime as `getText` (see
+    /// the contract on `Row`). Use `blobDup` to keep it past the row.
     pub fn getBlob(self: Row, index: usize) ?[]const u8 {
         return self.vtable.getBlob(self.ptr, index);
     }
@@ -338,6 +397,26 @@ pub const Row = struct {
     pub fn tryGetBlob(self: Row, index: usize) GetError![]const u8 {
         return self.getBlob(index) orelse error.NullColumn;
     }
+
+    /// Owned copy of `getText(index)`, for a value that has to outlive the row
+    /// it came from (`getText` borrows a slice the driver may reuse or free at
+    /// the next `Rows.next()` — see the lifetime contract on `Row`).
+    ///
+    /// Returns `null` when the column is NULL, exactly as `getText` does, and
+    /// `error.OutOfMemory` when the copy cannot be allocated. The returned bytes
+    /// are **owned by the caller**: release them with `allocator.free`.
+    pub fn textDup(self: Row, allocator: std.mem.Allocator, index: usize) error{OutOfMemory}!?[]const u8 {
+        const text = self.getText(index) orelse return null;
+        return try allocator.dupe(u8, text);
+    }
+
+    /// Owned copy of `getBlob(index)` — `textDup`'s byte-slice twin, with the
+    /// same NULL semantics, the same `error.OutOfMemory`, and the same caller
+    /// ownership of the returned bytes.
+    pub fn blobDup(self: Row, allocator: std.mem.Allocator, index: usize) error{OutOfMemory}!?[]const u8 {
+        const blob = self.getBlob(index) orelse return null;
+        return try allocator.dupe(u8, blob);
+    }
 };
 
 /// Iterator over query results.
@@ -353,6 +432,14 @@ pub const Rows = struct {
         nextError: ?*const fn (ptr: *anyopaque) ?Error = null,
     };
 
+    /// Advance to the next row, or null at the end of the result set. Check
+    /// `nextError` after a null to tell a finished iteration from a driver
+    /// failure.
+    ///
+    /// The returned `Row`'s slice getters (`getText` / `getBlob`) borrow the
+    /// driver's row buffer, and **that borrow expires at the next `next()` or at
+    /// `deinit()`** — see the lifetime contract on `Row`. Read (or `textDup` /
+    /// `blobDup`) a row's values before advancing past it.
     pub fn next(self: Rows) ?Row {
         return self.vtable.next(self.ptr);
     }
@@ -384,10 +471,10 @@ pub fn monotonicNs() i64 {
     // wall clock (non-monotonic, so deadline arithmetic is approximate) and
     // say so rather than trapping.
     zent_log.warn("clock_gettime(CLOCK_MONOTONIC) failed; timing falls back to the wall clock", .{});
-    if (readClockNs(std.c.CLOCK.REALTIME)) |ns| return ns;
-    // Both clocks failed: report 0 so deadlines computed from here still
-    // compare consistently (a deadline is `now + budget`).
-    return 0;
+    // The wall-clock read is `zent.walltime`'s, so its syscall and its failure
+    // answer (0, with a warn) have one implementation for the library instead
+    // of one per caller.
+    return walltime.nowNanos();
 }
 
 /// Execution context carried by driver operations.
@@ -869,4 +956,120 @@ test "retryTx stops after max_attempts and returns the last error" {
     try std.testing.expectEqual(@as(u32, 3), state.begin_calls);
     try std.testing.expectEqual(@as(u32, 3), state.deinit_calls);
     try std.testing.expectEqual(@as(u32, 0), state.commit_calls);
+}
+
+/// Minimal `Row` over caller-owned buffers, for pinning the borrowed-vs-owned
+/// contract (`textDup` / `blobDup`) without a database.
+///
+/// The slices it hands out point at memory the test still owns and can rewrite —
+/// which is what a real driver does to its row buffer between fetches — so a test
+/// can show a duplicated value surviving that rewrite while a borrowed one does
+/// not.
+const MockRow = struct {
+    text: ?[]const u8,
+    blob: ?[]const u8,
+
+    fn state(ptr: *anyopaque) *MockRow {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn columnCount(_: *anyopaque) usize {
+        return 1;
+    }
+
+    fn columnName(_: *anyopaque, _: usize) []const u8 {
+        return "col";
+    }
+
+    fn getBool(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+
+    fn getInt(_: *anyopaque, _: usize) ?i64 {
+        return null;
+    }
+
+    fn getFloat(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+
+    fn getText(ptr: *anyopaque, _: usize) ?[]const u8 {
+        return state(ptr).text;
+    }
+
+    fn getBlob(ptr: *anyopaque, _: usize) ?[]const u8 {
+        return state(ptr).blob;
+    }
+
+    fn isNull(_: *anyopaque, _: usize) bool {
+        return false;
+    }
+
+    const vtable = Row.VTable{
+        .columnCount = columnCount,
+        .columnName = columnName,
+        .getBool = getBool,
+        .getInt = getInt,
+        .getFloat = getFloat,
+        .getText = getText,
+        .getBlob = getBlob,
+        .isNull = isNull,
+    };
+
+    fn row(self: *MockRow) Row {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "textDup and blobDup return copies that survive a rewrite of the row buffer" {
+    var buf = [_]u8{ 'a', 'b', 'c' };
+    var state = MockRow{ .text = buf[0..], .blob = buf[0..] };
+    const row = state.row();
+
+    const text = (try row.textDup(std.testing.allocator, 0)).?;
+    defer std.testing.allocator.free(text);
+    const blob = (try row.blobDup(std.testing.allocator, 0)).?;
+    defer std.testing.allocator.free(blob);
+
+    try std.testing.expectEqualStrings("abc", text);
+    // Not a view onto the driver's buffer: a different allocation...
+    try std.testing.expect(text.ptr != row.getText(0).?.ptr);
+    // ...so rewriting the borrowed bytes — what the next fetch does to a row
+    // buffer — leaves both copies as they were.
+    buf[0] = 'z';
+    try std.testing.expectEqualStrings("abc", text);
+    try std.testing.expectEqualStrings("abc", blob);
+    try std.testing.expectEqualStrings("zbc", row.getText(0).?);
+}
+
+test "textDup and blobDup keep NULL as null and allocate nothing" {
+    var state = MockRow{ .text = null, .blob = null };
+    const row = state.row();
+
+    // A NULL column is the `null` the plain getters answer, not an empty
+    // allocation: the failing allocator would turn any attempt to copy the cell
+    // into `error.OutOfMemory` instead of the null a caller has nothing to free.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const alloc = failing.allocator();
+    try std.testing.expectEqual(@as(?[]const u8, null), try row.textDup(alloc, 0));
+    try std.testing.expectEqual(@as(?[]const u8, null), try row.blobDup(alloc, 0));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+}
+
+test "textDup and blobDup unwind cleanly when any single allocation fails" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var buf = [_]u8{ 'x', 'y' };
+            var state = MockRow{ .text = buf[0..], .blob = buf[0..] };
+            const row = state.row();
+
+            const text = (try row.textDup(allocator, 0)) orelse return error.MissingValue;
+            defer allocator.free(text);
+            try std.testing.expectEqualStrings("xy", text);
+
+            const blob = (try row.blobDup(allocator, 0)) orelse return error.MissingValue;
+            defer allocator.free(blob);
+            try std.testing.expectEqualStrings("xy", blob);
+        }
+    }.run, .{});
 }

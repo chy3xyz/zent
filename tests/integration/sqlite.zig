@@ -5784,3 +5784,309 @@ test "SQLite: a pooled connection enforces foreign keys too" {
         first.exec("INSERT INTO fk_pool_child (id, parent_id) VALUES (1, 7)", &.{}),
     );
 }
+
+// ------------------------------------------------------------------
+// Index creation on SQLite: measured, not assumed
+// ------------------------------------------------------------------
+//
+// A consumer reported "L0 (SQLite) creates no UNIQUE/secondary indexes, so a
+// duplicate `uk_biz_no` cannot be tested here". That is a claim about the DDL
+// layer, and the DDL layer has two entry points that both walk `info.indexes`
+// (`createAllTables` after `createTables`, and `planMigrateStatements`'s
+// per-entity index step), plus the inlined column-level `UNIQUE`. The probes
+// below read `PRAGMA index_list` — the same introspection `checkSchema` uses —
+// and then try the duplicate insert, so the assertion is about the constraint
+// the server enforces, not about the statement that was sent.
+
+/// One row of `PRAGMA index_list(<table>)`: `name`, whether the index is
+/// UNIQUE, its origin — `c` for a `CREATE INDEX`, `u` for a UNIQUE constraint
+/// declared in the table definition, `pk` for the primary key — and whether it
+/// is a partial index (`WHERE …`).
+const SqliteListedIndex = struct {
+    name: []const u8,
+    unique: bool,
+    origin: []const u8,
+    partial: bool,
+};
+
+/// `PRAGMA index_list(<table>)` as owned rows. The names live in the returned
+/// arena, so a failure part-way through cannot leak one.
+const SqliteIndexList = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []const SqliteListedIndex,
+
+    fn deinit(self: *SqliteIndexList) void {
+        self.arena.deinit();
+    }
+
+    fn find(self: *const SqliteIndexList, name: []const u8) ?SqliteListedIndex {
+        for (self.items) |item| {
+            if (std.mem.eql(u8, item.name, name)) return item;
+        }
+        return null;
+    }
+};
+
+fn readIndexList(allocator: std.mem.Allocator, drv: *SQLiteDriver, table: []const u8) !SqliteIndexList {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const sql = try a.print("PRAGMA index_list('{s}')", .{table});
+    var rows = try drv.query(sql, &.{});
+    defer rows.deinit();
+
+    var items = std.array_list.Managed(SqliteListedIndex).init(a);
+    while (rows.next()) |row| {
+        const name = row.getText(1) orelse continue;
+        try items.append(.{
+            .name = try a.dupe(u8, name),
+            .unique = (row.getInt(2) orelse 0) != 0,
+            .origin = try a.dupe(u8, row.getText(3) orelse "c"),
+            .partial = (row.getInt(4) orelse 0) != 0,
+        });
+    }
+    if (rows.nextError()) |err| return err;
+
+    return .{ .arena = arena, .items = items.items };
+}
+
+/// True when some UNIQUE index in `list` has `column` as its **only** key —
+/// the question `PRAGMA index_info` answers, and the one that decides whether
+/// the column-level `UNIQUE` is really enforced. The index cannot be looked up
+/// by name: on a fresh table SQLite inlines the constraint and generates an
+/// automatic index name (`sqlite_autoindex_…`, origin `u`), while on a table
+/// the migration had to repair it is the named `uq_<table>_<column>` index
+/// `planUniqueColumnIndex` builds.
+///
+/// A partial index is skipped: it constrains only the rows its `WHERE` admits,
+/// so it is not the same question (the schema cannot declare one through
+/// `info.indexes` yet, but the helper must not answer a wider question than it
+/// was asked just because nothing in this test produces one).
+fn uniqueIndexOverColumn(
+    allocator: std.mem.Allocator,
+    drv: *SQLiteDriver,
+    list: *const SqliteIndexList,
+    column: []const u8,
+) !bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (list.items) |item| {
+        if (!item.unique or item.partial) continue;
+        const sql = try a.print("PRAGMA index_info('{s}')", .{item.name});
+        var rows = try drv.query(sql, &.{});
+        defer rows.deinit();
+
+        // Columns: seqno, cid, name.
+        var key_count: usize = 0;
+        var first_is_column = false;
+        while (rows.next()) |row| {
+            if (key_count == 0) {
+                first_is_column = if (row.getText(2)) |name| std.mem.eql(u8, name, column) else false;
+            }
+            key_count += 1;
+        }
+        if (rows.nextError()) |err| return err;
+        if (key_count == 1 and first_is_column) return true;
+    }
+    return false;
+}
+
+/// The probe schema: (a) a named UNIQUE index, (b) a column-level `UNIQUE`
+/// (inlined into `CREATE TABLE`, no `info.indexes` entry), (c) a plain
+/// secondary index. One schema, three answers.
+const LedgerIndexProbe = schema("LedgerIndexProbe", .{
+    .fields = &.{
+        field.Int("id"),
+        field.String("biz_no"),
+        field.String("code").Unique(),
+        field.String("note"),
+    },
+    .indexes = &.{
+        index.Named("uk_biz_no", &.{"biz_no"}).Unique(),
+        index.Named("idx_note", &.{"note"}),
+    },
+});
+
+/// Assert (a), (b) and (c) exist with the right uniqueness, whatever entry
+/// point built the table.
+fn expectLedgerIndexShape(allocator: std.mem.Allocator, drv: *SQLiteDriver, table: []const u8) !void {
+    var list = try readIndexList(allocator, drv, table);
+    defer list.deinit();
+
+    // (a) the named UNIQUE index.
+    const uk = list.find("uk_biz_no");
+    try testing.expect(uk != null);
+    try testing.expect(uk.?.unique);
+    try testing.expectEqualStrings("c", uk.?.origin);
+
+    // (b) the column-level UNIQUE, which has no name in the schema: the
+    // assertion is on the shape — some UNIQUE index whose only key is `code` —
+    // because SQLite inlines the constraint and generates an automatic index
+    // name on a fresh table, while the repair path builds a named one. The
+    // insert probe below is what proves the index is enforced.
+    try testing.expect(try uniqueIndexOverColumn(allocator, drv, &list, "code"));
+
+    // (c) the plain secondary index.
+    const note = list.find("idx_note");
+    try testing.expect(note != null);
+    try testing.expect(!note.?.unique);
+}
+
+/// The behavioural half: a duplicate under (a) and under (b) is refused, a
+/// duplicate under (c) is not.
+fn expectLedgerUniquenessEnforced(drv: *SQLiteDriver, table: []const u8) !void {
+    const first = try std.testing.allocator.print(
+        "INSERT INTO {s} (id, biz_no, code, note) VALUES (1, 'B-1', 'C-1', 'shared')",
+        .{table},
+    );
+    defer std.testing.allocator.free(first);
+    _ = try drv.exec(first, &.{});
+
+    // (c) a non-unique index does not constrain anything: the same note twice.
+    const second = try std.testing.allocator.print(
+        "INSERT INTO {s} (id, biz_no, code, note) VALUES (2, 'B-2', 'C-2', 'shared')",
+        .{table},
+    );
+    defer std.testing.allocator.free(second);
+    _ = try drv.exec(second, &.{});
+
+    // (a) a repeated biz_no.
+    const dup_biz = try std.testing.allocator.print(
+        "INSERT INTO {s} (id, biz_no, code, note) VALUES (3, 'B-1', 'C-3', 'other')",
+        .{table},
+    );
+    defer std.testing.allocator.free(dup_biz);
+    try testing.expectError(error.UniqueViolation, drv.exec(dup_biz, &.{}));
+
+    // (b) a repeated code.
+    const dup_code = try std.testing.allocator.print(
+        "INSERT INTO {s} (id, biz_no, code, note) VALUES (4, 'B-3', 'C-1', 'other')",
+        .{table},
+    );
+    defer std.testing.allocator.free(dup_code);
+    try testing.expectError(error.UniqueViolation, drv.exec(dup_code, &.{}));
+}
+
+test "SQLite: both entry points create a named UNIQUE index, a column UNIQUE and a secondary index" {
+    const allocator = testing.allocator;
+    const infos = comptime buildGraph(&.{LedgerIndexProbe}).types;
+    const table = infos[0].table_name;
+
+    // Path 1: `createAllTables` — `createTables` builds the table (with the
+    // column UNIQUE inlined) and the index loop after it builds `info.indexes`.
+    {
+        var drv = try SQLiteDriver.open(allocator, ":memory:");
+        defer drv.close();
+        try Client.createAllTables(allocator, infos, drv.asDriver());
+
+        try expectLedgerIndexShape(allocator, &drv, table);
+        try expectLedgerUniquenessEnforced(&drv, table);
+    }
+
+    // Path 2: `migrateSchema` — indexes are planned by `planMigrateStatements`
+    // after the CREATE TABLE for the same entity.
+    {
+        var drv = try SQLiteDriver.open(allocator, ":memory:");
+        defer drv.close();
+        try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+        try expectLedgerIndexShape(allocator, &drv, table);
+        try expectLedgerUniquenessEnforced(&drv, table);
+
+        // And the drift report agrees with what was built: nothing is missing.
+        const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+        defer migrate.freeSchemaDrift(allocator, drifts);
+        try testing.expectEqual(@as(usize, 0), drifts.len);
+    }
+}
+
+test "SQLite: migrateSchema adds the indexes a pre-existing table is missing" {
+    // The other half of the same question, and the reason the two paths must
+    // stay in step: a table created before the declaration existed (here: by
+    // hand, which is what a table from an older deployment looks like) gets
+    // its indexes from the *existing table* branch — the named ones from the
+    // `info.indexes` step and the column-level UNIQUE from
+    // `planUniqueColumnIndex`, which exists precisely because
+    // `ALTER TABLE ADD COLUMN` cannot carry a column `UNIQUE`.
+    const allocator = testing.allocator;
+    const infos = comptime buildGraph(&.{LedgerIndexProbe}).types;
+    const table = infos[0].table_name;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // The table without any of the three indexes — and, on purpose, without
+    // the NOT NULLs either, so the only thing this migration has to repair is
+    // the indexes. (The DDL is otherwise the shape `createTableSQLAlloc`
+    // emits for this entity, so no other drift kind fires.)
+    const create = try allocator.print(
+        "CREATE TABLE {s} (id INTEGER PRIMARY KEY AUTOINCREMENT, biz_no TEXT NOT NULL, code TEXT NOT NULL, note TEXT NOT NULL)",
+        .{table},
+    );
+    defer allocator.free(create);
+    _ = try drv.exec(create, &.{});
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    try expectLedgerIndexShape(allocator, &drv, table);
+
+    // The column-level UNIQUE is now a real named index (not an automatic
+    // one): the migration cannot rebuild the table, so it adds the
+    // dialect-neutral unique index over the one column.
+    var list = try readIndexList(allocator, &drv, table);
+    defer list.deinit();
+    const uq = list.find("uq_ledger_index_probe_code");
+    try testing.expect(uq != null);
+    try testing.expect(uq.?.unique);
+
+    try expectLedgerUniquenessEnforced(&drv, table);
+
+    const drifts = try migrate.checkSchema(allocator, drv.asDriver(), infos);
+    defer migrate.freeSchemaDrift(allocator, drifts);
+    try testing.expectEqual(@as(usize, 0), drifts.len);
+}
+
+test "SQLite: the column type does not enforce VarChar(n), the write path does" {
+    // SQLite's `VARCHAR(n)` is TEXT affinity: the width is not enforced by the
+    // DDL at all (and this driver maps `field.String` to `TEXT` in the first
+    // place). So an over-long value that arrives through raw SQL lands — which
+    // is the shape a consumer described as "the over-long number cannot be
+    // caught at L0". It *is* caught, but one layer up: `validateSqlValue`
+    // refuses a value longer than the declared `VarChar(n)` on the builder
+    // write path (v0.86), on every dialect including this one — so a caller
+    // that goes through `Create()`/`Save()` gets a named error here instead of
+    // the server-side 1406 it would get on MySQL.
+    const allocator = testing.allocator;
+    const VarCharProbe = schema("VarCharProbe", .{
+        .fields = &.{ field.Int("id"), field.String("code").VarChar(8) },
+    });
+    const infos = comptime buildGraph(&.{VarCharProbe}).types;
+
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+    try migrate.migrateSchema(allocator, drv.asDriver(), infos);
+
+    // Raw SQL: no ceiling. The DDL is `code TEXT`/`VARCHAR(8)` and SQLite
+    // takes the value.
+    _ = try drv.exec("INSERT INTO var_char_probe (id, code) VALUES (1, 'far-longer-than-eight')", &.{});
+
+    // The builder path: refused before a statement is built, on this dialect
+    // too — the L0 answer to the same question.
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    var b = try client.var_char_probe.Create();
+    defer b.deinit();
+    _ = try b.setFieldValue("code", "far-longer-than-eight");
+    try testing.expectError(error.ValidationFailed, b.Save());
+
+    // A value inside the ceiling still saves, so the check is the length and
+    // not the call.
+    var ok = try client.var_char_probe.Create();
+    defer ok.deinit();
+    _ = try ok.setFieldValue("code", "short");
+    var saved = try ok.Save();
+    defer zent.codegen.deinitEntity(infos, infos[0], &saved, allocator);
+    try testing.expectEqualStrings("short", saved.code);
+}

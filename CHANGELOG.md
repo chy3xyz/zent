@@ -4,6 +4,59 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A public wall clock, `zent.walltime`** (`nowSecs`/`nowMilli`/`nowMicros`/
+  `nowNanos`). Zig 0.17 removed the `std.time` getters, and zent's own
+  wall-clock reads were private and scattered across four places (outbox,
+  pool, the driver's REALTIME fallback, the migration); consumers were writing
+  their own module. One implementation now backs all of them: libc
+  `CLOCK_REALTIME`, warning and answering `0` on failure — the same policy the
+  drivers already used. The doc points out what it is not for: durations use
+  `sql_logger.nowUs()`, which is monotonic (v0.83.0 made it so, and that is
+  exactly why the helper exists — a timestamp taken from a monotonic clock is
+  process uptime, and anything reading `nowUs` for a stored timestamp should
+  move here).
+- **`Row.textDup(allocator, index)` / `Row.blobDup(allocator, index)`**, plus
+  the borrowed-slice lifetime contract written onto `Row`, its vtable hooks,
+  the wrapper methods and `Rows.next`. The rule is the intersection of the
+  three drivers — valid until the next `next()` or `deinit()` — with each
+  driver's actual guarantee spelled out (PostgreSQL holds bytes for the whole
+  result; MySQL overwrites a column's buffer on the next fetch; SQLite
+  invalidates it at the next step; the bytea decoder reuses one buffer per
+  column, so re-reading a column overwrites what the previous read returned).
+  Both helpers answer `null` — allocating nothing — exactly when the getter
+  does, and hand back memory the caller frees.
+- **`zent.sql_dialect_expr`**: `nowSecs(dialect)` (the epoch-seconds expression
+  the audit defaults already used, now one definition instead of two),
+  `insertIgnore(dialect)` returning `{prefix, suffix}` (a pair because
+  PostgreSQL's form is a suffix — a prefix-only helper would silently produce
+  a non-ignoring statement), and `numericTextAsNumber(dialect, buf, expr)` for
+  `CAST`ing the `Decimal`-as-text columns.
+- **Prepared-statement cache counters**: `Stats`/`stats()` on the cache itself
+  and a `cacheStats()` accessor on each driver (SQLite reads under the same
+  mutex as every cache operation; the others are single-connection). Eleven
+  counters — `hits`, `misses`, `taken_misses`, `prepares`, `evictions`,
+  `invalidations`, `oversized_bypass`, `uncached_inserts`, `returned`,
+  `stale_returns`, `released_uncached` — each documented with the moment it
+  increments, and `hits + misses + taken_misses` covering every lookup. No
+  behaviour changed.
+
+### Documented
+
+- `BEST_PRACTICES` §5 gains the borrowed-row lifetime rule with the copy
+  recipe, and a table of the helpers above so nobody writes a fourth dialect
+  switch.
+- `UPGRADING` §13.6 covers the `nowUs`→`walltime` migration explicitly, plus
+  the new row contract and cache counters.
+- A regression test pins the L0 story that motivated this round's report:
+  `createAllTables` and `migrateSchema` both create a declared unique index, a
+  column-level `UNIQUE` (as the table's autoindex — the *name* is
+  `sqlite_autoindex_<table>_N`, not the one you declared) and a secondary
+  index on SQLite, and both refuse a duplicate key; the "L0 does not build
+  indexes" claim did not reproduce, and the four new integration cases keep it
+  that way.
+
 ## [0.92.0] - 2026-10-15
 
 ### Added
