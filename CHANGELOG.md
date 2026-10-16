@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.95.0] - 2026-10-17
+
 ### Added
 
 - **PostgreSQL-wire servers that carry a partial catalog are read, not
