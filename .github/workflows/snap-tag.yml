@@ -35,7 +35,7 @@ jobs:
           git fetch --quiet --tags origin main
 
           SHA="$(git rev-parse origin/main)"
-          STATE="$(gh run list --commit "$SHA" --limit 1 \
+          STATE="$(gh run list --workflow=ci.yml --commit "$SHA" --limit 1 \
               --json status,conclusion \
               -q '.[0] | [.status, (.conclusion // "")] | map(select(. != "")) | join(" ")')"
           if [ "$STATE" != "completed success" ]; then

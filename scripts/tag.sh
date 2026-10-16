@@ -101,7 +101,7 @@ HAVE_GH=0
 command -v gh >/dev/null 2>&1 && HAVE_GH=1
 CI_STATE=""
 if [ "$HAVE_GH" = "1" ]; then
-    CI_STATE="$(gh run list --commit "$LOCAL_HEAD" --limit 1 --json status,conclusion \
+    CI_STATE="$(gh run list --workflow=ci.yml --commit "$LOCAL_HEAD" --limit 1 --json status,conclusion \
         -q '.[0] | [.status, (.conclusion // "")] | map(select(. != "")) | join(" ")' 2>/dev/null || true)"
 fi
 case "$CI_STATE" in
