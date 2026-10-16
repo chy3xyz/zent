@@ -160,6 +160,223 @@
       "kind": "constant",
       "name": "Value",
       "parent": null
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10883,
+      "kind": "constant",
+      "name": "driver_vtable",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10899,
+      "kind": "function",
+      "name": "stubExec",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10905,
+      "kind": "function",
+      "name": "stubQuery",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10912,
+      "kind": "function",
+      "name": "rowsNext",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10916,
+      "kind": "function",
+      "name": "rowsDeinit",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10934,
+      "kind": "function",
+      "name": "stubBeginTx",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10944,
+      "kind": "function",
+      "name": "stubBeginSavepoint",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10948,
+      "kind": "function",
+      "name": "stubClose",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10950,
+      "kind": "function",
+      "name": "stubDialect",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10954,
+      "kind": "function",
+      "name": "stubPing",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 10956,
+      "kind": "function",
+      "name": "stubInTransaction",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11065,
+      "kind": "constant",
+      "name": "driver_vtable",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11081,
+      "kind": "constant",
+      "name": "row_vtable",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11094,
+      "kind": "function",
+      "name": "stubExec",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11098,
+      "kind": "function",
+      "name": "stubQuery",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11134,
+      "kind": "function",
+      "name": "rowsNext",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11142,
+      "kind": "function",
+      "name": "rowsDeinit",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11144,
+      "kind": "function",
+      "name": "rowColumnCount",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11150,
+      "kind": "function",
+      "name": "rowColumnName",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11154,
+      "kind": "function",
+      "name": "rowGetBool",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11158,
+      "kind": "function",
+      "name": "rowGetInt",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11165,
+      "kind": "function",
+      "name": "rowGetFloat",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11169,
+      "kind": "function",
+      "name": "rowGetText",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11176,
+      "kind": "function",
+      "name": "rowGetBlob",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11180,
+      "kind": "function",
+      "name": "rowIsNull",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11184,
+      "kind": "function",
+      "name": "stubBeginTx",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11188,
+      "kind": "function",
+      "name": "stubBeginSavepoint",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11192,
+      "kind": "function",
+      "name": "stubClose",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11194,
+      "kind": "function",
+      "name": "stubDialect",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11198,
+      "kind": "function",
+      "name": "stubPing",
+      "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11200,
+      "kind": "function",
+      "name": "stubInTransaction",
+      "parent": "PostgresIndexCatalogStub"
     }
   ]
 }
