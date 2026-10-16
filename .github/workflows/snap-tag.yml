@@ -27,6 +27,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The runner has no git identity, and `git tag -a` needs one (the first
+      # run failed with "empty ident name ... not allowed"). Same name/address
+      # the rest of GitHub's automation uses.
+      - name: Configure the tag identity
+        run: |
+          git config user.name "zent snapshot tag"
+          git config user.email "actions@users.noreply.github.com"
+
       - name: Tag the newest verified commit on main
         env:
           GH_TOKEN: ${{ github.token }}
