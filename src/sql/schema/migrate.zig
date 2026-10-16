@@ -726,79 +726,90 @@ pub fn checkSchema(
             // warning. That is the reason for the gates, not for silence.
             if (comptime info.indexes.len > 0 or wantsUniqueColumnCheck(table)) {
                 if (existing.items.len > 0) {
-                    var existing_idxs = try getExistingIndexes(allocator, driver, table.name);
-                    defer freeExistingIndexes(allocator, &existing_idxs);
+                    // A PostgreSQL-wire server need not carry PostgreSQL's index
+                    // catalogs (HeliosDB Nano has no `pg_am`, so both the full
+                    // query and its reduced form are refused). Index comparison
+                    // is then *unknown*, not negative — so this table's whole
+                    // index/unique half is skipped instead of reporting every
+                    // declared index as missing.
+                    index_half: {
+                        var existing_idxs = getExistingIndexes(allocator, driver, table.name) catch |err| switch (err) {
+                            error.IndexCatalogUnavailable => break :index_half,
+                            else => return err,
+                        };
+                        defer freeExistingIndexes(allocator, &existing_idxs);
 
-                    if (comptime info.indexes.len > 0) {
-                        inline for (info.indexes) |idx| {
-                            if (getExistingIndexByName(existing_idxs.items, idx.name)) |db_idx| {
-                                if (db_idx.columns_comparable and !columnsEqual(db_idx.columns, idx.columns)) {
-                                    try appendOwnedDrift(allocator, &drifts, .{
-                                        .table = table.name,
-                                        .kind = .index_columns,
-                                        .index_name = idx.name,
-                                        .index_detail = try indexColumnsDetailAlloc(allocator, idx.columns, db_idx.columns),
-                                    });
-                                }
-                                // Uniqueness, on its own gate. It is deliberately
-                                // *not* nested in the `columns_comparable` branch
-                                // above: that flag answers "can the key list be
-                                // read", and uniqueness can always be read, so
-                                // coupling the two would drop this drift for
-                                // exactly the indexes a comparison found hardest
-                                // to see (expression keys, partial indexes,
-                                // non-btree access methods). The reverse coupling
-                                // matters too: a difference in uniqueness must
-                                // never make `index_columns` report a key list it
-                                // could not compare.
-                                if (db_idx.unique != idx.unique) {
-                                    try appendOwnedDrift(allocator, &drifts, .{
-                                        .table = table.name,
-                                        .kind = .index_uniqueness,
-                                        .index_name = idx.name,
-                                        .index_detail = try indexUniquenessDetailAlloc(allocator, idx.unique, db_idx.unique),
-                                    });
+                        if (comptime info.indexes.len > 0) {
+                            inline for (info.indexes) |idx| {
+                                if (getExistingIndexByName(existing_idxs.items, idx.name)) |db_idx| {
+                                    if (db_idx.columns_comparable and !columnsEqual(db_idx.columns, idx.columns)) {
+                                        try appendOwnedDrift(allocator, &drifts, .{
+                                            .table = table.name,
+                                            .kind = .index_columns,
+                                            .index_name = idx.name,
+                                            .index_detail = try indexColumnsDetailAlloc(allocator, idx.columns, db_idx.columns),
+                                        });
+                                    }
+                                    // Uniqueness, on its own gate. It is deliberately
+                                    // *not* nested in the `columns_comparable` branch
+                                    // above: that flag answers "can the key list be
+                                    // read", and uniqueness can always be read, so
+                                    // coupling the two would drop this drift for
+                                    // exactly the indexes a comparison found hardest
+                                    // to see (expression keys, partial indexes,
+                                    // non-btree access methods). The reverse coupling
+                                    // matters too: a difference in uniqueness must
+                                    // never make `index_columns` report a key list it
+                                    // could not compare.
+                                    if (db_idx.unique != idx.unique) {
+                                        try appendOwnedDrift(allocator, &drifts, .{
+                                            .table = table.name,
+                                            .kind = .index_uniqueness,
+                                            .index_name = idx.name,
+                                            .index_detail = try indexUniquenessDetailAlloc(allocator, idx.unique, db_idx.unique),
+                                        });
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Field-level UNIQUE: the declaration is inlined into
-                    // `CREATE TABLE` and is not one of `info.indexes`, so the
-                    // loop above cannot see it and a table built before the
-                    // field was declared UNIQUE never gets the constraint.
-                    //
-                    // The whole table is skipped while a unique index is
-                    // unreadable: `lower(email)` and `email(10)` both have no
-                    // comparable key list *and* both do force the column — so
-                    // the answer is unknown, and a report would be a guess. An
-                    // unreadable **non**-unique index is not part of that
-                    // judgement; it enforces nothing, so it answers nothing.
-                    if (comptime wantsUniqueColumnCheck(table)) {
-                        const undecidable = hasUnreadableUniqueIndex(existing_idxs.items);
-                        inline for (table.columns) |col| {
-                            // Three reasons not to look at this column at all:
-                            // the declaration already enforces it (the PK is
-                            // unique by construction), the database does not
-                            // have the column (already reported as
-                            // `missing_column`), or an unreadable unique index
-                            // makes the answer unknown.
-                            //
-                            // Written as one condition rather than a chain of
-                            // `continue`s: the filter above is comptime-known
-                            // and `continue` inside it is comptime control flow
-                            // in a runtime block, which 0.17 rejects.
-                            if (uniqueColumnChecked(col, table) and
-                                getExistingColumnByName(existing.items, col.name) != null and
-                                !undecidable and
-                                !indexForcesColumnAlone(existing_idxs.items, col.name))
-                            {
-                                try drifts.append(.{
-                                    .table = table.name,
-                                    .column = col.name,
-                                    .kind = .unique_constraint,
-                                    .index_detail = uniqueColumnDriftDetail,
-                                });
+                        // Field-level UNIQUE: the declaration is inlined into
+                        // `CREATE TABLE` and is not one of `info.indexes`, so the
+                        // loop above cannot see it and a table built before the
+                        // field was declared UNIQUE never gets the constraint.
+                        //
+                        // The whole table is skipped while a unique index is
+                        // unreadable: `lower(email)` and `email(10)` both have no
+                        // comparable key list *and* both do force the column — so
+                        // the answer is unknown, and a report would be a guess. An
+                        // unreadable **non**-unique index is not part of that
+                        // judgement; it enforces nothing, so it answers nothing.
+                        if (comptime wantsUniqueColumnCheck(table)) {
+                            const undecidable = hasUnreadableUniqueIndex(existing_idxs.items);
+                            inline for (table.columns) |col| {
+                                // Three reasons not to look at this column at all:
+                                // the declaration already enforces it (the PK is
+                                // unique by construction), the database does not
+                                // have the column (already reported as
+                                // `missing_column`), or an unreadable unique index
+                                // makes the answer unknown.
+                                //
+                                // Written as one condition rather than a chain of
+                                // `continue`s: the filter above is comptime-known
+                                // and `continue` inside it is comptime control flow
+                                // in a runtime block, which 0.17 rejects.
+                                if (uniqueColumnChecked(col, table) and
+                                    getExistingColumnByName(existing.items, col.name) != null and
+                                    !undecidable and
+                                    !indexForcesColumnAlone(existing_idxs.items, col.name))
+                                {
+                                    try drifts.append(.{
+                                        .table = table.name,
+                                        .column = col.name,
+                                        .kind = .unique_constraint,
+                                        .index_detail = uniqueColumnDriftDetail,
+                                    });
+                                }
                             }
                         }
                     }
@@ -810,19 +821,35 @@ pub fn checkSchema(
             // direction: a constraint the database has and the schema does not
             // can only reject writes the schema never promised, so reporting it
             // would turn a table somebody hardened by hand into a red deploy.
-            if (comptime table.foreign_keys.len > 0) {
-                if (existing.items.len > 0) {
-                    var existing_fks = try getExistingForeignKeys(allocator, driver, table.name);
-                    defer freeExistingForeignKeys(allocator, &existing_fks);
+            // Foreign keys the schema declares and the database does not have.
+            // Shape, not name (see `foreignKeyPresent`), and only in that
+            // direction: a constraint the database has and the schema does not
+            // can only reject writes the schema never promised, so reporting it
+            // would turn a table somebody hardened by hand into a red deploy.
+            //
+            // A server that cannot answer the read (`ForeignKeyCatalogUnavailable`
+            // — no `pg_proc`, so no `generate_subscripts`) has every declared key
+            // *left alone* rather than reported missing: the report is what makes
+            // the planner emit a second `ADD CONSTRAINT`, and "unknown" is not
+            // "absent".
+            fk_half: {
+                if (comptime table.foreign_keys.len > 0) {
+                    if (existing.items.len > 0) {
+                        var existing_fks = getExistingForeignKeys(allocator, driver, table.name) catch |err| switch (err) {
+                            error.ForeignKeyCatalogUnavailable => break :fk_half,
+                            else => return err,
+                        };
+                        defer freeExistingForeignKeys(allocator, &existing_fks);
 
-                    inline for (table.foreign_keys) |fk| {
-                        if (!foreignKeyPresent(existing_fks.items, fk)) {
-                            try appendOwnedDrift(allocator, &drifts, .{
-                                .table = table.name,
-                                .column = if (fk.columns.len > 0) fk.columns[0] else "",
-                                .kind = .missing_foreign_key,
-                                .index_detail = try foreignKeyDetailAlloc(allocator, fk),
-                            });
+                        inline for (table.foreign_keys) |fk| {
+                            if (!foreignKeyPresent(existing_fks.items, fk)) {
+                                try appendOwnedDrift(allocator, &drifts, .{
+                                    .table = table.name,
+                                    .column = if (fk.columns.len > 0) fk.columns[0] else "",
+                                    .kind = .missing_foreign_key,
+                                    .index_detail = try foreignKeyDetailAlloc(allocator, fk),
+                                });
+                            }
                         }
                     }
                 }
@@ -997,7 +1024,12 @@ fn appendJunctionShapeDrifts(
     defer freeExistingViews(allocator, &views);
     if (views.items.len > 0) return;
 
-    var existing_idxs = try getExistingIndexes(allocator, driver, jtable.name);
+    // Unknown catalog ⇒ unknown uniqueness: return without reporting, the same
+    // "unknown rather than negative" answer the unreadable-index hatch gives.
+    var existing_idxs = getExistingIndexes(allocator, driver, jtable.name) catch |err| switch (err) {
+        error.IndexCatalogUnavailable => return,
+        else => return err,
+    };
     defer freeExistingIndexes(allocator, &existing_idxs);
 
     // The same escape hatch the column UNIQUE check uses, for the same reason: a
@@ -1015,7 +1047,14 @@ fn appendJunctionShapeDrifts(
         });
     }
 
-    var existing_fks = try getExistingForeignKeys(allocator, driver, jtable.name);
+    // A server whose foreign-key read cannot be answered (`pg_proc` absent, so
+    // no `generate_subscripts` — see `getPostgresForeignKeys`) stops here: the
+    // pair uniqueness above is decided, and the key half is left to a server
+    // that can answer it rather than reported as missing.
+    var existing_fks = getExistingForeignKeys(allocator, driver, jtable.name) catch |err| switch (err) {
+        error.ForeignKeyCatalogUnavailable => return,
+        else => return err,
+    };
     defer freeExistingForeignKeys(allocator, &existing_fks);
 
     inline for (jtable.foreign_keys) |fk| {
@@ -1383,7 +1422,7 @@ pub fn assertSchema(
     driver: sql_driver.Driver,
     comptime infos: []const TypeInfo,
     strictness: DriftStrictness,
-) (sql_driver.Error || error{ SchemaDrift, UnsupportedDialect, InvalidTableName })!void {
+) (sql_driver.Error || error{ SchemaDrift, UnsupportedDialect, InvalidTableName, IndexCatalogUnavailable, ForeignKeyCatalogUnavailable })!void {
     const drifts = try checkSchema(allocator, driver, infos);
     defer freeSchemaDrift(allocator, drifts);
     for (drifts) |d| {
@@ -1463,7 +1502,7 @@ pub const DriftStrictness = enum {
     any,
 };
 
-pub const NullabilityError = sql_driver.Error || error{ NullabilityDrift, UnsupportedDialect, InvalidTableName };
+pub const NullabilityError = sql_driver.Error || error{ NullabilityDrift, UnsupportedDialect, InvalidTableName, IndexCatalogUnavailable, ForeignKeyCatalogUnavailable };
 
 /// The same check as `checkNullability`, as a **gate** rather than a side
 /// effect: fails with `error.NullabilityDrift` instead of writing a log line.
@@ -1944,6 +1983,73 @@ fn requiredPostgresExtensions(comptime infos: []const TypeInfo) []const []const 
     }
 }
 
+/// `requiredPostgresExtensions` as one comma-separated string, for the warning
+/// `checkPostgresExtensions` emits when the catalog cannot be read: the
+/// returned value carries no text, so the line has to name what was asked
+/// about. Pure and comptime, like the list it renders.
+fn requiredExtensionsJoined(comptime infos: []const TypeInfo) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (requiredPostgresExtensions(infos), 0..) |name, i| {
+            if (i > 0) out = out ++ ", ";
+            out = out ++ name;
+        }
+        return out;
+    }
+}
+
+/// The opening of `pgRelationListed`'s statement.
+///
+/// Named once and used by both the producer and the stubs that answer it
+/// (`ExtensionStub`, `PostgresIndexCatalogStub`, and the catalog stub in
+/// `src/test/allocation_failures_plan.zig`), because the catalog queries
+/// themselves join `pg_class` — a stub keying on that substring alone would
+/// answer the *index read* with the probe's `count(*)` row and look, from the
+/// test's side, exactly like a probe asked twice. `pub` for that third stub;
+/// nothing outside the tests reads it.
+pub const pg_relation_probe_prefix = "SELECT count(*) FROM pg_class WHERE relname";
+
+/// Whether `pg_class` lists the relation `name` — the probe that decides
+/// whether a PostgreSQL-catalog query may be sent at all.
+///
+/// **Why a probe rather than a retry.** A rejected statement aborts the
+/// transaction it runs in on every PostgreSQL-compatible server ("current
+/// transaction is aborted, commands ignored until end of transaction block"),
+/// and this introspection runs inside the caller's migration transaction — so
+/// recovering from the rejection is not recovery: the migration would carry on
+/// over a dead transaction and fail somewhere else entirely (measured against
+/// HeliosDB Nano, which refuses `pg_am` with SQLSTATE 42P01 *and* leaves the
+/// transaction unusable). Asking a question that cannot fail keeps the decision
+/// ahead of the damage: `pg_class` is the one catalog both full PostgreSQL and
+/// the wire-compatible servers that lack the rest do have.
+///
+/// **One relation at a time, because the answer is per relation.** A
+/// wire-compatible server may have the table and still not list it here —
+/// HeliosDB Nano answers 0 for `pg_index` while `SELECT count(*) FROM pg_index`
+/// returns its real rows — so a probe asking about several names at once would
+/// read "none of them" and throw away reads that would have worked. The two
+/// names asked about in this module are exactly the ones whose *absence* is
+/// what has to be known in advance: `pg_am` (the join `getPostgresIndexes`
+/// cannot send when it is missing) and `pg_extension` (the catalog
+/// `checkPostgresExtensions` cannot read).
+///
+/// The statement is assembled rather than bound, and `name` is a `comptime`
+/// parameter, so the literal is this module's own constant and never caller
+/// input — a bind list could not spell `relname = '…'` either.
+///
+/// Conservative by construction: any problem reading `pg_class` — including
+/// being inside an already-aborted transaction — answers "not listed", so the
+/// caller drops to the reading that does not need it rather than assuming it is
+/// there.
+fn pgRelationListed(drv: sql_driver.Driver, comptime name: []const u8) bool {
+    const sql = comptime pg_relation_probe_prefix ++ " = '" ++ name ++ "'";
+    var rows = drv.query(sql, &.{}) catch return false;
+    defer rows.deinit();
+    const row = rows.next() orelse return false;
+    const n = row.getInt(0) orelse return false;
+    return n > 0;
+}
+
 /// Refuse a PostgreSQL migration whose schema declares a type this database has
 /// no extension for — **before any DDL**, so the caller gets one named error
 /// instead of `ERROR: type "vector" does not exist` from the middle of a
@@ -1958,15 +2064,64 @@ fn requiredPostgresExtensions(comptime infos: []const TypeInfo) []const []const 
 /// would be a schema change outside the plan, with privileges the migration has
 /// no business assuming — so the fix is stated and the decision stays with the
 /// caller.
+///
+/// **A server with no `pg_extension` is not a server without the type.** The
+/// catalog is how the check proves an extension is *missing*; it is not the
+/// only way the type can exist. A wire-compatible server may carry the type
+/// natively (HeliosDB Nano has no `pg_extension` at all and yet provides
+/// `vector`), and refusing the migration on a catalog it does not have would
+/// block a schema that would migrate perfectly — the opposite of what this
+/// check is for. Two things therefore answer "this server cannot be asked":
+///
+/// - The **catalog is not listed** (`pgRelationListed`): the query is never
+///   sent, one warning says so, and the run continues. This is the path a
+///   wire-compatible server takes, and the reason the read is gated at all —
+///   sending it anyway would abort the caller's transaction and turn one
+///   unknown capability into a migration that dies somewhere unrelated.
+/// - The catalog *is* listed and the **statement is rejected** anyway (SQLSTATE
+///   42P01, which reaches this function as `error.ExecFailed` or as the
+///   `error.DriverFailed` PostgreSQL's driver maps it to, both of them
+///   `postgresStatementRefused`): warned the same way and the run continues.
+///   Kept as a safety net behind the gate rather than as the mechanism, because
+///   by the time it fires the transaction it ran in is already dead.
+///
+/// Either way the declared types go to the server as declared, and a server
+/// that really cannot provide them answers its own, louder error at the
+/// `CREATE TABLE`. Every other failure — a lost connection, a protocol error —
+/// still propagates, because the check cannot tell "no catalog" from "no
+/// connection" for those and guessing would be worse than failing.
 fn checkPostgresExtensions(drv: sql_driver.Driver, comptime infos: []const TypeInfo) !void {
     if (drv.dialect().kind() != .postgres) return;
     const required = comptime requiredPostgresExtensions(infos);
     if (required.len == 0) return;
 
+    // Ahead of the query: a rejection here would abort the caller's transaction
+    // (see `pgRelationListed`), so a server that does not carry the catalog is
+    // answered without asking it the question that would fail.
+    if (!pgRelationListed(drv, "pg_extension")) {
+        zent_log.warn(
+            "zent: cannot verify the PostgreSQL extension(s) this schema declares ({s}) — this server does not list `pg_extension` in its catalog; the declared types are sent to the server as declared, which a server without that catalog may well provide natively",
+            .{comptime requiredExtensionsJoined(infos)},
+        );
+        return;
+    }
+
     // One bit per required extension. Every member of `required` came out of
     // `postgres_extension_types`, so the table's length bounds the index.
     var installed: [postgres_extension_types.len]bool = @splat(false);
-    var rows = try drv.query("SELECT extname FROM pg_extension", &.{});
+    var rows = drv.query("SELECT extname FROM pg_extension", &.{}) catch |err| {
+        if (!postgresStatementRefused(err)) return err;
+        // Warned, with what was asked and what came back: the returned value is
+        // `void`, so this line is the only trace of the check having been
+        // skipped. `{s}` for the declared types so the reader knows which
+        // `CREATE TABLE` is now on its own — and the last sentence names why
+        // that is often fine.
+        zent_log.warn(
+            "zent: cannot verify the PostgreSQL extension(s) this schema declares ({s}) — `SELECT extname FROM pg_extension` failed with {s}; the declared types are sent to the server as declared, which a server without that catalog may well provide natively",
+            .{ comptime requiredExtensionsJoined(infos), @errorName(err) },
+        );
+        return;
+    };
     defer rows.deinit();
     while (rows.next()) |row| {
         const name = row.getText(0) orelse continue;
@@ -3219,6 +3374,8 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
             existing_mysql_indexes = getExistingIndexes(allocator, driver_drv, info.table_name) catch |err| switch (err) {
                 error.UnsupportedDialect => unreachable, // The dialect was checked immediately above.
                 error.InvalidTableName => unreachable, // SQLite-only, and the dialect was checked immediately above.
+                error.IndexCatalogUnavailable => unreachable, // PostgreSQL-only, and the dialect was checked immediately above.
+                error.ForeignKeyCatalogUnavailable => unreachable, // PostgreSQL-only, and the dialect was checked immediately above.
                 error.OutOfMemory => return error.OutOfMemory,
                 error.PoolExhausted => return error.PoolExhausted,
                 error.PoolWaitTimeout => return error.PoolWaitTimeout,
@@ -3588,7 +3745,18 @@ pub const ExistingIndex = struct {
 /// parameter exists to remove. The names come from a comptime schema and never
 /// from user input, so this is a fail-closed guard rather than a sanitiser:
 /// refuse the name, and say which one.
-const IntrospectionError = sql_driver.Error || error{ UnsupportedDialect, InvalidTableName };
+///
+/// `IndexCatalogUnavailable` and `ForeignKeyCatalogUnavailable` are
+/// PostgreSQL's alone, and each is the answer to a server that speaks the wire
+/// protocol without carrying the catalog the comparison needs: `pg_index` and
+/// `pg_class` answer while `pg_am` does not (`getPostgresIndexes`), or the
+/// catalogs answer while `pg_proc` — where `generate_subscripts` would have to
+/// live — does not (`getPostgresForeignKeys`). Both are *named* errors rather
+/// than propagated driver failures, so a consumer can tell "this server cannot
+/// compare this at all" from "the migration broke", and both are returned
+/// before the statement that would be refused rather than after it: a refusal
+/// poisons the caller's transaction (see `pgRelationListed`).
+const IntrospectionError = sql_driver.Error || error{ UnsupportedDialect, InvalidTableName, IndexCatalogUnavailable, ForeignKeyCatalogUnavailable };
 
 /// True when `name` can be interpolated into a SQLite `PRAGMA` argument.
 ///
@@ -3606,6 +3774,36 @@ fn sqlitePragmaNameUsable(name: []const u8) bool {
         }
     }
     return true;
+}
+
+/// Whether `err` is *the server refusing the statement* — the one condition the
+/// two PostgreSQL catalog fallbacks in this file are written against
+/// (`getPostgresIndexes`'s retry without `pg_am`, `checkPostgresExtensions`'s
+/// tolerance for a server with no `pg_extension`).
+///
+/// `sql_driver.classify(err) == .client` is the direct spelling of it, and it is
+/// the whole answer on a driver that reports a rejected statement as
+/// `error.ExecFailed`.
+///
+/// `error.DriverFailed` is PostgreSQL's own spelling of the same event, and at
+/// this level it is indistinguishable from a driver fault: `sqlstateToError`
+/// maps SQLSTATE 42P01 (`undefined_table`) to `error.ExecFailed`, and
+/// `toDriverError` — which every call through the `Driver` vtable goes through
+/// — funnels everything outside its short list of named errors, `ExecFailed`
+/// included, into `error.DriverFailed`. So "this server has no such catalog"
+/// *arrives here as `DriverFailed` on PostgreSQL*, measured against HeliosDB
+/// 4.41.1: the `pg_am` join is refused with SQLSTATE 42P01 and the migration
+/// sees `error.DriverFailed`. Without this arm both fallbacks are dead code on
+/// the very server they were written for.
+///
+/// Treating it as a refusal is safe because the two are told apart by *asking
+/// again*: each fallback either succeeds (a degraded but honest answer) or
+/// returns an error — never a silent success — so a genuine driver fault stays
+/// a failure, just a named one. `.capacity` (a dead connection, a pool with
+/// nothing to give) is in neither answer and propagates unchanged, which is
+/// what a caller reacting to a lost connection needs.
+fn postgresStatementRefused(err: anyerror) bool {
+    return sql_driver.classify(err) == .client or err == error.DriverFailed;
 }
 
 /// The error carries no payload, so the name it refused is logged instead —
@@ -3848,12 +4046,45 @@ pub fn getMySQLIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
 /// access methods, `INCLUDE` payload columns, invalid indexes, or a key list
 /// that does not add up — is reported as not comparable.
 ///
+/// **A server that has no `pg_am` is still read, by name and uniqueness.**
+/// PostgreSQL's access-method catalog is not part of what a wire-compatible
+/// server has to carry, and one that omits it (HeliosDB Nano answers
+/// `Table 'pg_am' does not exist` with SQLSTATE 42P01) refuses the whole
+/// statement — so *every* index would go unreported, and the migration would
+/// treat each declared index as missing and re-`CREATE` it. The access method is
+/// therefore asked about **before** any query that joins it
+/// (`pgRelationListed`), because a rejection poisons the transaction this runs
+/// in: "is `pg_am` there?" is answered without a statement that can fail, and
+/// the answer selects which read is sent. **Not listed** means the read without
+/// the access-method join goes first — a server in that shape is read, not
+/// refused, and the read is the one `readIndexCatalog` describes below.
+/// **Listed** means the full read goes first, and a statement rejection behind
+/// the gate is still handled the way it always was (a server can answer the
+/// probe and refuse the query) — refused twice, the answer is
+/// `error.IndexCatalogUnavailable` rather than a failure dressed as an empty
+/// catalog. Either way, in the retry **no index is comparable**: the key list's
+/// order is restored by the dropped `array_position` term and the access method
+/// that decides `btree` is exactly what is missing, so the honest answer is
+/// "unknown" — not "btree, go ahead and compare". Names and uniqueness survive
+/// because neither needs `pg_am`, and those two are what the migration plans
+/// against (`indexExists`) and what the drift report gates the key list on.
+///
 /// `pub` for the alloc-failure sweep in `src/test/allocation_failures_plan.zig`
 /// — its only caller outside this module; `getExistingIndexes` remains the only
 /// one inside it.
 pub fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingIndex) {
     var result = std.array_list.Managed(ExistingIndex).init(allocator);
     errdefer freeExistingIndexes(allocator, &result);
+
+    // The access method before the query that joins it: on a server without it
+    // the rejection would abort the migration's transaction, and a retry inside
+    // a dead transaction cannot answer anything (see `pgRelationListed`). Only
+    // this one relation is probed — `pg_index`, `pg_attribute` and
+    // `pg_namespace` are read on both shapes below and a server may answer a
+    // query over them without listing them in `pg_class` (HeliosDB Nano does).
+    const access_method_listed = pgRelationListed(driver_drv, "pg_am");
+
+    const args = [_]Value{.{ .string = table_name }};
 
     // The table name is bound (`$1`), not interpolated: a name carrying a
     // quote would otherwise end the predicate early. `relkind = 'r'` and the
@@ -3877,14 +4108,94 @@ pub fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.D
         \\ORDER BY i.relname, array_position(string_to_array(ix.indkey::text, ' ')::smallint[], a.attnum)
     ;
 
-    var rows = try driver_drv.query(sql_text, &.{.{ .string = table_name }});
+    // The retry: `sql_text` with the `pg_am` join and its column removed, and
+    // the three `::int` casts on a boolean written as `CASE … THEN 1 ELSE 0
+    // END`. The case form is not cosmetic — the server that has no `pg_am`
+    // refuses `Boolean(false)::INT4` too ("Cannot cast Boolean(false) to
+    // INT4"), so leaving the casts in would make the retry fail for the same
+    // class of reason it exists to work around. The `ORDER BY` loses its
+    // `array_position` term with the same justification: it exists to restore
+    // the key *order*, and no key order is read on this path.
+    const sql_no_am =
+        \\SELECT i.relname,
+        \\       CASE WHEN ix.indisunique THEN 1 ELSE 0 END,
+        \\       CASE WHEN ix.indisvalid THEN 1 ELSE 0 END,
+        \\       CASE WHEN ix.indpred IS NOT NULL THEN 1 ELSE 0 END,
+        \\       CASE WHEN ix.indnatts <> ix.indnkeyatts THEN 1 ELSE 0 END,
+        \\       ix.indnkeyatts::int,
+        \\       a.attname
+        \\FROM pg_index ix
+        \\JOIN pg_class i ON i.oid = ix.indexrelid
+        \\JOIN pg_class t ON t.oid = ix.indrelid
+        \\LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (ix.indkey)
+        \\WHERE t.relname = $1 AND t.relkind = 'r'
+        \\  AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())
+        \\ORDER BY i.relname
+    ;
+
+    // Which of the two shapes answered. `true` also means the rows carry the
+    // `amname` column, which shifts every column after `indnkeyatts` by one —
+    // the parse below reads that offset off this flag instead of running twice.
+    var method_known = access_method_listed;
+    // The error the full read was refused with, when the probe said the catalog
+    // is there and the server refused the query anyway. `null` on the probe's
+    // own path: nothing failed, the access method is simply not listed.
+    var refused_reason: ?[]const u8 = null;
+
+    // The full read, when the access method is there to join. A refusal is the
+    // one thing that makes the retry worth asking — `postgresStatementRefused`
+    // is the whole condition, so `.capacity` (the connection is gone) is not
+    // repaired by asking a shorter question and propagates unchanged instead;
+    // see the helper for why `DriverFailed` counts as a refusal on this dialect.
+    var full: ?sql_driver.Rows = null;
+    if (access_method_listed) {
+        full = driver_drv.query(sql_text, &args) catch |err| refused: {
+            if (!postgresStatementRefused(err)) return err;
+            refused_reason = @errorName(err);
+            method_known = false;
+            break :refused null;
+        };
+    }
+
+    // The read that is sent whenever the full one was not: the probe said the
+    // access method is not listed, or the server refused the statement that
+    // joins it. Refused here too, this server has no index catalog to read at
+    // all — named, not a raw driver error, so the caller can tell it from a
+    // migration that broke.
+    const rows = full orelse retry: {
+        const retried = driver_drv.query(sql_no_am, &args) catch |retry_err| {
+            if (!postgresStatementRefused(retry_err)) return retry_err;
+            zent_log.warn(
+                "zent: this PostgreSQL-wire server has no PostgreSQL index catalog — reading the indexes of table {s} failed with {s}, with and without the pg_am access-method join; indexes do not take part in the comparison",
+                .{ table_name, @errorName(retry_err) },
+            );
+            return error.IndexCatalogUnavailable;
+        };
+        break :retry retried;
+    };
     defer rows.deinit();
+
+    if (!method_known) {
+        // One line per table, naming the reason the key lists cannot be
+        // compared — the error, when there was one, and the probe's answer when
+        // there was not.
+        zent_log.warn(
+            "zent: this PostgreSQL-wire server has no `pg_am` ({s}), so the indexes of table {s} are read without the access method; they are still matched by name and uniqueness, but their key columns are not compared",
+            .{ refused_reason orelse "not listed in its catalog", table_name },
+        );
+    }
 
     var keys = std.array_list.Managed([]const u8).init(allocator);
     defer {
         for (keys.items) |k| allocator.free(k);
         keys.deinit();
     }
+
+    // Which shape answered decides one offset and one verdict, so it is read
+    // here rather than duplicated into a second parse loop: the retry's select
+    // list is `amname` shorter, which moves `attname` from column 7 to 6, and
+    // it carries no access method at all.
+    const attname_col: usize = if (method_known) 7 else 6;
 
     var current: ?usize = null;
     var comparable = true;
@@ -3908,7 +4219,14 @@ pub fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.D
             comparable = (row.getInt(2) orelse 0) != 0 // indisvalid
             and (row.getInt(3) orelse 1) == 0 // indpred IS NULL
             and (row.getInt(4) orelse 1) == 0 // indnatts == indnkeyatts (no INCLUDE)
-            and std.mem.eql(u8, row.getText(6) orelse "", "btree");
+                // No access method was read, so no key list is comparable — the
+                // `and` short-circuits before column 6, which does not exist in
+                // that shape. An unknown method is *not* `btree`: assuming it is
+                // would compare a `USING gin`/`hash` index's keys as if it keyed
+                // the declared columns, which is the guess `columns_comparable`
+                // exists to refuse. The index keeps its name and its uniqueness,
+                // and only the key list becomes "unknown".
+            and method_known and std.mem.eql(u8, row.getText(6) orelse "", "btree");
             expected_keys = row.getInt(5) orelse 0;
             seen_keys = 0;
         }
@@ -3916,7 +4234,7 @@ pub fn getPostgresIndexes(allocator: std.mem.Allocator, driver_drv: sql_driver.D
         if (comparable) {
             // A NULL attname is an expression key (attnum 0), which no
             // declared column list can be equal to.
-            if (row.getText(7)) |column| {
+            if (row.getText(attname_col)) |column| {
                 const owned_column = try allocator.dupe(u8, column);
                 errdefer allocator.free(owned_column);
                 try keys.append(owned_column);
@@ -4189,9 +4507,31 @@ fn getMySQLForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
 /// `pg_attribute` join resolves one position of each side to a name. `contype =
 /// 'f'` is the foreign-key filter; the namespace join keeps a same-named table
 /// in another schema out of the answer.
+///
+/// **A server that cannot answer this is skipped, not refused.** The set
+/// returning function in the `FROM` clause is what makes the read a single
+/// statement, and it is a PostgreSQL function, not a catalog a wire-compatible
+/// server has to carry: HeliosDB Nano answers `Table 'generate_subscripts' does
+/// not exist` (SQLSTATE 42P01) and, like every rejected statement, leaves the
+/// caller's transaction unusable — so the read is gated on `pg_proc` first
+/// (`pgRelationListed`), the catalog such a function would be listed in. Not
+/// listed means one warning and `error.ForeignKeyCatalogUnavailable`, which the
+/// two callers turn into "this comparison is skipped" rather than a failed
+/// migration: a declared key that cannot be compared must not be reported as
+/// missing, because the report is what makes the planner emit a second
+/// `ADD CONSTRAINT` for a key the database may already have.
 fn getPostgresForeignKeys(allocator: std.mem.Allocator, driver_drv: sql_driver.Driver, table_name: []const u8) IntrospectionError!std.array_list.Managed(ExistingForeignKey) {
     var result = std.array_list.Managed(ExistingForeignKey).init(allocator);
     errdefer freeExistingForeignKeys(allocator, &result);
+
+    // Ahead of the query, never behind it: see the doc comment above.
+    if (!pgRelationListed(driver_drv, "pg_proc")) {
+        zent_log.warn(
+            "zent: this PostgreSQL-wire server does not list `pg_proc`, so the foreign keys of table {s} are not compared — a declared key is left alone rather than reported missing and added a second time",
+            .{table_name},
+        );
+        return error.ForeignKeyCatalogUnavailable;
+    }
 
     // The table name is bound (`$1`), not interpolated: a name carrying a
     // quote would otherwise end the predicate early. `contype` and the schema
@@ -5423,42 +5763,50 @@ pub fn planMigrateStatements(
             }
         }
 
-        var existing_idxs = try getExistingIndexes(allocator, driver, table.name);
-        defer freeExistingIndexes(allocator, &existing_idxs);
+        // No index catalog on this server (HeliosDB Nano): the existing index
+        // set is unknown, so planning an index here would duplicate whatever is
+        // already there. Skip the index half of this table's plan.
+        index_plan: {
+            var existing_idxs = getExistingIndexes(allocator, driver, table.name) catch |err| switch (err) {
+                error.IndexCatalogUnavailable => break :index_plan,
+                else => return err,
+            };
+            defer freeExistingIndexes(allocator, &existing_idxs);
 
-        inline for (info.indexes) |idx| {
-            const idx_def = indexDefFromInfo(idx);
-            if (!indexExists(existing_idxs.items, idx_def.name)) {
-                const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
-                try appendPlanned(
-                    allocator,
-                    &plan,
-                    try createIndexSQLForTableAllocWithServer(allocator, idx_def, table, dialect, mysql_server),
-                    version,
-                );
+            inline for (info.indexes) |idx| {
+                const idx_def = indexDefFromInfo(idx);
+                if (!indexExists(existing_idxs.items, idx_def.name)) {
+                    const version = computeMigrationVersion(info.table_name, "create_index", idx.name);
+                    try appendPlanned(
+                        allocator,
+                        &plan,
+                        try createIndexSQLForTableAllocWithServer(allocator, idx_def, table, dialect, mysql_server),
+                        version,
+                    );
+                }
             }
-        }
 
-        // A **column** declared UNIQUE, on a table that already exists. The
-        // declaration is inline in `CREATE TABLE` (and `ALTER TABLE ADD COLUMN`
-        // cannot carry it — see `alterTableAddColumnSQL`, which drops it on
-        // purpose), so a table created before the field was marked unique never
-        // gets the constraint. That is not a cosmetic drift: with no unique
-        // index the statement `SaveOrUpdateOn` builds is rejected outright
-        // ("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
-        // constraint" on SQLite and PostgreSQL), so every upsert call site
-        // against that table fails at runtime while the schema says it works.
-        // The dialect-neutral form is a unique index over the one column — no
-        // table rebuild, no data moved.
-        //
-        // Silent when a unique index exists whose keys could not be read
-        // (`lower(email)`, `email(10)`, a `WHERE`): such an index does
-        // constrain the column, so "is it constrained?" has no answer and a
-        // second index would be a guess. The primary key is skipped by
-        // `uniqueColumnChecked` — it is unique by construction.
-        if (!created[i] and !hasUnreadableUniqueIndex(existing_idxs.items)) {
-            inline for (table.columns) |col| {
-                try planUniqueColumnIndex(allocator, &plan, info, table, col, existing_idxs.items, dialect, mysql_server);
+            // A **column** declared UNIQUE, on a table that already exists. The
+            // declaration is inline in `CREATE TABLE` (and `ALTER TABLE ADD COLUMN`
+            // cannot carry it — see `alterTableAddColumnSQL`, which drops it on
+            // purpose), so a table created before the field was marked unique never
+            // gets the constraint. That is not a cosmetic drift: with no unique
+            // index the statement `SaveOrUpdateOn` builds is rejected outright
+            // ("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+            // constraint" on SQLite and PostgreSQL), so every upsert call site
+            // against that table fails at runtime while the schema says it works.
+            // The dialect-neutral form is a unique index over the one column — no
+            // table rebuild, no data moved.
+            //
+            // Silent when a unique index exists whose keys could not be read
+            // (`lower(email)`, `email(10)`, a `WHERE`): such an index does
+            // constrain the column, so "is it constrained?" has no answer and a
+            // second index would be a guess. The primary key is skipped by
+            // `uniqueColumnChecked` — it is unique by construction.
+            if (!created[i] and !hasUnreadableUniqueIndex(existing_idxs.items)) {
+                inline for (table.columns) |col| {
+                    try planUniqueColumnIndex(allocator, &plan, info, table, col, existing_idxs.items, dialect, mysql_server);
+                }
             }
         }
 
@@ -5570,7 +5918,15 @@ fn planMissingForeignKeys(
     if (table.foreign_keys.len == 0) return;
     if (dialect.kind() == .sqlite) return;
 
-    var existing = try getExistingForeignKeys(allocator, driver, table.name);
+    // No foreign-key read, no planned ALTER: `ALTER TABLE ADD CONSTRAINT` is not
+    // idempotent, so planning one without knowing which keys are already there
+    // is how a table ends up with the same key twice. Skipped, not guessed —
+    // the drift report is where the caller sees it (see
+    // `getPostgresForeignKeys`).
+    var existing = getExistingForeignKeys(allocator, driver, table.name) catch |err| switch (err) {
+        error.ForeignKeyCatalogUnavailable => return,
+        else => return err,
+    };
     defer freeExistingForeignKeys(allocator, &existing);
 
     var name_buf: [256]u8 = undefined;
@@ -5702,8 +6058,18 @@ pub fn migrateSchemaWithOptions(
     const applied = try appliedMigrations(allocator, driver);
     defer freeAppliedMigrations(allocator, applied);
 
+    // The transaction is released by `defer`, not `errdefer` + an explicit
+    // release at the end. The two are not the same thing: an `errdefer` stays
+    // armed after the explicit `tx.deinit()` below it, so an error raised
+    // *later* in this function — `reportNullability` reads the database again,
+    // after the transaction is gone — releases the same handle a second time.
+    // That is a double free of the driver's `PostgresTx`, and measured against
+    // HeliosDB Nano it takes the whole process down with a segfault rather than
+    // returning the error. One `defer` covers both paths, and `deinit` after a
+    // successful `commit` destroys the handle instead of rolling back
+    // (`PostgresTx.deinit` reads the state it was left in).
     var tx = try driver.beginTx();
-    errdefer tx.deinit();
+    defer tx.deinit();
 
     // Tx.inner is a Driver value type, so every helper that accepts a Driver
     // can run inside the transaction unchanged.
@@ -5712,7 +6078,6 @@ pub fn migrateSchemaWithOptions(
     try applyMigrationPlan(allocator, tx_drv, infos, opts, applied);
 
     try tx.commit();
-    tx.deinit();
 
     try reportNullability(allocator, driver, infos, opts);
 }
@@ -5734,7 +6099,7 @@ pub fn migrateSchemaWithOptions(
 ///
 /// ```zig
 /// var tx = try driver.beginTx();
-/// errdefer tx.deinit();
+/// defer tx.deinit();                                       // one release, both paths
 /// try migrateSchemaInTx(allocator, tx, infos, .{});        // group A
 /// try migrateSchemaInTx(allocator, tx, more_infos, .{});   // group B
 /// try tx.commit();                                         // both, or neither
@@ -5742,6 +6107,14 @@ pub fn migrateSchemaWithOptions(
 ///
 /// — where two `migrateSchema` calls would have been two independent
 /// transactions with group A committed before group B was even attempted.
+///
+/// **One `defer`, never `errdefer` plus a `deinit` at the end.** The two look
+/// equivalent and are not: an `errdefer` is armed against *any* later error
+/// return, including one raised after the explicit release has already run, so
+/// the handle is released twice. Measured against HeliosDB Nano — a rejected
+/// statement there made a post-`commit` read fail — the double release
+/// segfaults the process instead of returning an error.
+///
 /// The rule in one sentence: **one call = one transaction; N calls = N
 /// transactions, and the earlier ones are already committed; for all-or-nothing,
 /// open the transaction yourself and use this function.**
@@ -6181,7 +6554,7 @@ pub fn migrateFromFilesWithOptions(
     try verifyFileChecksums(applied, files);
 
     var tx = try driver.beginTx();
-    errdefer tx.deinit();
+    defer tx.deinit();
     const tx_drv = tx.inner;
 
     for (files) |f| {
@@ -6191,7 +6564,6 @@ pub fn migrateFromFilesWithOptions(
     }
 
     try tx.commit();
-    tx.deinit();
 }
 
 /// Roll back the last `steps` applied file migrations, using `.down.sql` files
@@ -6228,7 +6600,7 @@ pub fn rollbackFilesWithOptions(
     defer freeMigrationFiles(allocator, files);
 
     var tx = try driver.beginTx();
-    errdefer tx.deinit();
+    defer tx.deinit();
     const tx_drv = tx.inner;
 
     var rolled: usize = 0;
@@ -6250,7 +6622,6 @@ pub fn rollbackFilesWithOptions(
     }
 
     try tx.commit();
-    tx.deinit();
 }
 
 // ------------------------------------------------------------------
@@ -10063,18 +10434,38 @@ test "requiredPostgresExtensions lists a graph's declared extension types, once 
     try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
-/// A driver whose whole catalog is "which extensions are installed".
+/// A driver whose whole catalog is "which extensions are installed", plus the
+/// `pg_class` gate that decides whether that catalog may be read at all.
 ///
 /// The check is a read by contract, so `exec` fails outright — and counts the
 /// call, so an entry point can assert "not one statement reached the server"
 /// instead of inferring it from which error came back. Any statement that is
-/// not the `pg_extension` one is counted in `unmatched`, so a probe the stub
-/// never modelled cannot come back as "nothing is installed" and be mistaken
-/// for the check working.
+/// neither the gate nor the `pg_extension` read is counted in `unmatched`, so a
+/// probe the stub never modelled cannot come back as "nothing is installed" and
+/// be mistaken for the check working.
 const ExtensionStub = struct {
     dialect_value: Dialect = Dialect.postgres,
     installed: []const []const u8 = &.{},
+    /// What the `pg_extension` probe answers instead of a row set. `null` means
+    /// it answers `installed`.
+    ///
+    /// `error.ExecFailed` is a statement refusal as `sql_driver.classify` sees
+    /// it, and `error.DriverFailed` is the *same* refusal as PostgreSQL's
+    /// driver reports it (SQLSTATE 42P01 goes through `toDriverError`, whose
+    /// `else` arm is `DriverFailed`) — both are `postgresStatementRefused` and
+    /// both are pinned below, because the second is the one a real server
+    /// produces. Anything else must propagate.
+    probe_error: ?sql_driver.Error = null,
+    /// What the `pg_class` capability gate answers: whether the relation it asks
+    /// about is listed. `false` is the shape the gate exists for — a
+    /// wire-compatible server that answers 0 for `pg_extension` (HeliosDB Nano)
+    /// while still providing the type the schema declares.
+    lists_catalogs: bool = true,
     queries: usize = 0,
+    /// How many of `queries` were the capability gate. Counted separately so a
+    /// test can say "the catalog was asked exactly once" without the gate
+    /// making that number two.
+    probes: usize = 0,
     exec_calls: usize = 0,
     unmatched: usize = 0,
     /// The answer the live cursor walks, and how far along it is.
@@ -10083,6 +10474,9 @@ const ExtensionStub = struct {
     /// What the live row's `getText(0)` reads — borrowed exactly as a driver's
     /// row buffer is, so the check cannot keep a name past `next()`.
     row_text: ?[]const u8 = null,
+    /// What the live row's `getInt(0)` reads: the gate's `count(*)`, which is
+    /// not a name and must not be answered as one.
+    row_int: ?i64 = null,
 
     fn asDriver(self: *ExtensionStub) sql_driver.Driver {
         return .{ .ptr = self, .vtable = &driver_vtable };
@@ -10133,7 +10527,21 @@ const ExtensionStub = struct {
     fn stubQuery(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const Value) sql_driver.Error!sql_driver.Rows {
         const self: *ExtensionStub = @ptrCast(@alignCast(ptr));
         self.queries += 1;
-        if (std.mem.indexOf(u8, query_sql, "pg_extension") != null) return self.answering(self.installed);
+        // The capability gate first: it asks `pg_class` for a `count(*)`, so a
+        // stub that answered it out of `installed` would read a name as an
+        // integer and report every configured extension as unlisted. Answered
+        // deliberately instead, from `lists_catalogs`.
+        if (std.mem.indexOf(u8, query_sql, pg_relation_probe_prefix) != null) {
+            self.probes += 1;
+            self.row_int = if (self.lists_catalogs) 1 else 0;
+            self.row_text = null;
+            return self.answering(&.{"1"});
+        }
+        if (std.mem.indexOf(u8, query_sql, "pg_extension") != null) {
+            self.row_int = null;
+            if (self.probe_error) |e| return e;
+            return self.answering(self.installed);
+        }
         self.unmatched += 1;
         return self.answering(&.{});
     }
@@ -10160,8 +10568,10 @@ const ExtensionStub = struct {
         return null;
     }
 
-    fn rowGetInt(_: *anyopaque, _: usize) ?i64 {
-        return null;
+    fn rowGetInt(ptr: *anyopaque, index: usize) ?i64 {
+        if (index != 0) return null;
+        const self: *ExtensionStub = @ptrCast(@alignCast(ptr));
+        return self.row_int;
     }
 
     fn rowGetFloat(_: *anyopaque, _: usize) ?f64 {
@@ -10218,10 +10628,12 @@ test "the PostgreSQL extension check refuses a missing extension, and asks nothi
     zent_log.setSink(WarnCapture.sink);
     defer zent_log.setSink(null);
 
-    // Installed: the check passes, and the catalog was asked exactly once.
+    // Installed: the check passes, and the catalog was asked exactly once —
+    // behind the `pg_class` gate, which is the statement before it.
     var present = ExtensionStub{ .installed = &.{ "plpgsql", "vector" } };
     try checkPostgresExtensions(present.asDriver(), with_vector);
-    try std.testing.expectEqual(@as(usize, 1), present.queries);
+    try std.testing.expectEqual(@as(usize, 1), present.probes);
+    try std.testing.expectEqual(@as(usize, 2), present.queries);
     try std.testing.expectEqual(@as(usize, 0), present.unmatched);
     try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("CREATE EXTENSION"));
 
@@ -10231,7 +10643,8 @@ test "the PostgreSQL extension check refuses a missing extension, and asks nothi
     WarnCapture.reset();
     var missing = ExtensionStub{ .installed = &.{"plpgsql"} };
     try std.testing.expectError(error.MissingPostgresExtension, checkPostgresExtensions(missing.asDriver(), with_vector));
-    try std.testing.expectEqual(@as(usize, 1), missing.queries);
+    try std.testing.expectEqual(@as(usize, 1), missing.probes);
+    try std.testing.expectEqual(@as(usize, 2), missing.queries);
     try std.testing.expectEqual(@as(usize, 0), missing.unmatched);
     try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("PostgreSQL extension 'vector'"));
     try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("`CREATE EXTENSION IF NOT EXISTS vector;`"));
@@ -10240,7 +10653,7 @@ test "the PostgreSQL extension check refuses a missing extension, and asks nothi
     // the case `CREATE EXTENSION` was given, not in the one the schema wrote.
     var upper = ExtensionStub{ .installed = &.{"VECTOR"} };
     try checkPostgresExtensions(upper.asDriver(), with_vector);
-    try std.testing.expectEqual(@as(usize, 1), upper.queries);
+    try std.testing.expectEqual(@as(usize, 2), upper.queries);
 
     // No declared extension type: not one statement. The probe is conditional,
     // the same rule `graphHasMySqlTextDefault` follows, and the reason a
@@ -10257,6 +10670,92 @@ test "the PostgreSQL extension check refuses a missing extension, and asks nothi
     var sqlite_stub = ExtensionStub{ .dialect_value = Dialect.sqlite, .installed = &.{} };
     try checkPostgresExtensions(sqlite_stub.asDriver(), with_vector);
     try std.testing.expectEqual(@as(usize, 0), sqlite_stub.queries);
+}
+
+test "a server without pg_extension is not refused, and says so once" {
+    // `pg_extension` is PostgreSQL's own catalog, and a server that speaks the
+    // wire protocol is not obliged to carry it — HeliosDB Nano has neither
+    // `pg_extension` nor `pg_available_extensions`, and provides `vector`
+    // natively. Refusing the migration there would reject a schema the server
+    // would execute, so neither the gate nor a *statement-level* rejection of
+    // the read is an error: each is a warning and the run continues, and the
+    // declared types go to the server as declared. A server that cannot provide
+    // them answers its own, louder error at the DDL.
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const Doc = schema("ExtAbsentDoc", .{ .fields = &.{ field.Int("id"), field.Vector("embedding", 3) } });
+    const with_vector = comptime buildGraph(&.{Doc}).types;
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    // The gate, which is the path a wire-compatible server takes: `pg_class`
+    // answers that it does not list `pg_extension`, so the read is never sent —
+    // the statement would be refused, and a refused statement leaves the
+    // caller's transaction unusable, which is a much larger failure than the
+    // unknown capability this is about. One line, no error, and the catalog
+    // read is not among the statements made.
+    WarnCapture.reset();
+    var unlisted = ExtensionStub{ .lists_catalogs = false };
+    try checkPostgresExtensions(unlisted.asDriver(), with_vector);
+    try std.testing.expectEqual(@as(usize, 1), unlisted.probes);
+    // Only the gate: the read it would have gated was never sent.
+    try std.testing.expectEqual(@as(usize, 1), unlisted.queries);
+    try std.testing.expectEqual(@as(usize, 0), unlisted.exec_calls);
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("does not list `pg_extension`"));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("(vector)"));
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("SELECT extname FROM pg_extension"));
+    // Not "the extension is missing": that is a claim about the server this
+    // could not establish, and neither line may make it.
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("CREATE EXTENSION"));
+
+    // The safety net behind the gate: the catalog *is* listed and the server
+    // refuses the read anyway. Both spellings of that refusal are tolerated, in
+    // one loop: the classification-level one (`ExecFailed`) and the one
+    // PostgreSQL's driver actually produces (`DriverFailed` — SQLSTATE 42P01
+    // through `toDriverError`'s `else` arm). A tolerance that only knew the
+    // first would be dead code against the server it was written for.
+    for ([_]sql_driver.Error{ error.ExecFailed, error.DriverFailed }) |refusal| {
+        WarnCapture.reset();
+        var absent = ExtensionStub{ .probe_error = refusal };
+        try checkPostgresExtensions(absent.asDriver(), with_vector);
+        // No error, one line, and the gate plus the refused read are the only
+        // statements made.
+        try std.testing.expectEqual(@as(usize, 1), absent.probes);
+        try std.testing.expectEqual(@as(usize, 2), absent.queries);
+        try std.testing.expectEqual(@as(usize, 0), absent.exec_calls);
+        try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("SELECT extname FROM pg_extension"));
+        try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("(vector)"));
+        // Not "the extension is missing": that is a claim about the server this
+        // could not establish, and the line must not make it.
+        try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("CREATE EXTENSION"));
+    }
+
+    // A failure that is neither a refusal nor a lost connection still
+    // propagates. The tolerance is for "this server has no such catalog", never
+    // for "no answer" — proceeding on one would turn a protocol error into a
+    // migration that fails somewhere less informative.
+    WarnCapture.reset();
+    var broken = ExtensionStub{ .probe_error = error.ProtocolError };
+    try std.testing.expectError(error.ProtocolError, checkPostgresExtensions(broken.asDriver(), with_vector));
+    try std.testing.expectEqual(@as(usize, 2), broken.queries);
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("pg_extension"));
+
+    // And the entry point really does carry on: `exec` is the stub's answer to
+    // every DDL statement, so *reaching* one is the proof that the check no
+    // longer stops the run — the mirror image of the test above, which pins the
+    // opposite direction on a server that answers the catalog.
+    WarnCapture.reset();
+    var through_create = ExtensionStub{ .probe_error = error.DriverFailed };
+    try std.testing.expectError(
+        error.ExecFailed,
+        createAllTables(std.testing.allocator, through_create.asDriver(), with_vector),
+    );
+    try std.testing.expect(through_create.exec_calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("SELECT extname FROM pg_extension"));
 }
 
 /// A transaction handle over a stub driver, counting the three calls a
@@ -10312,7 +10811,9 @@ test "every migration entry point refuses a missing extension before its first s
         createAllTables(std.testing.allocator, for_create.asDriver(), infos),
     );
     try std.testing.expectEqual(@as(usize, 0), for_create.exec_calls);
-    try std.testing.expectEqual(@as(usize, 1), for_create.queries);
+    // The gate, then the catalog read: both are reads, neither is DDL.
+    try std.testing.expectEqual(@as(usize, 1), for_create.probes);
+    try std.testing.expectEqual(@as(usize, 2), for_create.queries);
     try std.testing.expectEqual(@as(usize, 0), for_create.unmatched);
 
     // `migrateSchemaWithOptions` — after the migration lock, before the history
@@ -10325,7 +10826,8 @@ test "every migration entry point refuses a missing extension before its first s
         migrateSchemaWithOptions(std.testing.allocator, for_migrate.asDriver(), infos, .{ .lock_timeout_ms = 0 }),
     );
     try std.testing.expectEqual(@as(usize, 0), for_migrate.exec_calls);
-    try std.testing.expectEqual(@as(usize, 1), for_migrate.queries);
+    try std.testing.expectEqual(@as(usize, 1), for_migrate.probes);
+    try std.testing.expectEqual(@as(usize, 2), for_migrate.queries);
     try std.testing.expectEqual(@as(usize, 0), for_migrate.unmatched);
 
     // `migrateSchemaInTx` — and the caller's transaction is untouched: the
@@ -10345,11 +10847,644 @@ test "every migration entry point refuses a missing extension before its first s
         migrateSchemaInTx(std.testing.allocator, tx, infos, .{ .lock_timeout_ms = 0 }),
     );
     try std.testing.expectEqual(@as(usize, 0), for_tx.exec_calls);
-    try std.testing.expectEqual(@as(usize, 1), for_tx.queries);
+    try std.testing.expectEqual(@as(usize, 1), for_tx.probes);
+    try std.testing.expectEqual(@as(usize, 2), for_tx.queries);
     try std.testing.expectEqual(@as(usize, 0), for_tx.unmatched);
     try std.testing.expectEqual(@as(usize, 0), TxProbe.commits);
     try std.testing.expectEqual(@as(usize, 0), TxProbe.rollbacks);
     try std.testing.expectEqual(@as(usize, 0), TxProbe.deinits);
+}
+
+/// A server that answers every read until the migration commits, and refuses
+/// every read after that.
+///
+/// The shape it pins is the one measured against HeliosDB Nano: an error raised
+/// *after* the transaction is gone must not release the transaction a second
+/// time. `migrateSchemaWithOptions` reports nullability last, and the report
+/// reads the database again — after the commit — so a server that starts
+/// refusing reads at that point drives the error path the double release lived
+/// on. The counters stand in for the heap on purpose: a second release of a
+/// real driver's handle is a segfault, not a failed assertion, so what a test
+/// can hold to is the number of releases.
+const PostCommitRefusalStub = struct {
+    /// Set by `commit`, and the whole rule: reads that happen after the
+    /// transaction is over are refused.
+    committed: bool = false,
+    queries: usize = 0,
+    execs: usize = 0,
+    commits: usize = 0,
+    rollbacks: usize = 0,
+    deinits: usize = 0,
+
+    fn asDriver(self: *PostCommitRefusalStub) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &driver_vtable };
+    }
+
+    const driver_vtable = sql_driver.Driver.VTable{
+        .exec = stubExec,
+        .query = stubQuery,
+        .beginTx = stubBeginTx,
+        .close = stubClose,
+        .dialect = stubDialect,
+        .ping = stubPing,
+        .inTransaction = stubInTransaction,
+        .beginSavepoint = stubBeginSavepoint,
+    };
+
+    const rows_vtable = sql_driver.Rows.VTable{
+        .next = rowsNext,
+        .deinit = rowsDeinit,
+    };
+
+    fn stubExec(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const Value) sql_driver.Error!sql_driver.Result {
+        const self: *PostCommitRefusalStub = @ptrCast(@alignCast(ptr));
+        self.execs += 1;
+        return .{ .rows_affected = 0, .last_insert_id = null };
+    }
+
+    fn stubQuery(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const Value) sql_driver.Error!sql_driver.Rows {
+        const self: *PostCommitRefusalStub = @ptrCast(@alignCast(ptr));
+        self.queries += 1;
+        if (self.committed) return error.DriverFailed;
+        return .{ .ptr = self, .vtable = &rows_vtable };
+    }
+
+    fn rowsNext(_: *anyopaque) ?sql_driver.Row {
+        return null;
+    }
+
+    fn rowsDeinit(_: *anyopaque) void {}
+
+    fn commitFn(ptr: *anyopaque) sql_driver.Error!void {
+        const self: *PostCommitRefusalStub = @ptrCast(@alignCast(ptr));
+        self.commits += 1;
+        self.committed = true;
+    }
+
+    fn rollbackFn(ptr: *anyopaque) sql_driver.Error!void {
+        const self: *PostCommitRefusalStub = @ptrCast(@alignCast(ptr));
+        self.rollbacks += 1;
+    }
+
+    fn deinitFn(ptr: *anyopaque) void {
+        const self: *PostCommitRefusalStub = @ptrCast(@alignCast(ptr));
+        self.deinits += 1;
+    }
+
+    fn stubBeginTx(ptr: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return .{
+            .inner = @as(*PostCommitRefusalStub, @ptrCast(@alignCast(ptr))).asDriver(),
+            .commitFn = commitFn,
+            .rollbackFn = rollbackFn,
+            .deinitFn = deinitFn,
+            .ptr = ptr,
+        };
+    }
+
+    fn stubBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn stubClose(_: *anyopaque) void {}
+
+    fn stubDialect(_: *anyopaque) Dialect {
+        return Dialect.postgres;
+    }
+
+    fn stubPing(_: *anyopaque) sql_driver.Error!void {}
+
+    fn stubInTransaction(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+test "an error raised after the commit releases the migration's transaction exactly once" {
+    // The regression this pins: `migrateSchemaWithOptions` used to release its
+    // own transaction with `errdefer tx.deinit()` *and* an explicit `tx.deinit()`
+    // before the nullability report. An `errdefer` is armed against any later
+    // error return, so a report that failed released the same handle twice — on
+    // HeliosDB Nano that was a use-after-free that took the process down with a
+    // segfault. The schema needs no extension type, so the only statements this
+    // stub answers with anything but "no rows" are the DDL the planner emits.
+    const field = @import("../../core/field.zig");
+    const schema = @import("../../core/schema.zig").Schema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const Doc = schema("TxReleaseDoc", .{ .fields = &.{ field.Int("id"), field.String("name") } });
+    const infos = comptime buildGraph(&.{Doc}).types;
+
+    var stub = PostCommitRefusalStub{};
+    try std.testing.expectError(
+        error.DriverFailed,
+        migrateSchemaWithOptions(std.testing.allocator, stub.asDriver(), infos, .{ .lock_timeout_ms = 0 }),
+    );
+
+    // The plan ran and committed, so the refused read is the post-commit
+    // report — and the transaction was released once, by the `defer`.
+    try std.testing.expect(stub.execs > 0);
+    try std.testing.expectEqual(@as(usize, 1), stub.commits);
+    try std.testing.expectEqual(@as(usize, 0), stub.rollbacks);
+    try std.testing.expectEqual(@as(usize, 1), stub.deinits);
+}
+
+// ------------------------------------------------------------------
+// A wire-compatible server without PostgreSQL's access-method catalog
+// ------------------------------------------------------------------
+
+/// One row of a stubbed catalog answer: `text[i]` is what `getText(i)` reads, a
+/// `null` is a NULL column, and `int[i]` is what `getInt(i)` reads. The two
+/// arrays are one per *column position*, so a row can carry only what the
+/// query reads — the second row of an index in the `pg_index` shapes has no
+/// integers at all, because they are read when the name changes and not again.
+const CatalogStubRow = struct {
+    text: []const ?[]const u8 = &.{},
+    int: []const ?i64 = &.{},
+};
+
+/// A PostgreSQL catalog where `information_schema.columns` and the
+/// `pg_index`/`pg_class`/`pg_attribute` join answer but the access-method table
+/// may not exist.
+///
+/// That is the shape of a server that speaks libpq's wire protocol without
+/// carrying PostgreSQL's whole catalog (HeliosDB Nano refuses `pg_am` with
+/// SQLSTATE 42P01), and the two failure modes are modelled separately because
+/// `getPostgresIndexes` answers them differently: `without_pg_am` refuses only
+/// the statement that joins `pg_am` — the retry must therefore succeed — and
+/// `refuse_all` refuses every statement, which is a server whose index catalog
+/// cannot be read at all.
+const PostgresIndexCatalogStub = struct {
+    columns_rows: []const CatalogStubRow = &.{},
+    /// The full query's rows: `relname`, `indisunique`, `indisvalid`,
+    /// `indpred IS NOT NULL`, `indnatts <> indnkeyatts`, `indnkeyatts`,
+    /// `amname`, `attname` at 0..7.
+    full_rows: []const CatalogStubRow = &.{},
+    /// The retry's rows: the same minus `amname`, so `attname` sits at 6.
+    degraded_rows: []const CatalogStubRow = &.{},
+    without_pg_am: bool = false,
+    /// What the `pg_class` gate answers: whether `pg_am` is listed. `null`
+    /// follows `without_pg_am`, so a test says one of the two unless it is
+    /// deliberately inconsistent — `lists_access_method = true` *with*
+    /// `without_pg_am = true` is the server that answers the gate and refuses
+    /// the query anyway, which is the case the retry is still there for.
+    lists_access_method: ?bool = null,
+    /// What the same gate answers for `pg_proc`, which is the relation
+    /// `getPostgresForeignKeys` needs (`generate_subscripts` is a function).
+    /// `null` means "listed" — the full-PostgreSQL shape, which is what every
+    /// index test here models.
+    lists_pg_proc: ?bool = null,
+    refuse_all: bool = false,
+    /// How a refused statement is refused: `error.ExecFailed` is the
+    /// classification-level shape `sql_driver.classify` reads as `.client`,
+    /// `error.DriverFailed` is what PostgreSQL's driver actually returns for a
+    /// rejected statement (SQLSTATE 42P01 lands in `toDriverError`'s `else`
+    /// arm). Both are `postgresStatementRefused`, and both are pinned below.
+    refuse_error: sql_driver.Error = error.ExecFailed,
+    queries: usize = 0,
+    /// How many of `queries` were the `pg_class` gate, counted separately so a
+    /// test can assert which read answered without the gate inflating it.
+    probes: usize = 0,
+    /// Statements this stub had no answer for. Counted rather than answered
+    /// with "nothing": a probe it never modelled must not come back as an empty
+    /// catalog and be mistaken for the real answer.
+    unmatched: usize = 0,
+    rows: []const CatalogStubRow = &.{},
+    pos: usize = 0,
+    row: ?CatalogStubRow = null,
+
+    fn asDriver(self: *PostgresIndexCatalogStub) sql_driver.Driver {
+        return .{ .ptr = self, .vtable = &driver_vtable };
+    }
+
+    fn answering(self: *PostgresIndexCatalogStub, next: []const CatalogStubRow) sql_driver.Rows {
+        self.rows = next;
+        self.pos = 0;
+        self.row = null;
+        return .{ .ptr = self, .vtable = &rows_vtable };
+    }
+
+    const driver_vtable = sql_driver.Driver.VTable{
+        .exec = stubExec,
+        .query = stubQuery,
+        .beginTx = stubBeginTx,
+        .close = stubClose,
+        .dialect = stubDialect,
+        .ping = stubPing,
+        .inTransaction = stubInTransaction,
+        .beginSavepoint = stubBeginSavepoint,
+    };
+
+    const rows_vtable = sql_driver.Rows.VTable{
+        .next = rowsNext,
+        .deinit = rowsDeinit,
+    };
+
+    const row_vtable = sql_driver.Row.VTable{
+        .columnCount = rowColumnCount,
+        .columnName = rowColumnName,
+        .getBool = rowGetBool,
+        .getInt = rowGetInt,
+        .getFloat = rowGetFloat,
+        .getText = rowGetText,
+        .getBlob = rowGetBlob,
+        .isNull = rowIsNull,
+    };
+
+    /// Introspection is a read by contract; a statement that reaches here is
+    /// one no helper was supposed to execute.
+    fn stubExec(_: *anyopaque, _: ?*const sql_driver.ExecutionContext, _: []const u8, _: []const Value) sql_driver.Error!sql_driver.Result {
+        return error.ExecFailed;
+    }
+
+    fn stubQuery(ptr: *anyopaque, _: ?*const sql_driver.ExecutionContext, query_sql: []const u8, _: []const Value) sql_driver.Error!sql_driver.Rows {
+        const self: *PostgresIndexCatalogStub = @ptrCast(@alignCast(ptr));
+        self.queries += 1;
+        // The capability gate first, and before the `pg_am` match below on
+        // purpose: the gate's statement *mentions* `pg_am` (it asks whether
+        // `pg_class` lists that relation), so a stub that classified it by that
+        // substring would model the gate as the query it gates.
+        if (std.mem.indexOf(u8, query_sql, pg_relation_probe_prefix) != null) {
+            self.probes += 1;
+            if (self.refuse_all) return self.refuse_error;
+            // Which relation was asked about decides which answer applies, and
+            // the two are separate knobs because the reads they gate degrade
+            // separately: the index read asks about `pg_am`, the foreign-key
+            // read about `pg_proc` (a server can have one and not the other —
+            // HeliosDB Nano has neither, and real PostgreSQL has both).
+            const listed = if (std.mem.indexOf(u8, query_sql, "pg_proc") != null)
+                (self.lists_pg_proc orelse true)
+            else
+                (self.lists_access_method orelse !self.without_pg_am);
+            // One row either way, because the gate reads a `count(*)`: the
+            // "not listed" answer is a zero, not an absent row.
+            return self.answering(if (listed) &.{.{ .int = &.{1} }} else &.{.{ .int = &.{0} }});
+        }
+        // `pg_am` next: it is what distinguishes the two shapes, and the full
+        // query mentions `pg_index` as well. `ExecFailed` is the class a
+        // refused statement lands in (`sql_driver.classify`), which is the
+        // condition the retry is written against — not a generic failure.
+        const joins_access_method = std.mem.indexOf(u8, query_sql, "pg_am") != null;
+        if (self.refuse_all or (self.without_pg_am and joins_access_method)) return self.refuse_error;
+        if (joins_access_method) return self.answering(self.full_rows);
+        if (std.mem.indexOf(u8, query_sql, "pg_index") != null) return self.answering(self.degraded_rows);
+        if (std.mem.indexOf(u8, query_sql, "information_schema.columns") != null) return self.answering(self.columns_rows);
+        self.unmatched += 1;
+        return self.answering(&.{});
+    }
+
+    fn rowsNext(ptr: *anyopaque) ?sql_driver.Row {
+        const self: *PostgresIndexCatalogStub = @ptrCast(@alignCast(ptr));
+        if (self.pos >= self.rows.len) return null;
+        self.row = self.rows[self.pos];
+        self.pos += 1;
+        return .{ .ptr = self, .vtable = &row_vtable };
+    }
+
+    fn rowsDeinit(_: *anyopaque) void {}
+
+    fn rowColumnCount(ptr: *anyopaque) usize {
+        const self: *PostgresIndexCatalogStub = @ptrCast(@alignCast(ptr));
+        const row = self.row orelse return 0;
+        return @max(row.text.len, row.int.len);
+    }
+
+    fn rowColumnName(_: *anyopaque, _: usize) []const u8 {
+        return "";
+    }
+
+    fn rowGetBool(_: *anyopaque, _: usize) ?bool {
+        return null;
+    }
+
+    fn rowGetInt(ptr: *anyopaque, index: usize) ?i64 {
+        const self: *PostgresIndexCatalogStub = @ptrCast(@alignCast(ptr));
+        const row = self.row orelse return null;
+        if (index >= row.int.len) return null;
+        return row.int[index];
+    }
+
+    fn rowGetFloat(_: *anyopaque, _: usize) ?f64 {
+        return null;
+    }
+
+    fn rowGetText(ptr: *anyopaque, index: usize) ?[]const u8 {
+        const self: *PostgresIndexCatalogStub = @ptrCast(@alignCast(ptr));
+        const row = self.row orelse return null;
+        if (index >= row.text.len) return null;
+        return row.text[index];
+    }
+
+    fn rowGetBlob(_: *anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+
+    fn rowIsNull(ptr: *anyopaque, index: usize) bool {
+        return rowGetText(ptr, index) == null;
+    }
+
+    fn stubBeginTx(_: *anyopaque) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn stubBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return error.TxFailed;
+    }
+
+    fn stubClose(_: *anyopaque) void {}
+
+    fn stubDialect(_: *anyopaque) Dialect {
+        return Dialect.postgres;
+    }
+
+    fn stubPing(_: *anyopaque) sql_driver.Error!void {}
+
+    fn stubInTransaction(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+/// The table the index tests introspect: one declared two-key index, and a
+/// second index the stub's catalog has that the schema does not declare (a
+/// database-only index, which no comparison may report).
+const PgIdxDoc = blk: {
+    const field = @import("../../core/field.zig");
+    const index_mod = @import("../../core/index.zig");
+    const Schema = @import("../../core/schema.zig").Schema;
+    break :blk Schema("PgIdxDoc", .{
+        .table_name = "pg_idx_doc",
+        .fields = &.{ field.Int("tenant_id"), field.String("title") },
+        .indexes = &.{index_mod.Named("idx_pg_idx_doc_pair", &.{ "tenant_id", "title" })},
+    });
+};
+
+/// `information_schema.columns` for the table both index tests introspect:
+/// `column_name`, `data_type`, `is_nullable` at 0/1/2, in the shape
+/// `getExistingColumns` reads on PostgreSQL (`udt_name` is column 4 and is not
+/// needed — an empty answer there is not a mismatch).
+const pg_idx_columns_rows = [_]CatalogStubRow{
+    // `integer`, not `bigint`: `field.Int` is emitted `INTEGER` and the
+    // auto-increment rewrite makes the primary key a `SERIAL`, which
+    // `information_schema.columns` also reports as `integer`. A stub that said
+    // `bigint` would report two `type_mismatch` drifts of its own and the
+    // zero-drift assertion below would never reach the index.
+    .{ .text = &.{ "id", "integer", "NO" } },
+    .{ .text = &.{ "tenant_id", "integer", "NO" } },
+    .{ .text = &.{ "title", "text", "NO" } },
+};
+
+/// The `pg_index` join's rows as a server *with* `pg_am` delivers them, in key
+/// order: the declared two-key index over `(tenant_id, title)`, then a
+/// database-only one-key index the schema does not declare. `btree` and a key
+/// count that adds up make both comparable, which is the answer the retry must
+/// never produce.
+const pg_idx_full_rows = [_]CatalogStubRow{
+    .{ .text = &.{ "idx_pg_idx_doc_pair", null, null, null, null, null, "btree", "tenant_id" }, .int = &.{ null, 0, 1, 0, 0, 2 } },
+    .{ .text = &.{ "idx_pg_idx_doc_pair", null, null, null, null, null, "btree", "title" } },
+    .{ .text = &.{ "idx_pg_idx_doc_title", null, null, null, null, null, "btree", "title" }, .int = &.{ null, 0, 1, 0, 0, 1 } },
+};
+
+/// The retry's rows: the same two indexes without the access-method column.
+/// `attname` sits at 6 here, so a parse that kept reading column 7 would find
+/// nothing — and the test asserts the columns come back empty *and* not
+/// comparable, which is the point of the degraded shape: the key list is
+/// unknown, not "btree over these columns".
+const pg_idx_degraded_rows = [_]CatalogStubRow{
+    .{ .text = &.{ "idx_pg_idx_doc_pair", null, null, null, null, null, "tenant_id" }, .int = &.{ null, 0, 1, 0, 0, 2 } },
+    .{ .text = &.{ "idx_pg_idx_doc_title", null, null, null, null, null, "title" }, .int = &.{ null, 0, 1, 0, 0, 1 } },
+};
+
+// A plain PostgreSQL server — `pg_am` answers — is read by the first query
+// alone, unchanged: one statement, the key list compared, `btree` honoured.
+// This is the guard on "nothing changed for PostgreSQL" that the two
+// degradation cases are the exception to.
+test "an index read that has pg_am is unchanged and comparable" {
+    const allocator = std.testing.allocator;
+
+    var stub = PostgresIndexCatalogStub{
+        .columns_rows = &pg_idx_columns_rows,
+        .full_rows = &pg_idx_full_rows,
+    };
+
+    var indexes = try getPostgresIndexes(allocator, stub.asDriver(), "pg_idx_doc");
+    defer freeExistingIndexes(allocator, &indexes);
+
+    // The gate, then the read it selected — and no retry: the access method was
+    // listed, so the statement that joins it was accepted.
+    try std.testing.expectEqual(@as(usize, 1), stub.probes);
+    try std.testing.expectEqual(@as(usize, 2), stub.queries);
+    try std.testing.expectEqual(@as(usize, 0), stub.unmatched);
+    try std.testing.expectEqual(@as(usize, 2), indexes.items.len);
+
+    const pair = getExistingIndexByName(indexes.items, "idx_pg_idx_doc_pair").?;
+    try std.testing.expect(pair.columns_comparable);
+    try std.testing.expectEqual(@as(usize, 2), pair.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", pair.columns[0]);
+    try std.testing.expectEqualStrings("title", pair.columns[1]);
+
+    const single = getExistingIndexByName(indexes.items, "idx_pg_idx_doc_title").?;
+    try std.testing.expect(single.columns_comparable);
+    try std.testing.expectEqual(@as(usize, 1), single.columns.len);
+}
+
+test "an index read survives a server without pg_am, by name and uniqueness" {
+    const allocator = std.testing.allocator;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    const info = comptime fromSchema(PgIdxDoc);
+    const infos = &[_]TypeInfo{info};
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    var stub = PostgresIndexCatalogStub{
+        .columns_rows = &pg_idx_columns_rows,
+        .degraded_rows = &pg_idx_degraded_rows,
+        .without_pg_am = true,
+    };
+
+    var indexes = try getPostgresIndexes(allocator, stub.asDriver(), "pg_idx_doc");
+    defer freeExistingIndexes(allocator, &indexes);
+
+    // The gate, then the read that goes without the access-method join: the
+    // statement joining `pg_am` is never sent, which is the point — sending it
+    // would be refused, and a refused statement leaves the migration's
+    // transaction unusable. Nothing else was asked.
+    try std.testing.expectEqual(@as(usize, 1), stub.probes);
+    try std.testing.expectEqual(@as(usize, 2), stub.queries);
+    try std.testing.expectEqual(@as(usize, 0), stub.unmatched);
+
+    // The names and the uniqueness flags survive — they need no access method.
+    try std.testing.expectEqual(@as(usize, 2), indexes.items.len);
+    try std.testing.expectEqualStrings("idx_pg_idx_doc_pair", indexes.items[0].name);
+    try std.testing.expectEqualStrings("idx_pg_idx_doc_title", indexes.items[1].name);
+    try std.testing.expect(!indexes.items[0].unique);
+    try std.testing.expect(!indexes.items[1].unique);
+
+    // The key lists do not: an unknown access method is not `btree`, so every
+    // index comes back not comparable with no keys rather than compared against
+    // the declared list.
+    for (indexes.items) |idx| {
+        try std.testing.expect(!idx.columns_comparable);
+        try std.testing.expectEqual(@as(usize, 0), idx.columns.len);
+    }
+
+    // And the name is what the planner decides on: an index the catalog knows
+    // is not emitted as `CREATE INDEX` again, which is the false "missing
+    // index" this degradation exists to prevent.
+    try std.testing.expect(indexExists(indexes.items, "idx_pg_idx_doc_pair"));
+
+    // Exactly one line, naming the table and why the key lists cannot be
+    // compared — not one per index.
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("no `pg_am`"));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("not listed in its catalog"));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("pg_idx_doc"));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("are not compared"));
+
+    // The retry is still behind the gate, for the shape where the server says
+    // `pg_am` is listed and refuses the query anyway — and with the refusal
+    // spelled the way PostgreSQL's driver actually spells it: SQLSTATE 42P01
+    // becomes `error.DriverFailed` through `toDriverError`'s `else` arm, so a
+    // retry that only knew `.client` would never fire against a real server.
+    // One `DriverFailed` is not a reason to give up — the retry is the test.
+    WarnCapture.reset();
+    var pg_shaped = PostgresIndexCatalogStub{
+        .degraded_rows = &pg_idx_degraded_rows,
+        .without_pg_am = true,
+        // Listed, so the gate selects the full read, and the server refuses it.
+        .lists_access_method = true,
+        .refuse_error = error.DriverFailed,
+    };
+    var pg_shaped_indexes = try getPostgresIndexes(allocator, pg_shaped.asDriver(), "pg_idx_doc");
+    defer freeExistingIndexes(allocator, &pg_shaped_indexes);
+
+    try std.testing.expectEqual(@as(usize, 1), pg_shaped.probes);
+    // The gate, the refused full read, then the retry: three statements, and
+    // the third is the one that answered.
+    try std.testing.expectEqual(@as(usize, 3), pg_shaped.queries);
+    try std.testing.expectEqual(@as(usize, 2), pg_shaped_indexes.items.len);
+    try std.testing.expect(indexExists(pg_shaped_indexes.items, "idx_pg_idx_doc_pair"));
+    for (pg_shaped_indexes.items) |idx| {
+        try std.testing.expect(!idx.columns_comparable);
+        try std.testing.expectEqual(@as(usize, 0), idx.columns.len);
+    }
+    // Named this time, because there was an error to name — the line says
+    // something different on the gate's path and the same thing on both.
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("no `pg_am`"));
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("(DriverFailed)"));
+
+    // The whole drift report agrees: the declared index is present by name and
+    // its key list is simply not compared, so nothing at all is reported. A
+    // comparable answer here would have produced an `index_columns` drift (the
+    // stub's key count is 2, the schema's too, but a *reported* drift would
+    // mean the comparison ran, which is the guess this refuses).
+    WarnCapture.reset();
+    const drifts = try checkSchema(allocator, stub.asDriver(), infos);
+    defer freeSchemaDrift(allocator, drifts);
+    try std.testing.expectEqual(@as(usize, 0), drifts.len);
+}
+
+test "a server with no index catalog at all answers one named error" {
+    const allocator = std.testing.allocator;
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    // Both spellings of the refusal, because a server that has no catalog at
+    // all refuses every statement either way.
+    for ([_]sql_driver.Error{ error.ExecFailed, error.DriverFailed }) |refusal| {
+        WarnCapture.reset();
+        var stub = PostgresIndexCatalogStub{ .refuse_all = true, .refuse_error = refusal };
+
+        try std.testing.expectError(
+            error.IndexCatalogUnavailable,
+            getPostgresIndexes(allocator, stub.asDriver(), "pg_idx_doc"),
+        );
+
+        // The gate was asked and refused too, so the read it fell back to was
+        // the only other statement — and exactly one line was emitted: the
+        // degradation warning is for a read that *worked*.
+        try std.testing.expectEqual(@as(usize, 1), stub.probes);
+        try std.testing.expectEqual(@as(usize, 2), stub.queries);
+        try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("no PostgreSQL index catalog"));
+        try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("pg_idx_doc"));
+        try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("no `pg_am`"));
+    }
+}
+
+/// `information_schema.columns` rows for the foreign-key case below: one row per
+/// column the child declares, so `checkSchema` reaches the foreign-key half —
+/// that half runs only for a table the database already has.
+const pg_fk_columns_rows = [_]CatalogStubRow{
+    .{ .text = &.{ "id", "integer", "NO" } },
+    .{ .text = &.{ "parent_id", "integer", "NO" } },
+    .{ .text = &.{ "title", "text", "NO" } },
+};
+
+/// The child of the foreign-key case: a `From` edge with an explicit column, so
+/// the graph carries a declared key whose presence `checkSchema` asks about.
+const PgFkSchemas = struct {
+    const field = @import("../../core/field.zig");
+    const edge = @import("../../core/edge.zig");
+    const Schema = @import("../../core/schema.zig").Schema;
+
+    const Parent = Schema("PgFkParent", .{
+        .table_name = "pg_fk_parent",
+        .fields = &.{ field.Int("id"), field.String("name") },
+    });
+    const Child = Schema("PgFkChild", .{
+        .table_name = "pg_fk_child",
+        .fields = &.{ field.Int("id"), field.Int("parent_id"), field.String("title") },
+        .edges = &.{edge.From("parent", Parent).Field("parent_id")},
+    });
+};
+
+test "a server without pg_proc reports no foreign key rather than a missing one" {
+    // `generate_subscripts` is what makes the foreign-key read one statement,
+    // and it lives in `pg_proc` — a catalog a wire-compatible server is not
+    // obliged to carry (HeliosDB Nano answers 0 for it, and refuses the
+    // statement that would have used it). The read is therefore gated, and the
+    // gate's two answers are pinned against each other: with the catalog the
+    // declared key is reported missing (the stub has no `pg_constraint` answer),
+    // without it the same schema is *not* reported, because "unknown" must never
+    // reach the planner as "absent" — that is how a duplicate `ADD CONSTRAINT`
+    // gets planned.
+    const allocator = std.testing.allocator;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+
+    const infos = comptime buildGraph(&.{ PgFkSchemas.Parent, PgFkSchemas.Child }).types;
+
+    WarnCapture.reset();
+    zent_log.setSink(WarnCapture.sink);
+    defer zent_log.setSink(null);
+
+    // `pg_proc` not listed: the foreign-key statement is never sent, and the
+    // declared key is left alone.
+    var gated = PostgresIndexCatalogStub{
+        .columns_rows = &pg_fk_columns_rows,
+        .lists_pg_proc = false,
+    };
+    const quiet = try checkSchema(allocator, gated.asDriver(), infos);
+    defer freeSchemaDrift(allocator, quiet);
+
+    for (quiet) |d| try std.testing.expect(d.kind != .missing_foreign_key);
+    try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("does not list `pg_proc`"));
+    try std.testing.expectEqual(@as(usize, 0), gated.unmatched);
+
+    // Listed: the same read runs, the stub's empty answer is "no such key", and
+    // that is the drift the pair above is the exception to.
+    WarnCapture.reset();
+    var open = PostgresIndexCatalogStub{ .columns_rows = &pg_fk_columns_rows };
+    const loud = try checkSchema(allocator, open.asDriver(), infos);
+    defer freeSchemaDrift(allocator, loud);
+
+    var missing: usize = 0;
+    for (loud) |d| {
+        if (d.kind == .missing_foreign_key) missing += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing);
+    try std.testing.expectEqual(@as(usize, 0), WarnCapture.occurrences("does not list `pg_proc`"));
+    try std.testing.expectEqual(@as(usize, 1), open.unmatched);
 }
 
 // ------------------------------------------------------------------

@@ -431,3 +431,25 @@ Groups worth *not* chasing into the builder: report aggregation (`JOIN` +
 aliases, and `UPDATE … FROM`. Their shapes are unbounded, the three dialects
 disagree, and they are precisely what `joinEdge` v1 refuses (`JoinWithGroupBy`)
 rather than approximates — keep them raw and scope them with `zent.scope`.
+
+### 13.8 Two new error members, for servers that cannot answer a comparison (unreleased)
+
+`sql_schema`'s error sets gained two members, both PostgreSQL-only and both
+returned *before* a statement that would be rejected rather than after it:
+
+- `error.IndexCatalogUnavailable` — no `pg_am` in the server's catalog (and no
+  access-method-free read accepted either), so indexes cannot be compared.
+- `error.ForeignKeyCatalogUnavailable` — no `pg_proc`, so `generate_subscripts`
+  cannot exist and the foreign-key read cannot be sent.
+
+`IntrospectionError`, `NullabilityError` and `assertSchema`'s error set all carry
+both, which is what a consumer switching exhaustively over them has to act on:
+add the two arms, or an `else =>` (a `switch` on either now fails to compile
+until you do). Neither member reaches a consumer that never points zent at a
+server with a partial catalog — `checkSchema` catches both and skips the
+comparison, so the drift list is simply shorter there.
+
+The behavior behind them is documented in the README, "Which database:
+PostgreSQL-wire servers": on such a server indexes are matched by name and
+uniqueness, foreign keys are left alone, and the extension check is skipped,
+each with one warning naming the table.

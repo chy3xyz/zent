@@ -307,6 +307,76 @@ was skipped. The bindings for drivers it could not find are then absent, which
 surfaces as `no module named sqlite3_c/pg_c/mysql_c` at the first use — that
 error names the mistake.
 
+### Which database: PostgreSQL-wire servers
+
+zent speaks PostgreSQL **through the wire protocol**, so it does not matter which
+server answers it — anything that speaks v3 and carries the catalogs below works
+through the same `PostgresDriver`. That is worth knowing on a small VPS, where
+one more service to install and tune is the thing that decides whether the
+project fits:
+
+```bash
+# HeliosDB Nano: one ~37 MB static binary, Apache-2.0, no pgvector to install
+# (it has a native `vector` type), plus its own MySQL wire listener.
+curl -LO https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/v4.41.1/heliosdb-nano-v4.41.1-$(uname -m)-linux.tar.gz
+tar xzf heliosdb-nano-*.tar.gz && ./heliosdb-nano start --port 5432 --listen 127.0.0.1
+```
+
+```zig
+const conninfo = "host=127.0.0.1 port=5432 dbname=postgres user=postgres";
+var drv = try zent.sql.PostgresDriver.connect(allocator, conninfo);
+```
+
+Link the same `libpq` you would for PostgreSQL (`linkDrivers`); the server is not
+libpq's business. `SELECT version()` answers
+`PostgreSQL 16.0 (HeliosDB Nano 4.41.1)`.
+
+**What works.** Measured against HeliosDB Nano 4.41.1 with this repository's own
+PostgreSQL integration suite: **226 passed / 3 skipped / 30 failed** (the same
+binary against PostgreSQL 17.10: 256 / 3 / 0). CRUD, fluent and eager-loaded
+queries, transactions with savepoints, `FOR UPDATE`, `RETURNING`, migrations
+(including the history table and the dry-run plan), `jsonb`, `uuid`, `numeric`,
+arrays and the **native `vector` type** all pass. The 30 failures are the
+suite's own PostgreSQL assumptions plus the three degradations below, not a
+wrong answer from a path that ran — each failure is a query the server itself
+rejected, and the error text names it.
+
+**What degrades, and says so.** Three reads are gated on catalogs a
+wire-compatible server may not carry. Each is a warning plus a skipped
+comparison, never a rejected statement — a rejected statement would leave the
+caller's transaction unusable, which is a much larger failure than an unknown
+capability:
+
+| read | gate | what you get instead |
+|---|---|---|
+| index comparison | `pg_am` | indexes are matched **by name and uniqueness**; their key columns are reported as not comparable, so `index_columns` drift is not reported for them |
+| foreign-key comparison | `pg_proc` (where `generate_subscripts` would live) | declared keys are **left alone**; `missing_foreign_key` is never reported and no `ADD CONSTRAINT` is planned |
+| extension check | `pg_extension` | the declared types go to the server as declared (HeliosDB provides `vector` natively, so there is nothing to verify) |
+
+`checkStatement`'s SQLSTATE classification also degrades to `.kind = .ok` rather
+than a specific kind where the server reports no SQLSTATE — the statement-level
+errors still surface, but not pre-classified.
+
+**What the server does not implement** (each is its own error message, and each
+is a reason to keep a PostgreSQL instance for the features you need): the
+set-returning functions `generate_subscripts` and `encode`, `pg_sleep`,
+`pg_terminate_backend`, `SET bytea_output`, `DEALLOCATE` (so zent's prepared
+statement cache cannot evict server-side), `ALTER COLUMN ... SET NOT NULL`, and
+`IN (subquery)` inside a locking statement. Its
+`information_schema.columns.data_type` also spells types its own way (`Uuid`,
+`Array(Int4)`), which zent's type normalization lowercases and canonicalizes, so
+drift comparison is unaffected — but a consumer reading `data_type` directly
+will see the server's spelling.
+
+Re-run the comparison on your own build:
+
+```bash
+zig build test-integration
+B=$(ls -t .zig-cache/o/*/test | head -1)
+$B                                            # PostgreSQL, from $PG_DSN or localhost
+PG_DSN="host=127.0.0.1 port=5432 dbname=postgres user=postgres" $B   # any PG-wire server
+```
+
 ### Build cost, and how to cut it on a small machine
 
 Most of a consumer's **first** build is not zent's codegen — it is `translate-c`

@@ -4,6 +4,73 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **PostgreSQL-wire servers that carry a partial catalog are read, not
+  refused.** zent talks PostgreSQL through the wire protocol, so the server on
+  the other end is not necessarily PostgreSQL — and one that speaks v3 without
+  carrying every catalog (`HeliosDB Nano`: one static binary, native `vector`,
+  no pgvector to install) used to fail the *whole* migration at the first
+  statement it rejected. A rejected statement is not a recoverable event: it
+  leaves the caller's transaction unusable ("current transaction is aborted,
+  commands ignored until end of transaction block"), so a retry inside it cannot
+  answer anything. Three reads are therefore **gated before they are sent**,
+  each on the catalog whose absence is what would break it, and each degrades to
+  a warning plus a skipped comparison instead of an error:
+  - **`getPostgresIndexes`** probes `pg_am` in `pg_class` first. Not listed
+    means the read that joins it is never sent and the same read *without* the
+    access-method join answers instead: indexes are matched by name and
+    uniqueness (which is what the planner acts on), their key columns are
+    reported as not comparable, and `index_columns` drift is not reported for
+    them. A statement rejection behind that gate — a server that lists `pg_am`
+    and refuses the query anyway — is still handled by the retry, and refused
+    twice the answer is `error.IndexCatalogUnavailable`.
+  - **`getPostgresForeignKeys`** probes `pg_proc` first, because
+    `generate_subscripts` (the set-returning function that makes the read one
+    statement) is a function, not a catalog a wire-compatible server has to
+    carry. Not listed means one warning and the new
+    **`error.ForeignKeyCatalogUnavailable`**, which the drift report and the
+    planner both turn into "this comparison is skipped": a declared key that
+    cannot be compared is **left alone**, never reported missing — the report is
+    what makes the planner emit a second `ADD CONSTRAINT` for a key that may
+    already be there.
+  - **`checkPostgresExtensions`** probes `pg_extension` first, and a server that
+    does not list it sends the declared types as declared with one warning —
+    HeliosDB answers `vector` natively, so refusing the migration on a catalog it
+    does not have would block a schema it executes perfectly.
+  Measured: this repository's PostgreSQL integration suite against HeliosDB Nano
+  4.41.1 goes from **217 passed / 3 skipped / 39 failed (and a segfault part-way
+  through)** to **226 / 3 / 30** with no crash, while PostgreSQL 17.10 stays at
+  **256 / 3 / 0** — the same binary, byte-identical behavior on the dialect the
+  gates never fire on. The remaining failures are the suite's own PostgreSQL-only
+  SQL (`encode`, `pg_sleep`, `pg_terminate_backend`, `SET bytea_output`,
+  `DEALLOCATE`, `ALTER COLUMN ... SET NOT NULL`, `IN (subquery)` under a row
+  lock) and the three degradations above; every one of them is a query the
+  server itself rejected, and the error text names it. See the new README
+  section "Which database: PostgreSQL-wire servers" for the full split.
+
+### Fixed
+
+- **A migration no longer releases its transaction twice.** All three
+  self-managing migration entry points released their own transaction with
+  `errdefer tx.deinit()` *and* an explicit `tx.deinit()`. The two look
+  equivalent and are not: an `errdefer` stays armed against **any** later error
+  return, including one raised after the explicit release already ran. In
+  `migrateSchemaWithOptions` there is exactly such an error —
+  `reportNullability` reads the database again *after* the commit — so a
+  post-commit read failure freed the driver's handle a second time. On HeliosDB
+  Nano that was a use-after-free that took the whole process down with
+  `Segmentation fault at address 0x555555555555555d` instead of returning an
+  error (measured: `reportNullability err=DriverFailed` immediately followed by
+  a second `PostgresTx.deinit` on the same pointer). One `defer` covers both
+  paths — `PostgresTx.deinit` destroys the handle after a successful `commit`
+  rather than rolling it back — and the two file-based entry points were
+  converted for the same reason, since the `errdefer`+explicit-release pair only
+  holds as long as nothing is ever added after the release. New test
+  "an error raised after the commit releases the migration's transaction exactly
+  once" counts the releases, because a second release of a real handle is a
+  segfault rather than a failed assertion.
+
 ## [0.94.0] - 2026-10-16
 
 ### Added

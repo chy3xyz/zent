@@ -658,6 +658,14 @@ const PostgresCatalogStub = struct {
 fn postgresStubQuery(ptr: *anyopaque, _: ?*const driver.ExecutionContext, query_sql: []const u8, args: []const sql.Value) driver.Error!driver.Rows {
     const self: *PostgresCatalogStub = @ptrCast(@alignCast(ptr));
     self.queries += 1;
+    // The capability gate ahead of the query that joins `pg_am`: this stub
+    // models a full PostgreSQL server, so the relation is listed and the read
+    // below is the one selected. Answered rather than counted as `unmatched` —
+    // a gate the stub does not model must not be read as "the catalog has
+    // nothing", which is what that counter exists for.
+    if (std.mem.indexOf(u8, query_sql, migrate.pg_relation_probe_prefix) != null) {
+        return self.answering(&.{.{ .int = &.{1} }});
+    }
     if (std.mem.indexOf(u8, query_sql, "information_schema.columns") != null) {
         return self.answering(if (bindsTable(args, self.existing_table)) self.columns_rows else &.{});
     }
