@@ -97,17 +97,36 @@ if [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
     exit 1
 fi
 
+HAVE_GH=0
+command -v gh >/dev/null 2>&1 && HAVE_GH=1
 CI_STATE=""
-if command -v gh >/dev/null 2>&1; then
+if [ "$HAVE_GH" = "1" ]; then
     CI_STATE="$(gh run list --commit "$LOCAL_HEAD" --limit 1 --json status,conclusion \
-        -q '.[0] | if .conclusion == null then .status else .status + " " + .conclusion end' 2>/dev/null || true)"
+        -q '.[0] | [.status, (.conclusion // "")] | map(select(. != "")) | join(" ")' 2>/dev/null || true)"
 fi
 case "$CI_STATE" in
     "completed success")
         echo "ci: green on $(git rev-parse --short HEAD)"
         ;;
     "")
-        echo "note: cannot read CI status for this commit (no gh, or no run yet)"
+        # Two very different cases, and only one of them is fine. Without gh we
+        # cannot check, so say so and continue (that is the documented
+        # limitation of this lane). With gh available but no run, the commit is
+        # brand new — tagging it now ships a ref whose suites nobody has run
+        # (this is how snap-2026-10-16-2 got cut seconds after its push).
+        if [ "$HAVE_GH" = "1" ]; then
+            if [ "$FORCE" != "1" ]; then
+                echo "FAIL: no CI run for $(git rev-parse --short HEAD) yet."
+                echo "      Wait for CI to start and finish, or pass --force if you ran the"
+                echo "      suites locally (zig build test + zig build test-integration +"
+                echo "      scripts/check-deadcode.sh)."
+                exit 1
+            fi
+            echo "WARNING: tagging a commit with no CI run because --force was given"
+        else
+            echo "note: gh is not installed, so CI status cannot be checked — the fast"
+            echo "      gates below are all this tag has"
+        fi
         ;;
     *)
         if [ "$FORCE" != "1" ]; then

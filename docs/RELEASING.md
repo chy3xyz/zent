@@ -38,8 +38,10 @@ The tag is annotated with the commits since the previous tag, so
 It refuses to tag a commit that is not `origin/main`, or whose CI did not
 conclude successfully — the cheap lane borrows CI's verdict instead of
 re-running the integration suites (the fast gates above are on top of it).
-`--force` overrides the CI check when CI is slow or flaky and someone is waiting
-on a pin; it does not override the push check.
+"No run yet" is a refusal too: a tag cut seconds after a push pins a commit
+whose suites nobody has run. `--force` overrides the CI check when CI is slow
+or flaky and someone is waiting on a pin; it does not override the push check.
+Without `gh` installed the check cannot happen, and the script says so.
 
 **A daily one happens anyway.** `.github/workflows/snap-tag.yml` tags the
 newest commit on `main` whose CI is green, once a day, as
