@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# One-shot release: bump the package version everywhere, run quality gates,
-# then commit + tag (+ push with --push).
+# Release: bump the package version everywhere, promote CHANGELOG, run the
+# quality gates, then commit + annotated tag (+ push and publish a GitHub
+# Release with --push).
+#
+# This is the **rare** lane. Releases are meant to be batched — roughly one a
+# week — because a release is what a consumer reads: a version, a changelog
+# section, a published artifact. For "I need to pin this exact commit now" use
+# the cheap lane instead, which bumps nothing:
+#
+#     scripts/tag.sh [--push]        # snapshot tag, many of them
 #
 # Note: .fingerprint is the package's permanent identity — it never changes.
 #
@@ -42,6 +50,22 @@ if [ "$OLD" = "$VERSION" ]; then
     exit 1
 fi
 echo "release: $OLD -> $VERSION"
+
+# Cadence: releases are the rare lane. Say how long it has been, and where the
+# cheap lane is, without blocking a release that needs to happen now.
+LAST_RELEASE="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 || true)"
+if [ -n "$LAST_RELEASE" ]; then
+    LAST_EPOCH="$(git log -1 --format=%ct "$LAST_RELEASE" 2>/dev/null || echo 0)"
+    NOW_EPOCH="$(date +%s)"
+    DAYS=$(( (NOW_EPOCH - LAST_EPOCH) / 86400 ))
+    echo "last release: $LAST_RELEASE (${DAYS} day(s) ago)"
+    if [ "$DAYS" -lt 7 ]; then
+        echo "note: the release cadence is roughly one a week — a snapshot tag"
+        echo "      (scripts/tag.sh) is the cheap way to pin a commit in between"
+    fi
+else
+    echo "last release: none"
+fi
 
 # 1. Bump version in every reference.
 sed -i '' "s/\.version = \"$OLD\"/.version = \"$VERSION\"/" build.zig.zon
@@ -88,4 +112,28 @@ if [ "$PUSH" = "1" ]; then
     git push origin main
     git push origin "v$VERSION"
     echo "pushed main + v$VERSION"
+
+    # 6. Publish the GitHub Release — what makes "release" different from "tag"
+    #    for anyone reading the repository rather than the dependency graph.
+    #    The notes are the CHANGELOG section this release just promoted, so the
+    #    two can never disagree. A missing or unauthenticated `gh` is a warning,
+    #    not a failure: the tag is already pushed and the release can be created
+    #    from the web UI.
+    notes="$(mktemp)"
+    awk -v pat="## \\[$VERSION\\]" '
+        $0 ~ pat { copying = 1; next }
+        copying && /^## \[/ { exit }
+        copying { print }
+    ' CHANGELOG.md > "$notes"
+    if [ -s "$notes" ] && command -v gh >/dev/null 2>&1; then
+        if gh release create "v$VERSION" --title "v$VERSION" --notes-file "$notes" >/dev/null 2>&1; then
+            echo "published GitHub Release v$VERSION"
+        else
+            echo "note: could not publish a GitHub Release (gh failed or is not authenticated);"
+            echo "      the tag is pushed — create it from the web UI with the CHANGELOG section"
+        fi
+    else
+        echo "note: skipping the GitHub Release (no gh, or an empty CHANGELOG section)"
+    fi
+    rm -f "$notes"
 fi

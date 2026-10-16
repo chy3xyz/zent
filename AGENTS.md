@@ -24,7 +24,11 @@
 - `bash scripts/check-version.sh` — release-consistency gate (CI)
 - `bash scripts/check-deadcode.sh` — dead-code baseline gate (CI; needs
   `ZMODU=<path>` pointing at the zmodu CLI built from zigmodu)
-- `bash scripts/release.sh <x.y.z> [--push]` — one-shot release flow
+- `bash scripts/release.sh <x.y.z> [--push]` — **release** lane: bumps the
+  version, promotes CHANGELOG, tags, publishes a GitHub Release. Roughly weekly.
+- `bash scripts/tag.sh [name] [--push]` — **snapshot tag** lane: tags the
+  current commit without touching the version; as often as needed
+  (`docs/RELEASING.md` explains the split)
 
 ## CI gates
 
