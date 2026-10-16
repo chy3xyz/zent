@@ -119,9 +119,12 @@ if [ "$PUSH" = "1" ]; then
     #    two can never disagree. A missing or unauthenticated `gh` is a warning,
     #    not a failure: the tag is already pushed and the release can be created
     #    from the web UI.
+    # `index(...) == 1` rather than a regex: `awk -v` rewrites escapes in the
+    # value, so `\[` would arrive as `[` and turn the heading into a character
+    # class (which silently matches nothing).
     notes="$(mktemp)"
-    awk -v pat="## \\[$VERSION\\]" '
-        $0 ~ pat { copying = 1; next }
+    awk -v head="## [$VERSION]" '
+        !copying && index($0, head) == 1 { copying = 1; next }
         copying && /^## \[/ { exit }
         copying { print }
     ' CHANGELOG.md > "$notes"
