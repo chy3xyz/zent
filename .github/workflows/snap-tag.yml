@@ -37,25 +37,31 @@ jobs:
           SHA="$(git rev-parse origin/main)"
           STATE="$(gh run list --commit "$SHA" --limit 1 \
               --json status,conclusion \
-              -q '.[0] | .status + " " + (.conclusion // "pending")')"
+              -q '.[0] | if .conclusion == null then .status else .status + " " + .conclusion end')"
           if [ "$STATE" != "completed success" ]; then
             echo "skip: CI on ${SHA:0:7} is '$STATE' — not tagging"
             exit 0
           fi
 
           DATE="$(date -u +%F)"
-          NAME="snap-$DATE"
-          if git rev-parse -q --verify "refs/tags/$NAME" >/dev/null; then
-            if [ "$(git rev-parse "refs/tags/$NAME^{commit}")" = "$SHA" ]; then
-              echo "already tagged: $NAME points at ${SHA:0:7}"
+
+          # Idempotent by commit, not by name: if today's snapshot (whatever
+          # suffix it got, including one cut by hand) already points at this
+          # commit, there is nothing to do — otherwise the next run would
+          # invent snap-<date>-3 for a commit that is already tagged.
+          for t in $(git tag -l "snap-$DATE*"); do
+            if [ "$(git rev-parse "refs/tags/$t^{commit}")" = "$SHA" ]; then
+              echo "already tagged: $t points at ${SHA:0:7}"
               exit 0
             fi
-            n=2
-            while git rev-parse -q --verify "refs/tags/$NAME" >/dev/null; do
-              NAME="snap-$DATE-$n"
-              n=$((n + 1))
-            done
-          fi
+          done
+
+          NAME="snap-$DATE"
+          n=2
+          while git rev-parse -q --verify "refs/tags/$NAME" >/dev/null; do
+            NAME="snap-$DATE-$n"
+            n=$((n + 1))
+          done
 
           PREV="$(git describe --tags --abbrev=0 "$SHA" 2>/dev/null || true)"
           if [ -n "$PREV" ]; then

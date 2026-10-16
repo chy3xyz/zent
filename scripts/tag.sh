@@ -35,12 +35,23 @@ for arg in "$@"; do
     esac
 done
 
-# Default name: snap-YYYY-MM-DD, suffixed when the day already has one.
+# Default name: snap-YYYY-MM-DD, suffixed when the day already has one. A
+# commit that already carries today's snapshot tag is left alone — re-tagging it
+# under a new suffix would add a second name for the same tree (the automated
+# daily job applies the same rule).
 if [ -z "$NAME" ]; then
-    NAME="snap-$(date +%F)"
+    DATE="$(date +%F)"
+    for t in $(git tag -l "snap-$DATE*"); do
+        if [ "$(git rev-parse "refs/tags/$t^{commit}")" = "$(git rev-parse HEAD)" ]; then
+            echo "already tagged today: $t points at $(git rev-parse --short HEAD)"
+            echo "pass an explicit name to add another"
+            exit 0
+        fi
+    done
+    NAME="snap-$DATE"
     n=2
     while git rev-parse -q --verify "refs/tags/$NAME" >/dev/null; do
-        NAME="snap-$(date +%F)-$n"
+        NAME="snap-$DATE-$n"
         n=$((n + 1))
     done
 fi
@@ -89,7 +100,7 @@ fi
 CI_STATE=""
 if command -v gh >/dev/null 2>&1; then
     CI_STATE="$(gh run list --commit "$LOCAL_HEAD" --limit 1 --json status,conclusion \
-        -q '.[0] | .status + " " + (.conclusion // "pending")' 2>/dev/null || true)"
+        -q '.[0] | if .conclusion == null then .status else .status + " " + .conclusion end' 2>/dev/null || true)"
 fi
 case "$CI_STATE" in
     "completed success")
