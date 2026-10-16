@@ -35,11 +35,24 @@ that borrowed the shape would break both gates and mislead a consumer.
 The tag is annotated with the commits since the previous tag, so
 `git show snap-2026-10-16` explains itself without a changelog entry.
 
-Use it for: handing a consumer (or a colleague, or a bisect) the exact tree you
-just verified; marking a known-good point before a risky change; publishing a
-fix that a downstream project needs today while the release waits for the
-weekly batch. Do **not** use it as a release: no changelog entry is written, so
-nobody reading the repository learns anything from it.
+It refuses to tag a commit that is not `origin/main`, or whose CI did not
+conclude successfully — the cheap lane borrows CI's verdict instead of
+re-running the integration suites (the fast gates above are on top of it).
+`--force` overrides the CI check when CI is slow or flaky and someone is waiting
+on a pin; it does not override the push check.
+
+**A daily one happens anyway.** `.github/workflows/snap-tag.yml` tags the
+newest commit on `main` whose CI is green, once a day, as
+`snap-YYYY-MM-DD` — so "today's verified main" is always pinnable without
+anyone asking. It is idempotent (a day already tagged at that commit is
+skipped) and it skips a day whose commits are not green yet.
+
+Use the manual command for: handing a consumer (or a colleague, or a bisect)
+the exact tree you just verified; marking a known-good point before a risky
+change; publishing a fix that a downstream project needs today while the release
+waits for the weekly batch. Do **not** use a snapshot tag as a release: no
+changelog entry is written, so nobody reading the repository learns anything
+from it.
 
 ## Releases (the rare lane)
 

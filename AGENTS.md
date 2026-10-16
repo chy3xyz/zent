@@ -32,6 +32,10 @@
 
 ## CI gates
 
+`.github/workflows/snap-tag.yml` is not a gate: it tags the newest green commit
+on `main` once a day (`snap-YYYY-MM-DD`) so consumers can pin "today's verified
+main" between weekly releases — see `docs/RELEASING.md`.
+
 fmt → build → unit tests → version consistency → integration tests
 (SQLite/PostgreSQL/MySQL) + a standalone dead-code baseline job.
 

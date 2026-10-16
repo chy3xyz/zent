@@ -250,11 +250,28 @@ const zent_build = b.lazyImport(@This(), "zent").?;
 zent_build.linkDrivers(b, mod, target, .{}); // .{ .pg = false } to narrow
 ```
 
+### Which ref to pin
+
+Two kinds of ref exist, and picking the wrong one is the only way to be
+surprised (see `docs/RELEASING.md`):
+
+| ref | what it is | when to pin it |
+|---|---|---|
+| `#vX.Y.Z` (a **release**) | a version: `zent.version`, a CHANGELOG section, a published GitHub Release | production — it is the thing whose changelog you read before upgrading |
+| `#snap-YYYY-MM-DD` (a **snapshot tag**) | that exact commit, no version bump, no changelog entry | you need a fix that is on `main` but not in a release yet; a bisect; handing a colleague the tree you verified |
+
+Both pin by content hash, so both are immutable once fetched. Releases are
+published roughly weekly; snapshot tags are cut whenever a downstream project
+needs one sooner (the annotation of a snapshot tag lists what landed since the
+previous tag).
+
 After every zent release the pinned hash must be refreshed:
 
 ```bash
 zig fetch --save git+https://github.com/chy3xyz/zent.git#vX.Y.Z
 ```
+
+The same command works for a snapshot tag (`#snap-2026-10-16`).
 
 ### Cross-compiling
 

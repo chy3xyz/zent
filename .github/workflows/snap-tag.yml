@@ -1,0 +1,74 @@
+name: snap-tag
+
+# The cheap lane, automated: one snapshot tag a day on the newest commit of
+# main whose CI concluded successfully. Consumers pin `#snap-YYYY-MM-DD` when
+# they need a fix that is on main but not yet in a weekly release (see
+# docs/RELEASING.md). Nothing is bumped, nothing is published — the tag's
+# annotation is the only record, and it lists what landed since the last tag.
+#
+# It deliberately does not tag a commit whose CI is still running or red: that
+# would hand a consumer a ref the repository does not stand behind. A day with
+# no green commit simply goes untagged, and the next run picks up the newer one.
+
+on:
+  schedule:
+    # Off the hour, and off :00 minutes — every cron job in the world asks for
+    # midnight, so ask for 04:17 UTC instead.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag the newest verified commit on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags origin main
+
+          SHA="$(git rev-parse origin/main)"
+          STATE="$(gh run list --commit "$SHA" --limit 1 \
+              --json status,conclusion \
+              -q '.[0] | .status + " " + (.conclusion // "pending")')"
+          if [ "$STATE" != "completed success" ]; then
+            echo "skip: CI on ${SHA:0:7} is '$STATE' — not tagging"
+            exit 0
+          fi
+
+          DATE="$(date -u +%F)"
+          NAME="snap-$DATE"
+          if git rev-parse -q --verify "refs/tags/$NAME" >/dev/null; then
+            if [ "$(git rev-parse "refs/tags/$NAME^{commit}")" = "$SHA" ]; then
+              echo "already tagged: $NAME points at ${SHA:0:7}"
+              exit 0
+            fi
+            n=2
+            while git rev-parse -q --verify "refs/tags/$NAME" >/dev/null; do
+              NAME="snap-$DATE-$n"
+              n=$((n + 1))
+            done
+          fi
+
+          PREV="$(git describe --tags --abbrev=0 "$SHA" 2>/dev/null || true)"
+          if [ -n "$PREV" ]; then
+            BODY="$(git log --oneline "$PREV..$SHA" | head -40)"
+          else
+            BODY="$(git log --oneline -40 "$SHA")"
+          fi
+
+          {
+            printf '%s\n\n' "$NAME"
+            printf 'Snapshot tag (automated) — not a release; the package version is unchanged.\n\n'
+            printf 'Since %s:\n%s\n' "${PREV:-the beginning}" "$BODY"
+          } > /tmp/body
+          git tag -a "$NAME" -F /tmp/body
+          git push origin "$NAME"
+          echo "tagged $NAME -> ${SHA:0:7}"

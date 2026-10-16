@@ -21,12 +21,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PUSH=0
+FORCE=0
 NAME=""
 for arg in "$@"; do
     case "$arg" in
         --push) PUSH=1 ;;
+        --force) FORCE=1 ;;
         -*)
-            echo "usage: scripts/tag.sh [name] [--push]"
+            echo "usage: scripts/tag.sh [name] [--push] [--force]"
             exit 2
             ;;
         *) NAME="$arg" ;;
@@ -69,10 +71,46 @@ if [ "$BR" != "main" ]; then
     exit 1
 fi
 
-# The fast gates only. A snapshot tag is not a release: it claims "this commit
-# is what it looks like", not "the integration suites pass" — that is CI's job
-# on every push, and release.sh's on the rare lane. If you do want the full
-# gates before tagging, run them yourself (see docs/RELEASING.md).
+# The commit must be pushed, and CI must have passed on it. A tag that points
+# at a commit nobody else can fetch is useless to a consumer, and the fast gates
+# below say nothing about the integration suites — so the cheap lane borrows
+# CI's verdict rather than re-running it. `--force` is for the case CI is slow
+# or flaky and someone is waiting on the pin.
+echo "-- what is being tagged --"
+git fetch --quiet origin main || true
+LOCAL_HEAD="$(git rev-parse HEAD)"
+REMOTE_HEAD="$(git rev-parse origin/main 2>/dev/null || true)"
+if [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
+    echo "FAIL: HEAD ($(git rev-parse --short HEAD)) is not origin/main (${REMOTE_HEAD:0:7})."
+    echo "      Push first — a tag on an unpushed commit is useless to a consumer."
+    exit 1
+fi
+
+CI_STATE=""
+if command -v gh >/dev/null 2>&1; then
+    CI_STATE="$(gh run list --commit "$LOCAL_HEAD" --limit 1 --json status,conclusion \
+        -q '.[0] | .status + " " + (.conclusion // "pending")' 2>/dev/null || true)"
+fi
+case "$CI_STATE" in
+    "completed success")
+        echo "ci: green on $(git rev-parse --short HEAD)"
+        ;;
+    "")
+        echo "note: cannot read CI status for this commit (no gh, or no run yet)"
+        ;;
+    *)
+        if [ "$FORCE" != "1" ]; then
+            echo "FAIL: CI on $(git rev-parse --short HEAD) is '$CI_STATE', not 'completed success'."
+            echo "      Wait for it, or pass --force if you have run the suites yourself"
+            echo "      (zig build test + zig build test-integration + scripts/check-deadcode.sh)."
+            exit 1
+        fi
+        echo "WARNING: tagging with CI '$CI_STATE' because --force was given"
+        ;;
+esac
+
+# The fast gates only, on top of CI: they are cheap and they catch a dirty
+# working tree's effect on the build before the tag exists.
 echo "-- fast gates --"
 zig fmt --check src examples tests build.zig
 zig build test --summary all
