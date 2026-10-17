@@ -365,11 +365,11 @@ write the statement through `zent.scope`, which composes the read-side scope and
 renders placeholders per dialect for you.
 
 **What works.** Measured against HeliosDB Nano 4.41.1 with this repository's own
-PostgreSQL integration suite: **226 passed / 3 skipped / 30 failed** (the same
-binary against PostgreSQL 17.10: 256 / 3 / 0). CRUD, fluent and eager-loaded
+PostgreSQL integration suite: **228 passed / 3 skipped / 29 failed** (the same
+binary against PostgreSQL 17.10: 257 / 3 / 0). CRUD, fluent and eager-loaded
 queries, transactions with savepoints, `FOR UPDATE`, `RETURNING`, migrations
 (including the history table and the dry-run plan), `jsonb`, `uuid`, `numeric`,
-arrays and the **native `vector` type** all pass. The 30 failures are the
+arrays and the **native `vector` type** all pass. The 29 failures are the
 suite's own PostgreSQL assumptions plus the three degradations below, not a
 wrong answer from a path that ran — each failure is a query the server itself
 rejected, and the error text names it.

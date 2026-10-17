@@ -45,8 +45,10 @@ All notable changes to this project will be documented in this file.
   junction table keeps both columns plus its pair primary key, but the
   **constraint** is left out, with one warning naming the edge, the source and
   the target — the database error never named any of them. See
-  `docs/UPGRADING.md` §13.9; a graph that carries every target emits byte-identical
-  DDL.
+  `docs/UPGRADING.md` §13.9; a graph that carries every target emits
+  byte-identical DDL. Measured on HeliosDB Nano 4.41.1: **228 / 3 / 29** with no
+  crash, up from the 226 / 3 / 30 this batch started at (PostgreSQL 17.10
+  unchanged at 257 / 3 / 0).
 - **A cross build says which driver it skipped and what that costs.** Discovery
   coming up empty is by design, but the only symptom was `no module named
   'mysql_c'` at the first import — an error that names a module, not the
