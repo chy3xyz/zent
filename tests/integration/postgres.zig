@@ -5463,3 +5463,47 @@ test "Postgres: a schema that needs a missing extension is refused before any DD
         return error.SkipZigTest;
     }
 }
+
+test "Postgres: a ?-style raw statement runs after translatePlaceholdersAlloc" {
+    // The consumer-facing escape hatch, end to end: `?` is not portable (it is
+    // SQLite/MySQL's own placeholder, and PostgreSQL reads it as a literal), so
+    // the documented port is translate-then-execute. This pins that the pair
+    // actually works against a server rather than only against the unit tests'
+    // expected strings — a translation that only *looks* right is exactly the
+    // failure mode that costs a consumers' afternoon.
+    const allocator = std.testing.allocator;
+    var drv = connect(allocator) catch |err| return skipIfNoServer(err);
+    defer drv.close();
+
+    _ = try drv.exec("DROP TABLE IF EXISTS zent_pg_ph_test", &.{});
+    _ = try drv.exec(
+        \\CREATE TABLE zent_pg_ph_test (
+        \\  id SERIAL PRIMARY KEY,
+        \\  note TEXT NOT NULL,
+        \\  amount INT NOT NULL
+        \\)
+    , &.{});
+    defer _ = drv.exec("DROP TABLE IF EXISTS zent_pg_ph_test", &.{}) catch {};
+
+    // A `?` inside the literal is data, and proves the scan rather than a blind
+    // replace: a rewritten literal would insert "why$1".
+    const written_with_question_marks =
+        "INSERT INTO zent_pg_ph_test (note, amount) VALUES ('why?', ?)";
+    const translated = try zent.sql_dialect.translatePlaceholdersAlloc(
+        zent.sql_dialect.Dialect.postgres,
+        allocator,
+        written_with_question_marks,
+    );
+    defer allocator.free(translated);
+    try testing.expectEqualStrings(
+        "INSERT INTO zent_pg_ph_test (note, amount) VALUES ('why?', $1)",
+        translated,
+    );
+    _ = try drv.exec(translated, &.{.{ .int = 7 }});
+
+    var rows = try drv.query("SELECT note, amount FROM zent_pg_ph_test", &.{});
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRow;
+    try testing.expectEqualStrings("why?", row.getText(0).?);
+    try testing.expectEqual(@as(i64, 7), row.getInt(1).?);
+}

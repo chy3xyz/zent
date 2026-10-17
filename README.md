@@ -303,9 +303,19 @@ library name is probed in the resolved lib dir — `libmariadb` before
 `mysqlclient` compat package.
 
 A cross build with neither a root nor an override warns once that host discovery
-was skipped. The bindings for drivers it could not find are then absent, which
-surfaces as `no module named sqlite3_c/pg_c/mysql_c` at the first use — that
-error names the mistake.
+was skipped, and each driver that discovery could not find warns again with its
+own name, the paths it searched and the module the consumer will fail to import
+(`no module named 'mysql_c'` at first use) — that line is the actionable one.
+
+Both channels work, and they are not equally robust. The environment is read
+from the process `zig build` itself runs in (`b.graph.environ_map`, which on Zig
+0.17.0 carries custom variables — verified, not assumed), so
+`XCOMPILE_ROOT=/root zig build -Dtarget=…` does take effect; a value exported
+inside a wrapper that spawns another tool, or a variable that never reached the
+build process, does not. When a **parent build script** drives the build —
+the normal case for a consumer — forward the option instead
+(`b.dependency("zent", .{ .xroot = root })`, or `linkDrivers(… .{ .root = root })`):
+it is a declared input, so it is part of what the configure step is keyed on.
 
 ### Which database: PostgreSQL-wire servers
 
@@ -330,6 +340,29 @@ var drv = try zent.sql.PostgresDriver.connect(allocator, conninfo);
 Link the same `libpq` you would for PostgreSQL (`linkDrivers`); the server is not
 libpq's business. `SELECT version()` answers
 `PostgreSQL 16.0 (HeliosDB Nano 4.41.1)`.
+
+**Raw SQL written with `?` has to be translated first.** A statement you build
+through the fluent API is dialect-correct by construction (`Builder.arg` writes
+the dialect's own placeholder), but `driver.exec` / `driver.query` take the
+statement **as written**: `$1, $2, …` on PostgreSQL, `?` on SQLite and MySQL. A
+`?`-style raw statement handed to a PostgreSQL driver is sent verbatim and the
+server answers `syntax error at or near "AND"` — there is no translation layer
+to forget, so the driver's doc comment states it, and the rewrite is one call:
+
+```zig
+const translated = try zent.sql_dialect.translatePlaceholdersAlloc(
+    .postgres,
+    allocator,
+    "SELECT * FROM orders WHERE status = ? AND paid_at < ?",
+); // → "… WHERE status = $1 AND paid_at < $2"
+defer allocator.free(translated);
+```
+
+It numbers only the `?` that is a placeholder: quoted strings and identifiers,
+`--` and `/* … */` comments, and PostgreSQL dollar-quoted bodies are copied
+verbatim, so a `'?'` in a literal stays a literal. A portable alternative is to
+write the statement through `zent.scope`, which composes the read-side scope and
+renders placeholders per dialect for you.
 
 **What works.** Measured against HeliosDB Nano 4.41.1 with this repository's own
 PostgreSQL integration suite: **226 passed / 3 skipped / 30 failed** (the same

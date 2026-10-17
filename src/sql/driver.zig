@@ -566,6 +566,18 @@ pub const Tx = struct {
 };
 
 /// Database driver abstraction.
+///
+/// **Placeholders are the dialect's own, not a portable `?`.** Everything zent
+/// builds through a `Builder` is translated as it is built (`Builder.arg` →
+/// `Dialect.placeholder`), so a fluent query is correct by construction; the
+/// two methods below take the statement as written, which means `$1, $2, …` on
+/// PostgreSQL and `?` on SQLite and MySQL. A raw statement written in the
+/// `?` style and handed to a PostgreSQL driver is *sent as written* and the
+/// server answers `syntax error at or near "..."` — translate it with
+/// `sql_dialect.translatePlaceholdersAlloc(.postgres, allocator, sql)` first.
+/// This is the one contract difference a consumer porting raw SQL from MySQL to
+/// PostgreSQL has to act on, so it is stated here rather than discovered from
+/// the server's error text.
 pub const Driver = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

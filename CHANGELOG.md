@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`zent.sql_dialect.translatePlaceholdersAlloc(dialect, allocator, sql)`** —
+  rewrite `?` placeholders into the dialect's own spelling (`$1, $2, …` on
+  PostgreSQL, unchanged on SQLite/MySQL). The fluent builders translate as they
+  build, so a query written through them is correct by construction; a **raw**
+  statement handed to `driver.exec` / `driver.query` is taken as written, and on
+  PostgreSQL that means `$n` — a `?`-style statement is sent verbatim and the
+  server answers `syntax error at or near "AND"`. That contract is now stated on
+  the driver type itself, and the rewrite is one call instead of one per
+  consumer: measured on a real port (154 tables, 552 raw-SQL execution points,
+  all `?`-style), every one of them failed on PostgreSQL and had to be
+  re-wrapped by hand. The scan is not a `replace`: quoted strings and
+  identifiers, `--` and `/* … */` comments (nesting included) and PostgreSQL
+  dollar-quoted bodies are copied verbatim, so `'?'` stays a literal and
+  `$1` is not mistaken for an empty tag.
+- **The `comptime` branch budget of the migration helpers scales with the
+  graph.** `requiredPostgresExtensions` had no `@setEvalBranchQuota` at all (so
+  it ran under the default 1000) and `tableFromTypeInfoCrossRef` used a fixed
+  50_000; both are private, so the `@setEvalBranchQuota` a caller writes cannot
+  reach them (the innermost quota on an evaluation path wins). A 154-table
+  schema hits both — measured by the consumer whose full-graph
+  `migrateSchema` failed to compile. The budget is now
+  `1_000_000 + tables × 20_000` (`evalQuotaFor`), which is a ceiling and costs
+  nothing when it is not reached. A 200-table × 16-field graph is pinned in a
+  test so the helpers cannot silently return to a fixed constant.
+
+### Fixed
+
+- **An edge whose target is outside the graph no longer emits a foreign key.**
+  `migrateSchema` / `createAllTables` built the table from the `infos` they were
+  given, and for an edge leaving that slice they fell back to
+  `toSnakeCase(target_name)` — a guess that ignores the target's declared
+  `table_name`. On PostgreSQL the guess is not a dangling reference but a
+  rejected `CREATE TABLE` (`relation "upload_file" does not exist` while the
+  table is `xdaofood_upload_file`), so a chunked migration failed on every
+  retry; on SQLite the DDL was accepted and the child's first INSERT failed
+  later. The **column** is still generated (the query side reads it) and a
+  junction table keeps both columns plus its pair primary key, but the
+  **constraint** is left out, with one warning naming the edge, the source and
+  the target — the database error never named any of them. See
+  `docs/UPGRADING.md` §13.9; a graph that carries every target emits byte-identical
+  DDL.
+- **A cross build says which driver it skipped and what that costs.** Discovery
+  coming up empty is by design, but the only symptom was `no module named
+  'mysql_c'` at the first import — an error that names a module, not the
+  discovery. `linkDrivers` now warns once per skipped driver with the target, the
+  paths searched, the override variables and the `.{ .pg = false }`-shaped
+  escape. The README's cross-compiling section also records what was measured
+  about the environment channel: on Zig 0.17.0 `b.graph.environ_map` **does**
+  carry custom variables, so `XCOMPILE_ROOT` reaches the build script when it is
+  set in the process `zig build` runs in — the reliable channel for a build
+  driven by a parent script remains the forwarded `.xroot` option, because that
+  is a declared input.
+
 ## [0.95.0] - 2026-10-17
 
 ### Added

@@ -453,3 +453,41 @@ The behavior behind them is documented in the README, "Which database:
 PostgreSQL-wire servers": on such a server indexes are matched by name and
 uniqueness, foreign keys are left alone, and the extension check is skipped,
 each with one warning naming the table.
+
+### 13.9 A cross-graph edge contributes no foreign key (unreleased)
+
+A migration builds its tables from the `infos` it is given. When an edge's
+target is **not** in that slice — a multi-database deployment that migrates each
+graph on its own, or a large schema migrated in chunks — the table name of the
+target cannot be resolved: the entity that would have said `.table_name` is not
+there. zent used to fall back to `toSnakeCase(target_name)` and emit
+`FOREIGN KEY … REFERENCES "<derived>"`. That fallback is gone from the migration
+path:
+
+- the **column** is still generated (the query side reads it either way), and a
+  junction table keeps both columns and its two-column primary key;
+- the **constraint** is left out, so the `CREATE TABLE` succeeds;
+- one warning names the edge, the source and the target.
+
+**Why it had to change.** The derived name is a guess, and a wrong guess is not
+a harmless dangling reference: PostgreSQL rejects the whole `CREATE TABLE`
+(`relation "upload_file" does not exist`) when the real table is
+`xdaofood_upload_file`, so a chunked migration failed on every retry. SQLite
+accepted the DDL and failed later, at the child's first INSERT — both worse than
+not emitting a key this layer cannot name.
+
+**What a consumer has to do.** Nothing, in the normal case: a graph that carries
+every edge target (every `buildGraph(&.{…all…})` call) emits exactly the same
+DDL as before. Two cases see a difference:
+
+- **Chunked / per-database migration**: the cross-chunk key is no longer
+  created. That is the point. If you want it, migrate once with the whole graph,
+  or let the second pass add it — `opts.add_missing_foreign_keys` reads the live
+  catalog, so it adds what the graph can name.
+- **Someone relying on the dangling reference**: pass the target entity in the
+  same `infos` slice (it need not be migrated by the same call to *exist* — the
+  DDL only needs its `.table_name` and `.pk`).
+
+`tableFromTypeInfo` (the `pub` helper that takes one table and no graph) keeps
+its historical derived shape — it has no `infos` to resolve against, and it is
+not on the migration path.

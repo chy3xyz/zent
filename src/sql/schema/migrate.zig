@@ -1957,11 +1957,33 @@ fn postgresExtensionForDeclaredType(declared: []const u8) ?[]const u8 {
 /// Two declarations can need one. A `field.Vector` column always needs pgvector
 /// (its `vector(n)` type is the extension's), and an explicit `.SqlType(s)` /
 /// `field.Other(name, s)` override may name an extension type — it is emitted
+/// The `comptime` branch budget a schema-shaped helper needs, **scaled by the
+/// graph** rather than fixed.
+///
+/// A constant is the wrong shape for these loops: they are per table × per
+/// field, and the cross-reference helpers add per table × per table again, so a
+/// 2-table test graph and a 154-table consumer differ by orders of magnitude —
+/// and the side that fails is the one that cannot see this file. A caller's own
+/// `@setEvalBranchQuota` cannot help either: the innermost quota on an
+/// evaluation path wins, and the failing evaluation happens *inside* these
+/// private functions. Measured on a 154-table, ~15-field-per-table schema: the
+/// default 1000 tripped in `requiredPostgresExtensions` (which had no quota at
+/// all) and the fixed 50_000 tripped in `tableFromTypeInfoCrossRef`.
+///
+/// The quota is a ceiling, never work: raising it costs nothing when it is not
+/// reached, which is why the base matches the codegen modules' 1_000_000 rather
+/// than something tuned to today's graph sizes.
+fn evalQuotaFor(comptime infos: []const TypeInfo) u32 {
+    const n: u32 = @intCast(infos.len);
+    return 1_000_000 + n * 20_000;
+}
+
 /// verbatim on PostgreSQL. The built-in field kinds cannot: `field.Json` is
 /// `JSONB`, `field.Bytes` is `BYTEA`, and every other kind maps to a type
 /// PostgreSQL owns.
 fn requiredPostgresExtensions(comptime infos: []const TypeInfo) []const []const u8 {
     comptime {
+        @setEvalBranchQuota(evalQuotaFor(infos));
         var needed: []const []const u8 = &.{};
         for (infos) |info| {
             if (info.is_view) continue;
@@ -1989,6 +2011,7 @@ fn requiredPostgresExtensions(comptime infos: []const TypeInfo) []const []const 
 /// about. Pure and comptime, like the list it renders.
 fn requiredExtensionsJoined(comptime infos: []const TypeInfo) []const u8 {
     comptime {
+        @setEvalBranchQuota(evalQuotaFor(infos));
         var out: []const u8 = "";
         for (requiredPostgresExtensions(infos), 0..) |name, i| {
             if (i > 0) out = out ++ ", ";
@@ -2817,9 +2840,10 @@ pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
 pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
     comptime {
         // Two ends × per-end name/column concatenations, per junction edge
-        // inside the `inline for (infos)` migration loops: match the siblings'
-        // quota so a 15+ table graph does not trip the default.
-        @setEvalBranchQuota(50_000);
+        // inside the `inline for (infos)` migration loops, each end resolved by
+        // a scan of `all_infos`: scaled with the graph like its siblings
+        // (see `evalQuotaFor`).
+        @setEvalBranchQuota(evalQuotaFor(all_infos));
         const ref = edgeRefTarget(edge, all_infos);
         const source_table = source_info.table_name;
         const target_table = ref.table;
@@ -2837,17 +2861,35 @@ pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeI
         const col_b = target_table ++ "_id";
         const col1 = if (a_first) col_a else col_b;
         const col2 = if (a_first) col_b else col_a;
-        const ref1 = if (a_first) source_table else target_table;
-        const ref2 = if (a_first) target_table else source_table;
 
         // Each reference names that end's primary-key column — `graph.pkColumn`
         // of the end's TypeInfo, the same resolver the relation query uses.
-        // Out of the graph there is no TypeInfo to ask, and the reference is
-        // dangling whichever column it names.
         const source_ref = pkColumn(source_info);
-        const target_ref = if (ref.info) |target| pkColumn(target) else "id";
-        const ref_col1 = if (a_first) source_ref else target_ref;
-        const ref_col2 = if (a_first) target_ref else source_ref;
+        const source_fk = ForeignKeyDef{
+            .columns = if (a_first) &[_][]const u8{col1} else &[_][]const u8{col2},
+            .ref_table = source_table,
+            .ref_columns = &[_][]const u8{source_ref},
+        };
+        // A cross-graph end contributes its column and its half of the primary
+        // key, and **no constraint**: the table name would have to be derived
+        // from the entity name, and a wrong derivation is a rejected
+        // `CREATE TABLE` rather than a dangling reference (see
+        // `tableFromTypeInfoCrossRef`). Emitted in column order, so an in-graph
+        // pair renders exactly as before.
+        const target_fk = ForeignKeyDef{
+            .columns = if (a_first) &[_][]const u8{col2} else &[_][]const u8{col1},
+            .ref_table = target_table,
+            .ref_columns = if (ref.info) |target|
+                &[_][]const u8{pkColumn(target)}
+            else
+                &[_][]const u8{"id"},
+        };
+        const fk_for_col1 = if (a_first) source_fk else target_fk;
+        const fk_for_col2 = if (a_first) target_fk else source_fk;
+        const foreign_keys: []const ForeignKeyDef = if (ref.info == null)
+            (if (a_first) &[_]ForeignKeyDef{fk_for_col1} else &[_]ForeignKeyDef{fk_for_col2})
+        else
+            &[_]ForeignKeyDef{ fk_for_col1, fk_for_col2 };
 
         return TableDef{
             .name = table_name,
@@ -2856,18 +2898,7 @@ pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeI
                 ColumnDef{ .name = col2, .sql_type = "INTEGER", .not_null = true },
             },
             .primary_keys = &.{ col1, col2 },
-            .foreign_keys = &.{
-                ForeignKeyDef{
-                    .columns = &[_][]const u8{col1},
-                    .ref_table = ref1,
-                    .ref_columns = &[_][]const u8{ref_col1},
-                },
-                ForeignKeyDef{
-                    .columns = &[_][]const u8{col2},
-                    .ref_table = ref2,
-                    .ref_columns = &[_][]const u8{ref_col2},
-                },
-            },
+            .foreign_keys = foreign_keys,
         };
     }
 }
@@ -3460,21 +3491,22 @@ fn edgeFKUsesRefTarget(comptime e: EdgeInfo) bool {
         (e.relation == .m2m and e.through == null);
 }
 
-/// Say out loud which edge crosses this graph, so the foreign key it builds is
-/// a dangling reference.
+/// Say out loud which edge crosses this graph, so the foreign key it cannot
+/// name is left out of the DDL instead of guessed.
 ///
 /// Every surface that resolves an edge for a *query* refuses this at compile
 /// time (`codegen/graph.edgeTargetInfo`, Z16), but a migration-only consumer —
-/// the multi-database deployment that migrates each graph on its own — never
-/// builds a Client, and `migrateSchema` / `createAllTables` build the table
-/// from the `infos` alone. `edgeRefTarget` then falls back to the historical
-/// `toSnakeCase(target_name)` + `"id"` reference. That fallback stays: the
-/// referenced table may legitimately exist in *another* database (or be created
-/// before its child), so the migration must not fail on it, and `checkSchema`
-/// compares against the same derived shape and stays silent. The one thing
-/// missing was *which* edge crossed the graph — the database error never says
-/// it (SQLite: `no such table` on the child's first INSERT; PostgreSQL/MySQL:
-/// a rejected CREATE or a silently dangling FK).
+/// the multi-database deployment that migrates each graph on its own, or one
+/// that migrates a large schema in chunks — never builds a Client, and
+/// `migrateSchema` / `createAllTables` build the table from the `infos` alone.
+/// A target that is not in `infos` has **no table name this graph can know**:
+/// `toSnakeCase(target_name)` is a guess that ignores the target's declared
+/// `table_name`, and a wrong guess is not a dangling reference but a
+/// `CREATE TABLE` the server rejects (`relation "…" does not exist`, measured on
+/// PostgreSQL), which made a chunked migration fail on every retry. So the
+/// column stays and the constraint is left out — that is the *silent* half; this
+/// function is the other half, because the database error never named the edge
+/// that caused it.
 ///
 /// Warning once per (source entity, edge) is structural, not tracked state:
 /// `inline for` visits each edge of `info` once, and each migration entry point
@@ -3483,18 +3515,15 @@ fn edgeFKUsesRefTarget(comptime e: EdgeInfo) bool {
 /// definition warns twice; `createTables` is the legacy path and never runs in
 /// the same migration.
 fn warnOutOfGraphEdgeRefs(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) void {
+    // `comptime` on the operand: this function is reached from a runtime frame,
+    // where a plain call would be a runtime value the builtin refuses.
+    @setEvalBranchQuota(comptime evalQuotaFor(all_infos));
     inline for (info.edges) |e| {
-        // `toSnakeCase` lives in a `comptime` block and cannot be called from a
-        // runtime frame, so the derived name is computed where the edge's name
-        // still is a comptime value.
-        const derived: ?[]const u8 = comptime if (edgeFKUsesRefTarget(e) and edgeRefTarget(e, all_infos).info == null)
-            toSnakeCase(e.target_name)
-        else
-            null;
-        if (derived) |table| {
+        const crosses: bool = comptime edgeFKUsesRefTarget(e) and edgeRefTarget(e, all_infos).info == null;
+        if (crosses) {
             zent_log.warn(
-                "zent: the edge '{s}' on entity {s} targets {s}, which is not in this graph's infos; its foreign key references the derived table '{s}' and will be dangling — migrate each graph separately in a multi-database deployment, or add {s} to this graph (cross-graph edges are Z16)",
-                .{ e.name, info.name, e.target_name, table, e.target_name },
+                "zent: the edge '{s}' on entity {s} targets {s}, which is not in this graph's infos, so the foreign key is left out of the CREATE TABLE (its column stays): the referenced table's name cannot be resolved from this graph — migrate each graph separately in a multi-database deployment, or add {s} to this graph (cross-graph edges are Z16)",
+                .{ e.name, info.name, e.target_name, e.target_name },
             );
         }
     }
@@ -3506,10 +3535,10 @@ fn warnOutOfGraphEdgeRefs(comptime info: TypeInfo, comptime all_infos: []const T
 fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
     comptime {
         // 字段/外键/交叉引用循环在 `inline for (infos)` 的迁移入口下按
-        // 表×字段展开，15+ 表的应用 schema 就会击穿默认 5000 分支限额
-        // (如 zenaipa);与 defaultValueStr 同量级提升配额，避免
-        // "exceeded backwards branches"。
-        @setEvalBranchQuota(50_000);
+        // 表×字段×表展开，15+ 表的应用 schema 就会击穿默认 5000 分支限额
+        // (如 zenaipa)；固定常数在 154 表的消费者上同样会溢出，所以配额随
+        // 图规模缩放（见 `evalQuotaFor`）。
+        @setEvalBranchQuota(evalQuotaFor(all_infos));
         var columns: []const ColumnDef = &.{};
         var foreign_keys: []const ForeignKeyDef = &.{};
 
@@ -3563,24 +3592,32 @@ fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []cons
                     columns = columns ++ &[_]ColumnDef{col};
                 }
 
+                // The constraint only when the target is resolvable. Its
+                // reference names the target's primary-key column
+                // (`graph.pkColumn`): the query side has always resolved it that
+                // way, while a literal "id" gave a target that declares `.pk`
+                // (or stores `id` under a StorageKey) an FK to a column it does
+                // not have — on SQLite the child's first INSERT then failed with
+                // `foreign key mismatch`.
+                //
+                // **A target outside this graph has no table name to name.** The
+                // historical fallback (`toSnakeCase(target_name)`) is a guess,
+                // and a wrong guess is not a dangling reference — it is a
+                // `CREATE TABLE` the server rejects (`relation "…" does not
+                // exist`, measured on PostgreSQL for a graph whose entities
+                // carry an explicit `table_name`), which made a chunked
+                // migration fail on every retry. The column stays: the data
+                // shape has to match what the query side reads. The constraint
+                // is left out, and `warnOutOfGraphEdgeRefs` names the edge.
                 const ref = edgeRefTarget(e, all_infos);
-                const fk = ForeignKeyDef{
-                    .columns = &[_][]const u8{fk_col_name},
-                    .ref_table = ref.table,
-                    // The reference names the target's primary-key column
-                    // (`graph.pkColumn`): the query side has always resolved
-                    // it that way, while a literal "id" gave a target that
-                    // declares `.pk` (or stores `id` under a StorageKey) an FK
-                    // to a column it does not have — on SQLite the child's
-                    // first INSERT then fails with `foreign key mismatch`.
-                    // Out of the graph there is no TypeInfo to ask, and the
-                    // reference is dangling whichever column it names.
-                    .ref_columns = if (ref.info) |target|
-                        &[_][]const u8{pkColumn(target)}
-                    else
-                        &[_][]const u8{"id"},
-                };
-                foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
+                if (ref.info) |target| {
+                    const fk = ForeignKeyDef{
+                        .columns = &[_][]const u8{fk_col_name},
+                        .ref_table = ref.table,
+                        .ref_columns = &[_][]const u8{pkColumn(target)},
+                    };
+                    foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
+                }
             }
         }
 
@@ -8688,7 +8725,7 @@ test "checkSchema reports a declared foreign key the database does not have (SQL
     const field = @import("../../core/field.zig");
     const edge = @import("../../core/edge.zig");
     const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8698,12 +8735,19 @@ test "checkSchema reports a declared foreign key the database does not have (SQL
         .fields = &.{field.String("model")},
         .edges = &.{edge.From("owner", FkOwner)},
     });
-    const info = comptime fromSchema(FkCar);
-    const infos = &[_]TypeInfo{info};
+    // Both ends in the graph: a key whose target is *out* of it is not declared
+    // at all any more (there is no table name to reference — see
+    // `tableFromTypeInfoCrossRef`), so the report this test is about only exists
+    // for a resolvable target.
+    const infos = comptime buildGraph(&.{ FkOwner, FkCar }).types;
 
-    // The legacy table: the column the edge generated is there, the constraint
+    // The legacy pair: the column the edge generated is there, the constraint
     // is not. This is the shape a table created before the edge existed has, and
     // `migrateSchema` will never add the constraint to it.
+    _ = try drv.exec(
+        "CREATE TABLE fk_owner (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
+        &.{},
+    );
     _ = try drv.exec(
         "CREATE TABLE fk_car (id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, owner_id INTEGER)",
         &.{},
@@ -10144,14 +10188,24 @@ test "junctionTableForEdge derives the ends' declared table names and pks" {
     try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES \"xf_member\" (\"id\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, sql, "xf_tag") == null);
 
-    // Out of the graph the target has no TypeInfo to ask, and the reference
-    // dangles either way — the historical short-name/"id" fallback stands,
-    // pinned here so the fallback stays a decision rather than an accident.
+    // Out of the graph the target end has no table name to name, so that half
+    // of the pair is a column and a primary-key entry and **no constraint** —
+    // a derived name is a guess, and a rejected `CREATE TABLE` is worse than
+    // no key at all (see `tableFromTypeInfoCrossRef`).
     const lone_infos = comptime &[_]TypeInfo{member_info};
     const fallback = comptime junctionTableForEdge(member_edge, member_info, lone_infos);
     try std.testing.expectEqualStrings("xf_member_xf_tag", fallback.name);
-    try std.testing.expectEqualStrings("xf_tag", fallback.foreign_keys[1].ref_table);
-    try std.testing.expectEqualStrings("id", fallback.foreign_keys[1].ref_columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), fallback.columns.len);
+    try std.testing.expectEqual(@as(usize, 2), fallback.primary_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), fallback.foreign_keys.len);
+    // What survives is the end this graph can resolve, and only that one.
+    try std.testing.expectEqualStrings("xf_member_id", fallback.foreign_keys[0].columns[0]);
+    try std.testing.expectEqualStrings("xf_member", fallback.foreign_keys[0].ref_table);
+
+    const fallback_sql = try createTableSQLAlloc(allocator, fallback, Dialect.sqlite);
+    defer allocator.free(fallback_sql);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_sql, "REFERENCES \"xf_member\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fallback_sql, "REFERENCES \"xf_tag\"") == null);
 }
 
 test "an implicit M2M junction references each end's declared table and pk (SQLite)" {
@@ -10232,7 +10286,7 @@ test "an implicit M2M junction references each end's declared table and pk (SQLi
     );
 }
 
-test "an edge FK to a target outside the graph keeps the historical derived shape" {
+test "an edge to a target outside the graph contributes its column and no constraint" {
     // The decision `warnOutOfGraphEdgeRefs` exists to make visible: a From edge
     // whose target is not in `all_infos` still gets the historical fallback —
     // `toSnakeCase(target_name)` and a literal "id" — rather than an error or a
@@ -10267,19 +10321,24 @@ test "an edge FK to a target outside the graph keeps the historical derived shap
 
     const table = comptime tableFromTypeInfoCrossRef(info, infos);
 
-    // Exactly one FK: the from edge's. The target's declared `table_name` and pk
-    // are unknowable out here, so the short derived name and the literal "id"
-    // stand — the same shape `checkSchema` compares against (hence its silence).
-    try std.testing.expectEqual(@as(usize, 1), table.foreign_keys.len);
-    try std.testing.expectEqualStrings("image_id", table.foreign_keys[0].columns[0]);
-    try std.testing.expectEqualStrings("upload_file", table.foreign_keys[0].ref_table);
-    try std.testing.expectEqualStrings("id", table.foreign_keys[0].ref_columns[0]);
+    // The column is there — the query side reads `image_id` whether or not the
+    // target is in this graph — and the constraint is not. The target's declared
+    // `table_name` (`xdaofood_upload_file`) is unknowable out here, and the
+    // derived short name it used to reference (`upload_file`) is a name nothing
+    // creates: PostgreSQL rejects the `CREATE TABLE` outright (`relation
+    // "upload_file" does not exist`), so a chunked migration failed on every
+    // retry. Omitting the key leaves the reference for the pass that has the
+    // whole graph.
+    try std.testing.expectEqual(@as(usize, 0), table.foreign_keys.len);
+    var has_image_id = false;
+    for (table.columns) |col| {
+        if (std.mem.eql(u8, col.name, "image_id")) has_image_id = true;
+    }
+    try std.testing.expect(has_image_id);
 
-    // The rendered DDL is the dangling reference the warning names.
     const sql = try createTableSQLAlloc(allocator, table, Dialect.sqlite);
     defer allocator.free(sql);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES \"upload_file\" (\"id\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sql, "xdaofood_upload_file") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "REFERENCES") == null);
 }
 
 const WarnCapture = struct {
@@ -10308,9 +10367,8 @@ const WarnCapture = struct {
 
 test "migrateSchema warns once about an edge that crosses the graph (SQLite)" {
     // On the migration-only path a cross-graph edge is *visible*, not fatal: no
-    // error and no drift kind are added, because a multi-database deployment
-    // relies on the dangling FK still being creatable (and `checkSchema` stays
-    // silent against the same derived shape). The warning is the whole
+    // error and no drift kind are added, and the key the graph cannot name is
+    // left out of the DDL rather than guessed. The warning is the whole
     // deliverable, and it is assertable in-tree through `zent_log.setSink` —
     // the library's own sink, documented for exactly this, not the root
     // module's `logFn` — so it is asserted here rather than left to a code read.
@@ -10345,24 +10403,26 @@ test "migrateSchema warns once about an edge that crosses the graph (SQLite)" {
     // (it rebuilds the table definition in both steps and still warns once).
     // Counted by a distinctive phrase so an unrelated warning cannot inflate it.
     try std.testing.expectEqual(@as(usize, 1), WarnCapture.occurrences("is not in this graph's infos"));
-    // The four names the database error never carries: edge, source, target and
-    // the derived table it will reference. `"targets UploadFile"` rather than
-    // `"UploadFile"`, which the closing suggestion repeats.
+    // The three names the database error never carries: the edge, the source and
+    // the target. `"targets UploadFile"` rather than `"UploadFile"`, which the
+    // closing suggestion repeats.
     try std.testing.expect(WarnCapture.occurrences("'file'") == 1);
     try std.testing.expect(WarnCapture.occurrences("OrderProduct") == 1);
     try std.testing.expect(WarnCapture.occurrences("targets UploadFile") == 1);
-    try std.testing.expect(WarnCapture.occurrences("'upload_file'") == 1);
     try std.testing.expect(WarnCapture.occurrences("Z16") == 1);
 
-    // Behaviour unchanged: the derived, dangling FK is still created, byte for
-    // byte what the shape test above pins.
+    // And the table is created without a constraint it could not name: the
+    // column is there (the query side reads `image_id`), `REFERENCES` is not.
+    // That is what makes a chunked migration survive — a derived name the
+    // server cannot resolve used to reject the whole `CREATE TABLE`.
     var meta = try drv.query(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'order_product'",
         &.{},
     );
     defer meta.deinit();
     const row = meta.next() orelse return error.NoTableRow;
-    try std.testing.expect(std.mem.indexOf(u8, row.getText(0).?, "REFERENCES \"upload_file\" (\"id\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row.getText(0).?, "image_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row.getText(0).?, "REFERENCES") == null);
 }
 
 // ------------------------------------------------------------------
@@ -10396,6 +10456,65 @@ test "a declared PostgreSQL extension type maps to its extension, and an unknown
     try std.testing.expect(postgresExtensionForDeclaredType("vectorize") == null);
     try std.testing.expect(postgresExtensionForDeclaredType("") == null);
     try std.testing.expect(postgresExtensionForDeclaredType("  ") == null);
+}
+
+test "a large graph does not trip the comptime quota the migration helpers evaluate under" {
+    // A consumer with 154 tables hit "evaluation exceeded … backwards branches"
+    // inside these helpers, which are private — so the caller's own
+    // `@setEvalBranchQuota` cannot reach them, and the budget has to be decided
+    // here. Two shapes are pinned: the functions *evaluate* on a graph far
+    // larger than any test graph (200 tables × 16 fields), and the budget they
+    // evaluate under scales with that graph rather than being a constant that a
+    // bigger schema outgrows. This does not reproduce the exact branch count of
+    // the reported schema (its fields carry extension-type overrides, which cost
+    // more per field than the plain `Int` fields below), so it is a size
+    // regression guard, not a replay of that graph.
+    const field = @import("../../core/field.zig");
+    const Schema = @import("../../core/schema.zig").Schema;
+    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+
+    const QuotaTables = 200;
+    const Fields = struct {
+        const list = blk: {
+            var out: []const @TypeOf(field.Int("x")) = &.{};
+            for (0..16) |i| {
+                const name = std.fmt.comptimePrint("f{d}", .{i});
+                out = out ++ &[_]@TypeOf(field.Int("x")){field.Int(name)};
+            }
+            break :blk out;
+        };
+    };
+
+    const infos = comptime blk: {
+        var out: []const TypeInfo = &.{};
+        for (0..QuotaTables) |i| {
+            const S = Schema(std.fmt.comptimePrint("QuotaDoc{d}", .{i}), .{
+                .table_name = std.fmt.comptimePrint("quota_doc_{d}", .{i}),
+                .fields = Fields.list,
+            });
+            out = out ++ &[_]TypeInfo{fromSchema(S)};
+        }
+        break :blk out;
+    };
+
+    try std.testing.expectEqual(@as(usize, QuotaTables), infos.len);
+
+    // A fixed budget is what the report was about: 50_000 is what
+    // `tableFromTypeInfoCrossRef` used to set, and it is not enough for a
+    // 154-table graph. The scaled one is above it by construction.
+    try std.testing.expect(evalQuotaFor(infos) > 50_000);
+
+    // No declared extension type, so the answer is empty — the point is that it
+    // is *computed* rather than aborting the compilation.
+    const needed = comptime requiredPostgresExtensions(infos);
+    try std.testing.expectEqual(@as(usize, 0), needed.len);
+
+    // And the cross-reference table builder, whose budget is per table × table.
+    // 16 declared fields plus the `id` primary key the table builder adds when
+    // the schema declares none.
+    const last = comptime tableFromTypeInfoCrossRef(infos[QuotaTables - 1], infos);
+    try std.testing.expectEqual(@as(usize, 17), last.columns.len);
+    try std.testing.expectEqualStrings("quota_doc_199", last.name);
 }
 
 test "requiredPostgresExtensions lists a graph's declared extension types, once each" {

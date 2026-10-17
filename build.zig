@@ -794,11 +794,42 @@ pub fn linkDrivers(b: *std.Build, mod: *std.Build.Module, target: std.Build.Reso
     const link = DriverLink{ .b = b, .target = target, .root = root };
     if (drivers.sqlite) link.sqlite(mod);
     if (drivers.pg) {
-        if (discoverPg(b, target, root)) |info| link.pg(mod, info);
+        if (discoverPg(b, target, root)) |info| link.pg(mod, info) else warnDriverSkipped(target, root, "pg", "ZENT_PG_INCLUDE_DIR/ZENT_PG_LIB_DIR", "pg_c");
     }
     if (drivers.mysql) {
-        if (discoverMySQL(b, target, root)) |info| link.mysql(mod, info);
+        if (discoverMySQL(b, target, root)) |info| link.mysql(mod, info) else warnDriverSkipped(target, root, "mysql", "ZENT_MYSQL_INCLUDE_DIR/ZENT_MYSQL_LIB_DIR", "mysql_c");
     }
+}
+
+/// Say which driver was skipped and what the consumer will see if it links it
+/// anyway.
+///
+/// Skipping is by design (see `linkDrivers`), but the *consequence* was only
+/// visible at the first use, as `no module named 'pg_c'` — an error that names
+/// a module, not the discovery that came up empty, and one that a consumer
+/// reads as "zent is broken" rather than "point me at the target's headers".
+/// One line per skipped driver, at configure time, with the variable that fixes
+/// it.
+fn warnDriverSkipped(
+    target: std.Build.ResolvedTarget,
+    root: ?[]const u8,
+    comptime driver: []const u8,
+    comptime override_vars: []const u8,
+    comptime import_name: []const u8,
+) void {
+    std.log.warn(
+        "zent: no {s} headers found for {s}-{s} (looked in {s}), so the '{s}' module was not added — a build that imports it will fail with `no module named '{s}'`. Point {s} at the target's headers and libraries, or pass .{{ .{s} = false }} to link without it.",
+        .{
+            driver,
+            @tagName(target.result.cpu.arch),
+            @tagName(target.result.os.tag),
+            root orelse "the host's discovery paths",
+            import_name,
+            import_name,
+            override_vars,
+            driver,
+        },
+    );
 }
 
 /// Say so, once, when a cross build has nowhere to look. Silence would read as
