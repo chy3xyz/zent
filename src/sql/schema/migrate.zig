@@ -6271,9 +6271,78 @@ fn applyMigrationPlan(
     defer freePlannedStatements(allocator, &plan);
 
     for (plan.items) |st| {
-        _ = try tx_drv.exec(st.sql, &.{});
+        try runPlannedStatement(tx_drv, st.sql);
         if (st.version) |version| try recordMigration(tx_drv, version, null);
     }
+}
+
+/// Run one planned statement, and on a server that **rejects** it, undo just
+/// that statement and say which one.
+///
+/// A rejected statement is what a wire-compatible server answers when the
+/// schema asks for something it does not implement — measured on HeliosDB Nano
+/// 4.41.1: `ALTER COLUMN … SET NOT NULL`, `ALTER COLUMN … TYPE` and
+/// `COMMENT ON` are all `Unsupported ALTER TABLE operation` / `not supported by
+/// HeliosDB Nano`. Without this guard the rejection lands in the middle of the
+/// migration's transaction, and on PostgreSQL that transaction is then dead
+/// ("current transaction is aborted, commands ignored until end of transaction
+/// block"): the caller gets a driver error naming no statement, and every
+/// follow-up read fails too, so the only way to find the offending line is to
+/// bisect the plan.
+///
+/// The savepoint moves the failure out of the transaction: the statement is
+/// undone, one warning carries the SQL the server refused, and the error is
+/// `error.MigrationStatementRejected` when the driver could not classify the
+/// failure — a classified one (`ForeignKeyViolation` from a `VALIDATE
+/// CONSTRAINT` over orphan rows, say) is returned unchanged, because it says
+/// more than this layer can. The transaction stays usable, so the
+/// *diagnosis* the caller may want to run afterwards still answers. The batch is
+/// still all-or-nothing — the error propagates and `migrateSchemaWithOptions`
+/// rolls the whole run back — and a caller-owned transaction is left exactly as
+/// the entry point's doc comment promises: nothing this call wrote is undone,
+/// but nothing is left broken either.
+///
+/// MySQL is not guarded: its DDL commits implicitly, which destroys the
+/// savepoint (the same reason its half of a migration is not atomic at all — see
+/// the file header), so a MySQL run behaves exactly as it always has. PostgreSQL
+/// and SQLite both answer `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` — as does
+/// HeliosDB Nano, which is where the guards were measured.
+fn runPlannedStatement(tx_drv: sql_driver.Driver, sql_text: []const u8) !void {
+    if (tx_drv.dialect().kind() == .mysql) {
+        _ = try tx_drv.exec(sql_text, &.{});
+        return;
+    }
+    // All three in-tree drivers implement savepoints, so a failure here is a
+    // real one (a dead connection, a lost transaction) and is propagated rather
+    // than papered over by running the statement unguarded — that would turn
+    // "the connection is gone" into "the statement failed".
+    var sp = try tx_drv.beginSavepoint("zent_migrate_stmt");
+    // `deinit` rolls a still-active savepoint back, so a successful statement
+    // has to be *released* first (SQLite's and PostgreSQL's handles both read
+    // the same way).
+    defer sp.deinit();
+
+    _ = tx_drv.exec(sql_text, &.{}) catch |err| {
+        sp.rollback() catch {};
+        zent_log.warn(
+            "zent: this migration statement was rejected ({s}) and is undone; the batch stops here: {s}",
+            .{ @errorName(err), sql_text },
+        );
+        // A classification the driver could make is the caller's answer, and it
+        // is more specific than anything this layer can say: a `VALIDATE
+        // CONSTRAINT` that fails on an orphan row is `ForeignKeyViolation`, and
+        // replacing that with "some statement was rejected" would delete
+        // `planMissingForeignKeys`' whole point — the run is *supposed* to fail
+        // loudly on data that violates the key. Only the unclassified case —
+        // what a server answers when it cannot even name the problem (HeliosDB's
+        // empty SQLSTATE for an unsupported `ALTER`) — becomes the named error,
+        // because "the driver could not say" is exactly what it means.
+        return switch (err) {
+            error.DriverFailed => error.MigrationStatementRejected,
+            else => err,
+        };
+    };
+    sp.commit() catch {};
 }
 
 /// Compare every column's nullability between the schema and the database and
@@ -11060,9 +11129,22 @@ const PostCommitRefusalStub = struct {
         };
     }
 
-    fn stubBeginSavepoint(_: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
-        return error.TxFailed;
+    /// A savepoint handle with its own lifecycle hooks: the migration guards
+    /// every planned statement in one, and reusing `commitFn` here would flip
+    /// the "the transaction is over" flag on a `RELEASE SAVEPOINT`.
+    fn stubBeginSavepoint(ptr: *anyopaque, _: []const u8) sql_driver.Error!sql_driver.Tx {
+        return .{
+            .inner = @as(*PostCommitRefusalStub, @ptrCast(@alignCast(ptr))).asDriver(),
+            .commitFn = savepointNoop,
+            .rollbackFn = savepointNoop,
+            .deinitFn = savepointDeinit,
+            .ptr = ptr,
+        };
     }
+
+    fn savepointNoop(_: *anyopaque) sql_driver.Error!void {}
+
+    fn savepointDeinit(_: *anyopaque) void {}
 
     fn stubClose(_: *anyopaque) void {}
 

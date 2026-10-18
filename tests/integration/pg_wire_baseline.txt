@@ -1,0 +1,32 @@
+# Tests that fail against a PostgreSQL-wire server with a partial
+# catalog (HeliosDB Nano 4.41.1). Regenerate deliberately:
+#   scripts/check-pg-wire.sh --update
+# One test name per line; `#` starts a comment.
+dialect_matrix.test.dialect matrix: one operation, one answer, three dialects
+postgres.test.Postgres: PG-specific types (TIMESTAMPTZ, JSONB, UUID, BYTEA)
+postgres.test.Postgres: Update edge writes maintain M2M and O2M associations
+postgres.test.Postgres: a BYTEA column reads back the bytes it was written with
+postgres.test.Postgres: a declared vector(1536) column is drift-free when pgvector is installed
+postgres.test.Postgres: a lost connection is marked dead instead of returned to the pool
+postgres.test.Postgres: a schema that needs a missing extension is refused before any DDL, and migrates once it is installed
+postgres.test.Postgres: add_missing_foreign_keys adds a validated key, then plans nothing
+postgres.test.Postgres: add_missing_foreign_keys defaults to report-only, and plans no ALTER
+postgres.test.Postgres: add_missing_foreign_keys fails loudly on an orphan and advances nothing
+postgres.test.Postgres: allow_nullability_change converges both directions of nullability
+postgres.test.Postgres: checkSchema reports a UNIQUE column and a foreign key the database lacks
+postgres.test.Postgres: checkSchema reports a missing M2M junction table
+postgres.test.Postgres: checkSchema reports a present M2M junction table whose shape is wrong
+postgres.test.Postgres: checkSchema reports a view the database does not have, and getExistingViews reads one it does
+postgres.test.Postgres: checkStatement rejects a statement naming a missing column
+postgres.test.Postgres: checkStatement rejects a statement naming a missing table
+postgres.test.Postgres: checkStatement rejects a syntax error
+postgres.test.Postgres: createAllTables keeps a UUID primary key typed as UUID
+postgres.test.Postgres: declared array columns are created and drift-free, and a wrong element type is still reported
+postgres.test.Postgres: field.Bytes round-trips through the client, and the schema reads clean
+postgres.test.Postgres: field.Vector is a real pgvector column and round-trips through the client
+postgres.test.Postgres: getExistingIndexes reads plain key columns and skips the rest
+postgres.test.Postgres: introspection binds the table name instead of interpolating it
+postgres.test.Postgres: outbox claim is exclusive and requeue re-enables a row
+postgres.test.Postgres: pgvector nearest-neighbour search through the fluent API
+postgres.test.Postgres: slow query times out
+postgres.test.Postgres: the ALTER TYPE plan names the dialect's declared type, not the graph's SQLite spelling

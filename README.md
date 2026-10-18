@@ -365,14 +365,24 @@ write the statement through `zent.scope`, which composes the read-side scope and
 renders placeholders per dialect for you.
 
 **What works.** Measured against HeliosDB Nano 4.41.1 with this repository's own
-PostgreSQL integration suite: **228 passed / 3 skipped / 29 failed** (the same
+PostgreSQL integration suite: **229 passed / 3 skipped / 28 failed** (the same
 binary against PostgreSQL 17.10: 257 / 3 / 0). CRUD, fluent and eager-loaded
 queries, transactions with savepoints, `FOR UPDATE`, `RETURNING`, migrations
 (including the history table and the dry-run plan), `jsonb`, `uuid`, `numeric`,
-arrays and the **native `vector` type** all pass. The 29 failures are the
+arrays and the **native `vector` type** all pass. The 28 failures are the
 suite's own PostgreSQL assumptions plus the three degradations below, not a
 wrong answer from a path that ran — each failure is a query the server itself
 rejected, and the error text names it.
+
+That split is a **gate, not a note**: `scripts/check-pg-wire.sh` runs the
+integration suite against a wire-compatible server and compares the *set* of
+failing test names with `tests/integration/pg_wire_baseline.txt` — a new name
+fails the build, and a baselined name that starts passing is reported so the
+list shrinks. CI runs it on a fresh in-memory HeliosDB Nano instance
+(`.github/workflows/ci.yml`, job `pg-wire`), because the comparison needs a
+server with no history: some tests create and re-create `SERIAL` tables, and a
+server that keeps sequences across `DROP TABLE` answers different ids on the
+second run.
 
 **What degrades, and says so.** Three reads are gated on catalogs a
 wire-compatible server may not carry. Each is a warning plus a skipped
@@ -386,9 +396,23 @@ capability:
 | foreign-key comparison | `pg_proc` (where `generate_subscripts` would live) | declared keys are **left alone**; `missing_foreign_key` is never reported and no `ADD CONSTRAINT` is planned |
 | extension check | `pg_extension` | the declared types go to the server as declared (HeliosDB provides `vector` natively, so there is nothing to verify) |
 
+A migration that asks for something the server does not implement — `ALTER
+COLUMN … SET NOT NULL`, `ALTER COLUMN … TYPE`, `COMMENT ON` — is stopped
+**before** it can poison the transaction: each planned statement runs under a
+savepoint, so the refusal undoes that statement, names it in one warning, and
+returns `error.MigrationStatementRejected` (a classified driver error, such as
+`ForeignKeyViolation` from a `VALIDATE CONSTRAINT` over orphan rows, is returned
+unchanged — it says more than "some statement was rejected"). The batch is still
+all-or-nothing; what changes is that the transaction survives long enough to run
+the diagnosis you probably want next, instead of every later statement failing
+with `current transaction is aborted`.
+
 `checkStatement`'s SQLSTATE classification also degrades to `.kind = .ok` rather
 than a specific kind where the server reports no SQLSTATE — the statement-level
-errors still surface, but not pre-classified.
+errors still surface, but not pre-classified. Two things the feedback we received
+listed as broken are **not** broken on HeliosDB Nano 4.41.1, measured: SQL
+comments (`-- …` and `/* … */`) parse fine, and both spellings of
+`SET bytea_output = 'hex'`/`'escape'` are accepted.
 
 **What the server does not implement** (each is its own error message, and each
 is a reason to keep a PostgreSQL instance for the features you need): the

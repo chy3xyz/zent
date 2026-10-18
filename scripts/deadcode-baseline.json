@@ -289,6 +289,20 @@
     },
     {
       "file": "src/sql/schema/migrate.zig",
+      "line": 11145,
+      "kind": "function",
+      "name": "savepointNoop",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
+      "line": 11147,
+      "kind": "function",
+      "name": "savepointDeinit",
+      "parent": "PostCommitRefusalStub"
+    },
+    {
+      "file": "src/sql/schema/migrate.zig",
       "line": 11150,
       "kind": "function",
       "name": "rowColumnName",

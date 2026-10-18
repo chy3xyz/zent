@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`scripts/check-pg-wire.sh` and a CI job: a PostgreSQL-wire server is a
+  gate, not an anecdote.** The script runs the integration suite against a
+  wire-compatible server and compares the **set of failing test names** with
+  `tests/integration/pg_wire_baseline.txt` — a pass *count* would let one test
+  start passing while another breaks, a named set does not. A new name fails the
+  build; a baselined name that starts passing is reported so the list shrinks.
+  CI (`job: pg-wire`) starts a fresh in-memory HeliosDB Nano 4.41.1, verifies the
+  release checksum, and runs the gate — a fresh instance is what makes the
+  baseline meaningful, since some tests create and re-create `SERIAL` tables and
+  a server that keeps sequences across `DROP TABLE` answers different ids on a
+  second run. Recorded baseline: **229 passed / 3 skipped / 28 failed** (the same
+  binary on PostgreSQL 17.10: 257 / 3 / 0).
+
 - **`zent.sql_dialect.translatePlaceholdersAlloc(dialect, allocator, sql)`** —
   rewrite `?` placeholders into the dialect's own spelling (`$1, $2, …` on
   PostgreSQL, unchanged on SQLite/MySQL). The fluent builders translate as they
@@ -20,6 +33,7 @@ All notable changes to this project will be documented in this file.
   identifiers, `--` and `/* … */` comments (nesting included) and PostgreSQL
   dollar-quoted bodies are copied verbatim, so `'?'` stays a literal and
   `$1` is not mistaken for an empty tag.
+
 - **The `comptime` branch budget of the migration helpers scales with the
   graph.** `requiredPostgresExtensions` had no `@setEvalBranchQuota` at all (so
   it ran under the default 1000) and `tableFromTypeInfoCrossRef` used a fixed
@@ -32,6 +46,33 @@ All notable changes to this project will be documented in this file.
   test so the helpers cannot silently return to a fixed constant.
 
 ### Fixed
+
+- **A rejected migration statement no longer takes the transaction with it.**
+  Every planned statement now runs inside a savepoint (PostgreSQL and SQLite;
+  MySQL's DDL commits implicitly and is untouched), so a server that does not
+  implement what the schema asked for undoes *that statement*, names it in one
+  warning, and returns the new `error.MigrationStatementRejected` — with the
+  transaction still usable, instead of PostgreSQL's "current transaction is
+  aborted, commands ignored until end of transaction block" and a driver error
+  that names no statement. A **classified** failure is returned unchanged
+  (`ForeignKeyViolation` from a `VALIDATE CONSTRAINT` over orphan rows keeps its
+  meaning), and the batch is still all-or-nothing. Measured on HeliosDB Nano
+  4.41.1, where `ALTER COLUMN … SET NOT NULL`, `ALTER COLUMN … TYPE` and
+  `COMMENT ON` are unimplemented: the failing run now says which statement, and
+  the 29-test gap at the end of v0.95.0 is down to 28 (see
+  `docs/UPGRADING.md` §13.10).
+
+- **Two integration tests assumed PostgreSQL's own behaviour and were wrong on a
+  wire-compatible server.** `ForUpdate / ForShare in transaction` selected a row
+  by `id = 1` after re-creating a `SERIAL` table; PostgreSQL drops the sequence
+  with the table and restarts at 1, while HeliosDB Nano keeps it (a fresh table's
+  rows came back as id 9 and 10), so the same run failed or passed depending on
+  how many times the suite had already run. It now selects by `val`.
+  `prepared statement cache hit` asserted through `pg_prepared_statements`, a
+  monitoring view a wire-compatible server need not carry — an absent view is not
+  a broken cache, so the assertion is now conditional while the row counts and
+  the re-execution (which is what proves the cached handle works) stay
+  unconditional.
 
 - **An edge whose target is outside the graph no longer emits a foreign key.**
   `migrateSchema` / `createAllTables` built the table from the `infos` they were
@@ -49,6 +90,7 @@ All notable changes to this project will be documented in this file.
   byte-identical DDL. Measured on HeliosDB Nano 4.41.1: **228 / 3 / 29** with no
   crash, up from the 226 / 3 / 30 this batch started at (PostgreSQL 17.10
   unchanged at 257 / 3 / 0).
+
 - **A cross build says which driver it skipped and what that costs.** Discovery
   coming up empty is by design, but the only symptom was `no module named
   'mysql_c'` at the first import — an error that names a module, not the

@@ -153,6 +153,61 @@ jobs:
       - name: Integration tests with real databases
         run: zig build test-integration --summary all
 
+  pg-wire:
+    name: PostgreSQL-wire compatibility (HeliosDB Nano)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('.zig-cache/never_was_here') }}
+          enableCrossOsArchive: true
+
+      - name: Install native database clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libpq-dev
+
+      # A wire-compatible server is the point of this job: it speaks libpq's
+      # protocol without carrying PostgreSQL's whole catalog or SQL surface, and
+      # zent's migration/introspection paths have to degrade there rather than
+      # die. The instance is in-memory and thrown away with the runner, which is
+      # what makes `scripts/check-pg-wire.sh`'s baseline meaningful — some tests
+      # create and re-create `SERIAL` tables, and a kept sequence answers
+      # different ids on a second run.
+      - name: Start HeliosDB Nano
+        run: |
+          set -euo pipefail
+          REL=https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/v4.41.1
+          ASSET=heliosdb-nano-v4.41.1-x86_64-unknown-linux-gnu.tar.gz
+          mkdir -p /tmp/helios
+          curl -sSLo /tmp/helios.tgz "$REL/$ASSET"
+          curl -sSLo /tmp/helios.sha "$REL/SHA256SUMS"
+          ( cd /tmp && grep " $ASSET$" helios.sha > helios.one && sha256sum -c helios.one )
+          tar xzf /tmp/helios.tgz -C /tmp/helios
+          /tmp/helios/heliosdb-nano start --memory --port 55432 --listen 127.0.0.1 >/tmp/helios/nano.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if (echo >/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
+              echo "HeliosDB Nano is listening on 55432"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "HeliosDB Nano did not start:" >&2
+          cat /tmp/helios/nano.log >&2
+          exit 1
+
+      - name: Compare the failing set with the baseline
+        run: bash scripts/check-pg-wire.sh
+
   deadcode:
     name: Dead-code baseline
     runs-on: ubuntu-latest

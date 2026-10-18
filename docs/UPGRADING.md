@@ -491,3 +491,38 @@ DDL as before. Two cases see a difference:
 `tableFromTypeInfo` (the `pub` helper that takes one table and no graph) keeps
 its historical derived shape — it has no `infos` to resolve against, and it is
 not on the migration path.
+
+### 13.10 `error.MigrationStatementRejected`, and the savepoint around each planned statement
+
+A migration now runs **each planned statement inside a savepoint** (PostgreSQL
+and SQLite; MySQL's DDL commits implicitly and is unchanged). This is not a new
+option — there is nothing to switch on — but it changes two things a consumer can
+observe:
+
+- **A refused statement is undone and named.** Before, a server that does not
+  implement what the schema asked for (`ALTER COLUMN … SET NOT NULL`,
+  `ALTER COLUMN … TYPE`, `COMMENT ON` on a wire-compatible server, measured on
+  HeliosDB Nano 4.41.1) answered with a driver error that named no statement and
+  left the transaction unusable, so every later read failed too and the offending
+  line had to be found by bisecting the plan. Now one warning carries the SQL,
+  the transaction stays usable, and the error is the new
+  **`error.MigrationStatementRejected`** — *when the driver could not classify
+  the failure*. A classified error is returned unchanged: a `VALIDATE CONSTRAINT`
+  that fails on an orphan row still surfaces as `error.ForeignKeyViolation`,
+  which is `planMissingForeignKeys`' documented behaviour and more specific than
+  anything this layer can say.
+- **A caller switching exhaustively over a migration entry point's error set**
+  needs an arm for the new member (`migrateSchema` / `migrateSchemaWithOptions` /
+  `migrateSchemaInTx` / `createAllTables`). An `else =>` covers it.
+
+Cost: two extra round trips (`SAVEPOINT` + `RELEASE`) per planned statement, on
+dialects that have transactional DDL. A migration is not a hot path, and the
+alternative is a failure mode whose diagnosis costs far more.
+
+**Not covered.** A server without `ALTER COLUMN` support does not get a
+table-rebuild fallback (add column → copy → drop → rename): those statements are
+only planned when `allow_nullability_change` / `allow_data_loss` are on, which are
+opt-in, and a rebuild has to recreate every index and foreign key that the drop
+takes with it — a data-destructive path this layer should not enter silently.
+The refusal is named instead, and the schema can be migrated on a server that
+supports the operation.
