@@ -189,10 +189,15 @@ jobs:
           REL=https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/v4.41.1
           ASSET=heliosdb-nano-v4.41.1-x86_64-unknown-linux-gnu.tar.gz
           mkdir -p /tmp/helios
-          curl -sSLo /tmp/helios.tgz "$REL/$ASSET"
-          curl -sSLo /tmp/helios.sha "$REL/SHA256SUMS"
-          ( cd /tmp && grep " $ASSET$" helios.sha > helios.one && sha256sum -c helios.one )
-          tar xzf /tmp/helios.tgz -C /tmp/helios
+          # Downloaded under its release name: `sha256sum -c` looks the file up
+          # by the name in SHA256SUMS, not by whatever we called the download.
+          ( cd /tmp
+            curl -sSLo "$ASSET" "$REL/$ASSET"
+            curl -sSLo SHA256SUMS "$REL/SHA256SUMS"
+            grep " $ASSET$" SHA256SUMS > helios.one
+            sha256sum -c helios.one
+            tar xzf "$ASSET" -C /tmp/helios
+          )
           /tmp/helios/heliosdb-nano start --memory --port 55432 --listen 127.0.0.1 >/tmp/helios/nano.log 2>&1 &
           for _ in $(seq 1 30); do
             if (echo >/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
