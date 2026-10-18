@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.96.0] - 2026-10-18
+
 ### Added
 
 - **`scripts/check-pg-wire.sh` and a CI job: a PostgreSQL-wire server is a
