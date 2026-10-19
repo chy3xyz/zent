@@ -15,7 +15,7 @@ fn mergeMixinFields(comptime base: []const @import("field.zig").Field, comptime 
         // graph does not have to be split into smaller schema files to compile
         // (BEST_PRACTICES.md §8a). 10_000 is a fixed ceiling, not a promise it
         // cannot be hit — raise it here if a schema ever does.
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(budget.flat);
         var result: []const @import("field.zig").Field = base;
         for (mixins) |M| {
             if (@hasDecl(M, "fields")) {
@@ -29,7 +29,7 @@ fn mergeMixinFields(comptime base: []const @import("field.zig").Field, comptime 
 fn mergeMixinEdges(comptime base: []const @import("edge.zig").Edge, comptime mixins: []const type) []const @import("edge.zig").Edge {
     comptime {
         // See mergeMixinFields.
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(budget.flat);
         var result: []const @import("edge.zig").Edge = base;
         for (mixins) |M| {
             if (@hasDecl(M, "edges")) {
@@ -43,7 +43,7 @@ fn mergeMixinEdges(comptime base: []const @import("edge.zig").Edge, comptime mix
 fn mergeMixinIndexes(comptime base: []const @import("index.zig").Index, comptime mixins: []const type) []const @import("index.zig").Index {
     comptime {
         // See mergeMixinFields.
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(budget.flat);
         var result: []const @import("index.zig").Index = base;
         for (mixins) |M| {
             if (@hasDecl(M, "indexes")) {
@@ -57,7 +57,7 @@ fn mergeMixinIndexes(comptime base: []const @import("index.zig").Index, comptime
 fn mergeMixinPolicies(comptime base: ?@import("../privacy/policy.zig").Policy, comptime mixins: []const type) ?@import("../privacy/policy.zig").Policy {
     comptime {
         // See mergeMixinFields.
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(budget.flat);
         var result = base;
         for (mixins) |M| {
             if (@hasDecl(M, "policy")) {
@@ -116,6 +116,7 @@ pub fn Schema(comptime name: []const u8, comptime config: struct {
 // ------------------------------------------------------------------
 
 const field = @import("field.zig");
+const budget = @import("../base/budget.zig");
 const edge = @import("edge.zig");
 const index = @import("index.zig");
 

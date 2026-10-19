@@ -1,8 +1,8 @@
 const std = @import("std");
-const dialect_mod = @import("dialect.zig");
+const dialect_mod = @import("../base/dialect.zig");
 const Dialect = dialect_mod.Dialect;
 const Step = @import("../graph/step.zig").Step;
-const value_mod = @import("value.zig");
+const value_mod = @import("../base/value.zig");
 pub const Value = value_mod.Value;
 
 pub const QueryResult = struct {

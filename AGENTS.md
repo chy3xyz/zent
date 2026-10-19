@@ -114,6 +114,7 @@ be set up at all on one server, create it only there and say why in a comment.
 | `_ = <error union>` | `try` / `catch` (bare statement OK, `_ =` is not) |
 | unused fn params | `_`-prefix them (0.17 errors otherwise) |
 | query rows | `All()` returns `std.array_list.Managed(Entity)`: `deinitEntity` per item, then `users.deinit()` (never pair a per-item free with a slice free) |
+| `@setEvalBranchQuota` | never write a bare number: `budget.flat` or `budget.graph(infos.len)` from `src/base/budget.zig`. A fixed constant is what made a 154-table schema fail to compile (the quota is a ceiling, free when unreached) |
 | `std.array_list.Managed` (204 sites) | **Not** deprecated in 0.17 — it is the owning-list wrapper, while `std.ArrayList` is the unmanaged shape. Do not mass-migrate for style |
 | `std.time.Instant` / `std.time.timestamp()` | Gone in 0.17 (clocks live under `std.Io.Clock`). Wall-clock reads are one definition — `src/sql/walltime.zig` (exported as `zent.walltime`), which `outbox`, `pool`, `migrate` and `driver`'s REALTIME fallback all call — and durations use `sql/logger.zig`'s monotonic `nowUs`. Not a defect to "fix" into `std.time` |
 | keyword tables | `std.StaticStringMapWithEql(T, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{…})` — comptime-built and allocation-free. Plain `StaticStringMap` is **exact-match**: switching a case-insensitive table to it is a silent behaviour change (it fails six tests today, which is what pins the case-insensitivity) |
@@ -356,16 +357,32 @@ Entities and queries are explicitly owned by the caller. See the contract:
 
 ## Layout
 
-- `src/core/` — comptime schema definition API
+- `src/base/` — the shared vocabulary **no package above it may be needed by it**:
+  `value.zig` (`Value`/`Filter`), `dialect.zig` (dialect identity +
+  `placeholder`/`quoteIdent`), `log.zig`, `budget.zig` (comptime branch budget).
+  Imports nothing but `std`; keep it that way — it is what lets `core` stay a leaf.
+- `src/core/` — comptime schema definition API (imports `base` and `privacy`
+  types only; **never** `sql`)
 - `src/codegen/` — comptime client/query/mutation generation
 - `src/sql/` — SQL builder, driver interface, SQLite/PostgreSQL/MySQL drivers
-  (`builder/dialect/driver/scan/sqlite/postgres/mysql/schema`, plus
-  `pool.zig`, `cache.zig`, `explain.zig`, `logger.zig`, `value.zig`)
+  (`builder/driver/scan/sqlite/postgres/mysql`, plus `pool.zig`, `cache.zig`,
+  `explain.zig`, `logger.zig`, `statement.zig`, `dialect_expr.zig`)
+- `src/migrate.zig` + `src/migrate/` — schema migration: `types.zig` (shapes +
+  declared→dialect type mapping), `ddl.zig` (CREATE TABLE/INDEX/VIEW, junction
+  tables, MySQL text rules), and `migrate.zig` (introspection, drift, plan,
+  execution guards, history table, advisory lock). It sits **above** `sql`
+  because it consumes `codegen/graph.zig` — that is why it is not under `sql/`.
+- `src/services/` — the layer a consumer wires rather than generates: `crud`,
+  `crud_helpers`, `outbox`, `shard`, `helpers`
 - `src/runtime/` — hook, interceptor (runtime query rewriting), and error helpers
 - `src/privacy/` — privacy policy framework
 - `src/graph/` — graph traversal helpers
 - `src/entql/` — EntQL expression parser
-- `src/crud.zig` / `src/outbox.zig` / `src/shard.zig` / `src/helpers.zig` — higher-level services
+
+Layer rule of thumb: a new module imports **downwards** (`base` ← `core` ←
+`codegen` ← `sql`/`migrate` ← `services`). The two remaining production cycles
+(`codegen ↔ graph`, `graph ↔ sql`) are documented in `docs/ARCHITECTURE.md`;
+do not add a third.
 - `examples/start/` — schema introspection + CRUD smoke test
 - `examples/complex/` — e-commerce demo with advanced SQL operations
 - `examples/pool/` — connection-pool usage demo

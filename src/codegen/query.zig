@@ -110,7 +110,7 @@ fn scanEntityNamed(comptime info: TypeInfo, comptime T: type, allocator: std.mem
     }
     return sql_scan.scanRowNamedMapped(T, allocator, row, &maps);
 }
-const Dialect = @import("../sql/dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const privacy = @import("../privacy/policy.zig");
 const intercept_op = @import("../runtime/hook.zig");
 const privacy_op = @import("../runtime/privacy.zig");
@@ -129,7 +129,7 @@ fn toPrivacyOp(op: intercept_op.Op) privacy_op.Op {
 }
 const hook = @import("../runtime/hook.zig");
 const intercept = @import("../runtime/intercept.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
 const nowUs = @import("../sql/logger.zig").nowUs;
@@ -2543,7 +2543,7 @@ test "WithEdge nested two-level preload" {
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -2658,7 +2658,7 @@ test "WithEdge honors edge order_by + limit" {
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -2748,7 +2748,7 @@ test "Count() on a grouped query answers the group count, not one group's rows" 
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -3191,7 +3191,7 @@ test "CursorKeyset composite pagination does not drop rows on ties" {
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -3258,7 +3258,7 @@ test "WithEdge applies edge filter (only visible comments)" {
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -3324,7 +3324,7 @@ test "uuid primary key works with create, query and CursorAfter" {
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const idgen = @import("../core/id.zig");
@@ -3413,7 +3413,7 @@ test "Select projects columns and leaves others zero" {
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -3464,7 +3464,7 @@ test "WithEdgeOptions inner join filters parents and honors SQL limit" {
     const buildGraph = @import("graph.zig").buildGraph;
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
 
     const User = Schema("InnerUser", .{
         .fields = &.{field.String("name")},
@@ -3568,7 +3568,7 @@ test "IDs projects the primary key, not the first declared field" {
     const field = @import("../core/field.zig");
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -3623,7 +3623,7 @@ test "EntQL has/not_has and WithEdgeOptions inner join keep the target's soft-de
     const buildGraph = @import("graph.zig").buildGraph;
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const SoftDeleteMixin = @import("../core/mixin.zig").SoftDeleteMixin;
 
     const UserBase = Schema("SoftUser", .{ .fields = &.{field.String("name")} });
@@ -3753,7 +3753,7 @@ test "an m2m has() predicate is qualified to the target table" {
     const buildGraph = @import("graph.zig").buildGraph;
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
 
     const GroupBase = Schema("D5QualGroup", .{ .fields = &.{field.String("name")} });
     const UserBase = Schema("D5QualUser", .{ .fields = &.{field.String("name")} });
@@ -3853,7 +3853,7 @@ test "WhereEntQL rejects a field the entity does not have" {
     const buildGraph = @import("graph.zig").buildGraph;
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
 
     const Pet = Schema("VfPet", .{
         .fields = &.{ field.String("nick"), field.Int("age"), field.String("tag").StorageKey("pet_tag") },
@@ -3972,7 +3972,7 @@ test "AllOwned answers the same rows as All under one release" {
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -4028,7 +4028,7 @@ test "OwnedRows deinit twice is a no-op, not a double free" {
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -4079,7 +4079,7 @@ test "an OwnedRows and a PagedResult release in either order" {
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
     const buildGraph = @import("graph.zig").buildGraph;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -4452,7 +4452,7 @@ test "joinEdge round trip fills the eager edge, releases cleanly and skips re-lo
     const schema = @import("../core/schema.zig").Schema;
     const buildGraph = @import("graph.zig").buildGraph;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
-const Dialect = @import("../sql/dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 
 /// Options for generating Markdown documentation.
 pub const DocOptions = struct {

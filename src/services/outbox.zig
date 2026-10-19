@@ -22,15 +22,15 @@
 //!   _ = try Outbox.requeueStale(allocator, client, 300);
 
 const std = @import("std");
-const field = @import("core/field.zig");
-const Schema = @import("core/schema.zig").Schema;
-const fromSchema = @import("codegen/graph.zig").fromSchema;
-const TypeInfo = @import("codegen/graph.zig").TypeInfo;
-const deinitEntity = @import("codegen/entity.zig").deinitEntity;
-const sql_driver = @import("sql/driver.zig");
-const sql = @import("sql/builder.zig");
-const walltime = @import("sql/walltime.zig");
-const zent_log = @import("runtime/log.zig");
+const field = @import("../core/field.zig");
+const Schema = @import("../core/schema.zig").Schema;
+const fromSchema = @import("../codegen/graph.zig").fromSchema;
+const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
+const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+const sql_driver = @import("../sql/driver.zig");
+const sql = @import("../sql/builder.zig");
+const walltime = @import("../sql/walltime.zig");
+const zent_log = @import("../base/log.zig");
 
 /// Outbox table schema - include this type in your schema list so the
 /// generated client exposes the `outbox_message` entity.
@@ -513,9 +513,9 @@ const testing = std.testing;
 
 // File-scope imports for the stress scaffolding below; the older tests keep
 // their own local imports under the plain names.
-const stress_migrate = @import("sql/schema/migrate.zig");
-const stress_sqlite = @import("sql/sqlite.zig");
-const stress_client = @import("codegen/client.zig");
+const stress_migrate = @import("../migrate.zig");
+const stress_sqlite = @import("../sql/sqlite.zig");
+const stress_client = @import("../codegen/client.zig");
 
 const TestSchema = struct {
     const Product = Schema("Product", .{
@@ -528,11 +528,11 @@ const TestSchema = struct {
 
 test "outbox enqueue + dispatch + retry semantics" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -627,11 +627,11 @@ test "outbox enqueue + dispatch + retry semantics" {
 
 test "outbox failed rows carry attempts" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -663,11 +663,11 @@ test "outbox failed rows carry attempts" {
 
 test "outbox dispatch exhausts max_attempts then marks failed" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -718,11 +718,11 @@ test "outbox dispatch exhausts max_attempts then marks failed" {
 
 test "outbox pending returns oldest-first and respects limit" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var driver = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -744,11 +744,11 @@ test "outbox pending returns oldest-first and respects limit" {
 
 test "outbox claim is exclusive and requeue re-enables a row" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -823,7 +823,7 @@ test "outbox claim reports a step failure instead of half a batch" {
     // call as a success. The failure is injected with a driver stub because
     // SQLITE_FULL cannot be aimed at this particular UPDATE.
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const OutboxOps = Outbox(graph.types, info);
 
     const StubClient = struct { driver: sql_driver.Driver };
@@ -950,7 +950,7 @@ const StubDriver = struct {
 
     fn close(_: *anyopaque) void {}
 
-    fn dialect(_: *anyopaque) @import("sql/dialect.zig").Dialect {
+    fn dialect(_: *anyopaque) @import("../base/dialect.zig").Dialect {
         return .sqlite;
     }
 
@@ -967,11 +967,11 @@ const StubDriver = struct {
 
 test "outbox dispatch claims before publish so a nested dispatcher cannot double-publish" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -1037,11 +1037,11 @@ fn expectRowState(
 
 test "outbox claim stamps claimed_at and requeueStale reclaims stale rows" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -1140,11 +1140,11 @@ test "staleCutoffMs saturates an unrepresentable threshold at the far past, not 
 
 test "requeueStale with a threshold too large to be representable reclaims nothing, not everything" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
     const OutboxOps = Outbox(infos, info);
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
@@ -1363,7 +1363,7 @@ fn expectOutboxStressInvariants(
 
 test "outbox stress: concurrent dispatchers on separate connections never double-claim" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
     const OutboxOps = Outbox(infos, info);
 
@@ -1421,7 +1421,7 @@ test "outbox stress: concurrent dispatchers on separate connections never double
 
 test "outbox stress: concurrent dispatchers on a shared connection never double-claim" {
     const allocator = testing.allocator;
-    const graph = comptime @import("codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
+    const graph = comptime @import("../codegen/graph.zig").buildGraph(&.{ TestSchema.Product, OutboxMessage });
     const infos = graph.types;
     const OutboxOps = Outbox(infos, info);
 

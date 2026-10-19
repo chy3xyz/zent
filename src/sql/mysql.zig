@@ -1,10 +1,10 @@
 const std = @import("std");
 const c = @import("mysql_c");
 const Value = @import("builder.zig").Value;
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const driver = @import("driver.zig");
 const cache = @import("cache.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 
 /// The value `mysql_affected_rows` and `mysql_stmt_affected_rows` return when
 /// they have no count to give. The C API documents it as `(my_ulonglong)-1`, so

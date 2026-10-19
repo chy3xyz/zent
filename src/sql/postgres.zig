@@ -1,10 +1,10 @@
 const std = @import("std");
 const c = @import("pg_c");
 const Value = @import("builder.zig").Value;
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const driver = @import("driver.zig");
 const cache_mod = @import("cache.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 
 const PreparedCache = cache_mod.PreparedCache;
 

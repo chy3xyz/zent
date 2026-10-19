@@ -1,5 +1,5 @@
 const std = @import("std");
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 
 pub const Format = enum { text, json };
 

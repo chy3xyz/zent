@@ -8,13 +8,13 @@ const pkColumn = @import("graph.zig").pkColumn;
 const sql = @import("../sql/builder.zig");
 const field_value = @import("field_value.zig");
 const sql_driver = @import("../sql/driver.zig");
-const Dialect = @import("../sql/dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const Hook = @import("../runtime/hook.zig").Hook;
 const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const rthook = @import("../runtime/hook.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
@@ -2716,7 +2716,7 @@ test "the bulk-insert chunk cap is SQLite's 999, not the PostgreSQL/MySQL 65535"
     // the failure mode the function exists to prevent. The assertion is on the
     // cap rather than on a statement count because the cap is what chunks are
     // computed from.
-    const DialectKind = @import("../sql/dialect.zig").Dialect;
+    const DialectKind = @import("../base/dialect.zig").Dialect;
     try std.testing.expectEqual(@as(usize, 999), maxBindParams(DialectKind.sqlite));
     try std.testing.expectEqual(@as(usize, 65535), maxBindParams(DialectKind.postgres));
     try std.testing.expectEqual(@as(usize, 65535), maxBindParams(DialectKind.mysql));

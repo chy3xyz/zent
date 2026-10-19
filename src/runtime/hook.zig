@@ -5,7 +5,7 @@ const Value = builder.Value;
 
 const privacy = @import("privacy.zig");
 const PrivacyContext = privacy.PrivacyContext;
-const zent_log = @import("log.zig");
+const zent_log = @import("../base/log.zig");
 
 /// Operation type for hooks.
 pub const Op = enum {

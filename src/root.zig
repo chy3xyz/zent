@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const sql = @import("sql/builder.zig");
 pub const sql_cache = @import("sql/cache.zig");
-pub const sql_dialect = @import("sql/dialect.zig");
+pub const sql_dialect = @import("./base/dialect.zig");
 /// Per-dialect SQL expression fragments for raw SQL the fluent builders do not
 /// cover: `nowSecs` (current epoch seconds), `insertIgnore` (the prefix *and*
 /// suffix that spell an ignore-on-conflict insert) and `numericTextAsNumber`
@@ -23,7 +23,13 @@ pub const scope = @import("codegen/scope.zig");
 pub const sql_sqlite = @import("sql/sqlite.zig");
 pub const sql_postgres = @import("sql/postgres.zig");
 pub const sql_mysql = @import("sql/mysql.zig");
-pub const sql_schema = @import("sql/schema/migrate.zig");
+/// Schema migration: introspection, drift, DDL planning and execution. Lives at
+/// the top of the tree rather than under `sql/` because it *consumes* the
+/// generated type graph (`codegen/graph.zig`) — keeping it below `sql` made the
+/// SQL layer depend on the code generation layer, which is the wrong way round.
+/// `zent.sql_schema` is the name this had before the move and keeps working.
+pub const migrate = @import("migrate.zig");
+pub const sql_schema = migrate;
 pub const sql_pool = @import("sql/pool.zig");
 pub const sql_explain = @import("sql/explain.zig");
 /// Validate a raw statement without running it: `checkStatement` prepares it
@@ -76,11 +82,44 @@ pub const codegen = struct {
     pub const beginTxFromDriverCtx = @import("codegen/client.zig").beginTxFromDriverCtx;
 };
 
-pub const crud = @import("crud.zig");
-pub const crud_helpers = @import("crud_helpers.zig");
-pub const outbox = @import("outbox.zig");
-pub const shard = @import("shard.zig");
-pub const helpers = @import("helpers.zig");
+/// The application services built on the generated client — the layer a
+/// consumer wires up rather than generates. Grouped here (and aliased flat
+/// below, so `zent.crud` keeps working) because "is this part of the API I
+/// should build on?" is the first question a reader has, and a flat list of 30
+/// exports cannot answer it.
+pub const services = struct {
+    /// Row-at-a-time CRUD over a client, with the ownership contract spelled out.
+    pub const crud = @import("services/crud.zig");
+    /// Delete/update/query helpers that also exist as `client.<entity>.*`.
+    pub const crud_helpers = @import("services/crud_helpers.zig");
+    /// Transactional outbox: write-then-publish with a claim/complete cycle.
+    pub const outbox = @import("services/outbox.zig");
+    /// Shard routing: a router over N clients, and a sharded client set.
+    pub const shard = @import("services/shard.zig");
+    /// Environment assemblers: single-store, pooled, sharded, test.
+    pub const helpers = @import("services/helpers.zig");
+};
+
+pub const crud = services.crud;
+pub const crud_helpers = services.crud_helpers;
+pub const outbox = services.outbox;
+pub const shard = services.shard;
+pub const helpers = services.helpers;
+
+/// The shared vocabulary below every layer: no module in here imports another
+/// package, so it is safe for `core`, `codegen`, `sql` and the services to use
+/// it without creating a dependency edge (see `docs/ARCHITECTURE.md`).
+pub const base = struct {
+    /// SQL parameter values (`Value`) and edge filters (`Filter`).
+    pub const value = @import("base/value.zig");
+    /// The dialect identity (`sqlite3` / `postgres` / `mysql`), its `kind()`
+    /// switch, and the two render helpers (`placeholder`, `quoteIdent`).
+    pub const dialect = @import("base/dialect.zig");
+    /// Where this library's own diagnostics go.
+    pub const log = @import("base/log.zig");
+    /// The `comptime` branch budget schema-shaped helpers evaluate under.
+    pub const budget = @import("base/budget.zig");
+};
 
 pub const runtime = struct {
     pub const hook = @import("runtime/hook.zig");
@@ -88,9 +127,9 @@ pub const runtime = struct {
     pub const err = @import("runtime/error.zig");
     pub const privacy = @import("runtime/privacy.zig");
     /// Where this library's own diagnostics go: `std.log` by default, an
-    /// installable sink otherwise (`zent.runtime.log.setSink`). See
-    /// `runtime/log.zig` for why a library needs its own.
-    pub const log = @import("runtime/log.zig");
+    /// installable sink otherwise (`zent.runtime.log.setSink`). Same module as
+    /// `zent.base.log`; the path is kept for consumers that already use it.
+    pub const log = @import("base/log.zig");
 };
 
 pub const graph = struct {
@@ -140,5 +179,5 @@ test {
     _ = @import("test/allocation_failures_plan.zig");
     // `refAllDecls` above reaches one level, so a test inside a *nested*
     // namespace (`runtime.log`) is only run when its file is imported here.
-    _ = @import("runtime/log.zig");
+    _ = @import("base/log.zig");
 }

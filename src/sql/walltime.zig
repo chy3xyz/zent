@@ -27,7 +27,7 @@
 //! clock itself.
 
 const std = @import("std");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 
 /// Read `CLOCK_REALTIME` as nanoseconds since the Unix epoch, or null when the
 /// syscall fails.

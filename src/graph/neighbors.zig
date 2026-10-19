@@ -1,5 +1,5 @@
 const std = @import("std");
-const Dialect = @import("../sql/dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const sql = @import("../sql/builder.zig");
 const Step = @import("step.zig").Step;
 

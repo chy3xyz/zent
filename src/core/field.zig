@@ -1,5 +1,5 @@
 const std = @import("std");
-const dialect_mod = @import("../sql/dialect.zig");
+const dialect_mod = @import("../base/dialect.zig");
 
 /// Field type category.
 pub const FieldType = enum {
@@ -774,7 +774,7 @@ test "SQL type mapping: String/Enum are VARCHAR on MySQL, TEXT elsewhere" {
 }
 
 test "MySQL CREATE TABLE emits an indexable, defaultable unique String column" {
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
 
     const table = migrate.TableDef{
         .name = "account",
@@ -831,7 +831,7 @@ test "VarChar: declared width on MySQL, TEXT elsewhere, undeclared unchanged" {
 }
 
 test "VarChar: MySQL CREATE TABLE emits the declared width, other dialects TEXT" {
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
 
     const table = migrate.TableDef{
         .name = "profile",
@@ -956,7 +956,7 @@ test "Vector: the declared dimension reaches the Zig type and the DDL" {
 }
 
 test "Vector: the CREATE TABLE names a dimension on PostgreSQL, a TEXT column elsewhere" {
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
 
     const table = migrate.TableDef{
         .name = "doc",

@@ -1,9 +1,9 @@
 const std = @import("std");
 const Value = @import("builder.zig").Value;
 const OwnedQuery = @import("builder.zig").OwnedQuery;
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const walltime = @import("walltime.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 
 pub const Result = struct {
     rows_affected: usize,

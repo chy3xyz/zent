@@ -1,5 +1,5 @@
 const std = @import("std");
-const zent_log = @import("log.zig");
+const zent_log = @import("../base/log.zig");
 
 /// Maximum number of filter predicates retained inline by a DecisionSet.
 const max_filters = 8;

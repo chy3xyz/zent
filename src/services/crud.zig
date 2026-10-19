@@ -9,13 +9,13 @@
 //! owned (caller frees via `zent.codegen.deinitEntity`).
 
 const std = @import("std");
-const graph_mod = @import("codegen/graph.zig");
-const codegen = @import("codegen/client.zig");
-const EntityGen = @import("codegen/entity.zig").Entity;
-const QueryGen = @import("codegen/query.zig").QueryBuilder;
-const sql = @import("sql/builder.zig");
-const sql_driver = @import("sql/driver.zig");
-const Dialect = @import("sql/dialect.zig").Dialect;
+const graph_mod = @import("../codegen/graph.zig");
+const codegen = @import("../codegen/client.zig");
+const EntityGen = @import("../codegen/entity.zig").Entity;
+const QueryGen = @import("../codegen/query.zig").QueryBuilder;
+const sql = @import("../sql/builder.zig");
+const sql_driver = @import("../sql/driver.zig");
+const Dialect = @import("../base/dialect.zig").Dialect;
 
 pub fn CrudEvent(comptime infos: []const graph_mod.TypeInfo, comptime info: graph_mod.TypeInfo) type {
     _ = infos;
@@ -234,20 +234,20 @@ pub fn CrudService(
     };
 }
 
-const zent_deinit = @import("codegen/entity.zig").deinitEntity;
+const zent_deinit = @import("../codegen/entity.zig").deinitEntity;
 /// The owned copy `getOwned` hands back now lives with the entity module's
 /// other ownership helpers: `entity.ownedCopy` is the `deinitEntity`-compatible
 /// counterpart of `dupeEntityTo`, and this is the CRUD path into it.
-const ownedCopy = @import("codegen/entity.zig").ownedCopy;
+const ownedCopy = @import("../codegen/entity.zig").ownedCopy;
 
 test "CrudService list/get/create/update/delete with events and tenant isolation" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
     const Product = Schema("Product", .{ .fields = &.{
         field.Int("tenant_id"),
@@ -319,12 +319,12 @@ test "CrudService list/get/create/update/delete with events and tenant isolation
 
 test "CrudService get with mismatched allocator (arena copy)" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
     const Item = Schema("Item", .{ .fields = &.{
         field.Int("tenant_id"),
@@ -360,12 +360,12 @@ test "CrudService get with mismatched allocator (arena copy)" {
 
 test "CrudService getOwned keeps a JSON payload whose source arena getOwned released" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
     const Settings = struct { theme: []const u8, retries: i64 };
     const Widget = Schema("OwnedJsonWidget", .{ .fields = &.{
@@ -406,11 +406,11 @@ test "CrudService getOwned keeps a JSON payload whose source arena getOwned rele
 
 test "CrudService insertMany/upsertMany batch writes" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Product = Schema("BatchProduct", .{
         .fields = &.{
@@ -471,11 +471,11 @@ test "CrudService insertMany/upsertMany batch writes" {
 
 test "CrudService insertMany/upsertMany write the tenant parameter, not the entity's zero value" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Product = Schema("BatchTenantProduct", .{ .fields = &.{
         field.Int("tenant_id"),
@@ -524,12 +524,12 @@ test "CrudService insertMany/upsertMany write the tenant parameter, not the enti
 
 test "CrudService handles optional string fields in create/get" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
     const Product = Schema("OptionalProduct", .{
         .fields = &.{
@@ -675,9 +675,9 @@ const ChangedRowsDriver = struct {
 
 test "CrudService update answers true for an idempotent write (0 changed rows, row exists)" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
 
     const Product = Schema("ChangedRowsProduct", .{ .fields = &.{
         field.Int("tenant_id"),
@@ -717,9 +717,9 @@ test "CrudService update answers true for an idempotent write (0 changed rows, r
 
 test "CrudService update answers false when the row is missing (0 changed rows, no row)" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
 
     const Product = Schema("MissingRowProduct", .{ .fields = &.{
         field.Int("tenant_id"),
@@ -753,12 +753,12 @@ test "CrudService update answers false when the row is missing (0 changed rows, 
 
 test "CrudService update idempotent write-back on sqlite returns true; missing row returns false" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
     const Product = Schema("IdempotentProduct", .{ .fields = &.{
         field.Int("tenant_id"),
@@ -801,13 +801,13 @@ test "an owned row is released through deinitRowWith, with its own allocator" {
     // spelled out — and `std.testing.allocator` fails on any leak or invalid
     // free, so this asserts the pairing instead of describing it.
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
-    const TypeInfo = @import("codegen/graph.zig").TypeInfo;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+    const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
 
     const OwRow = Schema("OwRow", .{ .fields = &.{
         field.Int("tenant_id"),
@@ -821,7 +821,7 @@ test "an owned row is released through deinitRowWith, with its own allocator" {
     defer driver.close();
     try migrate.migrateSchema(allocator, driver.asDriver(), infos);
 
-    const root = @import("codegen/client.zig").makeClient(infos, allocator, driver.asDriver());
+    const root = @import("../codegen/client.zig").makeClient(infos, allocator, driver.asDriver());
     const client = root.ow_row;
     var svc = Service.init(allocator, client);
 

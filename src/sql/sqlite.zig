@@ -1,10 +1,10 @@
 const std = @import("std");
 const c = @import("sqlite3_c");
 const Value = @import("builder.zig").Value;
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const driver = @import("driver.zig");
 const cache = @import("cache.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 
 pub const SQLiteDriver = struct {
     db: *c.sqlite3,

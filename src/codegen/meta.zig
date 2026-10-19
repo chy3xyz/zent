@@ -1,4 +1,5 @@
 const TypeInfo = @import("graph.zig").TypeInfo;
+const budget = @import("../base/budget.zig");
 
 /// Generate meta constants for an entity.
 pub fn Meta(comptime info: TypeInfo) type {
@@ -11,7 +12,7 @@ pub fn Meta(comptime info: TypeInfo) type {
 
         // Physical SQL column names array.
         pub const Columns = blk: {
-            @setEvalBranchQuota(1000000);
+            @setEvalBranchQuota(budget.flat);
             var cols: [info.fields.len][]const u8 = undefined;
             for (info.fields, 0..) |f, i| cols[i] = f.column_name;
             break :blk cols;
@@ -19,7 +20,7 @@ pub fn Meta(comptime info: TypeInfo) type {
 
         // Edge name constants
         pub const Edges = blk: {
-            @setEvalBranchQuota(1000000);
+            @setEvalBranchQuota(budget.flat);
             var edges: [info.edges.len][]const u8 = undefined;
             for (info.edges, 0..) |e, i| edges[i] = e.name;
             break :blk &edges;

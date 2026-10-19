@@ -1,4 +1,5 @@
 const std = @import("std");
+const budget = @import("../base/budget.zig");
 
 /// Comptime-fixed-capacity LRU cache for prepared statements.
 ///
@@ -857,7 +858,7 @@ const sqlite_driver = @import("sqlite.zig");
 /// set size so LRU eviction churns constantly.
 const stress_capacity = 8;
 const stress_sqls = blk: {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(budget.flat);
     var arr: [24][]const u8 = undefined;
     for (0..24) |i| arr[i] = std.fmt.comptimePrint("SELECT {d}", .{i});
     break :blk arr;

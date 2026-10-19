@@ -22,7 +22,7 @@ const graph_mod = @import("../codegen/graph.zig");
 const privacy = @import("../privacy/policy.zig");
 const field = @import("../core/field.zig");
 const schema_mod = @import("../core/schema.zig");
-const shard_mod = @import("../shard.zig");
+const shard_mod = @import("../services/shard.zig");
 const TypeInfo = graph_mod.TypeInfo;
 
 /// A pass-through allocator whose `remap` always declines, so a list that

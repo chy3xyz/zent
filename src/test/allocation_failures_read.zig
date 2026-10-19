@@ -202,7 +202,7 @@ const FixtureDriver = struct {
 
     fn closeFn(_: *anyopaque) void {}
 
-    fn dialectFn(_: *anyopaque) @import("../sql/dialect.zig").Dialect {
+    fn dialectFn(_: *anyopaque) @import("../base/dialect.zig").Dialect {
         return .sqlite;
     }
 

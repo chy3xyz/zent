@@ -10,14 +10,14 @@ const graph_step = @import("../graph/step.zig");
 const sql = @import("../sql/builder.zig");
 const field_value = @import("field_value.zig");
 const sql_driver = @import("../sql/driver.zig");
-const Dialect = @import("../sql/dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const Hook = @import("../runtime/hook.zig").Hook;
 const HookContext = @import("../runtime/hook.zig").HookContext;
 const HookError = @import("../runtime/hook.zig").HookError;
 const Op = @import("../runtime/hook.zig").Op;
 const rthook = @import("../runtime/hook.zig");
 const intercept = @import("../runtime/intercept.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 const privacy = @import("../privacy/policy.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const LogContext = @import("../sql/logger.zig").LogContext;
@@ -2067,7 +2067,7 @@ test "setExprArgs atomic stock decrement prevents oversell" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -2142,7 +2142,7 @@ test "setExprArgs with clamping expression (GREATEST-style floor at zero)" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -2225,7 +2225,7 @@ test "AuditMixin auto-fills created_by/updated_by from privacy context" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -2283,7 +2283,7 @@ test "soft-delete restore brings the row back" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -2365,7 +2365,7 @@ test "BulkDelete soft_delete performs bulk soft delete" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -2431,7 +2431,7 @@ test "BulkDelete with no predicate is the same named error on soft- and hard-del
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -2496,7 +2496,7 @@ test "BulkDelete with predicates keeps its semantics on soft- and hard-deleting 
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -2599,7 +2599,7 @@ test "updated_at auto-maintained by UpdateBuilder (TimeMixin)" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -3219,7 +3219,7 @@ test "BulkDelete on a soft-deleting entity applies the policy's row filters" {
     const field = @import("../core/field.zig");
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
 
@@ -3305,7 +3305,7 @@ test "Restore applies the policy's row filters and the interceptor chain" {
     const field = @import("../core/field.zig");
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -3424,7 +3424,7 @@ test "a second soft delete neither rewrites deleted_at nor counts the row" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;
@@ -3534,7 +3534,7 @@ test "a soft delete counts only the rows it trashes, like the hard path" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const client_mod = @import("client.zig");
     const deinitEntity = @import("entity.zig").deinitEntity;

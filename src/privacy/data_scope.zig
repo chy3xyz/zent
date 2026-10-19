@@ -18,11 +18,11 @@
 //!   // client.doc.Query() ... - scope predicate auto-injected.
 
 const std = @import("std");
-const Dialect = @import("../sql/dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const sql = @import("../sql/builder.zig");
 const privacy = @import("policy.zig");
 const rtp = @import("../runtime/privacy.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 
 /// Data scope semantics, mirroring Rbac.DataScope / zmsaas DataPermission.
 pub const DataScope = enum {
@@ -245,7 +245,7 @@ test "DataScopePolicy filters queries at the SQL layer" {
     const field = @import("../core/field.zig");
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("../codegen/graph.zig").fromSchema;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
@@ -470,7 +470,7 @@ test "DataScopePolicy applies the over-long dept list as a deny, not as no filte
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("../codegen/graph.zig").fromSchema;
     const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
@@ -533,7 +533,7 @@ test "DataScopePolicy applies an empty dept list as a deny, not as no filter" {
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("../codegen/graph.zig").fromSchema;
     const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
@@ -594,7 +594,7 @@ test "DataScopePolicy denies a context that carries no filter" {
     const Schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("../codegen/graph.zig").fromSchema;
     const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
-    const migrate = @import("../sql/schema/migrate.zig");
+    const migrate = @import("../migrate.zig");
     const sqlite_driver = @import("../sql/sqlite.zig");
     const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 

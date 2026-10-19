@@ -1,11 +1,12 @@
 const std = @import("std");
+const budget = @import("../base/budget.zig");
 const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const FieldInfo = @import("graph.zig").FieldInfo;
 const buildEdgeStep = @import("graph.zig").buildEdgeStep;
 const sql = @import("../sql/builder.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
-const runtime_log = @import("../runtime/log.zig");
+const runtime_log = @import("../base/log.zig");
 
 fn fieldName(comptime entity_name: []const u8, comptime base: []const u8, comptime suffix: []const u8) [:0]const u8 {
     comptime {
@@ -42,7 +43,7 @@ fn edgePredName(comptime entity_name: []const u8, comptime prefix: []const u8, c
 pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     _ = infos;
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
 
         // Count fields
         var total_fields: usize = 0;
@@ -170,7 +171,7 @@ pub fn Predicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) typ
 /// Instantiate the predicate namespace with actual function values.
 pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo) Predicates(infos, info) {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         var result: Predicates(infos, info) = undefined;
 
         // Field-based predicates. `col` names the generated predicate method
@@ -450,7 +451,7 @@ pub fn lowerHasEdge(
     // the instantiation regardless of which branch runs — two copies here
     // doubled the O(edges) buildEdgeStep work per entity on every graph.
     const edge_steps = comptime blk: {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step, soft_delete: bool } = undefined;
         for (info.edges, 0..) |e, i| {
             const target_info = edgeTargetInfo(infos, info, e);
@@ -567,7 +568,7 @@ test "Predicates: typed In/NotIn/IsNull/NotNil render dialect SQL" {
     const preds = comptime makePredicates(infos, infos[0]);
 
     const allocator = std.testing.allocator;
-    var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    var s = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s.deinit();
     _ = s.from(sql.Table("users"));
 
@@ -579,7 +580,7 @@ test "Predicates: typed In/NotIn/IsNull/NotNil render dialect SQL" {
     try std.testing.expect(std.mem.indexOf(u8, q.sql, "\"name\" IS NOT NULL") != null);
     try std.testing.expectEqual(@as(usize, 2), q.args.len);
 
-    var s2 = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    var s2 = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s2.deinit();
     _ = s2.from(sql.Table("users"));
     _ = try s2.where(preds.nameIsNull());
@@ -608,7 +609,7 @@ test "Predicates: prefix/suffix/fold LIKE variants and edge negation" {
     const preds = comptime makePredicates(resolved, resolved[0]);
 
     const allocator = std.testing.allocator;
-    var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    var s = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s.deinit();
     _ = s.from(sql.Table("users"));
     _ = try s.where(preds.nameHasPrefix("a%"));
@@ -626,7 +627,7 @@ test "Predicates: prefix/suffix/fold LIKE variants and edge negation" {
     _ = preds.nameEQFold("ALICE");
     const not_has = preds.NotHasCars();
     try std.testing.expect(not_has == .not_exists_fn);
-    var s2 = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
+    var s2 = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.sqlite, &.{.{ .table = null, .name = "id" }});
     defer s2.deinit();
     _ = s2.from(sql.Table("users"));
     _ = try s2.where(not_has);
@@ -667,7 +668,7 @@ test "Predicates: Has{Edge}With accepts the target entity's typed predicates" {
     try std.testing.expectEqual(@as(usize, 2), has_with.has_neighbors_with.preds.len);
 
     const allocator = std.testing.allocator;
-    var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.postgres, &.{.{ .table = null, .name = "id" }});
+    var s = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.postgres, &.{.{ .table = null, .name = "id" }});
     defer s.deinit();
     _ = s.from(sql.Table("users"));
     _ = try s.where(has_with);
@@ -690,7 +691,7 @@ test "Predicates: Has{Edge}With rejects a column the target does not have" {
     const edge = @import("../core/edge.zig");
     const schema = @import("../core/schema.zig").Schema;
     const fromSchema = @import("graph.zig").fromSchema;
-    const Dialect = @import("../sql/dialect.zig").Dialect;
+    const Dialect = @import("../base/dialect.zig").Dialect;
 
     const Car = schema("Car", .{
         .fields = &.{ field.String("model"), field.Int("year") },
@@ -785,7 +786,7 @@ test "Predicates: Contains binds the pattern, ContainsEscaped wraps it" {
     // (this is why it is the MySQL-safe variant and why passing "foo" is an
     // exact match, not a substring search).
     {
-        var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        var s = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
         defer s.deinit();
         _ = s.from(sql.Table("users"));
         _ = try s.where(preds.nameContains("foo"));
@@ -794,7 +795,7 @@ test "Predicates: Contains binds the pattern, ContainsEscaped wraps it" {
         try std.testing.expectEqual(@as(usize, 1), q.args.len);
         try std.testing.expectEqualStrings("foo", q.args[0].string);
 
-        var s2 = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        var s2 = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
         defer s2.deinit();
         _ = s2.from(sql.Table("users"));
         _ = try s2.where(preds.nameContains("%foo%"));
@@ -805,7 +806,7 @@ test "Predicates: Contains binds the pattern, ContainsEscaped wraps it" {
     // `Like` is the same predicate under a name that does not promise a
     // substring search, so a reader cannot be misled by the call site.
     {
-        var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        var s = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
         defer s.deinit();
         _ = s.from(sql.Table("users"));
         _ = try s.where(preds.nameLike("%foo%"));
@@ -817,7 +818,7 @@ test "Predicates: Contains binds the pattern, ContainsEscaped wraps it" {
     // `ContainsEscaped` adds the wildcards itself and escapes the input, so it
     // takes a literal substring and renders no bound arguments.
     {
-        var s = try sql.Select(allocator, @import("../sql/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
+        var s = try sql.Select(allocator, @import("../base/dialect.zig").Dialect.mysql, &.{.{ .table = null, .name = "id" }});
         defer s.deinit();
         _ = s.from(sql.Table("users"));
         _ = try s.where(preds.nameContainsEscaped("fo%o"));

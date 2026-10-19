@@ -16,8 +16,8 @@
 //!   const client = shards.clientForTenant(tenant_id);  // routed *Client
 
 const std = @import("std");
-const codegen = @import("codegen/client.zig");
-const TypeInfo = @import("codegen/graph.zig").TypeInfo;
+const codegen = @import("../codegen/client.zig");
+const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
 
 /// Tenant-to-shard routing: explicit map first, hash fallback otherwise.
 pub const ShardRouter = struct {
@@ -181,13 +181,13 @@ test "ShardRouter moveTenant is idempotent" {
 
 test "ShardSet routes writes to the tenant's shard" {
     const allocator = testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const buildGraph = @import("codegen/graph.zig").buildGraph;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const client_mod = @import("codegen/client.zig");
-    const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("../codegen/graph.zig").buildGraph;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const client_mod = @import("../codegen/client.zig");
+    const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
     const Account = Schema("Account", .{
         .fields = &.{
@@ -266,9 +266,9 @@ test "ShardRouter routes negative tenant ids without crashing" {
 
 test "ShardSet.init rejects shard count mismatch" {
     const allocator = testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const buildGraph = @import("codegen/graph.zig").buildGraph;
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const buildGraph = @import("../codegen/graph.zig").buildGraph;
 
     const Account = Schema("Account", .{
         .fields = &.{

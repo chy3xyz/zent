@@ -742,7 +742,7 @@ test "EntQL: parenthesized expression" {
 
 test "EntQL: SQL builder output" {
     const allocator = std.testing.allocator;
-    const Dialect = @import("../sql/dialect.zig").Dialect;
+    const Dialect = @import("../base/dialect.zig").Dialect;
 
     var b = sql.Builder.init(allocator, Dialect.sqlite);
     defer b.deinit();
@@ -808,7 +808,7 @@ test "EntQL: has and not_has parse into edge placeholders" {
 
 test "EntQL: SQL builder rejects schema-unaware edge predicates" {
     const allocator = std.testing.allocator;
-    const Dialect = @import("../sql/dialect.zig").Dialect;
+    const Dialect = @import("../base/dialect.zig").Dialect;
 
     var b = sql.Builder.init(allocator, Dialect.sqlite);
     defer b.deinit();
@@ -819,7 +819,7 @@ test "EntQL: SQL builder rejects schema-unaware edge predicates" {
 
 test "EntQL: NOT IN and EQFold with SQL builder" {
     const allocator = std.testing.allocator;
-    const Dialect = @import("../sql/dialect.zig").Dialect;
+    const Dialect = @import("../base/dialect.zig").Dialect;
 
     // Test NOT IN
     {

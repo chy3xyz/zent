@@ -27,13 +27,13 @@
 //! owned entity (free the same way); `update`/`delete` return rows affected.
 
 const std = @import("std");
-const graph_mod = @import("codegen/graph.zig");
-const client_mod = @import("codegen/client.zig");
-const sql_driver = @import("sql/driver.zig");
-const Value = @import("sql/builder.zig").Value;
-const deinitEntity = @import("codegen/entity.zig").deinitEntity;
-const deinitEntityList = @import("codegen/entity.zig").deinitEntityList;
-const zent_log = @import("runtime/log.zig");
+const graph_mod = @import("../codegen/graph.zig");
+const client_mod = @import("../codegen/client.zig");
+const sql_driver = @import("../sql/driver.zig");
+const Value = @import("../sql/builder.zig").Value;
+const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
+const deinitEntityList = @import("../codegen/entity.zig").deinitEntityList;
+const zent_log = @import("../base/log.zig");
 
 /// Resolve the `QueryError!?Entity` result type of an entity accessor's
 /// `Query()` builder via its `First()` method signature.
@@ -412,7 +412,7 @@ pub fn paginatedWithOptions(
         if (!isValidField(@TypeOf(accessor).entity_info, col)) {
             return error.InvalidSortColumn;
         }
-        const sql_builder = @import("sql/builder.zig");
+        const sql_builder = @import("../sql/builder.zig");
         if (opts.desc) {
             _ = try q.OrderBy(&.{sql_builder.OrderDesc(col)});
         } else {
@@ -451,7 +451,7 @@ pub fn latest(
     if (!isValidField(@TypeOf(accessor).entity_info, sort_col)) {
         return error.InvalidSortColumn;
     }
-    const sql_builder = @import("sql/builder.zig");
+    const sql_builder = @import("../sql/builder.zig");
     var q = accessor.Query();
     defer q.deinit();
     _ = try q.Where(predicates);
@@ -798,7 +798,7 @@ pub fn cursorPage(
     defer q.deinit();
     _ = try q.Where(predicates);
 
-    const sql_builder = @import("sql/builder.zig");
+    const sql_builder = @import("../sql/builder.zig");
     const cursor_sql = graph_mod.columnName(@TypeOf(accessor).entity_info, opts.cursor_col);
     if (opts.after) |after_val| {
         const p = if (opts.desc)
@@ -974,7 +974,7 @@ pub fn updateWithVersion(
     _ = try upd.setExprArgs(version_field, expr, &.{.{ .int = 1 }});
 
     _ = try upd.Where(predicates);
-    const sql_builder = @import("sql/builder.zig");
+    const sql_builder = @import("../sql/builder.zig");
     _ = try upd.Where(.{sql_builder.EQ(col, .{ .int = expected_version })});
 
     const affected = try upd.Save();
@@ -1009,7 +1009,7 @@ pub fn batchSaveOrUpdate(
 
     for (items) |item| {
         const val = @field(item, match_field);
-        const sql_builder = @import("sql/builder.zig");
+        const sql_builder = @import("../sql/builder.zig");
         const match_pred = sql_builder.EQ(graph_mod.columnName(@TypeOf(accessor).entity_info, match_field), switch (@typeInfo(@TypeOf(val))) {
             .int, .comptime_int => .{ .int = @intCast(val) },
             else => .{ .string = val },
@@ -1075,11 +1075,11 @@ pub fn deinitRows(
 
 test "crud_helpers: first/create/update/delete round-trip on sqlite" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
     const Product = Schema("Product", .{
         .table_name = "zigshop_product",
         .pk = "product_id",
@@ -1162,11 +1162,11 @@ test "crud_helpers: first/create/update/delete round-trip on sqlite" {
 
 test "crud_helpers: update returns matched rows, not changed rows" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Product = Schema("MatchedProduct", .{
         .fields = &.{
@@ -1207,11 +1207,11 @@ test "crud_helpers: increment reports matched rows for a zero delta" {
     // ROW_COUNT() = 0, `UPDATE 1`). A caller reading 0 as "no such row" took the
     // wrong branch, so the zero path re-checks exactly as `update` does.
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Counter = Schema("IncrementCounter", .{
         .fields = &.{
@@ -1250,11 +1250,11 @@ test "crud_helpers: increment reports matched rows for a zero delta" {
 
 test "crud_helpers: queryRows collects mapped rows into owned Rows(T)" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Item = Schema("Item", .{
         .table_name = "zigshop_item",
@@ -1296,11 +1296,11 @@ test "crud_helpers: queryRowsIn hands the slice and the mapper's strings to the 
     // string the mapper allocated outside it would be reported when the test
     // ends, after `arena.deinit()` has already run.
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Item = Schema("Item", .{
         .table_name = "zigshop_item",
@@ -1341,11 +1341,11 @@ test "crud_helpers: queryRowsIn hands the slice and the mapper's strings to the 
 
 test "crud_helpers: queryRows error mid-collection leaks no strings" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Item = Schema("Item", .{
         .table_name = "zigshop_item",
@@ -1384,7 +1384,7 @@ test "crud_helpers: queryRows reports a step failure instead of a short page" {
     // failed, and `INSERT` is precisely the case where "no rows" reads as
     // "nothing was written".
     const allocator = std.testing.allocator;
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -1410,11 +1410,11 @@ test "crud_helpers: queryRows reports a step failure instead of a short page" {
 
 test "crud_helpers: first with no match returns null (not error)" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
     const Tag = Schema("Tag", .{
         .table_name = "zigshop_tag",
         .pk = "tag_id",
@@ -1441,11 +1441,11 @@ test "crud_helpers: first with no match returns null (not error)" {
 
 test "crud_helpers: all + count over predicates" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Tag = Schema("Tag", .{
         .table_name = "zigshop_tag",
@@ -1478,11 +1478,11 @@ test "crud_helpers: all + count over predicates" {
 
 test "crud_helpers: batchCreate error path frees created entities (no leak)" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Category = Schema("Category", .{
         .table_name = "zigshop_category",
@@ -1509,11 +1509,11 @@ test "crud_helpers: batchCreate error path frees created entities (no leak)" {
 
 test "crud_helpers: exists, findOrStore, paginated, and batchCreate" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Category = Schema("Category", .{
         .table_name = "zigshop_category",
@@ -1571,11 +1571,11 @@ test "crud_helpers: exists, findOrStore, paginated, and batchCreate" {
 
 test "crud_helpers: get, findByIds, and saveOrUpdate" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Account = Schema("Account", .{
         .table_name = "zigshop_account",
@@ -1635,11 +1635,11 @@ test "crud_helpers: get, findByIds, and saveOrUpdate" {
 
 test "crud_helpers: paginatedWithOptions, latest, and withTx" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Article = Schema("Article", .{
         .table_name = "zigshop_article",
@@ -1719,11 +1719,11 @@ test "crud_helpers: paginatedWithOptions, latest, and withTx" {
 
 test "crud_helpers: increment and scoped tenant queries" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Inventory = Schema("Inventory", .{
         .table_name = "zigshop_inventory",
@@ -1788,11 +1788,11 @@ test "crud_helpers: increment and scoped tenant queries" {
 
 test "crud_helpers: cursorPage keyset pagination" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const FeedItem = Schema("FeedItem", .{
         .table_name = "zigshop_feed_item",
@@ -1845,11 +1845,11 @@ test "crud_helpers: cursorPage keyset pagination" {
 
 test "crud_helpers: cursorPage rejects a non-integer cursor column" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     // `title` is a string column: the cursor value binds as an integer, so a
     // text cursor would filter nothing and return the whole table (measured:
@@ -1901,15 +1901,15 @@ test "crud_helpers: cursorPage rejects a non-integer cursor column" {
 
 const OomBatchItem = struct { name: []const u8 };
 
-const OomBatchSchema = @import("core/schema.zig").Schema("OomBatch", .{
+const OomBatchSchema = @import("../core/schema.zig").Schema("OomBatch", .{
     .table_name = "crud_helpers_oom_batch",
     .pk = "batch_id",
     .fields = &.{
-        @import("core/field.zig").Int("batch_id"),
-        @import("core/field.zig").String("name"),
+        @import("../core/field.zig").Int("batch_id"),
+        @import("../core/field.zig").String("name"),
     },
 });
-const oom_batch_info = @import("codegen/graph.zig").fromSchema(OomBatchSchema);
+const oom_batch_info = @import("../codegen/graph.zig").fromSchema(OomBatchSchema);
 const oom_batch_infos = &[_]graph_mod.TypeInfo{oom_batch_info};
 
 const OomRow = struct { id: i64, name: []const u8 };
@@ -1923,8 +1923,8 @@ fn oomMapRow(allocator: std.mem.Allocator, row: sql_driver.Row) !OomRow {
 
 test "crud_helpers: batchCreate frees the created entity when the list append fails" {
     const allocator = std.testing.allocator;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -1950,7 +1950,7 @@ test "crud_helpers: batchCreate frees the created entity when the list append fa
 
 test "crud_helpers: queryRows frees the mapped row when the list append fails" {
     const allocator = std.testing.allocator;
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -1972,11 +1972,11 @@ test "crud_helpers: queryRows frees the mapped row when the list append fails" {
 
 test "crud_helpers: cursorPage rejects a nullable integer cursor column" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     // An optional integer is a permitted schema shape, and `seq` below is
     // NULL on the middle row. Folding that NULL into `next_cursor = null`
@@ -2020,11 +2020,11 @@ test "crud_helpers: cursorPage rejects a nullable integer cursor column" {
 
 test "crud_helpers: updateWithVersion optimistic locking and batchSaveOrUpdate" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Document = Schema("Document", .{
         .table_name = "zigshop_document",
@@ -2080,11 +2080,11 @@ test "nullable fields: Optional survives Default, and NULL round-trips" {
     // `?T`), which `Default` does not touch — this pins that, at the DDL level
     // *and* by round-tripping a NULL.
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Nullable = Schema("NullableRow", .{
         .fields = &.{
@@ -2103,9 +2103,9 @@ test "nullable fields: Optional survives Default, and NULL round-trips" {
 
     // The entity's Zig types: an Optional field is `?T`, with or without a
     // default.
-    try std.testing.expectEqual(?[]const u8, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).body));
-    try std.testing.expectEqual(?i64, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).n));
-    try std.testing.expectEqual(?i64, @TypeOf(@as(@import("codegen/entity.zig").Entity(infos, info), undefined).nill_by_name));
+    try std.testing.expectEqual(?[]const u8, @TypeOf(@as(@import("../codegen/entity.zig").Entity(infos, info), undefined).body));
+    try std.testing.expectEqual(?i64, @TypeOf(@as(@import("../codegen/entity.zig").Entity(infos, info), undefined).n));
+    try std.testing.expectEqual(?i64, @TypeOf(@as(@import("../codegen/entity.zig").Entity(infos, info), undefined).nill_by_name));
 
     var drv = try sqlite_driver.SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -2170,11 +2170,11 @@ test "setFieldValue accepts the documented value shapes" {
     // here, together with the create/update asymmetry that turned out to be an
     // accident — update rejected `std.json.Value` while create accepted it.
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
 
     const Payload = struct { kind: []const u8 };
     const ShapeRow = Schema("ShapeRow", .{
@@ -2283,12 +2283,12 @@ test "Where accepts every documented shape, on every builder" {
     // coverage anywhere — so narrowing `Where` fails here instead of in a
     // consumer's build.
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const sql_mod = @import("sql/builder.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const sql_mod = @import("../sql/builder.zig");
 
     const ShapeItem = Schema("ShapeItem", .{
         .fields = &.{ field.Int("id"), field.Int("n") },
@@ -2391,12 +2391,12 @@ test "Where accepts every documented shape, on every builder" {
 
 test "Where and crud_helpers support dynamic []sql.Predicate slices and single predicates" {
     const allocator = std.testing.allocator;
-    const field = @import("core/field.zig");
-    const Schema = @import("core/schema.zig").Schema;
-    const fromSchema = @import("codegen/graph.zig").fromSchema;
-    const migrate = @import("sql/schema/migrate.zig");
-    const sqlite_driver = @import("sql/sqlite.zig");
-    const sql_mod = @import("sql/builder.zig");
+    const field = @import("../core/field.zig");
+    const Schema = @import("../core/schema.zig").Schema;
+    const fromSchema = @import("../codegen/graph.zig").fromSchema;
+    const migrate = @import("../migrate.zig");
+    const sqlite_driver = @import("../sql/sqlite.zig");
+    const sql_mod = @import("../sql/builder.zig");
 
     const TaskItem = Schema("TaskItem", .{
         .table_name = "zigshop_task_item",

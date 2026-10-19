@@ -8,9 +8,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const driver = @import("driver.zig");
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const Value = @import("builder.zig").Value;
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 const walltime = @import("walltime.zig");
 
 /// Current Unix timestamp in seconds. Zig 0.17 removed the timestamp helpers

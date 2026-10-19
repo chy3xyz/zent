@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **The tree now has a layer order that matches the imports.** Measured on
+  production code (every `@import` outside `test` blocks): `core` pulled
+  `Dialect` from the SQL layer and `Value` from the builder; `sql/` carried the
+  migration planner, which itself pulls `codegen/graph.zig`; and
+  `runtime/log.zig` was imported by six SQL files while `runtime/hook.zig`
+  imported the builder — five two-way package cycles. Three moves fix the
+  direction:
+  - **`src/base/`** — `value.zig` (`Value`/`Filter`), `dialect.zig` (identity +
+    `placeholder`/`quoteIdent`), `log.zig` and `budget.zig`, importing nothing
+    but `std`. `core` now imports no SQL module at all.
+  - **`src/migrate.zig` + `src/migrate/`** — schema migration moved out of
+    `sql/schema/`, because it *consumes* the generated type graph: keeping it
+    under `sql` made the SQL layer import codegen. Its two pure halves are now
+    their own files — `types.zig` (the column/table/index shapes and the
+    declared→dialect type mapping) and `ddl.zig` (CREATE TABLE/INDEX/VIEW,
+    junction tables, MySQL text rules) — leaving `migrate.zig` with
+    introspection, drift, planning, execution guards and the history table.
+    `zent.sql_schema` still works; `zent.migrate` is the honest name.
+  - **`src/services/`** — `crud`, `crud_helpers`, `outbox`, `shard`, `helpers`:
+    the layer a consumer wires rather than generates. `zent.crud` and friends are
+    unchanged, and `zent.services` groups them.
+  Export paths are unchanged (`zent.sql_dialect`, `zent.sql_schema`,
+  `zent.runtime.log`, …); `zent.base` / `zent.services` / `zent.migrate` are new
+  ways to name what was already there. No behaviour change: the same 642 unit
+  tests, 257 integration tests and PostgreSQL-wire baseline (229 / 3 / 28) pass
+  before and after. `docs/ARCHITECTURE.md`'s layer map was rewritten from the
+  measured imports, including the two cycles deliberately left
+  (`codegen ↔ graph`, `graph ↔ sql`).
+- **One `comptime` budget instead of 31 numbers.** `@setEvalBranchQuota` was
+  written out as `1000000` at 31 call sites (plus `50_000` and `10_000_000`
+  elsewhere), and the graph-shaped ones got it wrong: a 154-table schema failed
+  to compile inside `requiredPostgresExtensions` (which set none) and
+  `tableFromTypeInfoCrossRef` (fixed 50 000). `src/base/budget.zig` now owns the
+  decision — `flat`, and `graph(tables) = flat + tables × 20_000` — and the
+  `AGENTS.md` gotcha table points at it, so a new helper cannot pick its own
+  number.
+
 ## [0.96.0] - 2026-10-18
 
 ### Added

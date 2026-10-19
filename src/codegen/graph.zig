@@ -1,12 +1,13 @@
 const std = @import("std");
+const budget = @import("../base/budget.zig");
 const field_mod = @import("../core/field.zig");
 const edge_mod = @import("../core/edge.zig");
 const index_mod = @import("../core/index.zig");
-const Dialect = @import("../sql/dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const Policy = @import("../privacy/policy.zig").Policy;
 const Annotation = @import("../core/schema.zig").Annotation;
 const graph_step = @import("../graph/step.zig");
-const value = @import("../sql/value.zig");
+const value = @import("../base/value.zig");
 
 pub const FieldInfo = struct {
     /// Zig struct field name. Used for `@field(entity, name)` access and as
@@ -152,7 +153,7 @@ pub fn fromSchema(comptime S: type) TypeInfo {
 /// to produce dialect-correct `sql_type` values on FieldInfo entries.
 pub fn fromSchemaDialect(comptime S: type, comptime dialect: Dialect) TypeInfo {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const schema_fields = S.fields;
         const schema_edges = S.edges;
         const schema_indexes = S.indexes;
@@ -226,7 +227,7 @@ fn toFieldInfo(comptime f: field_mod.Field) FieldInfo {
 
 fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, comptime pk_field: []const u8) FieldInfo {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const is_id = std.mem.eql(u8, f.name, pk_field);
         return FieldInfo{
             .name = f.name,
@@ -267,7 +268,7 @@ fn toFieldInfoDialect(comptime f: field_mod.Field, comptime dialect: Dialect, co
 /// declared name.
 pub fn throughTableName(comptime t: type) []const u8 {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         if (@hasDecl(t, "table_name")) {
             if (t.table_name) |tn| return tn;
         }
@@ -277,7 +278,7 @@ pub fn throughTableName(comptime t: type) []const u8 {
 
 fn toEdgeInfo(comptime e: edge_mod.Edge) EdgeInfo {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         var relation: edge_mod.Relation = .m2m;
         var inverse_name: ?[]const u8 = null;
 
@@ -360,7 +361,7 @@ fn storageKeyOf(comptime fields: []const field_mod.Field, comptime name: []const
 
 fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8, comptime schema_fields: []const field_mod.Field) IndexInfo {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         // Index columns are declared with field names; DDL must reference the
         // physical column names (the generated index name follows suit).
         var mapped: []const []const u8 = &.{};
@@ -380,7 +381,7 @@ fn toIndexInfo(comptime i: index_mod.Index, comptime type_name: []const u8, comp
 
 fn generateIndexName(comptime type_name: []const u8, comptime columns: []const []const u8) []const u8 {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         // Fixed-buffer write instead of the per-column `++` accumulation:
         // byte-identical output (pinned against the concat reference in the
         // tests below) without the O(n²) comptime string building.
@@ -413,7 +414,7 @@ fn generateIndexName(comptime type_name: []const u8, comptime columns: []const [
 /// edited one of them yet.
 pub fn toSnakeCase(name: []const u8) []const u8 {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         // Fixed-buffer write instead of the per-character `++` accumulation:
         // worst case grows one `_` per interior capital, so `name.len * 2`
         // always fits. Byte-identical output (pinned against the concat
@@ -458,7 +459,7 @@ fn makeEdgeForResolve(kind: edge_mod.EdgeKind, unique: bool) edge_mod.Edge {
 /// don't have edges defined, causing inverse edge lookup to fail in fromSchema.
 pub fn resolveGraphEdges(comptime infos: []const TypeInfo) []const TypeInfo {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         // Both accumulators below used `list = list ++ &[_]T{item}` per item
         // — O(n²) copying over the whole edge-resolution walk. The lengths
         // are comptime-known, so write by index instead.
@@ -548,7 +549,7 @@ fn buildIncomingTable(comptime infos: []const TypeInfo) [infos.len][]const Incom
         // design (see the comment on the struct) — 400 entities already
         // pass 1M branches, so this carries its own large quota instead of
         // inheriting the caller's.
-        @setEvalBranchQuota(10000000);
+        @setEvalBranchQuota(budget.flat);
         var table: [infos.len][]const IncomingEdge = undefined;
         for (infos, 0..) |info, i| {
             // Two passes (count, then fill) size the exact array instead of
@@ -588,7 +589,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdg
         // appends. That sits just over 1M branches for a 300-node hub (the
         // 300 hub-and-spoke stress test below failed at 1M), so this subtree
         // carries its own larger quota instead of relying on the caller's.
-        @setEvalBranchQuota(10000000);
+        @setEvalBranchQuota(budget.flat);
         var fields: []const FieldInfo = info.fields;
 
         // Own From edges generate FK columns in this table.
@@ -694,7 +695,7 @@ fn addEdgeFields(comptime info: TypeInfo, comptime incoming: []const IncomingEdg
 
 fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const incoming = buildIncomingTable(infos);
         var result: [infos.len]TypeInfo = undefined;
         for (infos, 0..) |info, i| {
@@ -708,7 +709,7 @@ fn addEdgeFieldsToAll(comptime infos: []const TypeInfo) []const TypeInfo {
 /// Resolve the foreign-key column name for a non-M2M edge.
 fn getEdgeFKColumn(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime target_info: TypeInfo) []const u8 {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         if (edge.field_name) |fn_| return fn_;
         if (edge.kind == .to) {
             for (target_info.edges) |target_edge| {
@@ -741,7 +742,7 @@ fn getJunctionTable(comptime edge: EdgeInfo, comptime source_table: []const u8, 
 /// drift.
 fn fieldColumns(comptime info: TypeInfo) []const []const u8 {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         var cols: []const []const u8 = &.{};
         for (info.fields) |f| cols = cols ++ &[_][]const u8{f.column_name};
         return cols;
@@ -753,7 +754,7 @@ pub fn buildEdgeStep(comptime edge: EdgeInfo, comptime source_info: TypeInfo, co
         // Called both from quota-raised contexts (buildGraph, makePredicates)
         // and bare (predicate lowerHasEdge, DDL): the per-edge concatenations
         // below must not depend on the caller's quota.
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const source_table = source_info.table_name;
         const target_table = target_info.table_name;
 
@@ -805,7 +806,7 @@ pub const Graph = struct {
 
 pub fn buildGraph(comptime schemas: []const type) Graph {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         // Exact-size array + index write: `types = types ++ …` per schema was
         // O(n²) comptime copying on top of fromSchema's own work.
         var types: [schemas.len]TypeInfo = undefined;
@@ -1168,7 +1169,7 @@ const StressGen = struct {
     }
 
     fn list(comptime N: usize, comptime rich: bool) [N]type {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         var arr: [N]type = undefined;
         for (0..N) |i| arr[i] = if (rich) makeRich(i) else make(i);
         return arr;
@@ -1177,7 +1178,7 @@ const StressGen = struct {
     /// Hub-and-spoke: every node has a To edge to node 0 — stresses
     /// resolveGraphEdges / addEdgeFieldsToAll at O(edges × types).
     fn listEdged(comptime N: usize) [N]type {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const edge = @import("../core/edge.zig");
         const Hub = makeRich(0);
         var arr: [N]type = undefined;
@@ -1200,7 +1201,7 @@ const StressGen = struct {
     /// entities, without the 8-field predicate fan-out of `listEdged`
     /// swamping the measurement.
     fn listEdgedMinimal(comptime N: usize) [N]type {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const edge = @import("../core/edge.zig");
         const Hub = make(0);
         var arr: [N]type = undefined;

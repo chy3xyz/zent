@@ -1,4 +1,5 @@
 const std = @import("std");
+const budget = @import("../base/budget.zig");
 const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
@@ -9,7 +10,7 @@ const EdgeInfo = @import("graph.zig").EdgeInfo;
 fn PlainFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     _ = infos;
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         // +1 for the json_arena member so eager-loaded targets get the same
         // arena-based JSON ownership contract as full entities.
         var field_names: [info.fields.len + 1][:0]const u8 = undefined;
@@ -43,7 +44,7 @@ fn PlainFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
 /// terminal target).
 fn EdgesTypeShallow(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         if (info.edges.len == 0) {
             return struct {
                 pub fn deinit(_: @This(), _: std.mem.Allocator) void {}
@@ -73,7 +74,7 @@ fn EdgesTypeShallow(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
 /// target type, so nested `WithEdge("a.b")` works for two levels.
 pub fn LightEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const ET = EdgesTypeShallow(infos, info);
         const edges_default: ET = .{};
         const Plain = PlainFields(infos, info);
@@ -106,7 +107,7 @@ pub fn LightEntity(comptime infos: []const TypeInfo, comptime info: TypeInfo) ty
 /// Uses LightEntity for target types to avoid comptime recursion.
 fn EdgesType(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         if (info.edges.len == 0) {
             return struct {
                 pub fn deinit(_: @This(), _: std.mem.Allocator) void {}
@@ -134,7 +135,7 @@ fn EdgesType(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
 
 fn EntityFields(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const ET = EdgesType(infos, info);
         const edges_default: ET = .{};
         var field_names: [info.fields.len + 1][:0]const u8 = undefined;
@@ -204,7 +205,7 @@ fn hasJsonStructField(comptime info: TypeInfo) bool {
 /// Generate an entity struct from TypeInfo.
 pub fn Entity(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const ET = EdgesType(infos, info);
         const edges_default: ET = .{};
         const needs_arena = hasJsonStructField(info);

@@ -62,7 +62,7 @@
 //! statement's own fault.
 
 const std = @import("std");
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 const sql_driver = @import("driver.zig");
 const Value = @import("builder.zig").Value;
 

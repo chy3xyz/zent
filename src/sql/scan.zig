@@ -4,7 +4,7 @@ const driver_mod = @import("driver.zig");
 const Row = driver_mod.Row;
 const Rows = driver_mod.Rows;
 const Driver = driver_mod.Driver;
-const Value = @import("value.zig").Value;
+const Value = @import("../base/value.zig").Value;
 
 /// Parse options for every JSON column this file scans.
 ///
@@ -1452,7 +1452,7 @@ const ListDriver = struct {
 
     fn closeFn(_: *anyopaque) void {}
 
-    fn dialectFn(_: *anyopaque) @import("dialect.zig").Dialect {
+    fn dialectFn(_: *anyopaque) @import("../base/dialect.zig").Dialect {
         return .sqlite;
     }
 

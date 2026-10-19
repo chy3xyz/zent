@@ -48,11 +48,11 @@
 const std = @import("std");
 const driver = @import("../sql/driver.zig");
 const sql = @import("../sql/builder.zig");
-const dialect = @import("../sql/dialect.zig");
-const migrate = @import("../sql/schema/migrate.zig");
+const dialect = @import("../base/dialect.zig");
+const migrate = @import("../migrate.zig");
 const graph_mod = @import("../codegen/graph.zig");
 const codegen = @import("../codegen/client.zig");
-const crud = @import("../crud.zig");
+const crud = @import("../services/crud.zig");
 const field = @import("../core/field.zig");
 const edge = @import("../core/edge.zig");
 const index = @import("../core/index.zig");
@@ -815,7 +815,7 @@ test "a PostgreSQL index introspection unwinds cleanly when any single allocatio
 // three and records which transaction lifecycle hooks ran, so the sweep
 // can hold that interleaving to the byte ledger.
 
-const outbox_mod = @import("../outbox.zig");
+const outbox_mod = @import("../services/outbox.zig");
 
 const outbox_infos = graph_mod.buildGraph(&.{outbox_mod.OutboxMessage}).types;
 const OutboxOps = outbox_mod.Outbox(outbox_infos, outbox_mod.info);

@@ -6,12 +6,26 @@ codegen step. This document maps the layers and the memory contract.
 
 ## Layer map
 
+The boxes below are **what production code actually imports** (measured by
+resolving every `@import` outside `test` blocks, not by intent). The one rule the
+whole tree keeps: `base` imports nothing, and `core` does not import `sql` — a
+dependency that used to run the other way, which made the schema DSL depend on
+the SQL layer.
+
 ```
-schema (src/core)
-   │  comptime introspection
-   ▼
-graph (src/codegen/graph.zig)  ── TypeInfo / EdgeInfo (compile-time IR)
-   │
+base (src/base)          no imports outside std — the shared vocabulary
+   ├── value.zig         Value / Filter (SQL parameter values, edge filters)
+   ├── dialect.zig       Dialect identity + kind() + placeholder/quoteIdent
+   ├── log.zig           where the library's own diagnostics go
+   └── budget.zig        the comptime branch budget (flat / graph(tables))
+   ▲        ▲        ▲        ▲
+   │        │        │        └─────────────┐
+schema (src/core)  │        │                │
+   field / edge / index / schema / mixin / id │
+   │  comptime definitions, no SQL            │
+   ▼                                          │
+graph (src/codegen/graph.zig) ── TypeInfo / EdgeInfo (compile-time IR)
+   │                                          │
    ├── entity.zig     Entity type + deinitEntity (caller-owned rows)
    ├── client.zig     EntityClient / TxClient / Client + query entry points
    ├── create.zig     CreateBuilder / BulkInsertBuilder (Save / SaveOrUpdate)
@@ -23,23 +37,43 @@ graph (src/codegen/graph.zig)  ── TypeInfo / EdgeInfo (compile-time IR)
    ▼
 sql (src/sql)         Dialect-aware SQL builder + driver interface
    ├── builder.zig    Insert/Select/Update/Delete/MultiInsert/InsertOrReplace
-   ├── dialect.zig    sqlite3 / postgres / mysql placeholder+quoting
    ├── driver.zig     Driver VTable (exec/query/beginTx/…)
    ├── sqlite.zig / postgres.zig / mysql.zig
    ├── scan.zig       row → struct (column-name mapping, arena or owned)
-   ├── schema/        migrate (create tables/views, Flyway-style)
    ├── pool.zig       ConnPool (with active ping & idle reaping)
    ├── diagnostics.zig SqlDiagnostic context for rich error formatting
    ├── statement.zig  checkStatement: prepare-and-discard raw-SQL validation
-   └── logger/cache/explain
+   ├── cache.zig      prepared-statement cache
+   └── logger/explain/walltime/dialect_expr
 
-cross-cutting:
-   crud_helpers ergonomic business CRUD sugar (get, findByIds, exists, findOrStore, saveOrUpdate, paginated, batchCreate)
-   graph/    edge traversal steps (neighbors/step), mermaid (ER diagram), doc_exporter (Markdown Data Dictionary)
+migrate (src/migrate.zig + src/migrate/)   schema migration
+   ├── types.zig      column/table/index shapes + declared→dialect type mapping
+   ├── ddl.zig        CREATE TABLE/INDEX/VIEW, junction tables, MySQL text rules
+   └── migrate.zig    introspection, drift, plan, execution guards, history, lock
+   Consumes `codegen/graph.zig`, which is why it sits *above* `sql` and not in
+   it: keeping it under `sql/` made the SQL layer import the codegen layer.
+
+services (src/services/)          the layer a consumer wires rather than generates
+   ├── crud.zig       row-at-a-time CRUD with the ownership contract
+   ├── crud_helpers.zig  get/findByIds/saveOrUpdate/paginated/batchCreate
+   ├── outbox.zig     transactional outbox (claim/complete cycle)
+   ├── shard.zig      ShardRouter / ShardSet
+   └── helpers.zig    environment assemblers (single-store, pooled, sharded, test)
+
+cross-cutting (each imports downwards only):
+   graph/    edge traversal steps (neighbors/step), mermaid (ER diagram), doc_exporter
    entql/    EntQL expression parser + parseOrder → SQL
    privacy/  policy filter/deny rules
    runtime/  hook chain, errors, privacy context
 ```
+
+**Cycles that remain, and why they are tolerated.** `codegen ↔ graph` and
+`graph ↔ sql` are two-way in production code: `graph/neighbors.zig` builds a
+`Builder`, `sql/builder.zig` reaches into `graph/step.zig` for `joinEdge`, and
+`graph/mermaid.zig`/`doc_exporter.zig` read `codegen/graph.zig`. Zig does not
+order compilation units, so they cost nothing at build time; they are listed
+here because a new module should not add a third, and because the fix (moving
+`joinEdge`'s SQL half into `sql/`) is worth doing when that area is next touched.
 
 ## Compile-time flow
 

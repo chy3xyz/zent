@@ -37,7 +37,7 @@
 //!   be folded onto this function by adding the parens at the DDL emitter.
 
 const std = @import("std");
-const Dialect = @import("dialect.zig").Dialect;
+const Dialect = @import("../base/dialect.zig").Dialect;
 
 /// The expression that evaluates to the current Unix epoch in whole seconds, as
 /// an integer, on `dialect` — the value zent's `.time` columns and the

@@ -1,5 +1,5 @@
 const std = @import("std");
-const value = @import("../sql/value.zig");
+const value = @import("../base/value.zig");
 
 /// Edge kind.
 pub const EdgeKind = enum {

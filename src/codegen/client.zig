@@ -1,4 +1,5 @@
 const std = @import("std");
+const budget = @import("../base/budget.zig");
 const edgeTargetInfo = @import("graph.zig").edgeTargetInfo;
 const TypeInfo = @import("graph.zig").TypeInfo;
 const EdgeInfo = @import("graph.zig").EdgeInfo;
@@ -7,10 +8,10 @@ const sql = @import("../sql/builder.zig");
 const sql_scan = @import("../sql/scan.zig");
 const Logger = @import("../sql/logger.zig").Logger;
 const debugLogger = @import("../sql/logger.zig").debugLogger;
-const migrate = @import("../sql/schema/migrate.zig");
+const migrate = @import("../migrate.zig");
 const Hook = @import("../runtime/hook.zig").Hook;
 const intercept = @import("../runtime/intercept.zig");
-const zent_log = @import("../runtime/log.zig");
+const zent_log = @import("../base/log.zig");
 const privacy = @import("../privacy/policy.zig");
 
 const EntityGen = @import("entity.zig").Entity;
@@ -46,7 +47,7 @@ fn capitalize(comptime s: []const u8) []const u8 {
 fn EdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) type {
     _ = infos;
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const edge_count = info.edges.len;
         var field_names: [edge_count][:0]const u8 = undefined;
         var field_types: [edge_count]type = undefined;
@@ -90,7 +91,7 @@ fn byEdgeName(comptime entity_name: []const u8, comptime edge_name: []const u8) 
 /// Instantiate edge order terms.
 fn makeEdgeOrderTerms(comptime infos: []const TypeInfo, comptime info: TypeInfo) EdgeOrderTerms(infos, info) {
     comptime {
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         var result: EdgeOrderTerms(infos, info) = undefined;
         for (info.edges) |edge| {
             const target_info = edgeTargetInfo(infos, info, edge);
@@ -118,7 +119,7 @@ pub fn EntityClient(comptime infos: []const TypeInfo, comptime info: TypeInfo) t
     // edge orders + meta) is O(fields + edges) comptime work per entity, and
     // the root Client instantiates it once per graph entry — the default 1000
     // branch quota breaks on medium graphs before this raises it.
-    @setEvalBranchQuota(1000000);
+    @setEvalBranchQuota(budget.flat);
     const Entity = EntityGen(infos, info);
     const CreateBuilder = CreateGen(infos, info, Entity);
     const BulkInsertBuilder = BulkInsertGen(infos, info, Entity);
@@ -481,7 +482,7 @@ pub fn Client(comptime infos: []const TypeInfo) type {
         // One EntityClient instantiation per graph entry plus the @Struct
         // assembly below: O(entities) comptime work that blows the default
         // 1000 branch quota on medium graphs.
-        @setEvalBranchQuota(1000000);
+        @setEvalBranchQuota(budget.flat);
         const total_fields = 5 + infos.len; // allocator, driver, logger, interceptors, owns_interceptors, + one per entity
         var field_names: [total_fields][:0]const u8 = undefined;
         var field_types: [total_fields]type = undefined;
@@ -1106,7 +1107,7 @@ test "beginTxFromDriver opens a typed tx straight from a Driver" {
 /// the generated code's preflight from blocking first (that preflight cost
 /// belongs to the pooled `inTransaction`, not to these entry points).
 const TxSpyDriver = struct {
-    const Dialect = @import("../sql/dialect.zig").Dialect;
+    const Dialect = @import("../base/dialect.zig").Dialect;
 
     inner: sql_driver.Driver,
     in_transaction_override: ?bool = null,
@@ -2018,7 +2019,7 @@ test "queryTargets reports a mid-read driver failure instead of a short page" {
 /// The row owns nothing, so `deinit` has nothing to release — which is also
 /// how a leak in the failing reader shows up (the test allocator reports it).
 const PartialRowsDriver = struct {
-    const Dialect = @import("../sql/dialect.zig").Dialect;
+    const Dialect = @import("../base/dialect.zig").Dialect;
 
     const row_vtable = sql_driver.Row.VTable{
         .columnCount = rowColumnCount,

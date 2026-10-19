@@ -4,11 +4,11 @@
 //! `_shared/zent_helpers.zig` into the framework so apps don't copy-paste.
 
 const std = @import("std");
-const codegen = @import("codegen/client.zig");
-const sql_pool = @import("sql/pool.zig");
-const sql_schema = @import("sql/schema/migrate.zig");
-const sql_sqlite = @import("sql/sqlite.zig");
-const sql_driver = @import("sql/driver.zig");
+const codegen = @import("../codegen/client.zig");
+const sql_pool = @import("../sql/pool.zig");
+const sql_schema = @import("../migrate.zig");
+const sql_sqlite = @import("../sql/sqlite.zig");
+const sql_driver = @import("../sql/driver.zig");
 const shard_mod = @import("shard.zig");
 
 comptime {
@@ -305,10 +305,10 @@ pub fn ShardedEnv(comptime Driver: type, comptime Infos: anytype) type {
 
 const testing = std.testing;
 
-const field = @import("core/field.zig");
-const Schema = @import("core/schema.zig").Schema;
-const buildGraph = @import("codegen/graph.zig").buildGraph;
-const deinitEntity = @import("codegen/entity.zig").deinitEntity;
+const field = @import("../core/field.zig");
+const Schema = @import("../core/schema.zig").Schema;
+const buildGraph = @import("../codegen/graph.zig").buildGraph;
+const deinitEntity = @import("../codegen/entity.zig").deinitEntity;
 
 const Account = Schema("Account", .{
     .fields = &.{

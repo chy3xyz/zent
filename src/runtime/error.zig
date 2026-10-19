@@ -1,5 +1,5 @@
 const std = @import("std");
-const zent_log = @import("log.zig");
+const zent_log = @import("../base/log.zig");
 
 /// Centralized error set for zent ORM.
 ///

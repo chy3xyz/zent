@@ -1,15 +1,87 @@
 const std = @import("std");
-const field_mod = @import("../../core/field.zig");
-const TypeInfo = @import("../../codegen/graph.zig").TypeInfo;
-const FieldInfo = @import("../../codegen/graph.zig").FieldInfo;
-const EdgeInfo = @import("../../codegen/graph.zig").EdgeInfo;
-const IndexInfo = @import("../../codegen/graph.zig").IndexInfo;
-const Dialect = @import("../dialect.zig").Dialect;
-const sql_driver = @import("../driver.zig");
-const Value = @import("../builder.zig").Value;
-const zent_log = @import("../../runtime/log.zig");
-const walltime = @import("../walltime.zig");
-const dialect_expr = @import("../dialect_expr.zig");
+const types_mod = @import("migrate/types.zig");
+const isSQLiteDialect = types_mod.isSQLiteDialect;
+const ddl_mod = @import("migrate/ddl.zig");
+const reportMySqlTextRestriction = ddl_mod.reportMySqlTextRestriction;
+const quoteIdentToBuffer = ddl_mod.quoteIdentToBuffer;
+
+// ------------------------------------------------------------------
+// DDL generation, extracted (see `migrate/ddl.zig`). Re-exported here so
+// the public API and every call site below are unchanged.
+// ------------------------------------------------------------------
+
+pub const findMySqlTextRestriction = ddl_mod.findMySqlTextRestriction;
+pub const findMySqlTextRestrictionWithServer = ddl_mod.findMySqlTextRestrictionWithServer;
+const detectMySqlServer = ddl_mod.detectMySqlServer;
+const classifyMySqlServer = ddl_mod.classifyMySqlServer;
+const graphHasMySqlTextDefault = ddl_mod.graphHasMySqlTextDefault;
+const warnDegradedColumnTypes = ddl_mod.warnDegradedColumnTypes;
+const indexDefFromInfo = ddl_mod.indexDefFromInfo;
+pub const tableFromTypeInfo = ddl_mod.tableFromTypeInfo;
+pub const junctionTableForEdge = ddl_mod.junctionTableForEdge;
+pub const createTableSQLAlloc = ddl_mod.createTableSQLAlloc;
+pub const createTableSQLAllocWithServer = ddl_mod.createTableSQLAllocWithServer;
+pub const createTableSQL = ddl_mod.createTableSQL;
+pub const createIndexSQLAlloc = ddl_mod.createIndexSQLAlloc;
+const isBareIdentifier = ddl_mod.isBareIdentifier;
+const indexMethodFor = ddl_mod.indexMethodFor;
+const indexOpClassFor = ddl_mod.indexOpClassFor;
+pub const createIndexSQL = ddl_mod.createIndexSQL;
+pub const createIndexSQLForTableAlloc = ddl_mod.createIndexSQLForTableAlloc;
+pub const createIndexSQLForTableAllocWithServer = ddl_mod.createIndexSQLForTableAllocWithServer;
+pub const createViewSQLAlloc = ddl_mod.createViewSQLAlloc;
+pub const createViewSQL = ddl_mod.createViewSQL;
+const EdgeRefTarget = ddl_mod.EdgeRefTarget;
+const edgeRefTarget = ddl_mod.edgeRefTarget;
+const edgeFKUsesRefTarget = ddl_mod.edgeFKUsesRefTarget;
+const warnOutOfGraphEdgeRefs = ddl_mod.warnOutOfGraphEdgeRefs;
+const tableFromTypeInfoCrossRef = ddl_mod.tableFromTypeInfoCrossRef;
+const defaultValueStr = ddl_mod.defaultValueStr;
+
+// ------------------------------------------------------------------
+// The schema vocabulary, extracted (see `migrate/types.zig`). Re-exported
+// here so the public API and every call site below are unchanged.
+// ------------------------------------------------------------------
+
+const isMySqlAutoIncrementType = types_mod.isMySqlAutoIncrementType;
+const mysql_blob_text_json_types = types_mod.mysql_blob_text_json_types;
+const isMySqlBlobTextJsonType = types_mod.isMySqlBlobTextJsonType;
+pub const MySqlServer = types_mod.MySqlServer;
+pub const MySqlTextError = types_mod.MySqlTextError;
+pub const IndexDeclError = types_mod.IndexDeclError;
+pub const PostgresExtensionError = types_mod.PostgresExtensionError;
+pub const MySqlTextRestriction = types_mod.MySqlTextRestriction;
+const nameInList = types_mod.nameInList;
+const columnDefByName = types_mod.columnDefByName;
+const PostgresExtensionType = types_mod.PostgresExtensionType;
+const postgres_extension_types = types_mod.postgres_extension_types;
+const bareDeclaredType = types_mod.bareDeclaredType;
+const postgresExtensionForDeclaredType = types_mod.postgresExtensionForDeclaredType;
+const requiredPostgresExtensions = types_mod.requiredPostgresExtensions;
+const requiredExtensionsJoined = types_mod.requiredExtensionsJoined;
+pub const ColumnDef = types_mod.ColumnDef;
+const columnSQLType = types_mod.columnSQLType;
+const DeclaredTypeRewrite = types_mod.DeclaredTypeRewrite;
+const declaredTypeRewrite = types_mod.declaredTypeRewrite;
+const dialectDisplayName = types_mod.dialectDisplayName;
+const auditTimestampDefault = types_mod.auditTimestampDefault;
+const normalizeSqlType = types_mod.normalizeSqlType;
+pub const ForeignKeyDef = types_mod.ForeignKeyDef;
+pub const IndexDef = types_mod.IndexDef;
+pub const TableDef = types_mod.TableDef;
+
+const budget = @import("./base/budget.zig");
+const field_mod = @import("./core/field.zig");
+const TypeInfo = @import("./codegen/graph.zig").TypeInfo;
+const FieldInfo = @import("./codegen/graph.zig").FieldInfo;
+const EdgeInfo = @import("./codegen/graph.zig").EdgeInfo;
+const IndexInfo = @import("./codegen/graph.zig").IndexInfo;
+const Dialect = @import("./base/dialect.zig").Dialect;
+const sql_driver = @import("./sql/driver.zig");
+const Value = @import("./sql/builder.zig").Value;
+const zent_log = @import("./base/log.zig");
+const walltime = @import("./sql/walltime.zig");
+const dialect_expr = @import("./sql/dialect_expr.zig");
 
 /// Transaction safety by backend
 ///
@@ -1586,441 +1658,6 @@ fn ensureMigrationsTable(drv: sql_driver.Driver) !void {
     _ = try drv.exec(migrationsTableSQL, &.{});
 }
 
-/// Returns true if `sql_type` is an integer type that supports AUTO_INCREMENT in MySQL.
-fn isMySqlAutoIncrementType(sql_type: []const u8) bool {
-    const types = &[_][]const u8{ "INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT", "MEDIUMINT" };
-    for (types) |t| {
-        if (std.ascii.eqlIgnoreCase(sql_type, t)) return true;
-    }
-    return false;
-}
-
-/// MySQL's BLOB/TEXT/JSON family, spelled in lower case for a
-/// case-insensitive comparison.
-const mysql_blob_text_json_types = [_][]const u8{
-    "text", "tinytext", "mediumtext", "longtext",
-    "blob", "tinyblob", "mediumblob", "longblob",
-    "json",
-};
-
-/// True when `sql_type` is in MySQL's BLOB/TEXT/JSON family.
-///
-/// These are the types MySQL refuses to use in a key specification without a
-/// key length (errno 1170, `BLOB/TEXT column used in key specification
-/// without a key length`) and — the TEXT and BLOB members — refuses to give a
-/// literal `DEFAULT` (errno 1101). PostgreSQL and SQLite have neither
-/// restriction, which is why `field.Text` keeps mapping to `TEXT` on every
-/// dialect (`src/core/field.zig`): the difference is diagnosed here, at DDL
-/// generation, instead of being papered over in the type mapping.
-///
-/// A parenthesized modifier (`TEXT(100)`, `BLOB(16)`) is ignored, the same
-/// way `normalizeSqlType` ignores it.
-fn isMySqlBlobTextJsonType(sql_type: []const u8) bool {
-    var base = sql_type;
-    if (std.mem.indexOfScalar(u8, base, '(')) |paren| base = base[0..paren];
-    base = std.mem.trimEnd(u8, base, " ");
-    for (mysql_blob_text_json_types) |candidate| {
-        if (std.ascii.eqlIgnoreCase(base, candidate)) return true;
-    }
-    return false;
-}
-
-/// Which server is behind a `.mysql`-kind connection, for the DDL rules the two
-/// server families do not share.
-///
-/// MySQL and MariaDB speak the same wire protocol and share the errno
-/// numbering, but not every rule: **MariaDB >= 10.2.1 accepts a `DEFAULT` on a
-/// BLOB/TEXT column**, which MySQL refuses with errno 1101 (the column cannot
-/// have a default value). Everything else `findMySqlTextRestriction` classifies
-/// — the key-length restriction behind errno 1170 — is refused by both, so it is
-/// the same on either server.
-///
-/// The name is derived once per migration from `SELECT VERSION()` (see
-/// `detectMySqlServer`) and threaded through the DDL generators, so a preview
-/// and the run it previews classify identically.
-pub const MySqlServer = enum {
-    /// MySQL — or a server that could not be identified, which is deliberately
-    /// treated as MySQL so an unknown server never gets a rule relaxed for it.
-    mysql,
-    /// MariaDB, identified by "MariaDB" in `SELECT VERSION()`.
-    mariadb,
-};
-
-/// The named errors a MySQL BLOB/TEXT/JSON restriction turns into.
-///
-/// Two names rather than one `MySQLTextColumnRestriction`, because they have
-/// different fixes and different blast radii: a stray `DEFAULT` is dropped
-/// from the declaration, while a key constraint has to move off the column
-/// (usually to `field.String`, which is `VARCHAR(255)` on MySQL). A caller
-/// switching on the error can tell the two apart; the unified name would fold
-/// that back into a log line. Neither name can carry the table/column, which
-/// is why the generator logs the detail (`MySqlTextRestriction`) before
-/// returning.
-pub const MySqlTextError = error{
-    MySQLTextColumnCannotHaveDefault,
-    MySQLTextColumnCannotBeIndexed,
-};
-
-/// The three ways a declared index method/opclass can be malformed. They are
-/// raised while the DDL is generated, so every entry point that builds tables
-/// carries them (`createTables` / `createAllTables` / the planner) and the
-/// codegen client re-states this set in `CreateTablesError`.
-pub const IndexDeclError = error{
-    /// The `method` (or its `opclass`) is not a bare identifier — the DDL
-    /// concatenates it verbatim, so anything else would be an injection hole.
-    InvalidIndexMethod,
-    InvalidIndexOpClass,
-    /// A PostgreSQL opclass describes *one* indexed column
-    /// (`(embedding vector_cosine_ops)`); declaring it over a multi-column
-    /// index has no legal rendering.
-    OpClassNeedsSingleColumn,
-};
-
-/// The named error a migration returns when a declared column type needs a
-/// PostgreSQL extension this database does not have installed.
-///
-/// One name rather than one per extension: the fix is the same statement in
-/// every case (`CREATE EXTENSION IF NOT EXISTS <name>`), and which extension is
-/// missing is what the log line the check emits before returning carries — an
-/// error tag cannot.
-pub const PostgresExtensionError = error{
-    /// The schema declares a column type provided by an extension
-    /// (`vector(n)`, `citext`, `hstore`, `ltree`, PostGIS's `geometry` /
-    /// `geography`) and `pg_extension` does not list that extension. Raised
-    /// *before* any DDL, so the run leaves the database exactly as it was.
-    MissingPostgresExtension,
-};
-
-/// A restriction MySQL puts on a BLOB/TEXT/JSON column that the DDL about to
-/// be generated would trip.
-///
-/// The error carries no payload, so this is both the detail the generator logs
-/// and the shape a caller can inspect *before* generating (via
-/// `findMySqlTextRestriction`) when it wants to decide rather than fail.
-pub const MySqlTextRestriction = struct {
-    table: []const u8,
-    column: []const u8,
-    /// The column's MySQL type as `columnSQLType` resolves it (e.g. `TEXT`).
-    sql_type: []const u8,
-    kind: Kind,
-    /// Set only for `.index`: the index whose key list names `column`.
-    index_name: []const u8 = "",
-
-    pub const Kind = enum {
-        /// `DEFAULT` on the column — errno 1101.
-        default_value,
-        /// `UNIQUE` on the column — errno 1170.
-        unique,
-        /// `PRIMARY KEY`, inline or listed in a composite `PRIMARY KEY (...)` —
-        /// errno 1170.
-        primary_key,
-        /// A key column of a `CREATE INDEX` — errno 1170.
-        index,
-    };
-};
-
-fn nameInList(names: []const []const u8, name: []const u8) bool {
-    for (names) |candidate| {
-        if (std.mem.eql(u8, candidate, name)) return true;
-    }
-    return false;
-}
-
-fn columnDefByName(table: TableDef, name: []const u8) ?ColumnDef {
-    for (table.columns) |col| {
-        if (std.mem.eql(u8, col.name, name)) return col;
-    }
-    return null;
-}
-
-/// Scan the DDL a caller is *about to emit* — the column definitions of
-/// `table`, plus `indexes` — for the first restriction MySQL puts on a
-/// BLOB/TEXT/JSON column, or null when there is none.
-///
-/// Pure: no allocation, no connection, no database. Returns null for every
-/// dialect but MySQL, whose restriction this is.
-///
-/// The rules applied are **MySQL's**, the stricter of the two server families:
-/// a caller that knows it is talking to MariaDB (and only such a caller can
-/// know, see `detectMySqlServer`) uses `findMySqlTextRestrictionWithServer`,
-/// which drops the `DEFAULT` restriction on MariaDB >= 10.2.1. This spelling
-/// stays the default so an unidentified server is never given the relaxed rule.
-///
-/// Each caller passes exactly what its statement contains:
-/// `createTableSQLAlloc` passes the table's columns and no indexes (a table
-/// statement never emits `table.indexes`, and rejecting a table that already
-/// exists because of an index it will not create would turn a no-op into a
-/// failed deploy), and `createIndexSQLForTableAlloc` passes the one index it
-/// is about to emit. That keeps the check honest about the SQL it precedes.
-pub fn findMySqlTextRestriction(table: TableDef, indexes: []const IndexDef, dialect: Dialect) ?MySqlTextRestriction {
-    return findMySqlTextRestrictionWithServer(table, indexes, dialect, .mysql);
-}
-
-/// `findMySqlTextRestriction`, told which server the statement is for.
-///
-/// `server` is consulted for exactly one kind: `.default_value`. MariaDB has
-/// accepted a `DEFAULT` on a BLOB/TEXT/JSON column since 10.2.1, so on
-/// `.mariadb` that column is not a restriction and the scan moves on — a
-/// column that is *also* UNIQUE (or a PRIMARY KEY, or a key of an index) is
-/// still reported, because the key-length rule is shared. On `.mysql` this is
-/// byte-for-byte `findMySqlTextRestriction`'s answer.
-pub fn findMySqlTextRestrictionWithServer(
-    table: TableDef,
-    indexes: []const IndexDef,
-    dialect: Dialect,
-    server: MySqlServer,
-) ?MySqlTextRestriction {
-    if (dialect.kind() != .mysql) return null;
-
-    for (table.columns) |col| {
-        const sql_type = columnSQLType(col, dialect);
-        if (!isMySqlBlobTextJsonType(sql_type)) continue;
-        const kind: MySqlTextRestriction.Kind = if (col.default_value != null and server == .mysql)
-            .default_value
-        else if (col.unique and !col.primary_key)
-            .unique
-        else if (col.primary_key or nameInList(table.primary_keys, col.name))
-            .primary_key
-        else
-            continue;
-        return .{ .table = table.name, .column = col.name, .sql_type = sql_type, .kind = kind };
-    }
-
-    for (indexes) |idx| {
-        for (idx.columns) |index_column| {
-            const col = columnDefByName(table, index_column) orelse continue;
-            const sql_type = columnSQLType(col, dialect);
-            if (isMySqlBlobTextJsonType(sql_type)) {
-                return .{
-                    .table = table.name,
-                    .column = index_column,
-                    .sql_type = sql_type,
-                    .kind = .index,
-                    .index_name = idx.name,
-                };
-            }
-        }
-    }
-    return null;
-}
-
-/// Identify the server behind a `.mysql`-kind connection from
-/// `SELECT VERSION()`, or answer `.mysql` when it cannot be identified.
-///
-/// This is the one probe that lets the DDL layer tell MySQL and MariaDB apart
-/// (they share the errno numbering but not every rule — see `MySqlServer`), and
-/// it runs once per migration, on the same connection the introspection uses.
-///
-/// **Failures are conservative and never propagate.** A server that refuses the
-/// query — no privilege, a connection mid-failure, a proxy that answers
-/// something else — is treated as MySQL, so an unidentified server keeps every
-/// restriction and never has one relaxed for it. Each failure logs a `warn`
-/// naming the reason, so an operator sees why a MariaDB deploy still writes
-/// MySQL-shaped DDL. The function has no error return on purpose: this probe is
-/// not a step a migration can fail on. It is also read-only (`query`, never
-/// `exec`), so the dry run can call the same code path.
-fn detectMySqlServer(drv: sql_driver.Driver) MySqlServer {
-    var rows = drv.query("SELECT VERSION()", &.{}) catch |err| {
-        zent_log.warn(
-            "zent: could not identify the MySQL/MariaDB server ({s}); applying MySQL's stricter BLOB/TEXT rules",
-            .{@errorName(err)},
-        );
-        return .mysql;
-    };
-    defer rows.deinit();
-    const row = rows.next() orelse {
-        const reason = if (rows.nextError()) |err| @errorName(err) else "no rows";
-        zent_log.warn(
-            "zent: could not identify the MySQL/MariaDB server ({s}); applying MySQL's stricter BLOB/TEXT rules",
-            .{reason},
-        );
-        return .mysql;
-    };
-    const version = row.getText(0) orelse {
-        zent_log.warn(
-            "zent: could not identify the MySQL/MariaDB server (SELECT VERSION() answered no text); applying MySQL's stricter BLOB/TEXT rules",
-            .{},
-        );
-        return .mysql;
-    };
-    return classifyMySqlServer(version);
-}
-
-/// The classification half of `detectMySqlServer`, split out so the spelling
-/// MariaDB is recognised by is pinned without a server: MariaDB's version
-/// strings read `10.11.6-MariaDB-1~deb12u1` and MySQL's `9.7.0`. The substring
-/// is the same one `tests/integration/mysql.zig`'s `isMariaDB` looks for.
-fn classifyMySqlServer(version: []const u8) MySqlServer {
-    return if (std.mem.indexOf(u8, version, "MariaDB") != null) .mariadb else .mysql;
-}
-
-/// Whether any table this plan can emit a `DEFAULT` for declares a
-/// BLOB/TEXT/JSON column on MySQL — the one shape where MySQL and MariaDB
-/// disagree, and therefore the only shape for which identifying the server can
-/// change the SQL.
-///
-/// Pure and comptime: a schema whose text columns carry no `DEFAULT` produces
-/// the same statements on both servers, so it is not worth a catalog round trip
-/// to ask which one is there. The probe is then skipped and the MySQL rules are
-/// used, which is exactly what the generators do with `.mysql` anyway. (The
-/// statement-modelling stub tests in `src/test/allocation_failures_plan.zig`
-/// depend on this: an unannounced `SELECT VERSION()` would be a statement they
-/// never claimed.)
-fn graphHasMySqlTextDefault(comptime infos: []const TypeInfo) bool {
-    inline for (infos) |info| {
-        if (info.is_view) continue;
-        const table = comptime tableFromTypeInfoCrossRef(info, infos);
-        inline for (table.columns) |col| {
-            if (col.default_value == null) continue;
-            if (isMySqlBlobTextJsonType(columnSQLType(col, Dialect.mysql))) return true;
-        }
-    }
-    return false;
-}
-
-/// A PostgreSQL column type whose *provider is an extension*, and the extension
-/// that provides it.
-///
-/// Deliberately small and exact. `zent` cannot ask a server "which extension
-/// owns this type?" before the type exists, so the only safe default is silence:
-/// a name this table does not know is not an extension type as far as the check
-/// is concerned, and the migration proceeds exactly as it did before the check
-/// existed. Guessing the other way would refuse a migration that would have
-/// worked.
-const PostgresExtensionType = struct {
-    /// The declared type's bare name, lower case.
-    declared_type: []const u8,
-    /// The extension that provides it — also the name `CREATE EXTENSION` takes
-    /// (pgvector's extension is `vector`, PostGIS's is `postgis`).
-    extension: []const u8,
-};
-
-/// The known type → extension pairs: PostgreSQL's own types are all built in,
-/// so what is left is the extension types a schema realistically declares.
-///
-/// `vector` is the one a `field.Vector` reaches (its spelling is `vector(n)`,
-/// and the dimension is stripped before the lookup); the rest arrive through
-/// `.SqlType(s)` / `field.Other(name, s)`, which on PostgreSQL is emitted
-/// verbatim and can therefore name anything.
-const postgres_extension_types = [_]PostgresExtensionType{
-    .{ .declared_type = "vector", .extension = "vector" }, // pgvector
-    .{ .declared_type = "citext", .extension = "citext" },
-    .{ .declared_type = "hstore", .extension = "hstore" },
-    .{ .declared_type = "ltree", .extension = "ltree" },
-    .{ .declared_type = "geometry", .extension = "postgis" },
-    .{ .declared_type = "geography", .extension = "postgis" },
-    // Not a type PostGIS defines (`geometry` and `geography` are), but a
-    // declaration that says `postgis` is asking for the same extension and
-    // deserves the same diagnosis rather than silence.
-    .{ .declared_type = "postgis", .extension = "postgis" },
-};
-
-/// The bare type name a declaration starts with: `vector(1536)` → `vector`,
-/// `public.citext` → `citext`, `hstore[]` → `hstore`.
-///
-/// The declaration is what the schema wrote, so it carries everything a type
-/// reference may: a schema qualifier, a dimension/scale, an array marker. Only
-/// the bare name is comparable to the table above. Pure, so the decision can be
-/// pinned without a server.
-fn bareDeclaredType(declared: []const u8) []const u8 {
-    var name = std.mem.trim(u8, declared, " \t");
-    // A schema qualifier. The *last* dot, because a quoted qualifier may itself
-    // contain one.
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name = name[dot + 1 ..];
-    var end = name.len;
-    if (std.mem.indexOfScalar(u8, name, '(')) |paren| end = @min(end, paren);
-    if (std.mem.indexOfScalar(u8, name, '[')) |bracket| end = @min(end, bracket);
-    return std.mem.trim(u8, name[0..end], " \t");
-}
-
-/// The extension a declared column type needs, or `null` when the name is not
-/// one this module knows — the common answer, since it covers every type
-/// PostgreSQL itself provides.
-fn postgresExtensionForDeclaredType(declared: []const u8) ?[]const u8 {
-    const bare = bareDeclaredType(declared);
-    if (bare.len == 0) return null;
-    for (postgres_extension_types) |entry| {
-        if (std.ascii.eqlIgnoreCase(bare, entry.declared_type)) return entry.extension;
-    }
-    return null;
-}
-
-/// Every PostgreSQL extension this graph's *declarations* need, deduplicated,
-/// in first-seen order.
-///
-/// Pure and comptime, so a schema that needs none answers with an empty list and
-/// the catalog is never asked. That is the same rule `graphHasMySqlTextDefault`
-/// follows and for the same reason: the statement-modelling stubs in
-/// `src/test/allocation_failures_plan.zig` claim every statement the planner
-/// issues, so a probe a schema did not warrant must not be issued at all.
-///
-/// Two declarations can need one. A `field.Vector` column always needs pgvector
-/// (its `vector(n)` type is the extension's), and an explicit `.SqlType(s)` /
-/// `field.Other(name, s)` override may name an extension type — it is emitted
-/// The `comptime` branch budget a schema-shaped helper needs, **scaled by the
-/// graph** rather than fixed.
-///
-/// A constant is the wrong shape for these loops: they are per table × per
-/// field, and the cross-reference helpers add per table × per table again, so a
-/// 2-table test graph and a 154-table consumer differ by orders of magnitude —
-/// and the side that fails is the one that cannot see this file. A caller's own
-/// `@setEvalBranchQuota` cannot help either: the innermost quota on an
-/// evaluation path wins, and the failing evaluation happens *inside* these
-/// private functions. Measured on a 154-table, ~15-field-per-table schema: the
-/// default 1000 tripped in `requiredPostgresExtensions` (which had no quota at
-/// all) and the fixed 50_000 tripped in `tableFromTypeInfoCrossRef`.
-///
-/// The quota is a ceiling, never work: raising it costs nothing when it is not
-/// reached, which is why the base matches the codegen modules' 1_000_000 rather
-/// than something tuned to today's graph sizes.
-fn evalQuotaFor(comptime infos: []const TypeInfo) u32 {
-    const n: u32 = @intCast(infos.len);
-    return 1_000_000 + n * 20_000;
-}
-
-/// verbatim on PostgreSQL. The built-in field kinds cannot: `field.Json` is
-/// `JSONB`, `field.Bytes` is `BYTEA`, and every other kind maps to a type
-/// PostgreSQL owns.
-fn requiredPostgresExtensions(comptime infos: []const TypeInfo) []const []const u8 {
-    comptime {
-        @setEvalBranchQuota(evalQuotaFor(infos));
-        var needed: []const []const u8 = &.{};
-        for (infos) |info| {
-            if (info.is_view) continue;
-            for (info.fields) |f| {
-                const extension: ?[]const u8 = blk: {
-                    if (f.field_type == .vector) break :blk "vector";
-                    if (f.sql_type_override) |override| break :blk postgresExtensionForDeclaredType(override);
-                    break :blk null;
-                };
-                const name = extension orelse continue;
-                var seen = false;
-                for (needed) |existing| {
-                    if (std.mem.eql(u8, existing, name)) seen = true;
-                }
-                if (!seen) needed = needed ++ &[_][]const u8{name};
-            }
-        }
-        return needed;
-    }
-}
-
-/// `requiredPostgresExtensions` as one comma-separated string, for the warning
-/// `checkPostgresExtensions` emits when the catalog cannot be read: the
-/// returned value carries no text, so the line has to name what was asked
-/// about. Pure and comptime, like the list it renders.
-fn requiredExtensionsJoined(comptime infos: []const TypeInfo) []const u8 {
-    comptime {
-        @setEvalBranchQuota(evalQuotaFor(infos));
-        var out: []const u8 = "";
-        for (requiredPostgresExtensions(infos), 0..) |name, i| {
-            if (i > 0) out = out ++ ", ";
-            out = out ++ name;
-        }
-        return out;
-    }
-}
-
 /// The opening of `pgRelationListed`'s statement.
 ///
 /// Named once and used by both the producer and the stubs that answer it
@@ -2164,37 +1801,6 @@ fn checkPostgresExtensions(drv: sql_driver.Driver, comptime infos: []const TypeI
         );
         return error.MissingPostgresExtension;
     }
-}
-
-/// Log what the error name cannot carry — which table, which column, which
-/// type, and why MySQL refuses — and return the matching named error.
-///
-/// `warn` and not `err`, so a consumer whose log handling treats `err` as
-/// fatal does not die on a diagnostic the caller is about to see as a returned
-/// error anyway.
-fn reportMySqlTextRestriction(restriction: MySqlTextRestriction) MySqlTextError {
-    switch (restriction.kind) {
-        .default_value => zent_log.warn(
-            "zent: MySQL rejects a DEFAULT on {s}.{s} ({s}, errno 1101: BLOB/TEXT/JSON cannot have a default value); use field.String (VARCHAR(255) on MySQL) or drop the default",
-            .{ restriction.table, restriction.column, restriction.sql_type },
-        ),
-        .unique => zent_log.warn(
-            "zent: MySQL cannot index {s}.{s} ({s}, errno 1170: BLOB/TEXT/JSON key specification without a key length), so its UNIQUE constraint has no DDL; use field.String (VARCHAR(255) on MySQL) or drop the uniqueness",
-            .{ restriction.table, restriction.column, restriction.sql_type },
-        ),
-        .primary_key => zent_log.warn(
-            "zent: MySQL cannot index {s}.{s} ({s}, errno 1170: BLOB/TEXT/JSON key specification without a key length), so it cannot be a PRIMARY KEY; use field.String or a narrower type",
-            .{ restriction.table, restriction.column, restriction.sql_type },
-        ),
-        .index => zent_log.warn(
-            "zent: MySQL cannot index {s}.{s} ({s}, errno 1170: BLOB/TEXT/JSON key specification without a key length), so index {s} cannot be created; use field.String (VARCHAR(255) on MySQL) or drop the column from the index",
-            .{ restriction.table, restriction.column, restriction.sql_type, restriction.index_name },
-        ),
-    }
-    return switch (restriction.kind) {
-        .default_value => error.MySQLTextColumnCannotHaveDefault,
-        .unique, .primary_key, .index => error.MySQLTextColumnCannotBeIndexed,
-    };
 }
 
 /// Build the dialect-appropriate INSERT statement for recording a migration.
@@ -2420,882 +2026,15 @@ fn verifyFileChecksums(applied: []const AppliedMigration, files: []const Migrati
     }
 }
 
-/// Column definition for CREATE TABLE.
-pub const ColumnDef = struct {
-    name: []const u8,
-    /// Explicit SQL type for synthetic columns and backwards-compatible callers.
-    sql_type: []const u8,
-    /// Logical schema type. When present, migration SQL resolves it through the
-    /// active dialect instead of reusing the SQLite-oriented `sql_type` value.
-    logical_type: ?field_mod.FieldType = null,
-    /// DDL spelling for a string column that declared `VarChar(n)` —
-    /// comptime-formatted (`"VARCHAR(120)"`), because `columnSQLType` is a
-    /// runtime fn returning a borrowed slice it cannot print into.
-    /// `columnSQLType` uses it only for a MySQL dialect (replacing the
-    /// default `VARCHAR(255)`); PostgreSQL and SQLite keep the `TEXT` the
-    /// `.string` family already resolves to there. null for every column
-    /// that declared no length.
-    varchar_sql: ?[]const u8 = null,
-    /// DDL spelling for a `field.Vector` column — comptime-formatted
-    /// (`"vector(3)"`) for the same reason `varchar_sql` is:
-    /// `columnSQLType` is a runtime fn returning a borrowed slice it cannot
-    /// print into. `columnSQLType` uses it on a PostgreSQL dialect only;
-    /// MySQL and SQLite get the field kind's mapping (`TEXT`). null for every
-    /// column that declared no dimension.
-    vector_sql: ?[]const u8 = null,
-    /// Explicit SQL type declared by `.SqlType(s)` / `field.Other(name, s)`,
-    /// null when the schema declared none. `columnSQLType` emits it verbatim
-    /// and on a PostgreSQL dialect only; it wins over `varchar_sql`. Beside
-    /// `logical_type` rather than inside `sql_type` for the same reason
-    /// `varchar_sql` is: `sql_type` is the graph's comptime-resolved value for
-    /// the dialect the graph was built with, while the override has to be
-    /// resolved against the dialect the migration is actually running on.
-    sql_type_override: ?[]const u8 = null,
-    primary_key: bool = false,
-    not_null: bool = false,
-    unique: bool = false,
-    default_value: ?[]const u8 = null,
-    auto_increment: bool = false,
-};
-
-fn columnSQLType(column: ColumnDef, dialect: Dialect) []const u8 {
-    // A declared `.SqlType(s)` / `field.Other(name, s)` names the column's type
-    // outright, so it is resolved first — ahead of the kind's mapping and ahead
-    // of a declared `VarChar(n)`. PostgreSQL only: the strings this names are
-    // PostgreSQL's own extension/custom types and arrays, and a server that
-    // cannot parse the name would fail `CREATE TABLE` rather than fall back.
-    if (column.sql_type_override) |override| {
-        if (dialect.kind() == .postgres) return override;
-    }
-    if (column.logical_type) |logical_type| {
-        // A declared `VarChar(n)` replaces the default VARCHAR(255) on MySQL
-        // only; every other dialect — and every undeclared column — resolves
-        // through `sqlType` byte-for-byte unchanged.
-        if (logical_type == .string) {
-            if (column.varchar_sql) |varchar| {
-                if (dialect.kind() == .mysql) return varchar;
-            }
-        }
-        // A `field.Vector`'s type is dimension-bearing (`vector(3)`), which the
-        // dimension-less `sqlType` cannot spell — the migration carries the
-        // declaration as the comptime-formatted string, exactly as `VarChar(n)`
-        // does. PostgreSQL only: MySQL and SQLite have no vector type, so they
-        // take the `TEXT` mapping below (pgvector's own text form, `[1,2,3]`).
-        if (logical_type == .vector) {
-            if (column.vector_sql) |vector| {
-                if (dialect.kind() == .postgres) return vector;
-            }
-        }
-        return switch (logical_type) {
-            inline else => |field_type| field_mod.sqlType(field_type, dialect),
-        };
-    }
-    return column.sql_type;
-}
-
-/// What a column declared, and what this dialect will actually emit, when the
-/// two differ because the declaration names a type the dialect does not have.
-const DeclaredTypeRewrite = struct {
-    /// The type the schema declared (`vector(1536)`, `citext`).
-    declared: []const u8,
-    /// The type `columnSQLType` resolves it to on this dialect (`TEXT`).
-    emitted: []const u8,
-};
-
-/// The rewrite a column's declaration is about to suffer, or `null` when the
-/// declaration is what gets emitted.
-///
-/// Two declarations can be rewritten, because only they name a type the schema
-/// chose rather than a kind the dialect mapping owns:
-///
-///   - a `field.Vector` column: PostgreSQL gets `vector(n)` (pgvector),
-///     MySQL/SQLite get the kind's `TEXT` (`field.sqlType`'s `.vector` arm),
-///     which is a column of a different type, not a different spelling of the
-///     same one;
-///   - a `.SqlType(s)` / `field.Other(name, s)` override: `columnSQLType`
-///     emits it verbatim on PostgreSQL **only**, so every other dialect falls
-///     back to the field kind's mapping.
-///
-/// Everything else is a *mapping*, not a rewrite: `field.String` is `TEXT` on
-/// PostgreSQL/SQLite and `VARCHAR(255)` on MySQL, `field.Json` is `JSONB` or
-/// `TEXT` — the schema declared a kind and the dialect rendered it, which is
-/// the dialect support working as documented. Those must stay silent, or every
-/// schema warns.
-///
-/// Decided by comparing the declaration with `columnSQLType`'s own answer
-/// rather than by re-deriving which arm fires, so the warning cannot disagree
-/// with the SQL it accompanies (a hand-built `ColumnDef` whose `sql_type`
-/// already *is* its override, for instance, is emitted as declared and stays
-/// silent). Pure, so both dialects can be pinned without a server.
-fn declaredTypeRewrite(col: ColumnDef, dialect: Dialect) ?DeclaredTypeRewrite {
-    const declared: ?[]const u8 = if (col.sql_type_override) |override|
-        override
-    else if (col.logical_type != null and col.logical_type.? == .vector)
-        (col.vector_sql orelse "vector")
-    else
-        null;
-    const declared_type = declared orelse return null;
-    const emitted = columnSQLType(col, dialect);
-    if (std.mem.eql(u8, declared_type, emitted)) return null;
-    return .{ .declared = declared_type, .emitted = emitted };
-}
-
-/// The dialect's name as the person reading the log says it.
-fn dialectDisplayName(kind: Dialect.Kind) []const u8 {
-    return switch (kind) {
-        .sqlite => "SQLite",
-        .postgres => "PostgreSQL",
-        .mysql => "MySQL",
-        .unknown => "this dialect",
-    };
-}
-
-/// Say out loud that a declared column type has no column type on this dialect
-/// and was emitted as something else.
-///
-/// The mirror image of the index-method/opclass warnings (`indexMethodFor`,
-/// `indexOpClassFor`), and deliberately the same shape — declared here, dropped
-/// with a line that names what was dropped. The *column* is the one that
-/// matters: an index on a vector column that is stored as `TEXT` still indexes
-/// the text, while the column itself is the whole loss (pgvector's operators
-/// and its `vector` type are gone, and the value is a `[1,2,3]` string).
-///
-/// Once per (table, column) per migration is structural, not tracked: both
-/// migration entry points call this once per entity, next to
-/// `warnOutOfGraphEdgeRefs`, and a table's column list names a column once — so
-/// the two DDL statements the planner can produce for one column (a `CREATE
-/// TABLE` and, when the table already existed, an `ALTER TABLE ADD COLUMN`)
-/// still produce one line.
-fn warnDegradedColumnTypes(table: TableDef, dialect: Dialect) void {
-    for (table.columns) |col| {
-        const rewrite = declaredTypeRewrite(col, dialect) orelse continue;
-        zent_log.warn(
-            "zent: {s}.{s} declares the {s} type, which {s} has no column type for, so the column is emitted as {s}; it is stored and read as text and none of {s}'s operators or indexes for {s} apply — migrate this schema on PostgreSQL, or declare a type {s} can create",
-            .{
-                table.name,
-                col.name,
-                rewrite.declared,
-                dialectDisplayName(dialect.kind()),
-                rewrite.emitted,
-                dialectDisplayName(dialect.kind()),
-                rewrite.declared,
-                dialectDisplayName(dialect.kind()),
-            },
-        );
-    }
-}
-
-/// Dialect-aware epoch default for the conventional audit timestamp columns
-/// (`created_at` / `updated_at` of logical type `.time`), matching zent's
-/// i64-epoch representation (CURRENT_TIMESTAMP would store text and break
-/// integer scanning). Returns null when the column has an explicit default
-/// or is not an audit column.
-fn auditTimestampDefault(column: ColumnDef, dialect: Dialect) ?[]const u8 {
-    if (column.default_value != null) return null;
-    if (column.logical_type == null or column.logical_type.? != .time) return null;
-    if (!std.mem.eql(u8, column.name, "created_at") and !std.mem.eql(u8, column.name, "updated_at")) return null;
-    // The spelling lives in `sql/dialect_expr.zig`; this form is the same
-    // expression with the parentheses a DDL `DEFAULT` needs.
-    return dialect_expr.nowSecsParenthesized(dialect);
-}
-
-/// Normalize a SQL type name for dialect-agnostic comparison by:
-/// - Lowercasing
-/// - Stripping size/precision modifiers: `varchar(255)` → `varchar`
-/// - Canonicalizing aliases: `character varying` → `varchar`, `int` → `integer`
-/// - Trimming whitespace
-/// - On MySQL, mapping the server's storage names back onto the declared
-///   family (see `server_canonical` below)
-fn normalizeSqlType(sql_type: []const u8, buf: []u8, dialect: Dialect) ![]u8 {
-    if (sql_type.len > buf.len) return error.NoSpaceLeft;
-
-    // Lowercase and copy to buf
-    for (sql_type, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-
-    // Strip parenthesized modifiers: e.g., "varchar(255)" → "varchar"
-    var end = sql_type.len;
-    if (std.mem.indexOfScalar(u8, buf[0..end], '(')) |paren_idx| {
-        end = paren_idx;
-        while (end > 0 and buf[end - 1] == ' ') end -= 1; // trim trailing space
-    }
-
-    const normalized = buf[0..end];
-
-    // Canonicalize aliases — copy canonical name into buffer and return
-    const canonical: ?[]const u8 = if (std.mem.eql(u8, normalized, "character varying")) "varchar" else if (std.mem.eql(u8, normalized, "int") or std.mem.eql(u8, normalized, "int4")) "integer" else if (std.mem.eql(u8, normalized, "double")) "double precision" else if (std.mem.eql(u8, normalized, "bool")) "boolean" else if (std.mem.eql(u8, normalized, "serial")) "integer" else if (std.mem.eql(u8, normalized, "bigserial")) "bigint" else if (std.mem.eql(u8, normalized, "timestamptz")) "timestamp with time zone" else null;
-
-    // MySQL answers `information_schema.columns.data_type` with the **storage
-    // type**, not the spelling the DDL used: BOOLEAN lands as `tinyint` (a
-    // `tinyint(1)`) and REAL as `double` (REAL is a DOUBLE synonym there;
-    // MariaDB behaves the same). zent emits both spellings dialect-independently
-    // (`field.sqlType`), so without mapping the server's answer back every MySQL
-    // table carrying a bool or a float reported a false `.type_mismatch` — and a
-    // run with `allow_data_loss` then planned an ALTER TYPE to "repair" it,
-    // which `alterColumnTypeSQL` refuses with `MySQLTypeChangeUnsafe`: planning
-    // failed hard, dry-run included, and the version was never recorded.
-    // Deliberately only these two, and gated on the dialect so PostgreSQL and
-    // SQLite normalize exactly as before: `tinyint` cannot collide with a real
-    // difference (zent's `.int` is emitted INTEGER and MySQL stores it as `int`,
-    // normalized to `integer` — a genuine `tinyint` column is still not an
-    // `.int`), and MySQL FLOAT keeps reporting `float`, distinct from the DOUBLE
-    // family REAL belongs to.
-    const server_canonical: ?[]const u8 = if (dialect.kind() != .mysql) null else if (std.mem.eql(u8, normalized, "tinyint")) "boolean" else if (std.mem.eql(u8, normalized, "real")) "double precision" else null;
-
-    if (server_canonical orelse canonical) |canon| {
-        if (canon.len > buf.len) return error.NoSpaceLeft;
-        @memcpy(buf[0..canon.len], canon);
-        return buf[0..canon.len];
-    }
-
-    return normalized;
-}
-
-/// Foreign key definition.
-pub const ForeignKeyDef = struct {
-    columns: []const []const u8,
-    ref_table: []const u8,
-    ref_columns: []const []const u8,
-    on_delete: []const u8 = "CASCADE",
-    on_update: []const u8 = "CASCADE",
-};
-
-/// Index definition.
-pub const IndexDef = struct {
-    name: []const u8,
-    columns: []const []const u8,
-    unique: bool = false,
-    /// Access method (`USING <method>`), `null` when the schema declared none.
-    ///
-    /// **Not compared by `checkSchema`.** It could be — PostgreSQL's
-    /// `getPostgresIndexes` already joins `pg_am` (it uses `am.amname` to decide
-    /// whether the key list is comparable at all), and MySQL carries
-    /// `information_schema.statistics.INDEX_TYPE` — but a mismatch is a
-    /// performance fact, and every drift reported here is one `assertSchema`
-    /// turns into a blocked deploy. The comparison would also have to answer
-    /// "equivalent?" rather than "equal?" for a great many pairs (a `btree`
-    /// index and an undeclared method are the same thing; so are `USING BTREE`
-    /// and the default on MySQL), and a wrong answer on either side is worse
-    /// than no answer. So the method is written and never read: declaring it is
-    /// free of drift risk, and changing it on an index that already exists by
-    /// name is not repaired (an existing index is never re-created).
-    method: ?[]const u8 = null,
-    /// Operator class for the index's single key column (`"vector_cosine_ops"`,
-    /// …). PostgreSQL only; see `createIndexSQLAlloc` for what the other two
-    /// dialects do with a declaration they cannot express. Like `method`, it is
-    /// never compared by `checkSchema`.
-    opclass: ?[]const u8 = null,
-};
-
-/// `IndexInfo` → `IndexDef`: the one construction both migration paths use, so
-/// a declaration cannot reach `migrateSchema` and not `planMigrateStatements`
-/// (the dry run and the run it previews must agree), and so the test that pins
-/// a schema's `method`/`opclass` reaching the DDL does not restate the mapping
-/// it is testing.
-fn indexDefFromInfo(idx: IndexInfo) IndexDef {
-    return .{
-        .name = idx.name,
-        .columns = idx.columns,
-        .unique = idx.unique,
-        .method = idx.method,
-        .opclass = idx.opclass,
-    };
-}
-
-/// Table definition for CREATE TABLE.
-pub const TableDef = struct {
-    name: []const u8,
-    columns: []const ColumnDef,
-    primary_keys: []const []const u8,
-    foreign_keys: []const ForeignKeyDef = &.{},
-    indexes: []const IndexDef = &.{},
-};
-
-/// Generate a TableDef from a TypeInfo at comptime.
-pub fn tableFromTypeInfo(comptime info: TypeInfo) TableDef {
-    comptime {
-        // 字段/外键循环在 `inline for (infos)` 的迁移入口下按表×字段展开，
-        // 15+ 表的应用 schema 就会击穿默认 5000 分支限额(如 zenaipa);与
-        // defaultValueStr 同量级提升配额，避免 "exceeded backwards branches"。
-        @setEvalBranchQuota(50_000);
-        var columns: []const ColumnDef = &.{};
-
-        // Generate columns from fields. DDL uses the physical column name
-        // (`StorageKey`), not the Zig field name.
-        for (info.fields) |f| {
-            const col = ColumnDef{
-                .name = f.column_name,
-                .sql_type = f.sql_type,
-                .logical_type = f.field_type,
-                .varchar_sql = if (f.max_length) |n| field_mod.varCharSQL(n) else null,
-                .vector_sql = if (f.vector_dims) |n| field_mod.vectorSQL(n) else null,
-                .sql_type_override = f.sql_type_override,
-                .primary_key = f.is_id,
-                .not_null = !f.optional and !f.nillable,
-                .unique = f.unique,
-                .default_value = defaultValueStr(f),
-                // Only an integer primary key auto-increments. Marking every id as
-                // auto-increment made PostgreSQL rewrite a UUID PK to SERIAL and
-                // MySQL reject a TEXT PK, silently generating the wrong column type.
-                .auto_increment = f.is_id and f.field_type == .int,
-            };
-            columns = columns ++ &[_]ColumnDef{col};
-        }
-
-        // Generate foreign keys from O2O and O2M edges (stored in target table)
-        // For O2M edges where this entity is the "one" side, the foreign key
-        // is in the target table, so we don't add it here.
-        // For O2O edges and From edges, we might add a column.
-        // For M2M edges, we need a junction table.
-        var foreign_keys: []const ForeignKeyDef = &.{};
-
-        for (info.edges) |e| {
-            if (e.kind == .from and (e.relation == .o2m or e.relation == .m2o)) {
-                // O2M/M2O From edge: this entity has a foreign key column
-                // e.g., Car.owner -> User (owner_id column in car table), named
-                // by the edge (`Field("owner_id")`) when it says so and
-                // `<edge>_id` otherwise — `graph.getEdgeFKColumn`'s choice, so
-                // this DDL and the queries name the same column.
-                const fk_col_name = e.field_name orelse (e.name ++ "_id");
-                const col = ColumnDef{
-                    .name = fk_col_name,
-                    .sql_type = "INTEGER",
-                    .not_null = e.required,
-                    .unique = e.unique,
-                };
-                columns = columns ++ &[_]ColumnDef{col};
-
-                const fk = ForeignKeyDef{
-                    .columns = &[_][]const u8{fk_col_name},
-                    .ref_table = toSnakeCase(e.target_name),
-                    // TODO: the referenced column is hardcoded to "id", so a
-                    // target declaring `.pk` or a StorageKey-renamed `id` gets
-                    // an FK to a column it does not have. Resolving it needs
-                    // the target's TypeInfo, which this pub signature does not
-                    // carry. The migration paths are not affected: they go
-                    // through `tableFromTypeInfoCrossRef`, which references
-                    // `graph.pkColumn` — and so does `junctionTableForEdge`,
-                    // leaving this pub export the last of that family.
-                    .ref_columns = &[_][]const u8{"id"},
-                };
-                foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
-            } else if (e.kind == .from and e.relation == .o2o) {
-                // O2O From edge: foreign key column
-                const fk_col_name = e.name ++ "_id";
-                const col = ColumnDef{
-                    .name = fk_col_name,
-                    .sql_type = "INTEGER",
-                    .not_null = e.required,
-                    .unique = true, // O2O FK is always unique
-                };
-                columns = columns ++ &[_]ColumnDef{col};
-
-                const fk = ForeignKeyDef{
-                    .columns = &[_][]const u8{fk_col_name},
-                    .ref_table = toSnakeCase(e.target_name),
-                    // TODO: the referenced column is hardcoded to "id", so a
-                    // target declaring `.pk` or a StorageKey-renamed `id` gets
-                    // an FK to a column it does not have. Resolving it needs
-                    // the target's TypeInfo, which this pub signature does not
-                    // carry. The migration paths are not affected: they go
-                    // through `tableFromTypeInfoCrossRef`, which references
-                    // `graph.pkColumn` — and so does `junctionTableForEdge`,
-                    // leaving this pub export the last of that family.
-                    .ref_columns = &[_][]const u8{"id"},
-                };
-                foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
-            }
-        }
-
-        // Primary keys
-        var pks: []const []const u8 = &.{};
-        for (info.fields) |f| {
-            if (f.is_id) {
-                pks = pks ++ &[_][]const u8{f.column_name};
-            }
-        }
-
-        return TableDef{
-            .name = info.table_name,
-            .columns = columns,
-            .primary_keys = pks,
-            .foreign_keys = foreign_keys,
-        };
-    }
-}
-
-/// Generate a junction table definition for M2M edges.
-/// Columns and table name are deterministically ordered alphabetically
-/// so that whichever edge triggers creation first produces the same schema.
-///
-/// Both ends resolve the way every other edge reference in this file does
-/// (`edgeRefTarget` + `graph.pkColumn`): the source end from `source_info`
-/// itself, the target end by looking the edge's target up in `all_infos` —
-/// a declared `table_name` and a declared `.pk` (or a `StorageKey`-renamed
-/// `id`) on either end are honoured, so the junction `migrateSchema` creates
-/// and the one `buildEdgeStep`/`getJunctionTable` read derive the same name,
-/// columns and referenced keys. A target outside the graph has no TypeInfo
-/// to ask and keeps the historical shape — `toSnakeCase(target_name)`
-/// referencing `"id"` — the same fallback `tableFromTypeInfoCrossRef` keeps,
-/// because the reference dangles either way.
-pub fn junctionTableForEdge(comptime edge: EdgeInfo, comptime source_info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
-    comptime {
-        // Two ends × per-end name/column concatenations, per junction edge
-        // inside the `inline for (infos)` migration loops, each end resolved by
-        // a scan of `all_infos`: scaled with the graph like its siblings
-        // (see `evalQuotaFor`).
-        @setEvalBranchQuota(evalQuotaFor(all_infos));
-        const ref = edgeRefTarget(edge, all_infos);
-        const source_table = source_info.table_name;
-        const target_table = ref.table;
-
-        const a_first = std.mem.lessThan(u8, source_table, target_table);
-
-        // Junction table name: alphabetically sorted
-        const table_name = if (a_first)
-            source_table ++ "_" ++ target_table
-        else
-            target_table ++ "_" ++ source_table;
-
-        // Columns are also ordered alphabetically by their referenced table
-        const col_a = source_table ++ "_id";
-        const col_b = target_table ++ "_id";
-        const col1 = if (a_first) col_a else col_b;
-        const col2 = if (a_first) col_b else col_a;
-
-        // Each reference names that end's primary-key column — `graph.pkColumn`
-        // of the end's TypeInfo, the same resolver the relation query uses.
-        const source_ref = pkColumn(source_info);
-        const source_fk = ForeignKeyDef{
-            .columns = if (a_first) &[_][]const u8{col1} else &[_][]const u8{col2},
-            .ref_table = source_table,
-            .ref_columns = &[_][]const u8{source_ref},
-        };
-        // A cross-graph end contributes its column and its half of the primary
-        // key, and **no constraint**: the table name would have to be derived
-        // from the entity name, and a wrong derivation is a rejected
-        // `CREATE TABLE` rather than a dangling reference (see
-        // `tableFromTypeInfoCrossRef`). Emitted in column order, so an in-graph
-        // pair renders exactly as before.
-        const target_fk = ForeignKeyDef{
-            .columns = if (a_first) &[_][]const u8{col2} else &[_][]const u8{col1},
-            .ref_table = target_table,
-            .ref_columns = if (ref.info) |target|
-                &[_][]const u8{pkColumn(target)}
-            else
-                &[_][]const u8{"id"},
-        };
-        const fk_for_col1 = if (a_first) source_fk else target_fk;
-        const fk_for_col2 = if (a_first) target_fk else source_fk;
-        const foreign_keys: []const ForeignKeyDef = if (ref.info == null)
-            (if (a_first) &[_]ForeignKeyDef{fk_for_col1} else &[_]ForeignKeyDef{fk_for_col2})
-        else
-            &[_]ForeignKeyDef{ fk_for_col1, fk_for_col2 };
-
-        return TableDef{
-            .name = table_name,
-            .columns = &.{
-                ColumnDef{ .name = col1, .sql_type = "INTEGER", .not_null = true },
-                ColumnDef{ .name = col2, .sql_type = "INTEGER", .not_null = true },
-            },
-            .primary_keys = &.{ col1, col2 },
-            .foreign_keys = foreign_keys,
-        };
-    }
-}
-
-/// Generate CREATE TABLE SQL for a TableDef using specified allocator.
-///
-/// Fail-closed on MySQL: a BLOB/TEXT/JSON column the table would declare with
-/// `DEFAULT`, `UNIQUE`, or as a `PRIMARY KEY` cannot be created at all, so the
-/// statement is refused with a named error and a logged detail instead of
-/// being emitted for the server to reject with errno 1101/1170 (see
-/// `findMySqlTextRestriction`). Indexes are not `CREATE TABLE`'s business —
-/// `table.indexes` is never emitted here — so they are checked by
-/// `createIndexSQLForTableAlloc`.
-///
-/// This applies MySQL's rules; a caller that identified its server as MariaDB
-/// (see `detectMySqlServer`) uses `createTableSQLAllocWithServer`, which emits
-/// the `DEFAULT` MariaDB >= 10.2.1 accepts.
-pub fn createTableSQLAlloc(allocator: std.mem.Allocator, table: TableDef, dialect: Dialect) ![]const u8 {
-    return createTableSQLAllocWithServer(allocator, table, dialect, .mysql);
-}
-
-/// `createTableSQLAlloc`, told which server the statement is for.
-///
-/// The only difference is which text-column restrictions are enforced before
-/// the SQL is built: on `.mariadb` a BLOB/TEXT `DEFAULT` is allowed through (and
-/// then emitted below like any other column's), while UNIQUE and PRIMARY KEY
-/// stay refused. On `.mysql` the output is identical to
-/// `createTableSQLAlloc`.
-pub fn createTableSQLAllocWithServer(
-    allocator: std.mem.Allocator,
-    table: TableDef,
-    dialect: Dialect,
-    server: MySqlServer,
-) ![]const u8 {
-    if (findMySqlTextRestrictionWithServer(table, &.{}, dialect, server)) |restriction| {
-        return reportMySqlTextRestriction(restriction);
-    }
-
-    var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
-    defer buf.deinit();
-
-    try buf.appendSlice("CREATE TABLE IF NOT EXISTS ");
-    try quoteIdentToBuffer(dialect, &buf, table.name);
-    try buf.appendSlice(" (\n");
-
-    for (table.columns, 0..) |col, i| {
-        var sql_type = columnSQLType(col, dialect);
-        // PostgreSQL: a bare `INTEGER PRIMARY KEY` has no default, so an
-        // INSERT without an explicit id fails NOT NULL on RETURNING. Map
-        // auto-increment ids to SERIAL/BIGSERIAL (which own a sequence).
-        if (col.auto_increment and dialect.kind() == .postgres) {
-            sql_type = if (std.ascii.eqlIgnoreCase(sql_type, "BIGINT")) "BIGSERIAL" else "SERIAL";
-        }
-        if (i > 0) try buf.appendSlice(",\n");
-        try buf.appendSlice("  ");
-        try quoteIdentToBuffer(dialect, &buf, col.name);
-        try buf.appendSlice(" ");
-        try buf.appendSlice(sql_type);
-
-        if (col.primary_key and isSQLiteDialect(dialect)) {
-            // SQLite AUTOINCREMENT only valid on INTEGER PRIMARY KEY.
-            if (std.ascii.eqlIgnoreCase(sql_type, "INTEGER") or
-                std.ascii.eqlIgnoreCase(sql_type, "INT"))
-            {
-                try buf.appendSlice(" PRIMARY KEY AUTOINCREMENT");
-            } else {
-                try buf.appendSlice(" PRIMARY KEY");
-            }
-        } else if (col.primary_key) {
-            try buf.appendSlice(" PRIMARY KEY");
-            if (col.auto_increment and
-                dialect.kind() == .mysql and
-                isMySqlAutoIncrementType(sql_type))
-            {
-                try buf.appendSlice(" AUTO_INCREMENT");
-            }
-        }
-
-        if (col.not_null and !col.primary_key) {
-            try buf.appendSlice(" NOT NULL");
-        }
-
-        if (col.unique and !col.primary_key) {
-            try buf.appendSlice(" UNIQUE");
-        }
-
-        if (col.default_value) |dv| {
-            try buf.appendSlice(" DEFAULT ");
-            try buf.appendSlice(dv);
-        } else if (auditTimestampDefault(col, dialect)) |dv2| {
-            try buf.appendSlice(" DEFAULT ");
-            try buf.appendSlice(dv2);
-        }
-    }
-
-    // Add composite primary key constraint (for multi-column PKs)
-    if (table.primary_keys.len > 1) {
-        try buf.appendSlice(",\n  PRIMARY KEY (");
-        for (table.primary_keys, 0..) |pk, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try quoteIdentToBuffer(dialect, &buf, pk);
-        }
-        try buf.appendSlice(")");
-    }
-
-    // Add foreign key constraints
-    for (table.foreign_keys) |fk| {
-        try buf.appendSlice(",\n  FOREIGN KEY (");
-        for (fk.columns, 0..) |col, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try quoteIdentToBuffer(dialect, &buf, col);
-        }
-        try buf.appendSlice(") REFERENCES ");
-        try quoteIdentToBuffer(dialect, &buf, fk.ref_table);
-        try buf.appendSlice(" (");
-        for (fk.ref_columns, 0..) |col, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try quoteIdentToBuffer(dialect, &buf, col);
-        }
-        try buf.appendSlice(") ON DELETE ");
-        try buf.appendSlice(fk.on_delete);
-        try buf.appendSlice(" ON UPDATE ");
-        try buf.appendSlice(fk.on_update);
-    }
-
-    try buf.appendSlice("\n)");
-
-    return allocator.dupe(u8, buf.items);
-}
-
-/// Generate CREATE TABLE SQL for a TableDef.
-pub fn createTableSQL(table: TableDef, dialect: Dialect) ![]const u8 {
-    return createTableSQLAlloc(std.heap.page_allocator, table, dialect);
-}
-
-/// Generate CREATE INDEX SQL for an IndexDef using specified allocator.
-///
-/// Unchecked: without the table's column types this cannot tell whether the
-/// dialect will accept the key list. `createIndexSQLForTableAlloc` is the
-/// entry point that can, and is what the migration paths use.
-///
-/// The access method and operator class are the one part of an index
-/// declaration the dialects genuinely disagree about, so each gets one spot:
-///
-/// | Dialect | `method` | `opclass` |
-/// |---|---|---|
-/// | PostgreSQL | `ON t USING <method> (…)`, verbatim | `<col> <opclass>` |
-/// | MySQL | `INDEX i USING BTREE\|HASH ON t (…)`; any other method is omitted with a warning | omitted with a warning |
-/// | SQLite (and an unknown dialect) | omitted with a warning | omitted with a warning |
-///
-/// Undeclared (the default) emits nothing new on any of them: the statement is
-/// byte-for-byte the one this function produced before either slot existed.
-/// Both values are validated against a bare-identifier shape before they are
-/// emitted (they are the only parts of this statement that are neither quoted
-/// nor a schema column), and a method/opclass pair the dialect cannot express is
-/// *reported*, never silently rewritten into one that means something else.
-pub fn createIndexSQLAlloc(allocator: std.mem.Allocator, index: IndexDef, table_name: []const u8, dialect: Dialect) ![]const u8 {
-    var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
-    defer buf.deinit();
-
-    const kind = dialect.kind();
-    // Resolved before anything is written: both helpers can report, and a
-    // statement half-emitted into `buf` would be discarded anyway.
-    const method = try indexMethodFor(index, kind, table_name);
-    const opclass = try indexOpClassFor(index, kind, table_name);
-
-    try buf.appendSlice("CREATE ");
-    if (index.unique) try buf.appendSlice("UNIQUE ");
-    if (kind == .mysql) {
-        // MySQL's grammar puts the index type between the name and `ON`;
-        // PostgreSQL's puts `USING` after the table. Both were checked against
-        // a running server.
-        try buf.appendSlice("INDEX ");
-        try quoteIdentToBuffer(dialect, &buf, index.name);
-        if (method) |m| {
-            try buf.appendSlice(" USING ");
-            try buf.appendSlice(m);
-        }
-        try buf.appendSlice(" ON ");
-        try quoteIdentToBuffer(dialect, &buf, table_name);
-    } else {
-        // `INDEX IF NOT EXISTS` is not accepted by MySQL at all, which is why
-        // the two dialects need separate prefixes (the `CREATE INDEX` above is
-        // not idempotent on MySQL — the migration layer's existence check in
-        // front of it is what keeps a re-run from failing).
-        try buf.appendSlice("INDEX IF NOT EXISTS ");
-        try quoteIdentToBuffer(dialect, &buf, index.name);
-        try buf.appendSlice(" ON ");
-        try quoteIdentToBuffer(dialect, &buf, table_name);
-        if (method) |m| {
-            try buf.appendSlice(" USING ");
-            try buf.appendSlice(m);
-        }
-    }
-    try buf.appendSlice(" (");
-
-    for (index.columns, 0..) |col, i| {
-        if (i > 0) try buf.appendSlice(", ");
-        try quoteIdentToBuffer(dialect, &buf, col);
-        // `opclass` is non-null on PostgreSQL only (see `indexOpClassFor`),
-        // and only for a single-column key, so this is the one column it can
-        // belong to.
-        if (opclass) |o| {
-            if (i == 0) {
-                try buf.appendSlice(" ");
-                try buf.appendSlice(o);
-            }
-        }
-    }
-    try buf.appendSlice(")");
-
-    return allocator.dupe(u8, buf.items);
-}
-
-/// Is `name` a bare SQL identifier, or a dotted chain of them
-/// (`[A-Za-z_][A-Za-z0-9_$]*`, joined by `.`)?
-///
-/// An access method and an operator class are the only two things this file
-/// emits *unquoted* and from outside the schema, and neither can be quoted
-/// instead: MySQL rejects a quoted `index_type` outright (errno 1064), and on
-/// PostgreSQL the unquoted spelling is what folds `HNSW` to `hnsw` the way every
-/// other identifier does. So the value goes out verbatim and this is what keeps
-/// "verbatim" from being an injection surface.
-fn isBareIdentifier(name: []const u8) bool {
-    if (name.len == 0) return false;
-    var part_start = true;
-    for (name) |c| {
-        if (c == '.') {
-            // An empty part means a leading, trailing or doubled dot.
-            if (part_start) return false;
-            part_start = true;
-            continue;
-        }
-        if (part_start) {
-            if (!std.ascii.isAlphabetic(c) and c != '_') return false;
-            part_start = false;
-        } else if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '$') {
-            return false;
-        }
-    }
-    return !part_start;
-}
-
-/// The access method as `kind` can express it, or `null` when it has to be
-/// omitted. See the table on `createIndexSQLAlloc`.
-fn indexMethodFor(index: IndexDef, kind: Dialect.Kind, table_name: []const u8) !?[]const u8 {
-    const declared = index.method orelse return null;
-    return switch (kind) {
-        .postgres => blk: {
-            if (!isBareIdentifier(declared)) return error.InvalidIndexMethod;
-            break :blk declared;
-        },
-        .mysql => blk: {
-            // MySQL's *grammar* has two values, so a third can only be a
-            // schema written for another database. Refusing the whole
-            // migration would make a shared schema unmigratable here for a
-            // performance-only declaration, so the index is created without
-            // one and the omission is said out loud.
-            if (std.ascii.eqlIgnoreCase(declared, "btree")) break :blk "BTREE";
-            if (std.ascii.eqlIgnoreCase(declared, "hash")) break :blk "HASH";
-            zent_log.warn(
-                "zent: MySQL has no `{s}` index access method (only BTREE and HASH), so {s} on {s} was created without one",
-                .{ declared, index.name, table_name },
-            );
-            break :blk null;
-        },
-        .sqlite, .unknown => blk: {
-            zent_log.warn(
-                "zent: this dialect has no index access methods, so `{s}` on {s} ({s}) was ignored",
-                .{ declared, index.name, table_name },
-            );
-            break :blk null;
-        },
-    };
-}
-
-/// The key column's operator class, or `null` when the dialect has none. See
-/// the table on `createIndexSQLAlloc`.
-fn indexOpClassFor(index: IndexDef, kind: Dialect.Kind, table_name: []const u8) !?[]const u8 {
-    const declared = index.opclass orelse return null;
-    return switch (kind) {
-        .postgres => blk: {
-            // An operator class belongs to exactly one key column. Attaching it
-            // to the first of several would build an index the schema did not
-            // ask for, and silently dropping it would build one that cannot
-            // answer the query it was declared for — so the declaration is
-            // refused instead.
-            if (index.columns.len != 1) return error.OpClassNeedsSingleColumn;
-            if (!isBareIdentifier(declared)) return error.InvalidIndexOpClass;
-            break :blk declared;
-        },
-        .mysql, .sqlite, .unknown => blk: {
-            zent_log.warn(
-                "zent: `{s}` is a PostgreSQL operator class and this dialect has none, so it was ignored on {s} ({s})",
-                .{ declared, index.name, table_name },
-            );
-            break :blk null;
-        },
-    };
-}
-
-/// Generate CREATE INDEX SQL for an IndexDef.
-pub fn createIndexSQL(index: IndexDef, table_name: []const u8, dialect: Dialect) ![]const u8 {
-    return createIndexSQLAlloc(std.heap.page_allocator, index, table_name, dialect);
-}
-
-/// `createIndexSQLAlloc` for an index *declared on* `table`, with MySQL's
-/// key-length restrictions enforced before any SQL is produced.
-///
-/// The column types are the whole point: a bare `CREATE INDEX ... (body)`
-/// looks identical whether `body` is `VARCHAR(255)` (fine) or `TEXT` (errno
-/// 1170, and no DDL MySQL will accept short of a key-length prefix that
-/// changes the meaning of a UNIQUE index). Refusing here turns that into
-/// `error.MySQLTextColumnCannotBeIndexed` with a logged table/column/reason,
-/// and every caller that goes through this function inherits it — including
-/// the dry run, which prints the SQL it would have executed.
-///
-/// This applies MySQL's rules; `createIndexSQLForTableAllocWithServer` is the
-/// spelling for a caller that identified its server, and it differs only for a
-/// table carrying a text `DEFAULT` the index is not the one to refuse.
-pub fn createIndexSQLForTableAlloc(allocator: std.mem.Allocator, index: IndexDef, table: TableDef, dialect: Dialect) ![]const u8 {
-    return createIndexSQLForTableAllocWithServer(allocator, index, table, dialect, .mysql);
-}
-
-/// `createIndexSQLForTableAlloc`, told which server the statement is for.
-///
-/// The index itself is refused on both families — a key column that is
-/// BLOB/TEXT/JSON is errno 1170 on MariaDB too. `server` matters because the
-/// scan walks the table's columns first: a text column carrying a `DEFAULT`
-/// used to report `.default_value` here even though this statement does not
-/// write that default, which on MariaDB would refuse the index for a reason
-/// the server does not have.
-pub fn createIndexSQLForTableAllocWithServer(
-    allocator: std.mem.Allocator,
-    index: IndexDef,
-    table: TableDef,
-    dialect: Dialect,
-    server: MySqlServer,
-) ![]const u8 {
-    if (findMySqlTextRestrictionWithServer(table, &.{index}, dialect, server)) |restriction| {
-        return reportMySqlTextRestriction(restriction);
-    }
-    return createIndexSQLAlloc(allocator, index, table.name, dialect);
-}
-
-/// Generate CREATE VIEW SQL using specified allocator.
-///
-/// The clause is dialect-dependent, and getting it wrong is not cosmetic:
-/// **PostgreSQL has no `CREATE VIEW IF NOT EXISTS`** — it rejects the statement
-/// with a syntax error (42601, `syntax error at or near "NOT"`), so on
-/// PostgreSQL a schema declaring a view could not be migrated at all. SQLite is
-/// the mirror image: it accepts `IF NOT EXISTS` and rejects `OR REPLACE`
-/// (`near "OR": syntax error`). So:
-///
-///   - PostgreSQL and MySQL/MariaDB: `CREATE OR REPLACE VIEW`, which is
-///     idempotent and replaces the stored definition — a changed `view_sql`
-///     therefore **does** take effect on those two, as long as the new shape is
-///     compatible (PostgreSQL allows columns to be added at the end, not
-///     reordered or retyped).
-///   - SQLite: `CREATE VIEW IF NOT EXISTS`, which creates a missing view and
-///     leaves an existing one alone. It has no way to replace a view in place,
-///     so on SQLite a changed `view_sql` still does not take effect — the
-///     original behaviour, and the only one SQLite offers.
-pub fn createViewSQLAlloc(allocator: std.mem.Allocator, comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
-    const view_sql = info.view_sql orelse return error.MissingViewSQL;
-    var buf = try std.array_list.Managed(u8).initCapacity(allocator, 256);
-    defer buf.deinit();
-
-    // PostgreSQL has no `CREATE VIEW IF NOT EXISTS` (42601) and SQLite no
-    // `CREATE OR REPLACE VIEW` (near `OR`), so SQLite alone takes IF NOT
-    // EXISTS; an unnamed dialect keeps the OR REPLACE it has always taken.
-    if (dialect.kind() == .sqlite) {
-        try buf.appendSlice("CREATE VIEW IF NOT EXISTS ");
-    } else {
-        try buf.appendSlice("CREATE OR REPLACE VIEW ");
-    }
-    try quoteIdentToBuffer(dialect, &buf, info.table_name);
-    try buf.appendSlice(" AS ");
-    try buf.appendSlice(view_sql);
-
-    return allocator.dupe(u8, buf.items);
-}
-
-/// Generate CREATE VIEW SQL.
-pub fn createViewSQL(comptime info: TypeInfo, dialect: Dialect) ![]const u8 {
-    return createViewSQLAlloc(std.heap.page_allocator, info, dialect);
-}
-
 test "CREATE VIEW uses the clause each dialect actually accepts" {
     // PostgreSQL has no `CREATE VIEW IF NOT EXISTS` (42601) and SQLite no
     // `CREATE OR REPLACE VIEW` (near "OR"), so a single clause cannot serve
     // both — and the wrong one is not a cosmetic difference: on PostgreSQL it
     // made a schema with a view entity unmigratable.
     const alloc = std.testing.allocator;
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
-    const field = @import("../../core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
+    const field = @import("./core/field.zig");
 
     const Probe = schema("CreateViewClauseProbe", .{
         .view = true,
@@ -3449,286 +2188,8 @@ pub fn createAllTables(allocator: std.mem.Allocator, driver_drv: sql_driver.Driv
     }
 }
 
-/// The table — and, when the edge's target is in this graph, the entity —
-/// an edge's foreign key must reference. The target's declared `table_name`
-/// wins when the target is in this graph, and the snake_case derivation of
-/// its schema name is the fallback when it is not (the historical spelling,
-/// kept for a caller that migrates a table whose target it did not pass — a
-/// foreign key to an entity outside the graph is dangling either way).
-///
-/// The derivation is *not* the same thing: an entity that declares
-/// `table_name = "xdaofood_upload_file"` is stored in that table, and an FK that
-/// names `upload_file` instead points at nothing. On SQLite, where foreign keys
-/// are enforced since v0.70, the child's first INSERT then fails with
-/// `no such table: main.upload_file` — the symptom a consumer reported as a
-/// "short name" defect. `tableFromTypeInfoCrossRef`'s To-edge half has always
-/// resolved this through `other_info.table_name`; the From-edge half derived the
-/// name instead, which is the inconsistency this closes.
-const EdgeRefTarget = struct {
-    table: []const u8,
-    /// The target entity when it is in this graph — the referenced column is
-    /// `graph.pkColumn` of it. `null` means the target is outside the graph
-    /// and there is no TypeInfo to ask.
-    info: ?TypeInfo,
-};
-
-fn edgeRefTarget(comptime e: EdgeInfo, comptime all_infos: []const TypeInfo) EdgeRefTarget {
-    comptime {
-        for (all_infos) |ti| {
-            if (std.mem.eql(u8, ti.name, e.target_name))
-                return .{ .table = ti.table_name, .info = ti };
-        }
-        return .{ .table = toSnakeCase(e.target_name), .info = null };
-    }
-}
-
-/// The edges whose foreign key goes through `edgeRefTarget`: a From m2o/o2o
-/// edge gets the FK column in this table, and an M2M edge without a `Through`
-/// gets one in the junction `junctionTableForEdge` derives. All other edges
-/// reference an in-graph entity by construction.
-fn edgeFKUsesRefTarget(comptime e: EdgeInfo) bool {
-    return (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) or
-        (e.relation == .m2m and e.through == null);
-}
-
-/// Say out loud which edge crosses this graph, so the foreign key it cannot
-/// name is left out of the DDL instead of guessed.
-///
-/// Every surface that resolves an edge for a *query* refuses this at compile
-/// time (`codegen/graph.edgeTargetInfo`, Z16), but a migration-only consumer —
-/// the multi-database deployment that migrates each graph on its own, or one
-/// that migrates a large schema in chunks — never builds a Client, and
-/// `migrateSchema` / `createAllTables` build the table from the `infos` alone.
-/// A target that is not in `infos` has **no table name this graph can know**:
-/// `toSnakeCase(target_name)` is a guess that ignores the target's declared
-/// `table_name`, and a wrong guess is not a dangling reference but a
-/// `CREATE TABLE` the server rejects (`relation "…" does not exist`, measured on
-/// PostgreSQL), which made a chunked migration fail on every retry. So the
-/// column stays and the constraint is left out — that is the *silent* half; this
-/// function is the other half, because the database error never named the edge
-/// that caused it.
-///
-/// Warning once per (source entity, edge) is structural, not tracked state:
-/// `inline for` visits each edge of `info` once, and each migration entry point
-/// calls this once per entity. `planMigrateStatements` is the shared planner of
-/// both the dry run and the real run, so neither rebuild of the table
-/// definition warns twice; `createTables` is the legacy path and never runs in
-/// the same migration.
-fn warnOutOfGraphEdgeRefs(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) void {
-    // `comptime` on the operand: this function is reached from a runtime frame,
-    // where a plain call would be a runtime value the builtin refuses.
-    @setEvalBranchQuota(comptime evalQuotaFor(all_infos));
-    inline for (info.edges) |e| {
-        const crosses: bool = comptime edgeFKUsesRefTarget(e) and edgeRefTarget(e, all_infos).info == null;
-        if (crosses) {
-            zent_log.warn(
-                "zent: the edge '{s}' on entity {s} targets {s}, which is not in this graph's infos, so the foreign key is left out of the CREATE TABLE (its column stays): the referenced table's name cannot be resolved from this graph — migrate each graph separately in a multi-database deployment, or add {s} to this graph (cross-graph edges are Z16)",
-                .{ e.name, info.name, e.target_name, e.target_name },
-            );
-        }
-    }
-}
-
-/// Like tableFromTypeInfo, but also adds FK columns from cross-referenced To edges.
-/// For example, if User has a To("cars", Car) O2M edge, this adds a "user_id" FK column
-/// to the Car table pointing back to User.
-fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {
-    comptime {
-        // 字段/外键/交叉引用循环在 `inline for (infos)` 的迁移入口下按
-        // 表×字段×表展开，15+ 表的应用 schema 就会击穿默认 5000 分支限额
-        // (如 zenaipa)；固定常数在 154 表的消费者上同样会溢出，所以配额随
-        // 图规模缩放（见 `evalQuotaFor`）。
-        @setEvalBranchQuota(evalQuotaFor(all_infos));
-        var columns: []const ColumnDef = &.{};
-        var foreign_keys: []const ForeignKeyDef = &.{};
-
-        // Generate columns from fields. DDL uses the physical column name
-        // (`StorageKey`), not the Zig field name.
-        for (info.fields) |f| {
-            const col = ColumnDef{
-                .name = f.column_name,
-                .sql_type = f.sql_type,
-                .logical_type = f.field_type,
-                .varchar_sql = if (f.max_length) |n| field_mod.varCharSQL(n) else null,
-                .vector_sql = if (f.vector_dims) |n| field_mod.vectorSQL(n) else null,
-                .sql_type_override = f.sql_type_override,
-                .primary_key = f.is_id,
-                .not_null = !f.optional and !f.nillable,
-                .unique = f.unique,
-                .default_value = defaultValueStr(f),
-                // Only an integer primary key auto-increments. Marking every id as
-                // auto-increment made PostgreSQL rewrite a UUID PK to SERIAL and
-                // MySQL reject a TEXT PK, silently generating the wrong column type.
-                .auto_increment = f.is_id and f.field_type == .int,
-            };
-            columns = columns ++ &[_]ColumnDef{col};
-        }
-
-        // Own From edges generate FK columns in this table
-        for (info.edges) |e| {
-            if (e.kind == .from and (e.relation == .m2o or e.relation == .o2o)) {
-                // The column the edge names (`Field("image_id")`) or `<edge>_id`
-                // without one — the same choice `graph.getEdgeFKColumn` makes for
-                // the query side. Deriving `<edge>_id` unconditionally put the FK
-                // on a column nothing reads, while the column the queries use held
-                // the reference with no constraint on it.
-                const fk_col_name = e.field_name orelse (e.name ++ "_id");
-                // Skip adding the column definition if it was already added via info.fields
-                // (e.g., from addEdgeFields), but still add the FK constraint.
-                var col_exists = false;
-                for (columns) |c| {
-                    if (std.mem.eql(u8, c.name, fk_col_name)) {
-                        col_exists = true;
-                        break;
-                    }
-                }
-                if (!col_exists) {
-                    const col = ColumnDef{
-                        .name = fk_col_name,
-                        .sql_type = "INTEGER",
-                        .not_null = e.required,
-                        .unique = e.unique,
-                    };
-                    columns = columns ++ &[_]ColumnDef{col};
-                }
-
-                // The constraint only when the target is resolvable. Its
-                // reference names the target's primary-key column
-                // (`graph.pkColumn`): the query side has always resolved it that
-                // way, while a literal "id" gave a target that declares `.pk`
-                // (or stores `id` under a StorageKey) an FK to a column it does
-                // not have — on SQLite the child's first INSERT then failed with
-                // `foreign key mismatch`.
-                //
-                // **A target outside this graph has no table name to name.** The
-                // historical fallback (`toSnakeCase(target_name)`) is a guess,
-                // and a wrong guess is not a dangling reference — it is a
-                // `CREATE TABLE` the server rejects (`relation "…" does not
-                // exist`, measured on PostgreSQL for a graph whose entities
-                // carry an explicit `table_name`), which made a chunked
-                // migration fail on every retry. The column stays: the data
-                // shape has to match what the query side reads. The constraint
-                // is left out, and `warnOutOfGraphEdgeRefs` names the edge.
-                const ref = edgeRefTarget(e, all_infos);
-                if (ref.info) |target| {
-                    const fk = ForeignKeyDef{
-                        .columns = &[_][]const u8{fk_col_name},
-                        .ref_table = ref.table,
-                        .ref_columns = &[_][]const u8{pkColumn(target)},
-                    };
-                    foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
-                }
-            }
-        }
-
-        // Cross-referenced To edges: if another entity has a To edge pointing here
-        // with O2M relation, add the FK column to THIS table.
-        // For example: User has To("cars", Car) → Car gets "user_id" FK column.
-        // If this entity already has a corresponding From edge, the FK is handled
-        // by that From edge (e.g., Car.From("owner", User).Ref("cars")) and we
-        // skip adding a duplicate column.
-        for (all_infos) |other_info| {
-            for (other_info.edges) |e| {
-                // Find To edges from other entities pointing to this entity
-                if (e.kind == .to and std.mem.eql(u8, e.target_name, info.name)) {
-                    // Check if this entity already has a corresponding From edge.
-                    var has_from_inverse = false;
-                    for (info.edges) |my_edge| {
-                        if (my_edge.kind == .from and
-                            std.mem.eql(u8, my_edge.target_name, other_info.name) and
-                            my_edge.ref != null and
-                            std.mem.eql(u8, my_edge.ref.?, e.name))
-                        {
-                            has_from_inverse = true;
-                            break;
-                        }
-                    }
-                    if (has_from_inverse) continue;
-
-                    if (e.relation == .o2m) {
-                        // O2M: "one User has many Cars" → Car table gets FK column
-                        const fk_col_name = e.field_name orelse toSnakeCase(other_info.name) ++ "_id";
-                        // Check if this column already exists
-                        var exists = false;
-                        for (columns) |c| {
-                            if (std.mem.eql(u8, c.name, fk_col_name)) {
-                                exists = true;
-                                break;
-                            }
-                        }
-                        if (!exists) {
-                            const col = ColumnDef{
-                                .name = fk_col_name,
-                                .sql_type = "INTEGER",
-                                .not_null = true,
-                                .unique = false,
-                            };
-                            columns = columns ++ &[_]ColumnDef{col};
-
-                            const fk = ForeignKeyDef{
-                                .columns = &[_][]const u8{fk_col_name},
-                                .ref_table = other_info.table_name,
-                                // Same rule as the From-edge half: reference
-                                // the target's primary-key column
-                                // (`graph.pkColumn`), not a literal "id".
-                                .ref_columns = &[_][]const u8{pkColumn(other_info)},
-                            };
-                            foreign_keys = foreign_keys ++ &[_]ForeignKeyDef{fk};
-                        }
-                    }
-                }
-            }
-        }
-
-        // Primary keys
-        var pks: []const []const u8 = &.{};
-        for (info.fields) |f| {
-            if (f.is_id) {
-                pks = pks ++ &[_][]const u8{f.column_name};
-            }
-        }
-
-        return TableDef{
-            .name = info.table_name,
-            .columns = columns,
-            .primary_keys = pks,
-            .foreign_keys = foreign_keys,
-        };
-    }
-}
-
-fn quoteIdentToBuffer(dialect: Dialect, buf: *std.array_list.Managed(u8), name: []const u8) !void {
-    const quote: u8 = if (dialect.kind() == .mysql) '`' else '"';
-    try buf.append(quote);
-    for (name) |c| {
-        try buf.append(c);
-        // SQL-92 escapes an embedded quote by doubling it, so the identifier
-        // cannot be terminated early by a quote inside the name.
-        if (c == quote) try buf.append(c);
-    }
-    try buf.append(quote);
-}
-
-fn isSQLiteDialect(dialect: Dialect) bool {
-    return dialect.kind() == .sqlite;
-}
-
-fn defaultValueStr(comptime f: FieldInfo) ?[]const u8 {
-    // comptimePrint 的泛型格式化在 `inline for (infos)` 下按表×字段展开,
-    // 15+ 表的应用 schema 就会击穿默认 5000 分支限额(如 zenaipa);在此
-    // 提升当前 comptime 子树的配额,避免 "exceeded backwards branches"。
-    @setEvalBranchQuota(50_000);
-    return switch (f.default) {
-        .none => null,
-        .bool => |v| if (v) "TRUE" else "FALSE",
-        .int => |v| comptime std.fmt.comptimePrint("{d}", .{v}),
-        .float => |v| comptime std.fmt.comptimePrint("{d}", .{v}),
-        .string => |v| comptime std.fmt.comptimePrint("'{s}'", .{v}),
-    };
-}
-
-const toSnakeCase = @import("../../codegen/graph.zig").toSnakeCase;
-const pkColumn = @import("../../codegen/graph.zig").pkColumn;
+const toSnakeCase = @import("./codegen/graph.zig").toSnakeCase;
+const pkColumn = @import("./codegen/graph.zig").pkColumn;
 
 /// A column as the *database* reports it. Owned: `name`, `sql_type` and
 /// `udt_name` are allocated, release the list with `freeExistingColumns`.
@@ -6742,9 +5203,9 @@ test "Migration version uses stable positive FNV-1a hash" {
 }
 
 test "TableDef from TypeInfo" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     const User = schema("User", .{
         .fields = &.{ field.String("name"), field.Int("age") },
@@ -6784,9 +5245,9 @@ test "columnSQLType resolves a declared VarChar width per dialect" {
 }
 
 test "a schema-declared VarChar width reaches the DDL on MySQL only" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const graph = @import("../../codegen/graph.zig");
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const graph = @import("./codegen/graph.zig");
 
     const Profile = schema("MigrateProfile", .{
         .fields = &.{
@@ -6851,9 +5312,9 @@ test "a declared VarChar width compares drift-free against the database's varcha
 }
 
 test "a declared Other/SqlType reaches the DDL, on PostgreSQL only" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const graph = @import("../../codegen/graph.zig");
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const graph = @import("./codegen/graph.zig");
 
     const NgTypes = schema("MigratePgTypes", .{
         .fields = &.{
@@ -7063,9 +5524,9 @@ test "the built-in type comparison is unchanged, and udt_name is PostgreSQL-only
 }
 
 test "Create table SQL" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     const User = schema("User", .{
         .fields = &.{ field.String("name"), field.Int("age") },
@@ -7134,9 +5595,9 @@ test "CREATE TABLE SQL includes ON DELETE/UPDATE cascade" {
 }
 
 test "PostgreSQL migration SQL resolves logical field types" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     const Payload = struct { value: i64 };
     const Event = schema("DialectEvent", .{
@@ -7164,10 +5625,10 @@ test "MySQL type-only ALTER is rejected as unsafe" {
 }
 
 test "Migrate schema adds missing columns" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -7199,10 +5660,10 @@ test "Migrate schema adds missing columns" {
 }
 
 test "Migrate schema drops columns when opts.drop_columns set (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -7237,10 +5698,10 @@ test "Migrate schema drops columns when opts.drop_columns set (SQLite)" {
 }
 
 test "Migrate schema does NOT drop columns when opts.drop_columns false (default)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -7272,10 +5733,10 @@ test "Migrate schema does NOT drop columns when opts.drop_columns false (default
 }
 
 test "Migrate schema alters column type when opts.allow_data_loss set (SQLite — skips gracefully)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -7441,11 +5902,11 @@ fn planHasStatementContaining(plan: []const PlannedStatement, needle: []const u8
 
 test "dry-run plans exactly the statements an incremental migrate executes (SQLite)" {
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const index = @import("../../core/index.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const index = @import("./core/index.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -7526,12 +5987,12 @@ test "dry-run plans exactly the statements an incremental migrate executes (SQLi
 
 test "dry-run on a fresh database plans the same statements the real migrate executes" {
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
-    const edge = @import("../../core/edge.zig");
-    const field = @import("../../core/field.zig");
-    const index = @import("../../core/index.zig");
-    const schema = @import("../../core/schema.zig").Schema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
+    const edge = @import("./core/edge.zig");
+    const field = @import("./core/field.zig");
+    const index = @import("./core/index.zig");
+    const schema = @import("./core/schema.zig").Schema;
 
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -7607,10 +6068,10 @@ test "dry-run on a fresh database plans the same statements the real migrate exe
 
 test "dry-run honours the opt-in switches on an existing table" {
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -7661,10 +6122,10 @@ test "dry-run honours the opt-in switches on an existing table" {
 
 test "migrateSchemaWithOptions dry_run executes nothing but plans the incremental diff" {
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(allocator, ":memory:");
     defer drv.close();
@@ -7712,7 +6173,7 @@ test "migrateSchemaWithOptions dry_run executes nothing but plans the incrementa
 test "file migration checksum mismatch is rejected" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
 
     const dir_name = "test_migrations_checksum_mismatch";
     try std.Io.Dir.cwd().createDirPath(io, dir_name);
@@ -7745,7 +6206,7 @@ test "file migration checksum mismatch is rejected" {
 test "lock_timeout_ms is a no-op on SQLite and repeated runs succeed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
 
     const dir_name = "test_migrations_lock_sqlite";
     try std.Io.Dir.cwd().createDirPath(io, dir_name);
@@ -7782,10 +6243,10 @@ test "lock_timeout_ms is a no-op on SQLite and repeated runs succeed" {
 }
 
 test "schema-diff migration succeeds with locking enabled (SQLite)" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8183,10 +6644,10 @@ test "an index declaration reaches the DDL, and the migration plans the hnsw sta
     // a schema → `IndexInfo` → `IndexDef` → the statement `migrateSchema`
     // would run. The unit above pins the DDL; this pins that a schema's
     // declaration is what reaches it.
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const index = @import("../../core/index.zig");
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const index = @import("./core/index.zig");
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
     const allocator = std.testing.allocator;
 
     const Doc = schema("Doc", .{
@@ -8409,14 +6870,14 @@ test "MySQL/MariaDB identification is the version string, and an unknown server 
     // not name MariaDB either way), so this is the conservative path: warn and
     // answer `.mysql`. The success path is exercised against a real server by
     // the MySQL integration tests.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
     try std.testing.expectEqual(MySqlServer.mysql, detectMySqlServer(drv.asDriver()));
 }
 
 test "SQLite introspection refuses a table name that would break the PRAGMA" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8461,7 +6922,7 @@ test "SQLite introspection refuses a table name that would break the PRAGMA" {
 }
 
 test "getExistingIndexes reports key columns in order (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8505,11 +6966,11 @@ test "getExistingIndexes reports key columns in order (SQLite)" {
 }
 
 test "checkSchema reports index column drift and read_breaking_only ignores it (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const index = @import("../../core/index.zig");
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const index = @import("./core/index.zig");
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8550,11 +7011,11 @@ test "checkSchema reports index column drift and read_breaking_only ignores it (
 }
 
 test "checkSchema stays silent about indexes it cannot compare (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const index = @import("../../core/index.zig");
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const index = @import("./core/index.zig");
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8599,11 +7060,11 @@ test "checkSchema stays silent about indexes it cannot compare (SQLite)" {
 }
 
 test "checkSchema reports an index whose uniqueness differs (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const index = @import("../../core/index.zig");
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const index = @import("./core/index.zig");
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8681,11 +7142,11 @@ test "checkSchema reports an index whose uniqueness differs (SQLite)" {
 }
 
 test "checkSchema reports uniqueness drift on an index it cannot compare by key (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const index = @import("../../core/index.zig");
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const index = @import("./core/index.zig");
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8726,7 +7187,7 @@ test "checkSchema reports uniqueness drift on an index it cannot compare by key 
 }
 
 test "getExistingForeignKeys reads local and referenced columns in order (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8790,11 +7251,11 @@ test "getExistingForeignKeys reads local and referenced columns in order (SQLite
 }
 
 test "checkSchema reports a declared foreign key the database does not have (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -8969,10 +7430,10 @@ test "uniqueColumnChecked exempts only a primary key's own uniqueness" {
 }
 
 test "checkSchema reports a UNIQUE column nothing forces, and only then (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9057,10 +7518,10 @@ test "checkSchema reports a UNIQUE column nothing forces, and only then (SQLite)
 }
 
 test "checkSchema stays silent about a UNIQUE column a unique index it cannot read may force (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9085,10 +7546,10 @@ test "checkSchema stays silent about a UNIQUE column a unique index it cannot re
 }
 
 test "checkSchema still reports a UNIQUE column when the unreadable index is not unique (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9121,10 +7582,10 @@ test "checkSchema reports a view the database does not have, and read_breaking_o
     // created — or was dropped out of band — produced a green check while
     // `SELECT … FROM it` errored. That is a *broken read*, not a missed
     // optimisation, and this pins the difference.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9204,11 +7665,11 @@ test "checkSchema reports a missing M2M junction table, and read_breaking_only s
     // not a `TypeInfo`, so an M2M edge survived a green check while a query over
     // it failed with "no such table". Same silent class as `missing_view`, and
     // pinned the same way.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9345,11 +7806,11 @@ test "checkSchema compares a present M2M junction table's shape (SQLite)" {
     // columns, the pair's composite key, the two foreign keys — because a
     // junction of the right name with the wrong shape fails the relation query
     // (`no such column`) or accepts the same pair twice.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9517,11 +7978,11 @@ test "checkSchema compares a junction served by a view on its columns alone (SQL
     // a view can carry neither a primary key nor a foreign key, and asking would
     // report two foreign keys and a primary key no view could ever have — the
     // false report that blocks a deploy.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9578,11 +8039,11 @@ test "checkSchema needs no junction table for an M2M edge with an explicit edge 
     // entity and is checked as one. Expecting an implicit junction here would
     // report a table `migrateSchema` never creates — a false drift, which blocks
     // deploys.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9633,13 +8094,13 @@ test "a through schema's declared table_name names the junction end to end (SQLi
     // its own entity. Both faces now resolve through one rule
     // (graph.throughTableName): the write, the adjacency read and the drift
     // check all land on `zt_link`, and no short-name junction is created.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
-    const client_mod = @import("../../codegen/client.zig");
-    const deinitEntity = @import("../../codegen/entity.zig").deinitEntity;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
+    const client_mod = @import("./codegen/client.zig");
+    const deinitEntity = @import("./codegen/entity.zig").deinitEntity;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9766,7 +8227,7 @@ test "a through schema's declared table_name names the junction end to end (SQLi
 }
 
 test "getExistingViews reads the stored definition and answers an empty list otherwise (SQLite)" {
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
 
     var drv = try SQLiteDriver.open(std.testing.allocator, ":memory:");
     defer drv.close();
@@ -9889,10 +8350,10 @@ test "migrateSchema adds the unique index a column-level UNIQUE needs on an exis
     // — so every upsert call site against that table fails at runtime while the
     // schema says it works. The duplicate insert at the end is the proof that
     // the migration closed it.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
     const allocator = std.testing.allocator;
 
     var drv = try SQLiteDriver.open(allocator, ":memory:");
@@ -9938,11 +8399,11 @@ test "checkSchema names a junction table whose name is a declared entity's table
     // columns from the other table — every traversal of that edge reads the
     // wrong thing, and the shape drifts it produces (`missing_column` and the
     // rest) name the symptom rather than the cause.
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const edge = @import("../../core/edge.zig");
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const edge = @import("./core/edge.zig");
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
     const allocator = std.testing.allocator;
 
     // The derived junction name for two M2M sides is `<left>_<right>`, sorted,
@@ -10037,11 +8498,11 @@ test "an edge FK references the target's declared primary key (SQLite)" {
     // where foreign keys are enforced, the child's first INSERT fails with
     // `foreign key mismatch - "child" referencing "parent"`.
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const UploadFile = schema("UploadFile", .{
         .table_name = "xdaofood_upload_file",
@@ -10091,11 +8552,11 @@ test "an edge FK references a StorageKey-renamed id column (SQLite)" {
     // the physical primary key — the only column a foreign key can name — is
     // `file_uid`, not "id".
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const UploadFile = schema("UploadFile", .{
         .table_name = "xdaofood_upload_file",
@@ -10135,10 +8596,10 @@ test "a cross-referenced To edge FK references the target's pk too (SQLite)" {
     // upload_file table referenced a literal "id" as well — wrong for a target
     // with a custom pk, with the same first-INSERT failure on SQLite.
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
 
     const UploadFile = schema("UploadFile", .{
         .table_name = "xdaofood_upload_file",
@@ -10157,7 +8618,7 @@ test "a cross-referenced To edge FK references the target's pk too (SQLite)" {
     // present and pairs no constraint with it. A hand-built `fromSchema` list
     // is the shape where this branch owns both the column and its FK — the
     // shape a caller migrating a raw TypeInfo list uses.
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
     const owner_info = comptime fromSchema(Owner);
     const file_info = comptime fromSchema(UploadFile);
     const infos = &[_]TypeInfo{ owner_info, file_info };
@@ -10189,10 +8650,10 @@ test "junctionTableForEdge derives the ends' declared table names and pks" {
     // got a junction whose columns and REFERENCES named a table the entity
     // does not live in and a column it does not have.
     const allocator = std.testing.allocator;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const XfTagBase = schema("XfTag", .{
         .table_name = "xdaofood_tag",
@@ -10285,11 +8746,11 @@ test "an implicit M2M junction references each end's declared table and pk (SQLi
     // `.pk`, the junction has to name the declared table and pk on both
     // ends — under enforced foreign keys, not just in the DDL text.
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const ZtTagBase = schema("ZtTag", .{
         .table_name = "zt_tag_xref",
@@ -10366,10 +8827,10 @@ test "an edge to a target outside the graph contributes its column and no constr
     // in "junctionTableForEdge derives the ends' declared table names and pks";
     // this is the entity-table half, which had no pin.
     const allocator = std.testing.allocator;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const UploadFile = schema("UploadFile", .{
         .table_name = "xdaofood_upload_file",
@@ -10442,11 +8903,11 @@ test "migrateSchema warns once about an edge that crosses the graph (SQLite)" {
     // the library's own sink, documented for exactly this, not the root
     // module's `logFn` — so it is asserted here rather than left to a code read.
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const UploadFile = schema("UploadFile", .{
         .table_name = "xdaofood_upload_file",
@@ -10538,9 +8999,9 @@ test "a large graph does not trip the comptime quota the migration helpers evalu
     // the reported schema (its fields carry extension-type overrides, which cost
     // more per field than the plain `Int` fields below), so it is a size
     // regression guard, not a replay of that graph.
-    const field = @import("../../core/field.zig");
-    const Schema = @import("../../core/schema.zig").Schema;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const field = @import("./core/field.zig");
+    const Schema = @import("./core/schema.zig").Schema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     const QuotaTables = 200;
     const Fields = struct {
@@ -10571,7 +9032,7 @@ test "a large graph does not trip the comptime quota the migration helpers evalu
     // A fixed budget is what the report was about: 50_000 is what
     // `tableFromTypeInfoCrossRef` used to set, and it is not enough for a
     // 154-table graph. The scaled one is above it by construction.
-    try std.testing.expect(evalQuotaFor(infos) > 50_000);
+    try std.testing.expect(budget.graph(infos.len) > 50_000);
 
     // No declared extension type, so the answer is empty — the point is that it
     // is *computed* rather than aborting the compilation.
@@ -10587,9 +9048,9 @@ test "a large graph does not trip the comptime quota the migration helpers evalu
 }
 
 test "requiredPostgresExtensions lists a graph's declared extension types, once each" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     // Three declaration shapes: the `field.Vector` kind, an explicit
     // `.SqlType(…)` override (`field.Other` is the same field underneath), and
@@ -10803,9 +9264,9 @@ const ExtensionStub = struct {
 };
 
 test "the PostgreSQL extension check refuses a missing extension, and asks nothing when nothing is needed" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const Doc = schema("ExtCheckDoc", .{ .fields = &.{ field.Int("id"), field.Vector("embedding", 3) } });
     const Plain = schema("ExtCheckPlain", .{ .fields = &.{ field.Int("id"), field.String("name") } });
@@ -10869,9 +9330,9 @@ test "a server without pg_extension is not refused, and says so once" {
     // the read is an error: each is a warning and the run continues, and the
     // declared types go to the server as declared. A server that cannot provide
     // them answers its own, louder error at the DDL.
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const Doc = schema("ExtAbsentDoc", .{ .fields = &.{ field.Int("id"), field.Vector("embedding", 3) } });
     const with_vector = comptime buildGraph(&.{Doc}).types;
@@ -10984,9 +9445,9 @@ test "every migration entry point refuses a missing extension before its first s
     // entry points are checked one by one because each is a separate place the
     // check has to be wired, and only `migrateSchemaWithOptions` is exercised by
     // the PG integration case.
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const Doc = schema("ExtEntryDoc", .{ .fields = &.{ field.Int("id"), field.Vector("embedding", 3) } });
     const infos = comptime buildGraph(&.{Doc}).types;
@@ -11167,9 +9628,9 @@ test "an error raised after the commit releases the migration's transaction exac
     // HeliosDB Nano that was a use-after-free that took the process down with a
     // segfault. The schema needs no extension type, so the only statements this
     // stub answers with anything but "no rows" are the DDL the planner emits.
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const Doc = schema("TxReleaseDoc", .{ .fields = &.{ field.Int("id"), field.String("name") } });
     const infos = comptime buildGraph(&.{Doc}).types;
@@ -11407,9 +9868,9 @@ const PostgresIndexCatalogStub = struct {
 /// second index the stub's catalog has that the schema does not declare (a
 /// database-only index, which no comparison may report).
 const PgIdxDoc = blk: {
-    const field = @import("../../core/field.zig");
-    const index_mod = @import("../../core/index.zig");
-    const Schema = @import("../../core/schema.zig").Schema;
+    const field = @import("./core/field.zig");
+    const index_mod = @import("./core/index.zig");
+    const Schema = @import("./core/schema.zig").Schema;
     break :blk Schema("PgIdxDoc", .{
         .table_name = "pg_idx_doc",
         .fields = &.{ field.Int("tenant_id"), field.String("title") },
@@ -11488,7 +9949,7 @@ test "an index read that has pg_am is unchanged and comparable" {
 
 test "an index read survives a server without pg_am, by name and uniqueness" {
     const allocator = std.testing.allocator;
-    const fromSchema = @import("../../codegen/graph.zig").fromSchema;
+    const fromSchema = @import("./codegen/graph.zig").fromSchema;
 
     const info = comptime fromSchema(PgIdxDoc);
     const infos = &[_]TypeInfo{info};
@@ -11625,9 +10086,9 @@ const pg_fk_columns_rows = [_]CatalogStubRow{
 /// The child of the foreign-key case: a `From` edge with an explicit column, so
 /// the graph carries a declared key whose presence `checkSchema` asks about.
 const PgFkSchemas = struct {
-    const field = @import("../../core/field.zig");
-    const edge = @import("../../core/edge.zig");
-    const Schema = @import("../../core/schema.zig").Schema;
+    const field = @import("./core/field.zig");
+    const edge = @import("./core/edge.zig");
+    const Schema = @import("./core/schema.zig").Schema;
 
     const Parent = Schema("PgFkParent", .{
         .table_name = "pg_fk_parent",
@@ -11651,7 +10112,7 @@ test "a server without pg_proc reports no foreign key rather than a missing one"
     // reach the planner as "absent" — that is how a duplicate `ADD CONSTRAINT`
     // gets planned.
     const allocator = std.testing.allocator;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const infos = comptime buildGraph(&.{ PgFkSchemas.Parent, PgFkSchemas.Child }).types;
 
@@ -11752,9 +10213,9 @@ test "declaredTypeRewrite answers only for a declaration this dialect cannot emi
 }
 
 test "warnDegradedColumnTypes names table, column and both types, once per column" {
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const Doc = schema("ZentDegradedDoc", .{
         .fields = &.{
@@ -11813,10 +10274,10 @@ test "migrateSchema warns once per degraded column, vector and .SqlType override
     // DDL that results really is the type the line describes, for both shapes a
     // declaration can take: `field.Vector`'s kind and a `.SqlType(…)` override.
     const allocator = std.testing.allocator;
-    const SQLiteDriver = @import("../sqlite.zig").SQLiteDriver;
-    const field = @import("../../core/field.zig");
-    const schema = @import("../../core/schema.zig").Schema;
-    const buildGraph = @import("../../codegen/graph.zig").buildGraph;
+    const SQLiteDriver = @import("./sql/sqlite.zig").SQLiteDriver;
+    const field = @import("./core/field.zig");
+    const schema = @import("./core/schema.zig").Schema;
+    const buildGraph = @import("./codegen/graph.zig").buildGraph;
 
     const Doc = schema("ZentVectorDoc", .{
         .fields = &.{
