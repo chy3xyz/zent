@@ -322,6 +322,7 @@ pub fn makePredicates(comptime infos: []const TypeInfo, comptime info: TypeInfo)
                         }.unknownFieldGen };
                     }
                     return .{ .has_neighbors_with = .{
+                        .render = graph_neighbors.appendHasNeighborsWith,
                         .step = step,
                         .preds = preds,
                         .soft_delete = target_soft_delete,
@@ -452,7 +453,7 @@ pub fn lowerHasEdge(
     // doubled the O(edges) buildEdgeStep work per entity on every graph.
     const edge_steps = comptime blk: {
         @setEvalBranchQuota(budget.flat);
-        var steps: [info.edges.len]struct { name: []const u8, step: @import("../graph/step.zig").Step, soft_delete: bool } = undefined;
+        var steps: [info.edges.len]struct { name: []const u8, step: @import("../base/step.zig").Step, soft_delete: bool } = undefined;
         for (info.edges, 0..) |e, i| {
             const target_info = edgeTargetInfo(infos, info, e);
             // The lowered predicate is an EXISTS over the *target* table, so
@@ -476,9 +477,9 @@ pub fn lowerHasEdge(
                         const preds = try allocator.alloc(sql.Predicate, 1);
                         preds[0] = nested.*;
                         allocator.destroy(nested);
-                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = preds, .soft_delete = es.soft_delete } };
+                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = preds, .soft_delete = es.soft_delete, .render = graph_neighbors.appendHasNeighborsWith } };
                     } else {
-                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{}, .soft_delete = es.soft_delete } };
+                        pred.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{}, .soft_delete = es.soft_delete, .render = graph_neighbors.appendHasNeighborsWith } };
                     }
                     lowered = true;
                     break;
@@ -491,7 +492,7 @@ pub fn lowerHasEdge(
             for (edge_steps) |es| {
                 if (std.mem.eql(u8, es.name, h.edge_name)) {
                     const inner = try allocator.create(sql.Predicate);
-                    inner.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{}, .soft_delete = es.soft_delete } };
+                    inner.* = .{ .has_neighbors_with = .{ .step = es.step, .preds = &.{}, .soft_delete = es.soft_delete, .render = graph_neighbors.appendHasNeighborsWith } };
                     pred.* = .{ .not_ = inner };
                     lowered = true;
                     break;

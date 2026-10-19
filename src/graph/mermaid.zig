@@ -1,5 +1,5 @@
 const std = @import("std");
-const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
+const TypeInfo = @import("../ir.zig").TypeInfo;
 
 /// Generates a Mermaid.js ER diagram string (`erDiagram`) for the given schemas.
 /// Caller owns the returned string memory and must free it with `allocator.free()`.

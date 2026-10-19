@@ -1,7 +1,7 @@
 const std = @import("std");
 const dialect_mod = @import("../base/dialect.zig");
 const Dialect = dialect_mod.Dialect;
-const Step = @import("../graph/step.zig").Step;
+const Step = @import("../base/step.zig").Step;
 const value_mod = @import("../base/value.zig");
 pub const Value = value_mod.Value;
 
@@ -342,7 +342,20 @@ pub const Predicate = union(enum) {
     /// EXISTS subquery with additional predicates on the neighbor side.
     /// The step describes the edge to traverse; preds are applied as AND
     /// conditions inside the subquery.
-    has_neighbors_with: struct { step: Step, preds: []const Predicate, soft_delete: bool = false },
+    ///
+    /// `render` is the graph layer's own writer (`graph/neighbors.zig`'s
+    /// `appendHasNeighborsWith`), supplied by whoever constructs the variant
+    /// rather than imported here. Two reasons, one historical: the SQL builder
+    /// must not depend on the graph package (that import pointed the wrong way
+    /// and is what made the two packages a cycle), and keeping exactly *one*
+    /// implementation is what fixed the soft-delete scope this prong used to
+    /// drop when it carried its own inline copy.
+    has_neighbors_with: struct {
+        step: Step,
+        preds: []const Predicate,
+        soft_delete: bool = false,
+        render: *const fn (*Builder, Step, []const Predicate, bool) anyerror!void,
+    },
     /// EntQL `has(edge)` / `not_has(edge)` placeholders. Emission fails with
     /// `error.UnimplementedHasEdge` until schema-aware lowering resolves edge
     /// tables, foreign-key columns, and correlation semantics.
@@ -623,14 +636,8 @@ pub const Predicate = union(enum) {
                 try b.writeByte(')');
             },
             .has_neighbors_with => |h| {
-                // Rendered by the graph layer: the EXISTS body is also emitted by
-                // `graph_neighbors.appendHasNeighborsWith`, and keeping a second
-                // inline copy here is how this prong silently ignored the
-                // target's soft-delete scope (`h.soft_delete`), while its sibling
-                // honoured it. One implementation, one place to change.
-                const graph_neighbors = @import("../graph/neighbors.zig");
                 try b.writeString("EXISTS (");
-                try graph_neighbors.appendHasNeighborsWith(b, h.step, h.preds, h.soft_delete);
+                try h.render(b, h.step, h.preds, h.soft_delete);
                 try b.writeByte(')');
             },
             .has_edge, .not_has_edge => return error.UnimplementedHasEdge,

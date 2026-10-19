@@ -361,6 +361,10 @@ Entities and queries are explicitly owned by the caller. See the contract:
   `value.zig` (`Value`/`Filter`), `dialect.zig` (dialect identity +
   `placeholder`/`quoteIdent`), `log.zig`, `budget.zig` (comptime branch budget).
   Imports nothing but `std`; keep it that way — it is what lets `core` stay a leaf.
+- `src/ir.zig` — the compile-time IR (`TypeInfo`/`FieldInfo`/`EdgeInfo`/
+  `IndexInfo`): *declared* here, built by `codegen/graph.zig`, read by both
+  `codegen` and `graph` — in its own file so those two cannot import each
+  other. `codegen/graph.zig` re-exports the names.
 - `src/core/` — comptime schema definition API (imports `base` and `privacy`
   types only; **never** `sql`)
 - `src/codegen/` — comptime client/query/mutation generation
@@ -379,10 +383,12 @@ Entities and queries are explicitly owned by the caller. See the contract:
 - `src/graph/` — graph traversal helpers
 - `src/entql/` — EntQL expression parser
 
-Layer rule of thumb: a new module imports **downwards** (`base` ← `core` ←
-`codegen` ← `sql`/`migrate` ← `services`). The two remaining production cycles
-(`codegen ↔ graph`, `graph ↔ sql`) are documented in `docs/ARCHITECTURE.md`;
-do not add a third.
+Layer rule of thumb: a new module imports **downwards** (`base` ← `core`/`ir` ←
+`codegen` ← `sql`/`graph`/`runtime`/`privacy`/`entql` ← `migrate` ← `services` ←
+`root`). The package graph has **no production-level cycles** and should stay
+that way: when a helper seems to need the layer above, pass a value or a function
+pointer instead (that is how `sql ↔ graph` and `codegen ↔ graph` were broken —
+see `docs/ARCHITECTURE.md`).
 - `examples/start/` — schema introspection + CRUD smoke test
 - `examples/complex/` — e-commerce demo with advanced SQL operations
 - `examples/pool/` — connection-pool usage demo

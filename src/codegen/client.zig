@@ -28,7 +28,7 @@ const BulkDeleteGen = @import("update_delete.zig").BulkDeleteBuilder;
 const PredGen = @import("predicate.zig").makePredicates;
 const buildEdgeStep = @import("graph.zig").buildEdgeStep;
 const graph_neighbors = @import("../graph/neighbors.zig");
-const graph_step = @import("../graph/step.zig");
+const graph_step = @import("../base/step.zig");
 const MetaGen = @import("meta.zig").Meta;
 
 fn capitalize(comptime s: []const u8) []const u8 {

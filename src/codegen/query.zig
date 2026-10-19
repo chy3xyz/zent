@@ -137,7 +137,7 @@ const deinitEntity = @import("entity.zig").deinitEntity;
 const deinitEntityList = @import("entity.zig").deinitEntityList;
 const deinitEagerTarget = @import("entity.zig").deinitEagerTarget;
 const EntityGen = @import("entity.zig").Entity;
-const graph_step = @import("../graph/step.zig");
+const graph_step = @import("../base/step.zig");
 const graph_neighbors = @import("../graph/neighbors.zig");
 const explain = @import("../sql/explain.zig");
 

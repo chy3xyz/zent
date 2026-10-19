@@ -17,12 +17,19 @@ base (src/base)          no imports outside std — the shared vocabulary
    ├── value.zig         Value / Filter (SQL parameter values, edge filters)
    ├── dialect.zig       Dialect identity + kind() + placeholder/quoteIdent
    ├── log.zig           where the library's own diagnostics go
+   ├── step.zig          one join step (`Rel` + `Step`): the descriptor the SQL
+   │                     builder renders and the graph layer produces
    └── budget.zig        the comptime branch budget (flat / graph(tables))
    ▲        ▲        ▲        ▲
    │        │        │        └─────────────┐
 schema (src/core)  │        │                │
    field / edge / index / schema / mixin / id │
    │  comptime definitions, no SQL            │
+   ▼                                          │
+ir (src/ir.zig)          TypeInfo / FieldInfo / EdgeInfo / IndexInfo
+   the flattened schema: *declared* here, built by `buildGraph`, read by
+   both `codegen` and `graph` — the one thing they share, which is why the
+   declaration is in neither of them
    ▼                                          │
 graph (src/codegen/graph.zig) ── TypeInfo / EdgeInfo (compile-time IR)
    │                                          │
@@ -73,13 +80,26 @@ cross-cutting (each imports downwards only):
    runtime/  hook chain, errors, privacy context
 ```
 
-**Cycles that remain, and why they are tolerated.** `codegen ↔ graph` and
-`graph ↔ sql` are two-way in production code: `graph/neighbors.zig` builds a
-`Builder`, `sql/builder.zig` reaches into `graph/step.zig` for `joinEdge`, and
-`graph/mermaid.zig`/`doc_exporter.zig` read `codegen/graph.zig`. Zig does not
-order compilation units, so they cost nothing at build time; they are listed
-here because a new module should not add a third, and because the fix (moving
-`joinEdge`'s SQL half into `sql/`) is worth doing when that area is next touched.
+**There are no production-level cycles left, and keeping it that way is the
+rule.** Measured by resolving every `@import` outside `test` blocks, the package
+graph is a DAG: `base` ← `core`/`ir` ← `codegen` ← {`sql`, `graph`, `runtime`,
+`privacy`, `entql`} ← `migrate` ← `services` ← `root`. Two used to be two-way,
+and each was a deliberate inversion rather than an accident:
+
+- **`sql ↔ graph`** — the builder imported `graph/step.zig` for the join
+  descriptor and `graph/neighbors.zig` for the `has_neighbors_with` body. The
+  descriptor moved to `base/step.zig` (plain data), and the predicate variant now
+  carries a `render` *function pointer* supplied by its constructor, so the
+  builder never names the graph package. Keeping one implementation is the point:
+  a second inline copy is what once dropped the target's soft-delete scope.
+- **`codegen ↔ graph`** — `graph/mermaid.zig` and `graph/doc_exporter.zig` read
+  `TypeInfo` from `codegen/graph.zig`, the module that *builds* it. The IR
+  declarations moved to `src/ir.zig`; `codegen/graph.zig` re-exports them, so
+  every `@import("codegen/graph.zig").TypeInfo` still resolves.
+
+A new module should import downwards. When a helper genuinely seems to need the
+layer above, pass a value or a function pointer — that is the shape both fixes
+took.
 
 ## Compile-time flow
 

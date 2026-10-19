@@ -1,7 +1,7 @@
 const std = @import("std");
 const Dialect = @import("../base/dialect.zig").Dialect;
 const sql = @import("../sql/builder.zig");
-const Step = @import("step.zig").Step;
+const Step = @import("../base/step.zig").Step;
 
 // ------------------------------------------------------------------
 // Internal helpers

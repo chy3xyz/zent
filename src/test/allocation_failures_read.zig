@@ -40,7 +40,7 @@ const Rows = driver_mod.Rows;
 const scan = @import("../sql/scan.zig");
 const sql = @import("../sql/builder.zig");
 const neighbors = @import("../graph/neighbors.zig");
-const Step = @import("../graph/step.zig").Step;
+const Step = @import("../base/step.zig").Step;
 
 // ------------------------------------------------------------------
 // A one-row `Row` fixture, and a `Driver` that yields a fixed list of them
@@ -378,7 +378,7 @@ const neighbor_preds = [_]sql.Predicate{
     // The predicate form of the other entry point: rendering it routes back
     // into `appendHasNeighborsWith`, so the nested EXISTS body is assembled by
     // the same call the second half of this test makes directly.
-    .{ .has_neighbors_with = .{ .step = reply_step, .preds = &.{sql.EQ("kind", .{ .string = "reply" })}, .soft_delete = true } },
+    .{ .has_neighbors_with = .{ .render = neighbors.appendHasNeighborsWith, .step = reply_step, .preds = &.{sql.EQ("kind", .{ .string = "reply" })}, .soft_delete = true } },
 };
 
 test "an entity with a JSON field unwinds cleanly when any single allocation fails" {

@@ -58,6 +58,27 @@
     },
     {
       "file": "src/codegen/graph.zig",
+      "line": 16,
+      "kind": "constant",
+      "name": "Policy",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/graph.zig",
+      "line": 17,
+      "kind": "constant",
+      "name": "Annotation",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/graph.zig",
+      "line": 19,
+      "kind": "constant",
+      "name": "value",
+      "parent": null
+    },
+    {
+      "file": "src/codegen/graph.zig",
       "line": 154,
       "kind": "function",
       "name": "toFieldInfo",
@@ -145,6 +166,13 @@
       "line": 320,
       "kind": "function",
       "name": "runSQL",
+      "parent": null
+    },
+    {
+      "file": "src/ir.zig",
+      "line": 13,
+      "kind": "constant",
+      "name": "std",
       "parent": null
     },
     {

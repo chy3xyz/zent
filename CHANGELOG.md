@@ -32,6 +32,16 @@ All notable changes to this project will be documented in this file.
   - **`src/services/`** — `crud`, `crud_helpers`, `outbox`, `shard`, `helpers`:
     the layer a consumer wires rather than generates. `zent.crud` and friends are
     unchanged, and `zent.services` groups them.
+  - **the last two cycles are gone too.** `sql ↔ graph`: the join descriptor
+    (`Step`) moved to `base/step.zig` as plain data, and the
+    `has_neighbors_with` predicate variant now carries a `render` **function
+    pointer** supplied by whoever builds it, so `sql/builder.zig` no longer
+    imports the graph package while the single implementation (the one that
+    fixed the target's soft-delete scope) stays single. `codegen ↔ graph`: the
+    IR *declarations* moved to `src/ir.zig`; `codegen/graph.zig` builds them and
+    re-exports them, so `graph/mermaid.zig` and `graph/doc_exporter.zig` read
+    `TypeInfo` from neither consumer. The package graph is now a **DAG**, and
+    `docs/ARCHITECTURE.md` states that as a rule rather than an accident.
   Export paths are unchanged (`zent.sql_dialect`, `zent.sql_schema`,
   `zent.runtime.log`, …); `zent.base` / `zent.services` / `zent.migrate` are new
   ways to name what was already there. No behaviour change: the same 642 unit
