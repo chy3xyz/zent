@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.97.0] - 2026-10-20
+
 ### Changed
 
 - **The tree now has a layer order that matches the imports.** Measured on
