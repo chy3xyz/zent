@@ -817,6 +817,26 @@ try Client.UseInterceptor(infos, &client, .{
   query counters) and are registered once per client.
 - `view.whereEq` validates the field against the entity schema —
   `error.UnknownField` surfaces as `error.InterceptFailed` on the query.
+  **That includes an eager-loaded target**: a `WithEdge` load asks the target's
+  own builder to render the predicate, so a schema where only some tables carry
+  the tenant column needs the scoped form below, or the load fails rather than
+  silently widening.
+- Scope by table when the schema is heterogeneous — `view.table_name` is the
+  physical name the operation targets:
+
+  ```zig
+  fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+      const id: *i64 = @ptrCast(@alignCast(ctx.?));
+      if (std.mem.indexOf(u8, view.table_name, "order") != null)
+          try view.whereEq("tenant_id", .{ .int = id.* });
+  }
+  ```
+
+  The `interceptor × eager-load` cells this covers (o2m / m2o / m2m, shared
+  column names, the junction carrying the column, a target with no scoped column
+  at all) are listed as a table at the top of
+  `tests/integration/sqlite.zig`'s "an interceptor scopes the eager load by
+  table" test.
 - Interceptor errors abort the operation: the first error wins, and all
   errors collapse to `error.InterceptFailed` at the builder boundary
   (execution methods keep explicit error sets).
