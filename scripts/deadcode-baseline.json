@@ -156,6 +156,55 @@
     },
     {
       "file": "src/migrate.zig",
+      "line": 5,
+      "kind": "constant",
+      "name": "declaredPgType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 7,
+      "kind": "constant",
+      "name": "pgInternalSpelling",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 8,
+      "kind": "constant",
+      "name": "pgUdtBaseName",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 9,
+      "kind": "constant",
+      "name": "NormalizedType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 10,
+      "kind": "constant",
+      "name": "DeclaredPgType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 23,
+      "kind": "constant",
+      "name": "appendJunctionRelationDrifts",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 24,
+      "kind": "constant",
+      "name": "appendJunctionShapeDrifts",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
       "line": 26,
       "kind": "constant",
       "name": "isBareIdentifier",
@@ -177,9 +226,30 @@
     },
     {
       "file": "src/migrate.zig",
+      "line": 31,
+      "kind": "constant",
+      "name": "uniqueColumnDriftDetail",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 33,
+      "kind": "constant",
+      "name": "missingJunctionTableDetail",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
       "line": 34,
       "kind": "constant",
       "name": "EdgeRefTarget",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 35,
+      "kind": "constant",
+      "name": "junctionNameCollisionDetail",
       "parent": null
     },
     {
@@ -191,6 +261,27 @@
     },
     {
       "file": "src/migrate.zig",
+      "line": 36,
+      "kind": "constant",
+      "name": "junctionShapeClause",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 37,
+      "kind": "constant",
+      "name": "missingJunctionColumnDetail",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 38,
+      "kind": "constant",
+      "name": "junctionPairUniquenessDetail",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
       "line": 39,
       "kind": "constant",
       "name": "defaultValueStr",
@@ -198,9 +289,51 @@
     },
     {
       "file": "src/migrate.zig",
+      "line": 39,
+      "kind": "constant",
+      "name": "foreignKeyDetailAlloc",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 40,
+      "kind": "constant",
+      "name": "columnsEqual",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 41,
+      "kind": "constant",
+      "name": "indexColumnsDetailAlloc",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 42,
+      "kind": "constant",
+      "name": "indexUniquenessDetailAlloc",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 44,
+      "kind": "constant",
+      "name": "freeDriftOwnedFields",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
       "line": 46,
       "kind": "constant",
       "name": "isMySqlAutoIncrementType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 46,
+      "kind": "constant",
+      "name": "appendOwnedDrift",
       "parent": null
     },
     {
@@ -226,6 +359,13 @@
     },
     {
       "file": "src/migrate.zig",
+      "line": 54,
+      "kind": "constant",
+      "name": "dupeLower",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
       "line": 55,
       "kind": "constant",
       "name": "columnDefByName",
@@ -236,6 +376,20 @@
       "line": 56,
       "kind": "constant",
       "name": "PostgresExtensionType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 56,
+      "kind": "constant",
+      "name": "pgRelationListed",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 57,
+      "kind": "constant",
+      "name": "reportUnusableSqliteName",
       "parent": null
     },
     {
@@ -261,9 +415,37 @@
     },
     {
       "file": "src/migrate.zig",
+      "line": 72,
+      "kind": "constant",
+      "name": "IntrospectionError",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 73,
+      "kind": "constant",
+      "name": "sqlitePragmaNameUsable",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 74,
+      "kind": "constant",
+      "name": "postgresStatementRefused",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
       "line": 76,
       "kind": "constant",
       "name": "FieldInfo",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 77,
+      "kind": "constant",
+      "name": "closeExistingIndex",
       "parent": null
     },
     {
@@ -275,9 +457,93 @@
     },
     {
       "file": "src/migrate.zig",
+      "line": 80,
+      "kind": "constant",
+      "name": "getSQLiteIndexes",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 83,
+      "kind": "constant",
+      "name": "closeExistingForeignKey",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
       "line": 84,
       "kind": "constant",
       "name": "dialect_expr",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 84,
+      "kind": "constant",
+      "name": "getMySQLForeignKeys",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 85,
+      "kind": "constant",
+      "name": "getPostgresForeignKeys",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 86,
+      "kind": "constant",
+      "name": "getSQLiteForeignKeys",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 89,
+      "kind": "constant",
+      "name": "getViewsByQuery",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 90,
+      "kind": "constant",
+      "name": "getSQLiteViews",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 91,
+      "kind": "constant",
+      "name": "getPostgresViews",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 92,
+      "kind": "constant",
+      "name": "getMySQLViews",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 148,
+      "kind": "constant",
+      "name": "postgres_extension_types",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 152,
+      "kind": "constant",
+      "name": "requiredExtensionsJoined",
+      "parent": null
+    },
+    {
+      "file": "src/migrate.zig",
+      "line": 168,
+      "kind": "constant",
+      "name": "EdgeInfo",
       "parent": null
     },
     {
@@ -524,6 +790,69 @@
       "kind": "function",
       "name": "stubInTransaction",
       "parent": "PostgresIndexCatalogStub"
+    },
+    {
+      "file": "src/migrate/drift.zig",
+      "line": 15,
+      "kind": "constant",
+      "name": "field_mod",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/drift.zig",
+      "line": 26,
+      "kind": "constant",
+      "name": "IndexDef",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/drift.zig",
+      "line": 27,
+      "kind": "constant",
+      "name": "normalizeSqlType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/drift.zig",
+      "line": 29,
+      "kind": "constant",
+      "name": "dialectDisplayName",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/drift.zig",
+      "line": 46,
+      "kind": "constant",
+      "name": "edgeFKUsesRefTarget",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/drift.zig",
+      "line": 50,
+      "kind": "constant",
+      "name": "NormalizedType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/drift.zig",
+      "line": 52,
+      "kind": "constant",
+      "name": "DeclaredPgType",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/introspect.zig",
+      "line": 15,
+      "kind": "constant",
+      "name": "budget",
+      "parent": null
+    },
+    {
+      "file": "src/migrate/introspect.zig",
+      "line": 16,
+      "kind": "constant",
+      "name": "Dialect",
+      "parent": null
     },
     {
       "file": "src/sql/postgres.zig",

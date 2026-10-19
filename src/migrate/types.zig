@@ -8,11 +8,11 @@
 
 const std = @import("std");
 
-const budget = @import("../base/budget.zig");
-const field_mod = @import("../core/field.zig");
-const dialect_expr = @import("../sql/dialect_expr.zig");
-const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
-const Dialect = @import("../base/dialect.zig").Dialect;
+pub const budget = @import("../base/budget.zig");
+pub const field_mod = @import("../core/field.zig");
+pub const Dialect = @import("../base/dialect.zig").Dialect;
+pub const dialect_expr = @import("../sql/dialect_expr.zig");
+pub const TypeInfo = @import("../codegen/graph.zig").TypeInfo;
 
 /// Returns true if `sql_type` is an integer type that supports AUTO_INCREMENT in MySQL.
 pub fn isMySqlAutoIncrementType(sql_type: []const u8) bool {
@@ -525,4 +525,108 @@ pub const TableDef = struct {
 
 pub fn isSQLiteDialect(dialect: Dialect) bool {
     return dialect.kind() == .sqlite;
+}
+
+/// A declared PostgreSQL type split into the name its element/own type is
+/// compared under, and whether the declaration is an array of it.
+pub const DeclaredPgType = struct {
+    name: []const u8,
+    is_array: bool,
+};
+
+/// Split a declared PostgreSQL type: drop every `[]` suffix and any `schema.`
+/// qualifier, and report whether the declaration was an array.
+///
+/// Every `[]` goes, not just one: PostgreSQL's catalog reports `integer[][]`
+/// and `integer[]` identically (`ARRAY` + `_int4`) — the dimensionality is not
+/// in `information_schema.columns` at all — so refusing the multi-dimensional
+/// spelling would be a drift report for a difference the server cannot express.
+/// The qualifier goes because `udt_name` is the bare `pg_type.typname` with no
+/// schema in it: a `public.vector(1536)` declaration has to compare equal to
+/// the `vector` the catalog answers, and `udt_schema` (which would tell them
+/// apart) is deliberately not read.
+pub fn declaredPgType(schema_type: []const u8) DeclaredPgType {
+    var name = std.mem.trim(u8, schema_type, " ");
+    var is_array = false;
+    while (std.mem.endsWith(u8, name, "[]")) {
+        name = std.mem.trimEnd(u8, name[0 .. name.len - 2], " ");
+        is_array = true;
+    }
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name = name[dot + 1 ..];
+    return .{ .name = name, .is_array = is_array };
+}
+
+/// `normalizeSqlType` into a caller-provided stack buffer, falling back to the
+/// heap when the declared type does not fit. The dialect rides along because
+/// the comparison is not spelling-identity on every server: MySQL reports its
+/// storage types under different names (see `normalizeSqlType`).
+///
+/// The fallback is the point. This comparison used to read
+/// `normalizeSqlType(...) catch null` with a 128-byte stack buffer, so a type
+/// longer than that — a hand-written `sql_type`, a `longtext CHARACTER SET …
+/// COLLATE …`, an `ENUM` dump — made the whole comparison **disappear**, and
+/// "no `type_mismatch` reported" is indistinguishable from "the types agree".
+/// That is the one outcome a drift check must never fake, so a type that does
+/// not fit is normalized on the heap rather than skipped.
+pub fn normalizeTypeForCompare(
+    allocator: std.mem.Allocator,
+    sql_type: []const u8,
+    stack_buf: *[128]u8,
+    dialect: Dialect,
+) error{OutOfMemory}!NormalizedType {
+    if (normalizeSqlType(sql_type, stack_buf, dialect)) |norm| {
+        return .{ .text = norm, .owned = null };
+    } else |err| switch (err) {
+        error.NoSpaceLeft => {},
+    }
+
+    const heap = try allocator.alloc(u8, sql_type.len);
+    if (normalizeSqlType(sql_type, heap, dialect)) |norm| {
+        return .{ .text = norm, .owned = heap };
+    } else |_| {
+        allocator.free(heap);
+        return error.OutOfMemory;
+    }
+}
+
+/// `udt_name`'s spellings for the built-in types that have one, mapped onto
+/// `information_schema`'s — `_float8` is a `double precision[]` column, so its
+/// element is compared as `double precision`, and `_int2` as `smallint`.
+///
+/// The shared alias table (`normalizeSqlType`) already carries `int4` →
+/// `integer`; this is the rest of the family. It is consulted from the
+/// `USER-DEFINED`/`ARRAY` branch only, so the built-in comparison keeps its
+/// exact behaviour, and every entry maps two spellings of *one* PostgreSQL
+/// type — it can turn a false drift into a match, never a difference into one.
+/// (`_bpchar` is `character`, whose element name would otherwise not match.)
+pub fn pgInternalSpelling(name: []const u8) []const u8 {
+    const aliases = [_]struct { udt: []const u8, info_schema: []const u8 }{
+        .{ .udt = "int2", .info_schema = "smallint" },
+        .{ .udt = "int8", .info_schema = "bigint" },
+        .{ .udt = "float4", .info_schema = "real" },
+        .{ .udt = "float8", .info_schema = "double precision" },
+        .{ .udt = "bpchar", .info_schema = "character" },
+    };
+    for (aliases) |alias| {
+        if (std.ascii.eqlIgnoreCase(name, alias.udt)) return alias.info_schema;
+    }
+    return name;
+}
+
+pub const NormalizedType = struct {
+    text: []const u8,
+    /// Set when `text` came from the heap and the caller must free it.
+    owned: ?[]u8,
+
+    pub fn deinit(self: NormalizedType, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
+    }
+};
+
+/// The element type behind an `ARRAY` column's `udt_name`: PostgreSQL names
+/// every array type after its element with a leading `_` (`_int4`, `_citext`).
+/// A name without the prefix is returned as it is.
+pub fn pgUdtBaseName(udt_name: []const u8, is_array: bool) []const u8 {
+    if (is_array and udt_name.len > 1 and udt_name[0] == '_') return udt_name[1..];
+    return udt_name;
 }

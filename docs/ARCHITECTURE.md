@@ -47,9 +47,15 @@ sql (src/sql)         Dialect-aware SQL builder + driver interface
    └── logger/explain/walltime/dialect_expr
 
 migrate (src/migrate.zig + src/migrate/)   schema migration
-   ├── types.zig      column/table/index shapes + declared→dialect type mapping
-   ├── ddl.zig        CREATE TABLE/INDEX/VIEW, junction tables, MySQL text rules
-   └── migrate.zig    introspection, drift, plan, execution guards, history, lock
+   ├── types.zig      632  column/table/index shapes, declared→dialect type
+   │                       mapping, the comparison rules (normalize/agree)
+   ├── ddl.zig       1116  CREATE TABLE/INDEX/VIEW, junction tables, MySQL text rules
+   ├── introspect.zig 1334 catalog reads per dialect + the capability probes
+   │                       (`pg_am`/`pg_proc`/`pg_extension`), one named error
+   │                       when a server cannot answer
+   ├── drift.zig     1524  checkSchema/assertSchema/nullability + drift details
+   └── migrate.zig   7540  plan, execution guards, history table, advisory lock,
+                           options/errors — and the module's tests (≈5.6k lines)
    Consumes `codegen/graph.zig`, which is why it sits *above* `sql` and not in
    it: keeping it under `sql/` made the SQL layer import the codegen layer.
 

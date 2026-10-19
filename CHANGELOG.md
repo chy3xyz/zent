@@ -18,11 +18,16 @@ All notable changes to this project will be documented in this file.
     but `std`. `core` now imports no SQL module at all.
   - **`src/migrate.zig` + `src/migrate/`** — schema migration moved out of
     `sql/schema/`, because it *consumes* the generated type graph: keeping it
-    under `sql` made the SQL layer import codegen. Its two pure halves are now
-    their own files — `types.zig` (the column/table/index shapes and the
-    declared→dialect type mapping) and `ddl.zig` (CREATE TABLE/INDEX/VIEW,
-    junction tables, MySQL text rules) — leaving `migrate.zig` with
-    introspection, drift, planning, execution guards and the history table.
+    under `sql` made the SQL layer import codegen. It is now four files, each
+    with one job: `types.zig` (shapes, declared→dialect type mapping, the
+    comparison rules), `ddl.zig` (CREATE TABLE/INDEX/VIEW, junction tables,
+    MySQL text rules), `introspect.zig` (the catalog reads per dialect and the
+    capability probes — where a server that cannot answer gets a *named* error
+    instead of a driver failure) and `drift.zig`
+    (checkSchema/assertSchema/nullability). `migrate.zig` went from 11 873 lines
+    to 7 540, and what is left is plan, execution guards, the history table and
+    the advisory lock — plus the tests, which stay together because they
+    exercise the whole sequence.
     `zent.sql_schema` still works; `zent.migrate` is the honest name.
   - **`src/services/`** — `crud`, `crud_helpers`, `outbox`, `shard`, `helpers`:
     the layer a consumer wires rather than generates. `zent.crud` and friends are
