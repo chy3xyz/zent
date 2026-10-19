@@ -6173,6 +6173,155 @@ test "SQLite: migrateSchemaInTx leaves the transaction boundary with the caller"
     try testing.expectEqual(recorded, try migrationRowCount(&drv));
 }
 
+// The `interceptor × eager-load` matrix, in one place, because the cells are
+// what escape: a fix to one (the eager target's scope) has broken another (an
+// unconditional `whereEq` on a table that has no such column) before.
+//
+// | edge | shared column | covered by |
+// |------|---------------|------------|
+// | o2m  | `tenant_id` on both sides | "eager-loaded children respect interceptor tenant scope" |
+// | m2o  | `app_id` on both sides, junction-free | "…the neighbour query joins the junction…" (xj_* m2o half) |
+// | m2m  | `app_id` on both sides **and** on the junction | the xj_* m2m half |
+// | o2m  | privacy filter instead of an interceptor | "eager-loaded children respect privacy filters" |
+// | m2o  | **the target has no scoped column at all** | this test |
+//
+// The last cell is the interesting one: `whereEq` adds a predicate the target's
+// builder renders, so injecting a column the target does not have fails
+// (`UnknownField`) rather than silently widening. An interceptor that scopes
+// several tables therefore has to look at `view.table_name` — which is what the
+// working half below does.
+test "SQLite: an interceptor scopes the eager load by table, not by wishful column" {
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    // The owner carries no tenant column: a shared-tenant deployment styles the
+    // reference data that way.
+    const OwnerBase = schema("MatrixOwner", .{
+        .fields = &.{field.String("name")},
+    });
+    const DocBase = schema("MatrixDoc", .{
+        .fields = &.{
+            field.String("title"),
+            field.Int("owner_id"),
+            field.Int("tenant_id"),
+        },
+        .edges = &.{edge.From("owner", OwnerBase).Field("owner_id")},
+    });
+
+    const graph = comptime buildGraph(&.{ DocBase, OwnerBase });
+    const infos = graph.types;
+    try Client.createAllTables(std.testing.allocator, infos, drv.asDriver());
+    var client = Client.makeClient(infos, allocator, drv.asDriver());
+    defer Client.DeinitClient(infos, &client);
+
+    var tenant: i64 = 1;
+    try Client.UseInterceptor(infos, &client, .{
+        .ctx = &tenant,
+        .intercept = struct {
+            fn f(ctx: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                const id: *i64 = @ptrCast(@alignCast(ctx.?));
+                // Only the table that carries the column is scoped. `whereEq`
+                // on any other table would add a predicate the target cannot
+                // render — the documented failure this test's second half pins.
+                if (std.mem.indexOf(u8, view.table_name, "matrix_doc") != null) {
+                    try view.whereEq("tenant_id", .{ .int = id.* });
+                }
+            }
+        }.f,
+    });
+
+    var owner_id: i64 = 0;
+    {
+        var b = try client.matrix_owner.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "shared owner");
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[1], &e, allocator);
+        owner_id = e.id;
+    }
+    for ([_]i64{ 1, 2 }) |t| {
+        var b = try client.matrix_doc.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("title", if (t == 1) "t1 doc" else "t2 doc");
+        _ = try b.setFieldValue("owner_id", owner_id);
+        _ = try b.setFieldValue("tenant_id", t);
+        var e = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &e, allocator);
+    }
+
+    // The scoped table filters, and the unscoped target still loads: the eager
+    // load crosses from a tenant-scoped table into a shared one.
+    {
+        var q = client.matrix_doc.Query();
+        defer q.deinit();
+        _ = try q.WithEdge("owner");
+        const docs = try q.All();
+        defer {
+            for (docs.items) |*e| zent.codegen.deinitEntity(infos, infos[0], e, allocator);
+            docs.deinit();
+        }
+        try testing.expectEqual(@as(usize, 1), docs.items.len);
+        try testing.expectEqualStrings("t1 doc", docs.items[0].title);
+        // An m2o edge eager-loads as a list too (the same shape every edge
+        // projection uses), so the reference is its single element.
+        const owners = docs.items[0].edges.owner orelse return error.OwnerNotLoaded;
+        try testing.expectEqual(@as(usize, 1), owners.len);
+        try testing.expectEqualStrings("shared owner", owners[0].name);
+    }
+
+    // The boundary, pinned: injecting the column unconditionally reaches the
+    // owner's builder, which cannot render `tenant_id`, and the query fails
+    // loudly instead of returning every owner.
+    tenant = 1;
+    {
+        var q2 = client.matrix_doc.Query();
+        defer q2.deinit();
+        _ = try q2.WithEdge("owner");
+        // A second interceptor on the same client would stack; use a scoped
+        // client instead so this assertion is about the column, not ordering.
+        var drv2 = try SQLiteDriver.open(allocator, ":memory:");
+        defer drv2.close();
+        try Client.createAllTables(std.testing.allocator, infos, drv2.asDriver());
+        var client2 = Client.makeClient(infos, allocator, drv2.asDriver());
+        defer Client.DeinitClient(infos, &client2);
+        // Seeded before the interceptor is registered: an unconditional
+        // `whereEq` also runs on the create path (where it means "set this
+        // column"), and the owner has no such column either.
+        var b = try client2.matrix_owner.Create();
+        defer b.deinit();
+        _ = try b.setFieldValue("name", "shared owner");
+        var oe = try b.Save();
+        defer zent.codegen.deinitEntity(infos, infos[1], &oe, allocator);
+        var d = try client2.matrix_doc.Create();
+        defer d.deinit();
+        _ = try d.setFieldValue("title", "t1 doc");
+        _ = try d.setFieldValue("owner_id", oe.id);
+        _ = try d.setFieldValue("tenant_id", @as(i64, 1));
+        var de = try d.Save();
+        defer zent.codegen.deinitEntity(infos, infos[0], &de, allocator);
+
+        var wound_up: i64 = 1;
+        try Client.UseInterceptor(infos, &client2, .{
+            .ctx = &wound_up,
+            .intercept = struct {
+                fn f(_: ?*anyopaque, view: *zent.runtime.intercept.QueryView) anyerror!void {
+                    try view.whereEq("tenant_id", .{ .int = 1 });
+                }
+            }.f,
+        });
+
+        var wq = client2.matrix_doc.Query();
+        defer wq.deinit();
+        _ = try wq.WithEdge("owner");
+        // `InterceptFailed` is the chain's wrapper; the cause is the target's
+        // `UnknownField` (the warning `whereEq` emits names the column and the
+        // table). What matters here is the direction: it fails rather than
+        // dropping the predicate and returning every owner.
+        try testing.expectError(error.InterceptFailed, wq.All());
+    }
+}
+
 /// How many versions `zent_schema_migrations` holds — the observation that says
 /// whether a migration recorded work or found it already done.
 fn migrationRowCount(drv: *SQLiteDriver) !i64 {

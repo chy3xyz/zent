@@ -52,6 +52,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The `interceptor × eager-load` matrix is written down, and its last gap is
+  pinned.** The cells existed as separate tests (o2m with a shared `tenant_id`,
+  m2o and m2m with a shared `app_id`, the junction carrying it too, and a privacy
+  variant), so a fix to one had no single place to notice it had broken another —
+  the way the eager-target scope fix once broke an unconditional `whereEq`. The
+  matrix now lives as a table at the top of the test that covers the remaining
+  cell: **an eager target with no scoped column at all**. The interceptor there
+  scopes by `view.table_name`, which is the form that works across tables; the
+  test's second half pins the other direction — an unconditional `whereEq` on a
+  table without that column fails (`InterceptFailed`, caused by the target's
+  `UnknownField`) rather than dropping the predicate and returning every row.
+
 - **`scripts/check-pg-wire.sh` and a CI job: a PostgreSQL-wire server is a
   gate, not an anecdote.** The script runs the integration suite against a
   wire-compatible server and compares the **set of failing test names** with
