@@ -891,6 +891,14 @@ pub fn warnOutOfGraphEdgeRefs(comptime info: TypeInfo, comptime all_infos: []con
 }
 
 /// Like tableFromTypeInfo, but also adds FK columns from cross-referenced To edges.
+///
+/// **Prefer this over `tableFromTypeInfo` on the migration path.** The
+/// single-`TypeInfo` export has no `all_infos` to resolve against, so its
+/// From-edge FK keeps the historical derived shape (short table name + a literal
+/// `"id"` pk) — a guess that can be wrong for a target with an explicit
+/// `.table_name` or `.pk`. This function resolves both through the target's
+/// TypeInfo, and leaves the constraint out entirely when the target is not in
+/// `all_infos` rather than guessing it.
 /// For example, if User has a To("cars", Car) O2M edge, this adds a "user_id" FK column
 /// to the Car table pointing back to User.
 pub fn tableFromTypeInfoCrossRef(comptime info: TypeInfo, comptime all_infos: []const TypeInfo) TableDef {

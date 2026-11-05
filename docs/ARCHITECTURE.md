@@ -150,7 +150,7 @@ took.
 
 ## Driver abstraction
 
-`src/sql/dialect.zig` captures the three dialects; `driver.zig` defines the
+`src/base/dialect.zig` captures the three dialects; `driver.zig` defines the
 `Driver` vtable. Backends differ in: placeholders, identifier quoting,
 `RETURNING` support (SQLite/PostgreSQL yes, MySQL no → `last_insert_id`
 chaining), and upsert syntax (`ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY

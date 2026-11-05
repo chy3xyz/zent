@@ -6322,6 +6322,46 @@ test "SQLite: an interceptor scopes the eager load by table, not by wishful colu
     }
 }
 
+test "SQLite: a changed view definition is rebuilt, and an unchanged one is left alone" {
+    // Z31's remaining half: PostgreSQL and MySQL converge with
+    // `CREATE OR REPLACE VIEW`, while SQLite's `CREATE VIEW IF NOT EXISTS`
+    // meant a changed `view_sql` never landed. Only a *changed* definition is
+    // rebuilt — the second run with the same schema must not drop anything.
+    const allocator = testing.allocator;
+    var drv = try SQLiteDriver.open(allocator, ":memory:");
+    defer drv.close();
+
+    const ViewA = schema("ViewChanged", .{
+        .table_name = "v_changed",
+        .view = true,
+        .view_sql = "SELECT 1 AS one",
+    });
+    const ViewB = schema("ViewChanged", .{
+        .table_name = "v_changed",
+        .view = true,
+        .view_sql = "SELECT 2 AS one",
+    });
+
+    try migrate.migrateSchema(allocator, drv.asDriver(), comptime buildGraph(&.{ViewA}).types);
+
+    const graph_b = comptime buildGraph(&.{ViewB});
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph_b.types);
+
+    {
+        var rows = try drv.query("SELECT one FROM v_changed", &.{});
+        defer rows.deinit();
+        const row = rows.next() orelse return error.NoRow;
+        try testing.expectEqual(@as(i64, 2), row.getInt(0).?);
+    }
+
+    // Third run, same schema: the definition matches, so nothing is emitted and
+    // the history table does not grow (a drop+create on every run would be the
+    // other way to get this wrong).
+    const before = try migrationRowCount(&drv);
+    try migrate.migrateSchema(allocator, drv.asDriver(), graph_b.types);
+    try testing.expectEqual(before, try migrationRowCount(&drv));
+}
+
 /// How many versions `zent_schema_migrations` holds — the observation that says
 /// whether a migration recorded work or found it already done.
 fn migrationRowCount(drv: *SQLiteDriver) !i64 {

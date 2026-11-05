@@ -61,6 +61,25 @@ pub fn nowMilli() i64 {
     return @divTrunc(nowNanos(), std.time.ns_per_ms);
 }
 
+/// The fail-closed form of `nowMilli`, for a caller for whom **0 is not a
+/// timestamp**. `nowMilli` answers 0 and warns on a failed syscall because that
+/// is the driver's fallback shape; an outbox cannot accept it: `created_at` of 0
+/// sorts a row behind every other row forever, and `requeueStale`'s age test
+/// (`claimed_at < now - older_than_secs * 1000`) would then match every
+/// never-claimed row on the next sweep — i.e. a transient clock failure turns
+/// into a permanently mis-ordered queue. So this variant returns
+/// `error.ClockUnavailable` and the outbox propagates it instead of writing an
+/// epoch it did not read.
+pub const ClockError = error{ClockUnavailable};
+
+pub fn nowMilliChecked() ClockError!i64 {
+    const ns = readRealtimeNs() orelse {
+        _ = failed(); // the one warning, in the same words as everywhere else
+        return error.ClockUnavailable;
+    };
+    return @divTrunc(ns, std.time.ns_per_ms);
+}
+
 /// Whole seconds since the Unix epoch on the wall clock — the unit
 /// `pool.unixTimestamp` measures connection age in, the unit the migration
 /// history's `applied_at` is written in, and the unit zent's `.time` columns
@@ -118,4 +137,16 @@ test "the wall clock does not step backwards between two consecutive reads" {
     const before_s = nowSecs();
     const after_s = nowSecs();
     try std.testing.expect(after_s >= before_s - 1);
+}
+
+test "nowMilliChecked answers in milliseconds, not nanoseconds" {
+    // The one way this wrapper can be wrong without looking wrong: dropping the
+    // unit conversion. `requeueStale`'s age test is in the same unit, so a
+    // nanosecond answer would call every claimed row stale.
+    const checked = try nowMilliChecked();
+    const plain = nowMilli();
+    const delta = if (checked > plain) checked - plain else plain - checked;
+    // Two reads of the same clock may legitimately differ by a tick, never by
+    // a second: an ns-vs-ms mix-up is three orders of magnitude apart.
+    try std.testing.expect(delta < 1000);
 }

@@ -91,12 +91,17 @@ pub const Publisher = struct {
 
 /// Wall-clock milliseconds since the Unix epoch (the unit used for
 /// `created_at` / `claimed_at`). `claim` and `requeueStale` read the same
-/// clock, so claim stamps and the staleness cutoff stay comparable. The read
-/// itself is `zent.walltime.nowMilli` — one implementation for the whole
-/// library, which answers 0 and warns if the syscall fails (kept here as a
-/// same-named wrapper so this file's call sites and their fallback stay put).
-fn nowMs() i64 {
-    return walltime.nowMilli();
+/// clock, so claim stamps and the staleness cutoff stay comparable.
+///
+/// **Fail closed.** The read is `zent.walltime.nowMilliChecked`, not the
+/// 0-on-failure variant: `created_at = 0` sorts a row behind every other row
+/// forever, and a zero `claimed_at` would make the stale-sweep predicate match
+/// everything on the next pass, so a transient clock failure would become a
+/// permanently mis-ordered outbox. A failed syscall therefore surfaces as
+/// `error.ClockUnavailable` (with the same warning the other clock readers
+/// emit) rather than a timestamp this module did not measure.
+fn nowMs() !i64 {
+    return walltime.nowMilliChecked();
 }
 
 /// The `claimed_at` cutoff (epoch ms) for a positive `older_than_secs`: a row
@@ -279,7 +284,7 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             _ = try b.set("claimed_at", .null);
             _ = try b.where(sql.EQ("status", .{ .string = Status.processing }));
             if (older_than_secs > 0) {
-                const cutoff = staleCutoffMs(nowMs(), older_than_secs);
+                const cutoff = staleCutoffMs(try nowMs(), older_than_secs);
                 const never_claimed = sql.IsNull("claimed_at");
                 const claimed_too_long_ago = sql.LT("claimed_at", .{ .int = cutoff });
                 _ = try b.where(sql.Or(&never_claimed, &claimed_too_long_ago));
@@ -311,7 +316,7 @@ pub fn Outbox(comptime infos: []const TypeInfo, comptime outbox_info: TypeInfo) 
             const d = @field(client, "driver");
             const dialect = d.dialect();
             const table = outbox_info.table_name;
-            const now = nowMs();
+            const now = try nowMs();
 
             // SQLite and PostgreSQL select and flip the rows in one statement,
             // so the claim is atomic without an explicit transaction.

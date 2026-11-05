@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed `clock_gettime` can no longer write a timestamp the outbox did not
+  measure.** `outbox.nowMs` used the wall-clock fallback that answers `0` on a
+  syscall failure, which is fine for a driver's age arithmetic and wrong for an
+  outbox: `created_at = 0` sorts a row behind every other row *forever*, and a
+  zero `claimed_at` makes `requeueStale`'s age predicate match every
+  never-claimed row on the next sweep — one transient clock failure becomes a
+  permanently mis-ordered queue. It now reads the new
+  `zent.walltime.nowMilliChecked()` (returning `error.ClockUnavailable` instead,
+  with the same warning the other readers emit), so `claim` and `requeueStale`
+  propagate the failure instead of stamping it. Unit-covered that the checked
+  variant answers **milliseconds** — dropping the conversion made every claimed
+  row look stale (found by the outbox integration test, not by reading).
+- **SQLite views converge on a changed `view_sql` (Z31's remaining half).**
+  PostgreSQL and MySQL already converged with `CREATE OR REPLACE VIEW`; SQLite's
+  `CREATE VIEW IF NOT EXISTS` meant a changed definition never landed and a
+  migration with the recorded version emitted nothing at all. An existing SQLite
+  view is now dropped and re-created **only when the stored `sqlite_master.sql`
+  differs from the statement the schema renders** — an unchanged view is not
+  dropped, and the history table does not grow, which the new integration test
+  pins in both directions.
+
 ## [0.97.0] - 2026-10-20
 
 ### Changed

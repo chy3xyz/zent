@@ -1199,6 +1199,24 @@ pub fn freePlannedStatements(allocator: std.mem.Allocator, plan: *std.array_list
 /// own the statement from the moment it exists. The list itself is unchanged
 /// when `append` fails (`ensureUnusedCapacity` then `appendAssumeCapacity`), so
 /// freeing here is the whole cleanup.
+/// Whether two view statements say the same thing, for the "do we need to
+/// drop and re-create this SQLite view" test.
+///
+/// SQLite stores `sqlite_master.sql` as written, and `createViewSQLAlloc`
+/// renders the same statement from the schema — so an unchanged view compares
+/// equal. Only the outside is normalized: `sqlite_master` may keep a trailing
+/// `;` or newline the render does not have. Nothing inside the statement is
+/// touched, because a `' '` inside a string literal is data, and collapsing it
+/// would make a changed view look unchanged.
+fn viewDefinitionMatches(stored: []const u8, rendered: []const u8) bool {
+    const trim = " \t\r\n;";
+    return std.mem.eql(
+        u8,
+        std.mem.trim(u8, stored, trim),
+        std.mem.trim(u8, rendered, trim),
+    );
+}
+
 fn appendPlanned(
     allocator: std.mem.Allocator,
     plan: *std.array_list.Managed(PlannedStatement),
@@ -1281,6 +1299,37 @@ pub fn planMigrateStatements(
                     try appendPlanned(allocator, &plan, try createViewSQLAlloc(allocator, info, dialect), version);
                 } else {
                     freeExistingColumns(allocator, &existing);
+                    // SQLite has no `CREATE OR REPLACE VIEW`, and its
+                    // `IF NOT EXISTS` is a no-op for an *existing* view — so a
+                    // changed `view_sql` used to leave the stale definition
+                    // standing forever while every other dialect converged. Drop
+                    // and re-create, **only when the stored statement differs
+                    // from the one this schema renders**: otherwise every
+                    // migration would drop a view it did not change (a view of
+                    // another view is not something to drop for fun).
+                    if (dialect.kind() == .sqlite) {
+                        // Ownership, spelled out because all three outcomes
+                        // differ: `rendered` is freed here when the definitions
+                        // agree (nothing is planned), it moves into the plan when
+                        // they differ, and `appendPlanned` frees it on its own
+                        // error path. A flag is the only way to say all three
+                        // without leaking it or freeing it twice.
+                        const rendered = try createViewSQLAlloc(allocator, info, dialect);
+                        var rendered_in_plan = false;
+                        defer if (!rendered_in_plan) allocator.free(rendered);
+
+                        var views = try getExistingViews(allocator, driver, info.table_name);
+                        defer freeExistingViews(allocator, &views);
+                        if (views.items.len > 0 and !viewDefinitionMatches(views.items[0].definition, rendered)) {
+                            var drop_buf = try std.array_list.Managed(u8).initCapacity(allocator, 64);
+                            defer drop_buf.deinit();
+                            try drop_buf.appendSlice("DROP VIEW IF EXISTS ");
+                            try quoteIdentToBuffer(dialect, &drop_buf, info.table_name);
+                            try appendPlanned(allocator, &plan, try drop_buf.toOwnedSlice(), null);
+                            rendered_in_plan = true;
+                            try appendPlanned(allocator, &plan, rendered, version);
+                        }
+                    }
                 }
             }
         } else {
