@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.97.1] - 2026-11-05
+
 ### Fixed
 
 - **A failed `clock_gettime` can no longer write a timestamp the outbox did not
