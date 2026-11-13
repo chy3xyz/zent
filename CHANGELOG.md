@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.97.2] - 2026-11-13
+
 ### Fixed
 
 - **The pool no longer holds its mutex across a connection handshake.** This is
