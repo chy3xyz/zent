@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The pool no longer holds its mutex across a connection handshake.** This is
+  the freeze a consumer reported as "table-buy hangs until the request times
+  out": the transaction commits, and the request then blocks *after* the commit
+  with the process at 0% CPU and nothing in flight in PostgreSQL. The cause was
+  `selectNoLock`: opening a connection was "the one driver call that still runs
+  under the mutex" (its own comment said so), so one slow handshake — a server
+  accepting slowly, a half-open TCP, a firewall dropping SYN — froze every
+  borrower *and every `release`*, which is exactly where a request that already
+  committed sits. The new connection's `SET client_encoding` completing while the
+  request hangs, and connections piling up as callers time out, are both the
+  same queue.
+  The ceiling is preserved without the lock: a borrower reserves the slot
+  (`pending_connects`) under the mutex, drops it, connects, and registers the
+  entry afterwards — so `all.len + pending_connects` still bounds
+  `max_connections` against concurrent opens. The borrow-path health check for a
+  freshly opened connection moved into the same unlocked region. New test
+  "ConnPool does not hold its mutex while a connection is opening" pins it
+  deterministically: a connect factory that parks, with another thread calling
+  `stats()` — it blocked for the full window before this change and returns
+  immediately now. (`closeConnection` still closes under the mutex; a blocking
+  `PQfinish` remains the one theoretical stall left there, recorded here rather
+  than folded into this change.)
+
 ## [0.97.1] - 2026-11-05
 
 ### Fixed

@@ -174,6 +174,13 @@ pub fn ConnPool(comptime D: type) type {
         cond: std.Io.Condition = .init,
         all: std.ArrayListUnmanaged(*PooledEntry) = .empty,
         available: std.ArrayListUnmanaged(*PooledEntry) = .empty,
+        /// Connections this pool has *reserved* a slot for and is opening right
+        /// now. Counted with `all.len` against `max_connections`, which is what
+        /// keeps the ceiling a ceiling without holding the mutex across the
+        /// handshake — a slow or hung `openConnection` used to freeze every
+        /// other borrower (and every `release`, which is why a request that had
+        /// already committed could hang before rendering its response).
+        pending_connects: u32 = 0,
         closed: bool = false,
         /// Source of waiter tickets, handed out under `mutex`. See `borrow`.
         next_ticket: u64 = 0,
@@ -348,12 +355,15 @@ pub fn ConnPool(comptime D: type) type {
             self.allocator.destroy(entry);
         }
 
-        /// A connection picked by `selectNoLock`, and whether the pool opened it
-        /// just now: the health check treats a fresh connection differently (see
-        /// `tryBorrowNoLock`).
-        const Selection = struct {
+        /// What `selectNoLock` decided: hand out this idle entry, or open one.
+        /// Opening is *not* done there — it is a network round trip, and the
+        /// mutex is not held across one any more (see `pending_connects`).
+        const Selection = union(enum) {
+            /// An idle entry, already marked borrowed.
             entry: *PooledEntry,
-            fresh: bool,
+            /// Room below the ceiling and nothing idle: the caller opens one,
+            /// with the mutex released, after reserving the slot.
+            open: void,
         };
 
         /// Non-blocking selection: hand out an idle connection (evicting stale
@@ -366,32 +376,12 @@ pub fn ConnPool(comptime D: type) type {
             self.last_attempt_error = null;
             while (true) {
                 const entry = self.available.pop() orelse {
-                    if (self.all.items.len < self.options.max_connections) {
-                        // Open a new connection. This is the one driver call
-                        // that still runs under the mutex: it decides whether
-                        // the pool has room, and reserving the slot before the
-                        // connect is what keeps `max_connections` a ceiling.
-                        var new_conn = self.openConnection() catch |err| {
-                            self.last_attempt_error = err;
-                            return null;
-                        };
-                        const entry = self.allocator.create(PooledEntry) catch {
-                            new_conn.close();
-                            self.last_attempt_error = error.OutOfMemory;
-                            return null;
-                        };
-                        entry.* = .{
-                            .conn = new_conn,
-                            .created_at = unixTimestamp(),
-                            .idle_since = null,
-                        };
-                        self.all.append(self.allocator, entry) catch {
-                            entry.conn.close();
-                            self.allocator.destroy(entry);
-                            self.last_attempt_error = error.OutOfMemory;
-                            return null;
-                        };
-                        return .{ .entry = entry, .fresh = true };
+                    // The ceiling counts the connections being opened right now
+                    // (`pending_connects`), which is what the reservation under
+                    // the mutex buys: two borrowers cannot both decide there is
+                    // room for the last slot and open a connection each.
+                    if (self.all.items.len + self.pending_connects < self.options.max_connections) {
+                        return .open;
                     }
                     return null;
                 };
@@ -414,7 +404,7 @@ pub fn ConnPool(comptime D: type) type {
 
                 // Mark as borrowed (no longer idle).
                 entry.idle_since = null;
-                return .{ .entry = entry, .fresh = false };
+                return .{ .entry = entry };
             }
         }
 
@@ -429,43 +419,107 @@ pub fn ConnPool(comptime D: type) type {
         /// `available` and only its borrower can reach it, while `reapIdle` /
         /// `pingIdle` only look at entries still in `available` and `release`
         /// only accepts a pointer its own borrower holds.
-        fn tryBorrowNoLock(self: *Self) ?*PooledEntry {
+        fn tryBorrowNoLock(self: *Self, want_open: *bool) ?*PooledEntry {
             const io = self.io;
             while (true) {
-                const selected = self.selectNoLock() orelse return null;
-                if (!self.options.health_check_on_borrow) return selected.entry;
+                const selected = switch (self.selectNoLock() orelse return null) {
+                    .open => {
+                        want_open.* = true;
+                        return null;
+                    },
+                    .entry => |entry| entry,
+                };
+                if (!self.options.health_check_on_borrow) return selected;
 
                 self.mutex.unlock(io);
-                const checked = selected.entry.conn.asDriver().ping();
+                const checked = selected.conn.asDriver().ping();
                 self.mutex.lockUncancelable(io);
 
                 if (checked) |_| {
-                    return selected.entry;
+                    return selected;
                 } else |err| {
-                    self.closeConnection(selected.entry);
+                    self.closeConnection(selected);
                     // Closing frees room below `max_connections`, so a parked
                     // borrower may be able to open a fresh one instead of
                     // waiting out its budget.
                     self.cond.signal(io);
-                    // A *pooled* connection that fails its check is dropped and
-                    // the next idle one is tried, as before. A freshly opened
-                    // one that fails means the server is refusing everything:
-                    // report no selection so the caller's retry logic decides,
-                    // instead of spinning here opening and discarding
-                    // connections.
-                    //
-                    // The ping's own error is what the caller ends up being told
-                    // (`last_attempt_error`): "the health check failed" is the
-                    // reason no connection could be handed out, and
-                    // `PoolExhausted` would claim the pool is too small, which it
-                    // is not — the pool just made room by closing this entry.
-                    if (selected.fresh) {
-                        self.last_attempt_error = err;
-                        return null;
-                    }
+                    // An idle connection that fails its check is dropped and the
+                    // next one is tried. The ping's own error is recorded as the
+                    // reason no connection could be handed out: "the health check
+                    // failed" is what the caller is told, and `PoolExhausted`
+                    // would claim the pool is too small, which it is not — the
+                    // pool just made room by closing this entry.
+                    self.last_attempt_error = err;
                     continue;
                 }
             }
+        }
+
+        /// Open one connection and register it as borrowed — with the mutex
+        /// **released** across the handshake.
+        ///
+        /// The caller has already reserved the slot (`pending_connects += 1`
+        /// under the mutex), which is what keeps `max_connections` a ceiling now
+        /// that the connect is not serialized by the pool lock. Every path
+        /// releases that reservation exactly once, under the mutex.
+        ///
+        /// `ping` is the borrow-path health check for a connection nobody has
+        /// used yet: a server that accepts the handshake and then refuses a
+        /// round trip is not a usable connection. It also runs unlocked.
+        ///
+        /// Returns null when the connection could not be opened or failed its
+        /// check, recording `last_attempt_error` under the mutex first.
+        fn openAndTake(self: *Self, ping: bool) ?*PooledEntry {
+            const io = self.io;
+
+            var conn = self.openConnection() catch |err| {
+                self.mutex.lockUncancelable(io);
+                self.pending_connects -= 1;
+                self.last_attempt_error = err;
+                // The reservation held a slot; releasing it is room a parked
+                // borrower can use.
+                self.cond.signal(io);
+                self.mutex.unlock(io);
+                return null;
+            };
+
+            self.mutex.lockUncancelable(io);
+            self.pending_connects -= 1;
+            const entry = self.allocator.create(PooledEntry) catch {
+                self.mutex.unlock(io);
+                conn.close();
+                self.mutex.lockUncancelable(io);
+                self.last_attempt_error = error.OutOfMemory;
+                self.mutex.unlock(io);
+                return null;
+            };
+            entry.* = .{
+                .conn = conn,
+                .created_at = unixTimestamp(),
+                .idle_since = null,
+            };
+            self.all.append(self.allocator, entry) catch {
+                self.mutex.unlock(io);
+                entry.conn.close();
+                self.allocator.destroy(entry);
+                self.mutex.lockUncancelable(io);
+                self.last_attempt_error = error.OutOfMemory;
+                self.mutex.unlock(io);
+                return null;
+            };
+            self.mutex.unlock(io);
+
+            if (ping) {
+                if (entry.conn.asDriver().ping()) |_| {} else |err| {
+                    self.mutex.lockUncancelable(io);
+                    self.closeConnection(entry);
+                    self.last_attempt_error = err;
+                    self.cond.signal(io);
+                    self.mutex.unlock(io);
+                    return null;
+                }
+            }
+            return entry;
         }
 
         /// How many times a younger waiter steps aside for an older ticket
@@ -503,7 +557,8 @@ pub fn ConnPool(comptime D: type) type {
         ///
         /// The caller must hold `self.mutex`.
         fn atCeilingNoLock(self: *Self) bool {
-            return self.available.items.len == 0 and self.all.items.len >= self.options.max_connections;
+            return self.available.items.len == 0 and
+                self.all.items.len + self.pending_connects >= self.options.max_connections;
         }
 
         /// Milliseconds still left of this call's budget, measured from `start`;
@@ -660,6 +715,11 @@ pub fn ConnPool(comptime D: type) type {
                 // there is no release to wait for, so this call retries on the
                 // bounded path below instead of parking (see `atCeilingNoLock`).
                 var retry_instead_of_park = false;
+                // Set when this attempt decided the pool should open a
+                // connection: the reservation is already counted under the
+                // mutex, and the handshake happens below, unlocked.
+                var needs_open = false;
+                var want_open = false;
 
                 self.mutex.lockUncancelable(io);
                 {
@@ -671,9 +731,16 @@ pub fn ConnPool(comptime D: type) type {
                     {
                         deferrals += 1;
                         deferred = true;
-                    } else if (self.tryBorrowNoLock()) |entry| {
+                    } else if (self.tryBorrowNoLock(&want_open)) |entry| {
                         self.dropTicketNoLock(&ticket);
                         borrowed = entry;
+                    } else if (want_open) {
+                        // The pool has room and nothing idle: reserve the slot
+                        // here (so the ceiling still binds other borrowers) and
+                        // open the connection *after* releasing the mutex.
+                        self.pending_connects += 1;
+                        needs_open = true;
+                        self.dropTicketNoLock(&ticket);
                     } else if (!wait_done and self.atCeilingNoLock()) {
                         if (ticket == null) {
                             ticket = self.registerWaiterNoLock();
@@ -719,6 +786,14 @@ pub fn ConnPool(comptime D: type) type {
                     }
                 }
                 self.mutex.unlock(io);
+
+                if (needs_open) {
+                    // Any failure here is a failed attempt like any other: the
+                    // retry/backoff tail below applies, and its budget check is
+                    // what stops a caller from retrying past its deadline.
+                    borrowed = self.openAndTake(self.options.health_check_on_borrow);
+                    if (borrowed == null) retry_instead_of_park = true;
+                }
 
                 if (borrowed) |entry| {
                     if (self.options.metrics.onBorrow) |cb| {
@@ -3867,4 +3942,98 @@ test "ConnPool stress: every parked waiter is served when connections come back"
     try std.testing.expectEqual(@as(usize, 0), state.borrow_errors.load(.monotonic));
     try std.testing.expectEqual(@as(usize, max_connections + waiters * cycles), state.borrows);
     try expectStressInvariants(&state, &pool, max_connections);
+}
+
+test "ConnPool does not hold its mutex while a connection is opening" {
+    // The regression behind BUG-043 in a consumer: a request commits its
+    // transaction and then needs the pool again — to return the connection, to
+    // borrow one for the response, or merely to read `stats()` — while another
+    // thread is inside `openConnection`. Connecting while holding the pool's
+    // mutex turns one slow handshake into a freeze of *every* request: 0% CPU,
+    // nothing in flight in the database, and hangs that start right after a
+    // commit (which is exactly where the release happens).
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const Pool = ConnPool(SQLiteDriver);
+    const allocator = std.heap.page_allocator;
+
+    const Gate = struct {
+        var open = std.atomic.Value(bool).init(true);
+        var entered = std.atomic.Value(bool).init(false);
+        var holding = std.atomic.Value(bool).init(false);
+        var release_now = std.atomic.Value(bool).init(false);
+        var stats_done = std.atomic.Value(bool).init(false);
+
+        fn connect(a: std.mem.Allocator) !SQLiteDriver {
+            entered.store(true, .release);
+            while (!open.load(.acquire)) std.Thread.yield() catch {};
+            return SQLiteDriver.open(a, ":memory:");
+        }
+
+        /// Takes the one idle connection and holds it, so the second borrower
+        /// has to open a new one.
+        fn hold(pool: *Pool) void {
+            const c = pool.borrow() catch return;
+            holding.store(true, .release);
+            while (!release_now.load(.acquire)) std.Thread.yield() catch {};
+            pool.release(c);
+        }
+
+        fn borrowSecond(pool: *Pool) void {
+            const c = pool.borrow() catch return;
+            pool.release(c);
+        }
+
+        fn readStats(pool: *Pool) void {
+            _ = pool.stats();
+            stats_done.store(true, .release);
+        }
+    };
+
+    // `init` warms `min_connections` through the same factory, so the gate is
+    // open for that and closed afterwards.
+    var pool = try Pool.init(allocator, .{
+        .connect = Gate.connect,
+        .min_connections = 1,
+        .max_connections = 2,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 2_000,
+    });
+    defer pool.deinit();
+    Gate.open.store(false, .release);
+    Gate.entered.store(false, .release);
+
+    const holder = try std.Thread.spawn(.{}, Gate.hold, .{&pool});
+    var spins: usize = 0;
+    while (!Gate.holding.load(.acquire) and spins < 200_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(Gate.holding.load(.acquire));
+
+    // The second borrower must open a connection: the gate holds it inside the
+    // factory, which is the window under test.
+    const opener = try std.Thread.spawn(.{}, Gate.borrowSecond, .{&pool});
+    spins = 0;
+    while (!Gate.entered.load(.acquire) and spins < 200_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(Gate.entered.load(.acquire));
+
+    // With the handshake still in flight, another caller must still get the
+    // mutex. `stats()` is the cheapest such caller and reads only bookkeeping.
+    const reader = try std.Thread.spawn(.{}, Gate.readStats, .{&pool});
+    var waited: usize = 0;
+    while (!Gate.stats_done.load(.acquire) and waited < 200) : (waited += 1) {
+        std.Io.sleep(pool.io, std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    const blocked = !Gate.stats_done.load(.acquire);
+
+    // Release the handshake either way, so the test cannot hang on the bug it
+    // is looking for.
+    Gate.open.store(true, .release);
+    opener.join();
+    Gate.release_now.store(true, .release);
+    holder.join();
+    reader.join();
+
+    try std.testing.expect(!blocked);
 }
