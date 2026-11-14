@@ -1644,3 +1644,23 @@ later. Use this template:
 - `errdefer` for rollback/cleanup; `defer` for forward-only cleanup.
 - Preserve query constants (`pay_status = 20`, `apply_status = 10`, ...)
   verbatim across migrations — do not "fix" a number you don't understand.
+
+## Pool: borrows outlive nothing
+
+A borrowed connection is the caller's until it is returned — and there is no
+scope guard for it, so two rules keep a pool healthy:
+
+- **Release before borrowing again.** A transaction holds its connection until
+  `tx.deinit()`, which is usually a `defer` at the end of the enclosing scope.
+  Code that runs *inside* that scope and borrows a second connection (an event
+  flush, a second query outside the tx) needs a second connection to exist. With
+  a pool sized 1 that borrow waits out `max_wait_ms` and reports
+  `PoolWaitTimeout`; size the pool for the concurrency, or finish the transaction
+  first.
+- **A cancelled borrower leaks its connection.** zent cannot see a fiber being
+  abandoned, so a request that is timed out mid-borrow never runs its `release`.
+  The pool makes that visible rather than mysterious: `stats().oldest_borrow_ms`
+  is how long the oldest lent-out connection has been gone, and the
+  "no connection could be handed out" warning carries the same number — an age
+  that keeps growing with `in_use == total` is a leaked borrow, not a pool that
+  is too small.

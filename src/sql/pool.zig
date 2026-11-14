@@ -164,6 +164,14 @@ pub fn ConnPool(comptime D: type) type {
             /// Unix timestamp when the connection was last released to the pool,
             /// or null when currently borrowed.
             idle_since: ?i64,
+            /// Unix timestamp when the connection was taken out of the pool, or
+            /// null when it is idle. `idle_since` says the same thing from the
+            /// other side; both are kept because "how long has this been lent
+            /// out" is the number a stuck consumer needs (see
+            /// `Stats.oldest_borrow_ms` and the exhaustion warning), and
+            /// deriving it from a null would mean reading the clock at every
+            /// status call.
+            borrowed_at: ?i64,
         };
 
         allocator: std.mem.Allocator,
@@ -296,6 +304,7 @@ pub fn ConnPool(comptime D: type) type {
                 .conn = conn,
                 .created_at = unixTimestamp(),
                 .idle_since = unixTimestamp(),
+                .borrowed_at = null,
             };
 
             try self.all.append(self.allocator, entry);
@@ -497,6 +506,7 @@ pub fn ConnPool(comptime D: type) type {
                 .conn = conn,
                 .created_at = unixTimestamp(),
                 .idle_since = null,
+                .borrowed_at = unixTimestamp(),
             };
             self.all.append(self.allocator, entry) catch {
                 self.mutex.unlock(io);
@@ -867,9 +877,25 @@ pub fn ConnPool(comptime D: type) type {
                 @intCast(@max(start.untilNow(io).raw.toMilliseconds(), 0))
             else
                 0;
+            // The number that turns "the pool is exhausted" into a diagnosis: a
+            // connection lent out long ago and never returned is a borrower that
+            // was abandoned (a cancelled fiber, a `defer release` that never
+            // ran), not a pool that is too small.
+            self.mutex.lockUncancelable(io);
+            const oldest_borrow_ms = self.oldestBorrowMsNoLock();
+            self.mutex.unlock(io);
+            var age_note_buf: [96]u8 = undefined;
+            const age_note: []const u8 = if (oldest_borrow_ms >= 1_000)
+                std.fmt.bufPrint(
+                    &age_note_buf,
+                    " — the oldest borrow has been held for {d} ms (borrowed and never released?)",
+                    .{oldest_borrow_ms},
+                ) catch ""
+            else
+                "";
             zent_log.warn(
-                "zent pool: no connection could be handed out after {d} attempt(s) and {d} ms of waiting: {s}",
-                .{ attempt + 1, waited_ms, @errorName(reason) },
+                "zent pool: no connection could be handed out after {d} attempt(s) and {d} ms of waiting: {s}{s}",
+                .{ attempt + 1, waited_ms, @errorName(reason), age_note },
             );
             return borrowErrorFor(reason);
         }
@@ -938,6 +964,7 @@ pub fn ConnPool(comptime D: type) type {
                 if (!evicted) {
                     if (self.available.append(self.allocator, entry)) |_| {
                         entry.idle_since = unixTimestamp();
+                        entry.borrowed_at = null;
                     } else |_| {
                         self.closeConnection(entry);
                     }
@@ -997,6 +1024,12 @@ pub fn ConnPool(comptime D: type) type {
             waiters: usize,
             /// Borrows that gave up since the pool was created.
             exhausted_total: u64,
+            /// How long the oldest currently-borrowed connection has been lent
+            /// out, in milliseconds (0 when nothing is borrowed). A number that
+            /// keeps growing while `in_use` stays at `total` is the signature of
+            /// a borrower that never released — the shape a consumer saw as
+            /// "connections slowly get used up after requests time out".
+            oldest_borrow_ms: i64,
             closed: bool,
         };
 
@@ -1010,8 +1043,22 @@ pub fn ConnPool(comptime D: type) type {
                 .available = self.available.items.len,
                 .waiters = self.wait_tickets.items.len,
                 .exhausted_total = self.exhausted_total,
+                .oldest_borrow_ms = self.oldestBorrowMsNoLock(),
                 .closed = self.closed,
             };
+        }
+
+        /// Age of the oldest borrow, in milliseconds. The caller must hold
+        /// `self.mutex`.
+        fn oldestBorrowMsNoLock(self: *Self) i64 {
+            const now = unixTimestamp();
+            var oldest: i64 = 0;
+            for (self.all.items) |entry| {
+                const since = entry.borrowed_at orelse continue;
+                const age = now - since;
+                if (age > oldest) oldest = age;
+            }
+            return oldest * 1000;
         }
 
         /// Actively ping all idle connections in the pool and drop dead ones.
@@ -4036,4 +4083,75 @@ test "ConnPool does not hold its mutex while a connection is opening" {
     reader.join();
 
     try std.testing.expect(!blocked);
+}
+
+test "ConnPool reports the age of the oldest outstanding borrow" {
+    // The diagnosis for "connections slowly get used up": a borrow that is taken
+    // and never released. `stats().oldest_borrow_ms` is the number a watchdog
+    // reads, and the exhaustion warning carries it too.
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, ":memory:");
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+    });
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(i64, 0), pool.stats().oldest_borrow_ms);
+
+    const c = try pool.borrow();
+    // The stamp has second resolution (`unixTimestamp`), so a same-second check
+    // only asserts "something is borrowed"; a sleep would make the test slow
+    // without making it stronger.
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().in_use);
+    try std.testing.expect(pool.stats().oldest_borrow_ms >= 0);
+
+    pool.release(c);
+    try std.testing.expectEqual(@as(i64, 0), pool.stats().oldest_borrow_ms);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().in_use);
+}
+
+test "ConnPool: a transaction holding the only connection makes a second borrow time out, not deadlock" {
+    // The shape a consumer hit as "the request hangs after commit". A pool of
+    // one, a transaction that still owns that connection (`tx.deinit` is what
+    // returns it), and code below it that borrows another: there is no second
+    // connection to hand out, so the second borrow waits out its budget and
+    // reports `PoolWaitTimeout` — and, because the first borrow is still
+    // outstanding, the warning names its age. Sizing the pool for the
+    // concurrency, or finishing the transaction before borrowing, is the fix;
+    // this test pins that zent says so instead of blocking forever.
+    const SQLiteDriver = @import("sqlite.zig").SQLiteDriver;
+    const allocator = std.testing.allocator;
+
+    var pool = try ConnPool(SQLiteDriver).init(allocator, .{
+        .connect = struct {
+            fn f(a: std.mem.Allocator) !SQLiteDriver {
+                return SQLiteDriver.open(a, ":memory:");
+            }
+        }.f,
+        .min_connections = 1,
+        .max_connections = 1,
+        .health_check_on_borrow = false,
+        .max_wait_ms = 20,
+    });
+    defer pool.deinit();
+
+    // The driver-level entry point is what a transaction goes through; it takes
+    // the pool's only connection and holds it until `deinit`.
+    const drv = pool.asDriver();
+    var tx = try drv.beginTx();
+    defer tx.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().in_use);
+    try std.testing.expectError(error.PoolWaitTimeout, pool.borrow());
+
+    // The transaction still owns the connection and is still usable: the failed
+    // borrow did not disturb it.
+    _ = try tx.exec("CREATE TABLE t (id INTEGER)", &.{});
 }

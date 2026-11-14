@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **The pool says how long its oldest borrow has been out.** `Stats` gained
+  `oldest_borrow_ms`, and the "no connection could be handed out" warning now
+  carries it (`… — the oldest borrow has been held for 512000 ms (borrowed and
+  never released?)`). This is the difference between two very different
+  diagnoses a consumer was stuck between: *the pool is too small* (raise
+  `max_connections`) and *a borrower was abandoned holding a connection* (a
+  request that was timed out mid-borrow never runs its `release`, and zent cannot
+  see a fiber being abandoned). A borrow is stamped when it is taken and cleared
+  when the connection goes back to `available`. Two tests pin it: the age is
+  reported while a connection is out and zero after release, and a transaction
+  holding a one-connection pool makes a second borrow answer
+  `PoolWaitTimeout` — with the transaction unharmed — rather than deadlock.
+- `docs/BEST_PRACTICES.md` gained the matching two rules ("release before
+  borrowing again", "a cancelled borrower leaks its connection").
+
+### Known
+
+- `release` still runs one network round trip under the pool mutex: the
+  `ROLLBACK` it issues when a connection comes back *inside* a transaction
+  (`closeConnection`'s `PQfinish` is the same shape). Measured need so far is
+  low — a caller that commits or rolls back before returning never takes that
+  branch — but it is the last instance of the class fixed in v0.97.2 (a slow
+  socket under the pool lock stalls every borrower and every release), and it is
+  recorded here rather than silently left as the odd one out.
+
 ## [0.97.2] - 2026-11-13
 
 ### Fixed
