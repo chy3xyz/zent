@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.97.3] - 2026-11-16
+
 ### Added
 
 - **The pool says how long its oldest borrow has been out.** `Stats` gained
